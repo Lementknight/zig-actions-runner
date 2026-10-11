@@ -62,6 +62,18 @@ pub const Job = struct {
     github: Github = .{},
     /// Base URL of the results service (`system.github.results_endpoint`), where logs are uploaded.
     results_endpoint: []const u8 = "",
+    /// Run metadata for the `runs` and `jobs` tables (SPEC §3, §4). Null when the definition lacks
+    /// it. A null `run_id` means the job still runs but no rows are written for it.
+    run_id: ?u64 = null,
+    repo: ?[]const u8 = null,
+    workflow: ?[]const u8 = null,
+    event: ?[]const u8 = null,
+    branch: ?[]const u8 = null,
+    sha: ?[]const u8 = null,
+    /// Job display name (`jobDisplayName`, else `jobName`, else the job's key in the workflow).
+    name: []const u8 = "",
+    /// The runner's `AgentName` from the JIT config's `.runner` file; set by the job loop.
+    runner_name: []const u8 = "",
     steps: []const Step,
 };
 
@@ -94,6 +106,13 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .secrets = try collectSecrets(arena, root),
         .results_endpoint = variable(root, "system.github.results_endpoint") orelse "",
         .github = githubContext(root),
+        .run_id = runId(root),
+        .repo = contextString(root, "github", "repository"),
+        .workflow = contextString(root, "github", "workflow"),
+        .event = contextString(root, "github", "event_name"),
+        .branch = contextString(root, "github", "ref_name"),
+        .sha = contextString(root, "github", "sha"),
+        .name = jobName(root),
         .has_container = if (root.object.get("jobContainer")) |c| c != .null else false,
         .steps = steps,
     };
@@ -220,23 +239,55 @@ fn inList(list: []const []const u8, name: []const u8) bool {
 /// `contextData.github` is `{t, d:[{k, v}]}` with plain string values.
 fn githubContext(root: Value) Github {
     var g: Github = .{};
-    const cd = root.object.get("contextData") orelse return g;
-    if (cd != .object) return g;
-    const gh = cd.object.get("github") orelse return g;
-    if (gh != .object) return g;
-    const d = gh.object.get("d") orelse return g;
-    if (d != .array) return g;
-    for (d.array.items) |e| {
+    g.repository = contextString(root, "github", "repository") orelse "";
+    g.sha = contextString(root, "github", "sha") orelse "";
+    g.ref = contextString(root, "github", "ref") orelse "";
+    if (contextString(root, "github", "server_url")) |u| g.server_url = u;
+    return g;
+}
+
+/// The `{t, d:[{k, v}]}` dictionary at `contextData.<context>`, or null.
+fn contextEntries(root: Value, context: []const u8) ?[]const Value {
+    const cd = root.object.get("contextData") orelse return null;
+    if (cd != .object) return null;
+    const ctx = cd.object.get(context) orelse return null;
+    if (ctx != .object) return null;
+    const d = ctx.object.get("d") orelse return null;
+    return if (d == .array) d.array.items else null;
+}
+
+fn contextValue(root: Value, context: []const u8, key: []const u8) ?Value {
+    for (contextEntries(root, context) orelse return null) |e| {
         if (e != .object) continue;
         const k = e.object.get("k") orelse continue;
-        const v = e.object.get("v") orelse continue;
-        if (k != .string or v != .string) continue;
-        if (std.mem.eql(u8, k.string, "repository")) g.repository = v.string //
-        else if (std.mem.eql(u8, k.string, "sha")) g.sha = v.string //
-        else if (std.mem.eql(u8, k.string, "ref")) g.ref = v.string //
-        else if (std.mem.eql(u8, k.string, "server_url") and v.string.len > 0) g.server_url = v.string;
+        if (k != .string or !std.mem.eql(u8, k.string, key)) continue;
+        return e.object.get("v");
     }
-    return g;
+    return null;
+}
+
+/// A non-empty string value from a context dictionary; null when missing, empty or not a string.
+fn contextString(root: Value, context: []const u8, key: []const u8) ?[]const u8 {
+    const v = contextValue(root, context, key) orelse return null;
+    return if (v == .string and v.string.len > 0) v.string else null;
+}
+
+/// `jobDisplayName`, else `jobName`, else `github.job`, skipping empty values.
+fn jobName(root: Value) []const u8 {
+    if (nonEmpty(path(root, &.{"jobDisplayName"}) orelse "")) |n| return n;
+    if (nonEmpty(path(root, &.{"jobName"}) orelse "")) |n| return n;
+    return contextString(root, "github", "job") orelse "job";
+}
+
+/// `github.run_id` is a decimal string in the `github` context; a number is accepted too.
+fn runId(root: Value) ?u64 {
+    const v = contextValue(root, "github", "run_id") orelse return null;
+    const id: u64 = switch (v) {
+        .string => |s| std.fmt.parseInt(u64, s, 10) catch return null,
+        .integer => |i| if (i > 0) @intCast(i) else return null,
+        else => return null,
+    };
+    return if (id > 0) id else null;
 }
 
 /// Flattens a mapping token whose keys and values are all string literals.
@@ -329,20 +380,8 @@ fn collectSecrets(arena: Allocator, root: Value) Allocator.Error![]const []const
 
 /// `contextData.job` is `{"t":N,"d":[{"k":"check_run_id","v":123},...]}`.
 fn checkRunId(root: Value) u64 {
-    const cd = root.object.get("contextData") orelse return 0;
-    if (cd != .object) return 0;
-    const job = cd.object.get("job") orelse return 0;
-    if (job != .object) return 0;
-    const d = job.object.get("d") orelse return 0;
-    if (d != .array) return 0;
-    for (d.array.items) |e| {
-        if (e != .object) continue;
-        const k = e.object.get("k") orelse continue;
-        if (k != .string or !std.mem.eql(u8, k.string, "check_run_id")) continue;
-        const v = e.object.get("v") orelse return 0;
-        return if (v == .integer and v.integer > 0) @intCast(v.integer) else 0;
-    }
-    return 0;
+    const v = contextValue(root, "job", "check_run_id") orelse return 0;
+    return if (v == .integer and v.integer > 0) @intCast(v.integer) else 0;
 }
 
 fn jobToken(root: Value) ?[]const u8 {
@@ -431,4 +470,56 @@ test "malformed job" {
     defer a.deinit();
     try std.testing.expectError(error.MalformedJob, parse(a.allocator(), "{}"));
     try std.testing.expectError(error.MalformedJob, parse(a.allocator(), "not json"));
+}
+
+test "run metadata from testdata/job-mixed.json" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const job = try parse(a.allocator(), @embedFile("job-mixed.json"));
+    try std.testing.expectEqual(@as(?u64, 18400000042), job.run_id);
+    try std.testing.expectEqual(@as(u64, 4242), job.check_run_id);
+    try std.testing.expectEqualStrings("Lementknight/zig-actions-runner", job.repo.?);
+    try std.testing.expectEqualStrings("CI", job.workflow.?);
+    try std.testing.expectEqualStrings("push", job.event.?);
+    try std.testing.expectEqualStrings("feature/tiger-db", job.branch.?);
+    try std.testing.expectEqualStrings("5dc85102f3a1c0de5dc85102f3a1c0de5dc85102", job.sha.?);
+    try std.testing.expectEqualStrings("Build and test", job.name);
+    // Set by the job loop from the JIT config, not by the definition.
+    try std.testing.expectEqualStrings("", job.runner_name);
+}
+
+test "missing run metadata becomes null and the job still parses" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const minimal =
+        \\{"plan":{"planId":"p"},"jobId":"j","jobDisplayName":"","jobName":"build",
+        \\ "contextData":{"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"run_id","v":"not-a-number"},{"k":"workflow","v":""}]}},
+        \\ "resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},"steps":[]}
+    ;
+    const job = try parse(a.allocator(), minimal);
+    try std.testing.expectEqual(@as(?u64, null), job.run_id);
+    try std.testing.expectEqualStrings("o/r", job.repo.?);
+    try std.testing.expect(job.workflow == null);
+    try std.testing.expect(job.event == null);
+    try std.testing.expect(job.branch == null);
+    try std.testing.expect(job.sha == null);
+    try std.testing.expectEqualStrings("build", job.name);
+
+    // No context data at all: every field null, the name falls back to "job".
+    const bare = try parse(a.allocator(),
+        \\{"plan":{"planId":"p"},"jobId":"j","resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},"steps":[]}
+    );
+    try std.testing.expect(bare.run_id == null and bare.repo == null and bare.workflow == null);
+    try std.testing.expectEqualStrings("job", bare.name);
+}
+
+test "numeric run_id is accepted" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const job = try parse(a.allocator(),
+        \\{"plan":{"planId":"p"},"jobId":"j","contextData":{"github":{"t":2,"d":[{"k":"run_id","v":99},{"k":"job","v":"lint"}]}},
+        \\ "resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},"steps":[]}
+    );
+    try std.testing.expectEqual(@as(?u64, 99), job.run_id);
+    try std.testing.expectEqualStrings("lint", job.name);
 }

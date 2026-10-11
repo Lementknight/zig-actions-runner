@@ -19,6 +19,8 @@ pub fn build(b: *std.Build) void {
     run_cmd.addPassthruArgs();
     b.step("run", "Run the runner").dependOn(&run_cmd.step);
 
+    // Saved job definitions, embedded by unit tests (`@embedFile("job-mixed.json")`).
+    exe.root_module.addAnonymousImport("job-mixed.json", .{ .root_source_file = b.path("testdata/job-mixed.json") });
     const tests = b.addTest(.{ .root_module = exe.root_module });
     b.step("test", "Run tests").dependOn(&b.addRunArtifact(tests).step);
 }
