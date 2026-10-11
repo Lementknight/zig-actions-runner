@@ -1,0 +1,84 @@
+/* Log lines (R7, R8). Light panel per the plan; every value is an --ar-* token. */
+
+.ar-log-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--ar-space-3);
+  padding: 0 var(--ar-space-3) 0 var(--ar-space-2);
+  color: var(--ar-log-fg);
+  font-family: var(--ar-font-mono);
+  font-size: var(--ar-log-font-size);
+  line-height: var(--ar-log-line-height);
+}
+
+.ar-log-line:hover {
+  background: var(--ar-log-line-hover);
+}
+
+.ar-log-line__number {
+  flex: none;
+  width: var(--ar-gutter-width);
+  color: var(--ar-log-muted);
+  text-align: right;
+  user-select: none;
+}
+
+.ar-log-line__ts {
+  flex: none;
+  color: var(--ar-log-muted);
+  white-space: nowrap;
+}
+
+.ar-log-line__text {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* An empty line still takes a row. */
+.ar-log-line__text:empty::before {
+  content: '\00a0';
+}
+
+/* The 16 basic colors, by name, from the token palette (KTD5). */
+
+.ar-ansi[data-fg='black'] { color: var(--ar-ansi-black); }
+.ar-ansi[data-fg='red'] { color: var(--ar-ansi-red); }
+.ar-ansi[data-fg='green'] { color: var(--ar-ansi-green); }
+.ar-ansi[data-fg='yellow'] { color: var(--ar-ansi-yellow); }
+.ar-ansi[data-fg='blue'] { color: var(--ar-ansi-blue); }
+.ar-ansi[data-fg='magenta'] { color: var(--ar-ansi-magenta); }
+.ar-ansi[data-fg='cyan'] { color: var(--ar-ansi-cyan); }
+.ar-ansi[data-fg='white'] { color: var(--ar-ansi-white); }
+.ar-ansi[data-fg='bright-black'] { color: var(--ar-ansi-bright-black); }
+.ar-ansi[data-fg='bright-red'] { color: var(--ar-ansi-bright-red); }
+.ar-ansi[data-fg='bright-green'] { color: var(--ar-ansi-bright-green); }
+.ar-ansi[data-fg='bright-yellow'] { color: var(--ar-ansi-bright-yellow); }
+.ar-ansi[data-fg='bright-blue'] { color: var(--ar-ansi-bright-blue); }
+.ar-ansi[data-fg='bright-magenta'] { color: var(--ar-ansi-bright-magenta); }
+.ar-ansi[data-fg='bright-cyan'] { color: var(--ar-ansi-bright-cyan); }
+.ar-ansi[data-fg='bright-white'] { color: var(--ar-ansi-bright-white); }
+
+.ar-ansi[data-bg='black'] { background-color: var(--ar-ansi-black); }
+.ar-ansi[data-bg='red'] { background-color: var(--ar-ansi-red); }
+.ar-ansi[data-bg='green'] { background-color: var(--ar-ansi-green); }
+.ar-ansi[data-bg='yellow'] { background-color: var(--ar-ansi-yellow); }
+.ar-ansi[data-bg='blue'] { background-color: var(--ar-ansi-blue); }
+.ar-ansi[data-bg='magenta'] { background-color: var(--ar-ansi-magenta); }
+.ar-ansi[data-bg='cyan'] { background-color: var(--ar-ansi-cyan); }
+.ar-ansi[data-bg='white'] { background-color: var(--ar-ansi-white); }
+.ar-ansi[data-bg='bright-black'] { background-color: var(--ar-ansi-bright-black); }
+.ar-ansi[data-bg='bright-red'] { background-color: var(--ar-ansi-bright-red); }
+.ar-ansi[data-bg='bright-green'] { background-color: var(--ar-ansi-bright-green); }
+.ar-ansi[data-bg='bright-yellow'] { background-color: var(--ar-ansi-bright-yellow); }
+.ar-ansi[data-bg='bright-blue'] { background-color: var(--ar-ansi-bright-blue); }
+.ar-ansi[data-bg='bright-magenta'] { background-color: var(--ar-ansi-bright-magenta); }
+.ar-ansi[data-bg='bright-cyan'] { background-color: var(--ar-ansi-bright-cyan); }
+.ar-ansi[data-bg='bright-white'] { background-color: var(--ar-ansi-bright-white); }
+
+.ar-ansi[data-bold] { font-weight: var(--ar-weight-semibold); }
+.ar-ansi[data-dim] { opacity: 0.6; }
+.ar-ansi[data-italic] { font-style: italic; }
+.ar-ansi[data-underline] { text-decoration: underline; }
+.ar-ansi[data-strikethrough] { text-decoration: line-through; }

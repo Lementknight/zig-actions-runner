@@ -1,0 +1,83 @@
+/* Steps (R6), after GitHub's job log: one row per step with a chevron, the status icon,
+   the name and the duration on the right; the lines sit under an open row. */
+
+.ar-step-list {
+  border-top: var(--ar-border-width) solid var(--ar-border-muted);
+}
+
+.ar-step-list__empty,
+.ar-step__note {
+  margin: 0;
+  padding: var(--ar-space-3) var(--ar-space-4);
+  color: var(--ar-fg-muted);
+  font-size: var(--ar-text-sm);
+}
+
+.ar-step {
+  border-bottom: var(--ar-border-width) solid var(--ar-border-muted);
+}
+
+.ar-step:last-child {
+  border-bottom: 0;
+}
+
+.ar-step__summary {
+  display: flex;
+  align-items: center;
+  gap: var(--ar-space-2);
+  padding: var(--ar-space-2) var(--ar-space-4);
+  cursor: pointer;
+  list-style: none;
+  font-size: var(--ar-text-sm);
+  line-height: var(--ar-line-relaxed);
+  user-select: none;
+}
+
+.ar-step__summary::-webkit-details-marker {
+  display: none;
+}
+
+.ar-step__summary:hover {
+  background: var(--ar-bg-subtle);
+}
+
+.ar-step__chevron {
+  display: inline-flex;
+  flex: none;
+  color: var(--ar-fg-muted);
+  transition: transform 0.12s ease-out;
+}
+
+.ar-step[open] > .ar-step__summary .ar-step__chevron {
+  transform: rotate(90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ar-step__chevron {
+    transition: none;
+  }
+}
+
+.ar-step__name {
+  flex: 1;
+  min-width: 0;
+  font-weight: var(--ar-weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.ar-step[data-placeholder] .ar-step__name {
+  color: var(--ar-fg-muted);
+  font-style: italic;
+}
+
+.ar-step__duration {
+  flex: none;
+  color: var(--ar-fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.ar-step__log {
+  padding: var(--ar-space-1) 0 var(--ar-space-2);
+  background: var(--ar-log-bg);
+  border-top: var(--ar-border-width) solid var(--ar-border-muted);
+}
