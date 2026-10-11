@@ -86,7 +86,7 @@ Build arguments, baked into the bundle (only `VITE_` names, so never a secret):
 |---|---|---|
 | `VITE_DATA_SOURCE` | `http` | `http` reads the API; `fake` builds the demo with bundled fixtures. |
 | `VITE_API_BASE_URL` | `/api` | Leave as `/api` so the browser calls the server, which proxies it. |
-| `BUN_VERSION` | `1.3.14` | The `oven/bun` tag for both stages. |
+| `BUN_VERSION` | `1.4.3` | The `oven/bun` tag for both stages. `api/Dockerfile` pins the same version; change both together. |
 
 For example `docker build --build-arg VITE_DATA_SOURCE=fake -t zig-runner-web-demo web` gives an
 image that needs no API.

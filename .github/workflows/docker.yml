@@ -28,6 +28,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Both images pin the same Bun version
+        run: |
+          versions=$(grep -h '^ARG BUN_VERSION=' api/Dockerfile web/Dockerfile | sort -u)
+          echo "$versions"
+          test "$(echo "$versions" | wc -l)" -eq 1 || { echo "api/Dockerfile and web/Dockerfile pin different Bun versions"; exit 1; }
+
       - name: Build the images and start the stack
         run: docker compose up --build --wait --wait-timeout 300
 

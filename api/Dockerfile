@@ -6,12 +6,15 @@
 
 # Install production dependencies only (hono, @hono/node-server, pg) from the npm lockfile, which
 # bun reads in place. Local dev and CI stay on npm, so the repo has no bun.lock.
-FROM oven/bun:1.4.3 AS deps
+# The Bun version both images share (web/Dockerfile pins the same one; docker.yml fails if they differ).
+ARG BUN_VERSION=1.4.3
+
+FROM oven/bun:${BUN_VERSION} AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN bun install --frozen-lockfile --production --no-cache
 
-FROM oven/bun:1.4.3-slim
+FROM oven/bun:${BUN_VERSION}-slim
 WORKDIR /app
 ENV NODE_ENV=production \
     PORT=8080

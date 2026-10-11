@@ -30,6 +30,8 @@ docker run --rm -e DATABASE_URL=... -p 8080:8080 zig-actions-api
 | `DATABASE_URL` | yes | none | Given at `docker run`, never stored in the image. Without it the container prints `DATABASE_URL is not set` and exits 1. |
 | `PORT` | no | `8080` | The port inside the container. |
 
+The Bun version is the `BUN_VERSION` build argument (`1.4.3`), pinned to the same value as `web/Dockerfile`; change both together.
+
 The `HEALTHCHECK` calls `GET /api/health` every 10 seconds with Bun's own `fetch` (the slim image
 has no curl). That route runs `SELECT 1`, so `docker ps` shows the container `unhealthy` while the
 database is down and `healthy` again once it answers. The container runs as the image's `bun`

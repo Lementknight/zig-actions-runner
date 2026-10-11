@@ -4,7 +4,8 @@
 #
 #   docker build -t zig-runner-web web
 #   docker run --rm -p 8080:3000 -e API_UPSTREAM=http://host.docker.internal:8081 zig-runner-web
-ARG BUN_VERSION=1.3.14
+# The Bun version both images share (api/Dockerfile pins the same one; docker.yml fails if they differ).
+ARG BUN_VERSION=1.4.3
 
 FROM oven/bun:${BUN_VERSION}-slim AS build
 WORKDIR /app
