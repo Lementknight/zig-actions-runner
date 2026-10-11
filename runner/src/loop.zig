@@ -8,8 +8,10 @@ const broker = @import("github/broker.zig");
 const runservice = @import("github/runservice.zig");
 const job_mod = @import("job.zig");
 const dagger = @import("dagger.zig");
+const results = @import("github/results.zig");
 const sink = @import("sink.zig");
 const redact = @import("redact.zig");
+const timefmt = @import("timefmt.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -87,26 +89,30 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit
 
     // The definition holds secrets; it is parsed but never printed.
     const job = job_mod.parse(c.arena, acq.body) catch |e| return fail(c, "parse job", e);
-    c.log.setSecrets(try std.mem.concat(c.arena, []const u8, &.{ c.secrets, job.secrets }));
-    try c.log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job acquired: {d} steps", .{job.steps.len}));
+    // Everything the job logs is also kept (redacted, timestamped) so it can be uploaded to GitHub.
+    var collect: sink.LogSink = .{ .collect = .{ .arena = c.arena, .io = c.io, .inner = c.log } };
+    collect.setSecrets(try std.mem.concat(c.arena, []const u8, &.{ c.secrets, job.secrets }));
+    const log = &collect;
+    try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job acquired: {d} steps", .{job.steps.len}));
 
     var result: dagger.Result = undefined;
     if (job.has_container) {
-        const results = try c.arena.alloc(dagger.StepResult, job.steps.len);
-        @memset(results, .{});
-        try c.log.append(job.check_run_id, 0, .stderr, "container: jobs are not supported yet");
-        result = .{ .steps = results, .engine_error = null, .succeeded = false };
+        const step_results = try c.arena.alloc(dagger.StepResult, job.steps.len);
+        @memset(step_results, .{});
+        try log.append(job.check_run_id, 0, .stderr, "container: jobs are not supported yet");
+        result = .{ .steps = step_results, .engine_error = null, .succeeded = false };
     } else {
         result = try dagger.run(c.arena, c.io, c.environ, .{
             .argv = &.{ c.cfg.dagger_cmd, "--progress=logs", "query" },
             .sink_job_id = job.check_run_id,
-        }, job, c.log);
+        }, job, log);
         if (result.engine_error) |msg| {
-            try c.log.append(job.check_run_id, 0, .stderr, "dagger failed before running the steps:");
-            try c.log.append(job.check_run_id, 0, .stderr, msg);
+            try log.append(job.check_run_id, 0, .stderr, "dagger failed before running the steps:");
+            try log.append(job.check_run_id, 0, .stderr, msg);
         }
     }
-    try c.log.flush();
+    try log.flush();
+    try uploadLogs(c, job, log.collect.lines.items);
 
     const conclusion: runservice.Conclusion = if (result.succeeded) .succeeded else .failed;
     const step_json = try stepResultsJson(c.arena, job, result);
@@ -117,8 +123,24 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit
         done = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, "[]") catch |e| return fail(c, "completejob", e);
         if (done.status.class() != .success) return failBody(c, "completejob", done);
     }
-    try c.log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job {s}", .{@tagName(conclusion)}));
+    try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job {s}", .{@tagName(conclusion)}));
     return if (result.succeeded) .done else .github;
+}
+
+/// Uploads each step's log, then the whole job's, so GitHub's UI can show them. Failures are reported
+/// but never stop the job from completing.
+fn uploadLogs(c: Context, job: job_mod.Job, lines: []const sink.CollectedLine) !void {
+    for (job.steps, 1..) |step, n| {
+        const blob = try results.formatBlob(c.arena, lines, @intCast(n));
+        if (blob.line_count == 0) continue;
+        const r = results.upload(c.arena, c.io, job, .{ .step = step.id }, blob);
+        try c.err.print("log upload step {d}: {s}{s}\n", .{ n, if (r.ok) "ok, " else "FAILED: ", r.detail });
+    }
+    const all = try results.formatBlob(c.arena, lines, null);
+    if (all.line_count > 0) {
+        const r = results.upload(c.arena, c.io, job, .job, all);
+        try c.err.print("log upload job: {s}{s}\n", .{ if (r.ok) "ok, " else "FAILED: ", r.detail });
+    }
 }
 
 /// `stepResults` for completejob. Field names follow `actions/runner`'s StepResult; verified live
@@ -146,26 +168,13 @@ pub fn stepResultsJson(arena: Allocator, job: job_mod.Job, result: dagger.Result
                 .failure => if (step.continue_on_error) "succeeded" else "failed",
                 .skipped, .not_run => "skipped",
             },
-            .started_at = if (r.started_ms > 0) try isoTime(arena, r.started_ms) else null,
-            .completed_at = if (r.completed_ms > 0) try isoTime(arena, r.completed_ms) else null,
+            .started_at = if (r.started_ms > 0) try timefmt.isoTime(arena, r.started_ms) else null,
+            .completed_at = if (r.completed_ms > 0) try timefmt.isoTime(arena, r.completed_ms) else null,
         };
     }
     var aw: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(items, .{ .emit_null_optional_fields = false }, &aw.writer);
     return aw.written();
-}
-
-pub fn isoTime(arena: Allocator, ms: i64) Allocator.Error![]const u8 {
-    const secs: u64 = @intCast(@divFloor(ms, 1000));
-    const es: std.time.epoch.EpochSeconds = .{ .secs = secs };
-    const yd = es.getEpochDay().calculateYearDay();
-    const md = yd.calculateMonthDay();
-    const ds = es.getDaySeconds();
-    return std.fmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>3}Z", .{
-        yd.year,                            md.month.numeric(),      md.day_index + 1,
-        ds.getHoursIntoDay(),               ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
-        @as(u64, @intCast(@mod(ms, 1000))),
-    });
 }
 
 fn mintToken(c: Context, creds: auth.Credentials, status: *std.http.Status) !([]const u8) {
@@ -199,13 +208,6 @@ fn failBody(c: Context, what: []const u8, r: broker.Response) !Exit {
     // Error bodies are short JSON documents without credentials.
     try c.err.print("error during {s}: HTTP {d}: {s}\n", .{ what, @backingInt(r.status), r.body[0..@min(r.body.len, 400)] });
     return .github;
-}
-
-test "isoTime formats UTC with milliseconds" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    try std.testing.expectEqualStrings("2026-10-11T17:23:25.042Z", try isoTime(a.allocator(), 1791739405042));
-    try std.testing.expectEqualStrings("1970-01-01T00:00:00.000Z", try isoTime(a.allocator(), 0));
 }
 
 test "stepResultsJson maps outcomes and continue-on-error" {

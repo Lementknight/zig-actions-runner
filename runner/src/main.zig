@@ -17,9 +17,11 @@ comptime {
     _ = @import("inspect.zig");
     _ = @import("github/broker.zig");
     _ = @import("github/runservice.zig");
+    _ = @import("github/results.zig");
     _ = @import("job.zig");
     _ = @import("dagger.zig");
     _ = @import("loop.zig");
+    _ = @import("timefmt.zig");
 }
 
 const Exit = loop.Exit;

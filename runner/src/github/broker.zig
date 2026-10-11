@@ -40,7 +40,28 @@ pub fn call(
     token: []const u8,
     payload: ?[]const u8,
 ) !Response {
-    const bearer = try std.fmt.allocPrint(arena, "Bearer {s}", .{token});
+    return request(arena, io, method, url, payload, .{ .token = token });
+}
+
+pub const RequestOptions = struct {
+    /// Sent as `Authorization: Bearer`. Leave null for signed URLs (blob storage rejects extra auth).
+    token: ?[]const u8 = null,
+    content_type: []const u8 = "application/json",
+    extra_headers: []const std.http.Header = &.{},
+};
+
+pub fn request(
+    arena: Allocator,
+    io: std.Io,
+    method: std.http.Method,
+    url: []const u8,
+    payload: ?[]const u8,
+    opts: RequestOptions,
+) !Response {
+    const bearer: ?[]const u8 = if (opts.token) |t| try std.fmt.allocPrint(arena, "Bearer {s}", .{t}) else null;
+    const headers = try arena.alloc(std.http.Header, opts.extra_headers.len + 1);
+    headers[0] = .{ .name = "Accept", .value = "application/json" };
+    @memcpy(headers[1..], opts.extra_headers);
     // The default 1 KiB write buffer is smaller than the ~1.6 KiB bearer token; requests stall.
     var client: std.http.Client = .{ .allocator = arena, .io = io, .write_buffer_size = 16 * 1024 };
     defer client.deinit();
@@ -48,10 +69,10 @@ pub fn call(
     if (trace) std.debug.print("trace: connecting {s} {s}\n", .{ @tagName(method), url[0 .. std.mem.indexOfScalarPos(u8, url, 8, '/') orelse url.len] });
     var req = try client.request(method, try std.Uri.parse(url), .{
         .headers = .{
-            .authorization = .{ .override = bearer },
-            .content_type = if (payload != null) .{ .override = "application/json" } else .default,
+            .authorization = if (bearer) |b| .{ .override = b } else .default,
+            .content_type = if (payload != null) .{ .override = opts.content_type } else .default,
         },
-        .extra_headers = &.{.{ .name = "Accept", .value = "application/json" }},
+        .extra_headers = headers,
     });
     defer req.deinit();
 

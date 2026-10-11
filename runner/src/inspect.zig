@@ -7,7 +7,7 @@ const jitconfig = @import("github/jitconfig.zig");
 const auth = @import("github/auth.zig");
 const broker = @import("github/broker.zig");
 const runservice = @import("github/runservice.zig");
-const loop = @import("loop.zig");
+const timefmt = @import("timefmt.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -187,8 +187,8 @@ fn probeRunService(arena: Allocator, io: std.Io, out: *std.Io.Writer, token: []c
     // The shape of `stepResults` is not documented: try candidates on this one acquired job until
     // completejob accepts one (a rejected attempt leaves the job held, so we can keep trying).
     const step_id = firstStepId(job) orelse "00000000-0000-0000-0000-000000000000";
-    const t1 = try loop.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds() - 2000);
-    const t2 = try loop.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds());
+    const t1 = try timefmt.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds() - 2000);
+    const t2 = try timefmt.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds());
     const secs_only = try std.fmt.allocPrint(arena, "{s}Z", .{t1[0 .. t1.len - 5]});
     const secs_only2 = try std.fmt.allocPrint(arena, "{s}Z", .{t2[0 .. t2.len - 5]});
     const candidates = [_][]const u8{

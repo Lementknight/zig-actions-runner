@@ -44,6 +44,8 @@ pub const Job = struct {
     has_container: bool,
     /// Literal values that must never reach a log: the job token and every variable marked `isSecret`.
     secrets: []const []const u8,
+    /// Base URL of the results service (`system.github.results_endpoint`), where logs are uploaded.
+    results_endpoint: []const u8 = "",
     steps: []const Step,
 };
 
@@ -67,6 +69,7 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .job_token = jobToken(root) orelse return error.MalformedJob,
         .check_run_id = checkRunId(root),
         .secrets = try collectSecrets(arena, root),
+        .results_endpoint = variable(root, "system.github.results_endpoint") orelse "",
         .has_container = if (root.object.get("jobContainer")) |c| c != .null else false,
         .steps = steps,
     };
@@ -193,6 +196,13 @@ fn path(v: Value, keys: []const []const u8) ?[]const u8 {
     return if (cur == .string) cur.string else null;
 }
 
+fn variable(root: Value, name: []const u8) ?[]const u8 {
+    const vars = root.object.get("variables") orelse return null;
+    if (vars != .object) return null;
+    const v = vars.object.get(name) orelse return null;
+    return path(v, &.{"value"});
+}
+
 fn collectSecrets(arena: Allocator, root: Value) Allocator.Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     if (jobToken(root)) |t| try out.append(arena, t);
@@ -240,7 +250,7 @@ fn jobToken(root: Value) ?[]const u8 {
 
 const fixture =
     \\{"plan":{"planId":"plan-1"},"jobId":"job-1","jobContainer":null,
-    \\ "variables":{"github_token":{"value":"ghs_secret","isSecret":true},"plain":{"value":"x"}},
+    \\ "variables":{"github_token":{"value":"ghs_secret","isSecret":true},"plain":{"value":"x"},"system.github.results_endpoint":{"value":"https://results.test/"}},
     \\ "contextData":{"job":{"t":2,"d":[{"k":"status","v":"success"},{"k":"check_run_id","v":777}]}},
     \\ "resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"jobtok"},"scheme":"OAuth"}}]},
     \\ "steps":[
@@ -262,6 +272,7 @@ test "parse job fixture" {
     try std.testing.expectEqualStrings("plan-1", job.plan_id);
     try std.testing.expectEqualStrings("jobtok", job.job_token);
     try std.testing.expectEqual(@as(u64, 777), job.check_run_id);
+    try std.testing.expectEqualStrings("https://results.test/", job.results_endpoint);
     try std.testing.expectEqual(@as(usize, 2), job.secrets.len);
     try std.testing.expectEqualStrings("jobtok", job.secrets[0]);
     try std.testing.expectEqualStrings("ghs_secret", job.secrets[1]);
