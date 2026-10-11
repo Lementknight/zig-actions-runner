@@ -9,6 +9,8 @@ comptime {
     _ = @import("redact.zig");
     _ = @import("config.zig");
     _ = @import("github/jitconfig.zig");
+    _ = @import("github/rsa_sign.zig");
+    _ = @import("github/auth.zig");
 }
 
 /// SPEC §2 exit codes.
