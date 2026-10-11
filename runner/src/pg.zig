@@ -370,6 +370,7 @@ pub const Client = struct {
         c.r = &c.stream_reader.interface;
         c.w = &c.stream_writer.interface;
 
+        errdefer c.ca_bundle.deinit(gpa);
         if (cfg.sslmode != .disable) try c.startTls(cfg, buffers[2 * tls_len ..]);
         try c.startup(cfg);
         return c;
