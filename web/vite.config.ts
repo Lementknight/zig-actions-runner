@@ -19,6 +19,9 @@ export default defineConfig(({ mode }) => {
     test: {
       environment: 'jsdom',
       setupFiles: ['./src/test/setup.ts'],
+      // Node 25 ships its own localStorage global, an empty stub without --localstorage-file,
+      // and it shadows jsdom's working one. Turn Node's off in the test workers.
+      execArgv: ['--no-experimental-webstorage'],
       css: true,
     },
   }
