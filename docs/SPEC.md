@@ -39,7 +39,7 @@ Environment variables (flags override):
 | `LOG_FLUSH_LINES` | no | Default `200` |
 | `LOG_FLUSH_MS` | no | Default `500` |
 
-Flags: `--token`, `--scope`, `--labels`, `--group-id`, `--name-prefix`, `--database-url`, `--dagger-cmd`, `--log-flush-lines`, `--log-flush-ms` (as `--flag value` or `--flag=value`), plus `--dry-run` (validate config, register nothing).
+Flags: `--token`, `--scope`, `--labels`, `--group-id`, `--name-prefix`, `--database-url`, `--dagger-cmd`, `--log-flush-lines`, `--log-flush-ms` (as `--flag value` or `--flag=value`), plus `--dry-run` (validate config, register nothing) and `--db-check` (connect to the configured database, print the server and TimescaleDB versions, whether the tables and the `job_logs` hypertable exist, and how many `zig_it_*` test schemas are left; no GitHub credentials needed, prints no credentials or host name; exit 0, or 3 if the database is unavailable).
 
 Exit codes: `0` job done (ephemeral exit), `1` config error (including an unparsable database URL), `2` GitHub auth/protocol error, `3` DB unavailable when the runner starts (a database that fails later never fails a job; see §5.1).
 
@@ -271,6 +271,10 @@ Secrets (verified live on a repository with Actions secrets):
 - The `secrets` context is built from those variables (without `system.*`), with `github_token` exposed as `GITHUB_TOKEN`; `secrets.NOPE` for an unknown name is an empty string, as in GitHub.
 - Workflow- and job-level `env` is part of every step's environment (it is set on the base container, so `$TIGER_HOST` works in a script, not only `${{ env.TIGER_HOST }}`). Any env value that contains a secret, at job or step level, is registered as a Dagger secret in the session (`setSecret`, then `withSecretVariable`) instead of being written into a command line. That keeps it out of the exec arguments, which Dagger keeps in its cache metadata and prints in its progress log, and Dagger scrubs it from its own logs.
 - A secret written directly into a script (`run: echo ${{ secrets.X }}`) is still part of that script's text, and therefore of its exec arguments; pass secrets through `env:` as GitHub recommends. Secrets shorter than 3 characters are not routed through Dagger secrets (they would match unrelated text).
+
+Postgres TLS (verified against Tiger Data):
+- Tiger negotiates TLS 1.3 (`TLS_AES_256_GCM_SHA384`, X25519, an ECDSA P-256 certificate chaining to a public CA) and verifies against the system CAs and the host name with `sslmode=require`.
+- Tiger sends a TLS `CertificateRequest` during the handshake, as any Postgres server with a CA file configured does. Zig 0.17's `std.crypto.tls.Client` rejects it (`TlsUnexpectedMessage`), so the runner uses `src/vendor/tls_client.zig`: std's client with one marked change that answers it with an empty `Certificate` message (RFC 8446 §4.4.2), TLS 1.3 only. Reproduced locally with `ssl_ca_file` set on a Postgres container. Drop the copy once std handles it.
 
 Executor design (verified live against Dagger v0.21.10, offline with `runner --exec-job testdata/job-mixed.json` and end to end through GitHub):
 - One long-lived Dagger session hosts the whole job. The runner spawns `dagger run --progress=logs sh -c '<print $DAGGER_SESSION_PORT and $DAGGER_SESSION_TOKEN, then wait for stdin to close>'`, reads that first line from the child's stdout, and sends GraphQL over HTTP (`POST http://127.0.0.1:<port>/query`, `Authorization: Basic base64("<token>:")`), as the Dagger SDKs do. Closing the child's stdin ends the session. `dagger session` is documented as internal-only and is not used.

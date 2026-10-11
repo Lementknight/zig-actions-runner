@@ -62,3 +62,9 @@ jobs:
       - name: Database tests over TLS
         working-directory: runner
         run: zig test src/main.zig
+
+      # Proves the tests cleaned up after themselves and shows what the database holds. Prints no
+      # credentials and no host name (this repository's logs are public).
+      - name: Database check
+        working-directory: runner
+        run: zig build run -- --db-check

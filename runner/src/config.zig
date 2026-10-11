@@ -37,6 +37,8 @@ pub const Config = struct {
     log_flush_lines: u32 = 200,
     log_flush_ms: u32 = 500,
     dry_run: bool = false,
+    /// Connect to the configured database, report what is there, and exit (no GitHub credentials needed).
+    db_check: bool = false,
     /// Dev: run a saved acquirejob response through the executor without contacting GitHub.
     exec_job: ?[]const u8 = null,
     /// Register one runner, print the shape of its config, delete it, exit.
@@ -62,6 +64,10 @@ pub const Config = struct {
         var i: usize = 1; // args[0] is the program name
         while (i < args.len) : (i += 1) {
             const arg: []const u8 = args[i];
+            if (std.mem.eql(u8, arg, "--db-check")) {
+                c.db_check = true;
+                continue;
+            }
             if (std.mem.eql(u8, arg, "--dry-run")) {
                 c.dry_run = true;
                 continue;
@@ -95,7 +101,7 @@ pub const Config = struct {
             else return error.UnknownFlag;
         }
 
-        if (c.exec_job != null) {
+        if (c.exec_job != null or c.db_check) {
             // Offline mode: no GitHub credentials needed.
             c.gh_token = token orelse "";
             c.scope = .{ .org = "offline" };
@@ -157,4 +163,11 @@ test "load: missing token" {
     defer env.deinit();
     try env.put("GH_SCOPE", "o/r");
     try std.testing.expectError(error.MissingGhToken, Config.load(&env, &.{"runner"}));
+}
+
+test "--db-check needs no GitHub credentials" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    const c = try Config.load(&env, &.{ "runner", "--db-check" });
+    try std.testing.expect(c.db_check);
 }
