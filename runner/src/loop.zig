@@ -103,7 +103,7 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit
         result = .{ .steps = step_results, .engine_error = null, .succeeded = false };
     } else {
         result = try dagger.run(c.arena, c.io, c.environ, .{
-            .argv = &.{ c.cfg.dagger_cmd, "--progress=logs", "query" },
+            .dagger_cmd = c.cfg.dagger_cmd,
             .sink_job_id = job.check_run_id,
         }, job, log);
         if (result.engine_error) |msg| {
