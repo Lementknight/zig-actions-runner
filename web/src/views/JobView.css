@@ -1,0 +1,139 @@
+/* Job view (U4), after GitHub's job page: a breadcrumb, the job title, a rail of the run's
+   jobs on the left and the job box on the right, its header above the steps. */
+
+.ar-job-view__loading {
+  display: flex;
+  justify-content: center;
+  padding: var(--ar-space-12) var(--ar-space-6);
+}
+
+.ar-job-crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ar-space-2);
+  margin-bottom: var(--ar-space-2);
+  font-size: var(--ar-text-sm);
+}
+
+.ar-job-crumbs__sep {
+  color: var(--ar-fg-muted);
+}
+
+.ar-job-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--ar-space-4);
+  align-items: start;
+}
+
+@media (min-width: 64em) {
+  .ar-job-layout {
+    grid-template-columns: var(--ar-sidebar-width) minmax(0, 1fr);
+    gap: var(--ar-space-6);
+  }
+}
+
+/* The jobs rail */
+
+.ar-job-rail {
+  font-size: var(--ar-text-sm);
+}
+
+.ar-job-rail__summary {
+  display: block;
+  padding: var(--ar-space-2) var(--ar-space-2);
+  color: var(--ar-fg-default);
+  font-weight: var(--ar-weight-medium);
+  border-radius: var(--ar-radius-md);
+}
+
+.ar-job-rail__summary:hover {
+  background: var(--ar-bg-hover);
+  text-decoration: none;
+}
+
+.ar-job-rail__heading {
+  margin: var(--ar-space-3) 0 var(--ar-space-1);
+  padding: 0 var(--ar-space-2);
+  color: var(--ar-fg-muted);
+  font-size: var(--ar-text-xs);
+  font-weight: var(--ar-weight-semibold);
+}
+
+.ar-job-rail__list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ar-job-rail__job {
+  display: flex;
+  align-items: center;
+  gap: var(--ar-space-2);
+  padding: var(--ar-space-2) var(--ar-space-2);
+  color: var(--ar-fg-default);
+  border-radius: var(--ar-radius-md);
+}
+
+.ar-job-rail__job:hover {
+  background: var(--ar-bg-hover);
+  text-decoration: none;
+}
+
+.ar-job-rail__job[aria-current='page'] {
+  background: var(--ar-bg-selected);
+  font-weight: var(--ar-weight-semibold);
+}
+
+.ar-job-rail__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The job box */
+
+.ar-job {
+  min-width: 0;
+}
+
+.ar-job__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ar-space-3);
+  padding: var(--ar-space-4);
+}
+
+.ar-job__title {
+  flex: 1;
+  min-width: 0;
+}
+
+.ar-job__name {
+  margin: 0;
+  font-size: var(--ar-text-lg);
+  font-weight: var(--ar-weight-semibold);
+  line-height: var(--ar-line-tight);
+  overflow-wrap: anywhere;
+}
+
+.ar-job__meta {
+  margin: var(--ar-space-1) 0 0;
+  color: var(--ar-fg-muted);
+  font-size: var(--ar-text-sm);
+}
+
+/* Phone widths: the controls take their own row under the title, and the gutter narrows. */
+@media (max-width: 48em) {
+  .ar-job__header .ar-job-toolbar {
+    flex-basis: 100%;
+    justify-content: flex-end;
+  }
+
+  .ar-job .ar-log-line__number {
+    width: var(--ar-space-6);
+  }
+}

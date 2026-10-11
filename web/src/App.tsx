@@ -1,10 +1,10 @@
 import { Label } from '@primer/react'
 import { PlayIcon } from '@primer/octicons-react'
 import { Link, Route, Switch } from 'wouter'
+import { JobView } from './views/JobView'
 import { RunList } from './views/RunList'
 
-// The three routes (R16). Each placeholder is replaced by its real view in a later unit:
-// RunList (U5), RunPage (U6), JobView (U4).
+// The three routes (R16). The run page placeholder is replaced by its real view in U6.
 
 function Placeholder({ title, body }: { title: string; body: string }) {
   return (
@@ -60,10 +60,7 @@ export default function App() {
           </Route>
           <Route path="/runs/:runId/jobs/:jobId">
             {(params) => (
-              <Placeholder
-                title={`Job ${params.jobId}`}
-                body={`Steps and logs for job ${params.jobId} of run ${params.runId} will appear here.`}
-              />
+              <JobView key={`${params.runId}/${params.jobId}`} runId={Number(params.runId)} jobId={Number(params.jobId)} />
             )}
           </Route>
           <Route>

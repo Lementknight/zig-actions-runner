@@ -1,0 +1,76 @@
+/* Job log controls: the timestamps switch and the floating jump button. */
+
+.ar-job-toolbar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--ar-space-2);
+  font-size: var(--ar-text-sm);
+}
+
+.ar-job-toolbar__label {
+  color: var(--ar-fg-muted);
+}
+
+/* A switch in GitHub's shape: a pill track, a round knob that slides right when on. */
+.ar-switch {
+  position: relative;
+  flex: none;
+  width: calc(var(--ar-space-8) + var(--ar-space-1));
+  height: var(--ar-space-5);
+  padding: 0;
+  background: var(--ar-bg-inset);
+  border: var(--ar-border-width) solid var(--ar-border-default);
+  border-radius: var(--ar-radius-full);
+  cursor: pointer;
+  transition: background-color 0.12s ease-out;
+}
+
+.ar-switch__knob {
+  position: absolute;
+  top: calc(var(--ar-space-1) / 2);
+  left: calc(var(--ar-space-1) / 2);
+  width: calc(var(--ar-space-4) - var(--ar-space-1) / 2);
+  height: calc(var(--ar-space-4) - var(--ar-space-1) / 2);
+  background: var(--ar-bg-canvas);
+  border: var(--ar-border-width) solid var(--ar-border-default);
+  border-radius: var(--ar-radius-full);
+  box-sizing: border-box;
+  box-shadow: var(--ar-shadow-resting);
+  transition: transform 0.12s ease-out;
+}
+
+.ar-switch[aria-checked='true'] {
+  background: var(--ar-focus-outline);
+  border-color: var(--ar-focus-outline);
+}
+
+.ar-switch[aria-checked='true'] .ar-switch__knob {
+  transform: translateX(var(--ar-space-4));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ar-switch,
+  .ar-switch__knob {
+    transition: none;
+  }
+}
+
+.ar-jump {
+  position: fixed;
+  right: var(--ar-space-6);
+  bottom: var(--ar-space-6);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ar-space-2);
+  padding: var(--ar-space-2) var(--ar-space-4);
+  color: var(--ar-fg-on-emphasis);
+  background: var(--ar-fg-accent);
+  border: 0;
+  border-radius: var(--ar-radius-full);
+  box-shadow: var(--ar-shadow-floating);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--ar-text-sm);
+  font-weight: var(--ar-weight-medium);
+}
