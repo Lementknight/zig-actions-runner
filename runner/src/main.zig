@@ -22,6 +22,7 @@ comptime {
     _ = @import("dagger.zig");
     _ = @import("loop.zig");
     _ = @import("timefmt.zig");
+    _ = @import("expr.zig");
 }
 
 const Exit = loop.Exit;
