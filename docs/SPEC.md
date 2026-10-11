@@ -54,7 +54,13 @@ Undocumented (reverse-engineered from `actions/runner`, treat as unverified unti
 - Broker error kinds to handle: `RunnerNotFound`, `RunnerVersionTooOld`, `RunnerSessionInvalid`, `HostedRunnerDeprovisioned`.
 - Job message type `AgentJobRequestMessage`.
 
-Findings from M1–M4 must be written back into this section.
+Verified live (M1, 2026-10-11, repo scope):
+- `encoded_jit_config` decodes to three files: `.runner`, `.credentials`, `.credentials_rsaparams`.
+- `.runner` is JSON with PascalCase string values: `AgentId`, `AgentName`, `PoolId`, `ServerUrl`, `ServerUrlV2` (`https://broker.actions.githubusercontent.com/`), `UseV2Flow` (`"true"`), `Ephemeral`, `GitHubUrl`, `WorkFolder`, `DisableUpdate`.
+- `.credentials` is PascalCase: `Scheme` (`OAuth`), `Data.ClientId`, `Data.AuthorizationUrl`.
+- `.credentials_rsaparams` is lowercase base64: `modulus`, `exponent`, `d`, `p`, `q`, `dp`, `dq`, `inverseQ`.
+
+Findings from M2–M4 must be written back into this section.
 
 ## 4. Database schema (Tiger Data / TimescaleDB)
 

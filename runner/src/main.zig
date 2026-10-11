@@ -1,11 +1,14 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
+const jitconfig = @import("github/jitconfig.zig");
+const redact = @import("redact.zig");
 const sink = @import("sink.zig");
 
 comptime {
     _ = @import("sink.zig");
     _ = @import("redact.zig");
     _ = @import("config.zig");
+    _ = @import("github/jitconfig.zig");
 }
 
 /// SPEC §2 exit codes.
@@ -42,6 +45,19 @@ pub fn main(init: std.process.Init) !u8 {
         return @backingInt(Exit.done);
     }
 
-    try err.writeAll("registration not implemented yet; use --dry-run\n");
+    var status: std.http.Status = .ok;
+    const jit = jitconfig.generate(arena, io, &cfg, name, &status) catch |e| {
+        try err.writeAll("github error: ");
+        try redact.write(err, @errorName(e), secrets);
+        try err.print(" (HTTP {d})\n", .{@backingInt(status)});
+        return @backingInt(Exit.github);
+    };
+
+    // Never print file contents: they hold RSA keys and OAuth credentials.
+    try log.append(0, 0, .stdout, try std.fmt.allocPrint(arena, "registered runner '{s}' (id {d}) with {d} config files", .{ jit.runner_name, jit.runner_id, jit.files.len }));
+    for (jit.files) |f| {
+        try log.append(0, 0, .stdout, try std.fmt.allocPrint(arena, "  {s} ({d} bytes)", .{ f.name, f.content.len }));
+    }
+    try err.writeAll("broker session not implemented yet (M2); exiting\n");
     return @backingInt(Exit.github);
 }
