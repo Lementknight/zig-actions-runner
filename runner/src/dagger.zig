@@ -25,6 +25,7 @@ const sink = @import("sink.zig");
 const broker = @import("github/broker.zig");
 const expr = @import("expr.zig");
 const context = @import("context.zig");
+const commands = @import("commands.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -115,11 +116,24 @@ pub const Resolved = union(enum) {
     checkout: Fetched,
 };
 
+const fc_dir = "/github/file_commands";
+const fc_kinds = [_][]const u8{ "output", "env", "path", "step_summary" };
+
+fn fcPath(arena: Allocator, kind: []const u8, n: u32) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}/{s}_{d}", .{ fc_dir, kind, n });
+}
+
 /// The `sh -c` script of step number `n` (1-based). Its exit code is the step's.
-pub fn stepScript(arena: Allocator, n: u32, r: Resolved) ![]const u8 {
+///
+/// The script creates the step's file commands first and touches them again afterwards, so the
+/// query can always read them even if the step deleted them. A `run:` step sees them as
+/// `$GITHUB_OUTPUT`, `$GITHUB_ENV`, `$GITHUB_PATH` and `$GITHUB_STEP_SUMMARY`.
+pub fn stepScript(arena: Allocator, n: u32, r: Resolved, action_name: []const u8) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
-    try w.print("echo '{s}begin {d}'\n", .{ marker, n });
+    try w.print("echo '{s}begin {d}'\nmkdir -p " ++ fc_dir ++ " && : ", .{ marker, n });
+    for (fc_kinds) |k| try w.print("> {s} ", .{try fcPath(arena, k, n)});
+    try w.writeByte('\n');
     switch (r) {
         .run => |sc| {
             try w.writeAll("( ");
@@ -128,14 +142,20 @@ pub fn stepScript(arena: Allocator, n: u32, r: Resolved) ![]const u8 {
                 try shellQuote(w, wd);
                 try w.writeAll(" && ");
             }
-            if (sc.env.len > 0) {
-                try w.writeAll("env ");
-                for (sc.env) |e| {
-                    const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
-                    try shellQuote(w, pair);
-                    try w.writeByte(' ');
-                }
+            try w.writeAll("env ");
+            for (sc.env) |e| {
+                const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
+                try shellQuote(w, pair);
+                try w.writeByte(' ');
             }
+            // Set after the step's own env, so a step cannot point these somewhere else.
+            const names = [_][]const u8{ "GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY" };
+            for (names, fc_kinds) |name, kind| {
+                try shellQuote(w, try std.fmt.allocPrint(arena, "{s}={s}", .{ name, try fcPath(arena, kind, n) }));
+                try w.writeByte(' ');
+            }
+            try shellQuote(w, try std.fmt.allocPrint(arena, "GITHUB_ACTION={s}", .{action_name}));
+            try w.writeByte(' ');
             if (sc.shell != null and std.mem.eql(u8, sc.shell.?, "sh")) {
                 try w.writeAll("sh -e -c ");
             } else {
@@ -153,7 +173,9 @@ pub fn stepScript(arena: Allocator, n: u32, r: Resolved) ![]const u8 {
             try w.writeAll("\nrc=0\n");
         },
     }
-    try w.print("echo '{s}end {d}'\nexit $rc\n", .{ marker, n });
+    try w.writeAll("mkdir -p " ++ fc_dir ++ " && : ");
+    for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, n)});
+    try w.print("\necho '{s}end {d}'\nexit $rc\n", .{ marker, n });
     return aw.written();
 }
 
@@ -331,7 +353,7 @@ fn fetchCheckout(arena: Allocator, t: Transport, job: job_mod.Job, co: job_mod.C
 
 // --- expression evaluation ---
 
-const StepCtx = struct { id: []const u8, outcome: []const u8, conclusion: []const u8 };
+const StepCtx = struct { id: []const u8, outcome: []const u8, conclusion: []const u8, outputs: []const job_mod.EnvVar };
 
 /// Holds what expressions can see while a job runs and evaluates the templates of each step.
 const Evaluator = struct {
@@ -348,6 +370,9 @@ const Evaluator = struct {
     /// Workflow- and job-level env, evaluated once.
     job_env: std.ArrayList(job_mod.EnvVar) = .empty,
     steps: std.ArrayList(StepCtx) = .empty,
+    /// Changes a step made through $GITHUB_ENV / $GITHUB_PATH, applied to the container before the next step.
+    pending_env: std.ArrayList(job_mod.EnvVar) = .empty,
+    pending_path: std.ArrayList([]const u8) = .empty,
     job_failed: bool = false,
     diag: []const u8 = "",
 
@@ -390,8 +415,10 @@ const Evaluator = struct {
 
         const step_entries = try arena.alloc(expr.Value.Entry, ev.steps.items.len);
         for (ev.steps.items, step_entries) |sc, *o| {
+            const outs = try arena.alloc(expr.Value.Entry, sc.outputs.len);
+            for (sc.outputs, outs) |ov, *oo| oo.* = .{ .key = ov.name, .value = .{ .string = ov.value } };
             const fields = try arena.alloc(expr.Value.Entry, 3);
-            fields[0] = .{ .key = "outputs", .value = .{ .object = &.{} } };
+            fields[0] = .{ .key = "outputs", .value = .{ .object = outs } };
             fields[1] = .{ .key = "outcome", .value = .{ .string = sc.outcome } };
             fields[2] = .{ .key = "conclusion", .value = .{ .string = sc.conclusion } };
             o.* = .{ .key = sc.id, .value = .{ .object = fields } };
@@ -438,14 +465,66 @@ const Evaluator = struct {
         return out;
     }
 
-    fn record(ev: *Evaluator, step: job_mod.Step, outcome: Outcome, continued: bool) !void {
+    fn record(ev: *Evaluator, step: job_mod.Step, outcome: Outcome, continued: bool, outputs: []const job_mod.EnvVar) !void {
         const raw: []const u8 = switch (outcome) {
             .success => "success",
             .failure => "failure",
             .skipped, .not_run => "skipped",
         };
         const conclusion: []const u8 = if (outcome == .failure and continued) "success" else raw;
-        try ev.steps.append(ev.arena, .{ .id = if (step.context_name.len > 0) step.context_name else step.id, .outcome = raw, .conclusion = conclusion });
+        try ev.steps.append(ev.arena, .{ .id = if (step.context_name.len > 0) step.context_name else step.id, .outcome = raw, .conclusion = conclusion, .outputs = outputs });
+    }
+
+    /// A string from the `github` context ("" when absent).
+    fn githubString(ev: *const Evaluator, key: []const u8) []const u8 {
+        if (ev.github != .object) return "";
+        for (ev.github.object) |e| if (std.ascii.eqlIgnoreCase(e.key, key)) return switch (e.value) {
+            .string => |str| str,
+            else => "",
+        };
+        return "";
+    }
+
+    /// The variables every step sees, as on a GitHub-hosted runner.
+    fn defaultEnv(ev: *const Evaluator) ![]const job_mod.EnvVar {
+        var out: std.ArrayList(job_mod.EnvVar) = .empty;
+        const fixed = [_]job_mod.EnvVar{
+            .{ .name = "CI", .value = "true" },
+            .{ .name = "GITHUB_ACTIONS", .value = "true" },
+            .{ .name = "GITHUB_WORKSPACE", .value = workspace },
+            .{ .name = "RUNNER_OS", .value = "Linux" },
+            .{ .name = "RUNNER_ARCH", .value = "X64" },
+            .{ .name = "RUNNER_NAME", .value = "zig-runner" },
+            .{ .name = "RUNNER_TEMP", .value = "/tmp" },
+            .{ .name = "RUNNER_TOOL_CACHE", .value = "/opt/hostedtoolcache" },
+        };
+        try out.appendSlice(ev.arena, &fixed);
+        const from_github = [_][2][]const u8{
+            .{ "GITHUB_REPOSITORY", "repository" },
+            .{ "GITHUB_REPOSITORY_OWNER", "repository_owner" },
+            .{ "GITHUB_SHA", "sha" },
+            .{ "GITHUB_REF", "ref" },
+            .{ "GITHUB_REF_NAME", "ref_name" },
+            .{ "GITHUB_REF_TYPE", "ref_type" },
+            .{ "GITHUB_EVENT_NAME", "event_name" },
+            .{ "GITHUB_ACTOR", "actor" },
+            .{ "GITHUB_TRIGGERING_ACTOR", "triggering_actor" },
+            .{ "GITHUB_RUN_ID", "run_id" },
+            .{ "GITHUB_RUN_NUMBER", "run_number" },
+            .{ "GITHUB_RUN_ATTEMPT", "run_attempt" },
+            .{ "GITHUB_JOB", "job" },
+            .{ "GITHUB_WORKFLOW", "workflow" },
+            .{ "GITHUB_BASE_REF", "base_ref" },
+            .{ "GITHUB_HEAD_REF", "head_ref" },
+            .{ "GITHUB_SERVER_URL", "server_url" },
+            .{ "GITHUB_API_URL", "api_url" },
+            .{ "GITHUB_GRAPHQL_URL", "graphql_url" },
+        };
+        for (from_github) |m| {
+            const v = ev.githubString(m[1]);
+            if (v.len > 0) try out.append(ev.arena, .{ .name = m[0], .value = v });
+        }
+        return out.items;
     }
 };
 
@@ -638,17 +717,28 @@ pub fn run(
     };
     const transport: Transport = opts.test_transport orelse .{ .ptr = &http, .sendFn = HttpTransport.send };
 
+    var ev = try Evaluator.init(arena, &job);
     var err_msg: []const u8 = "";
     var container_id: []const u8 = blk: {
         var doc: std.Io.Writer.Allocating = .init(arena);
-        try doc.writer.writeAll("{ container { from(address:");
-        try std.json.Stringify.value(opts.image, .{}, &doc.writer);
-        try doc.writer.print(") {{ withWorkdir(path:\"{s}\") {{ id }} }} }} }}", .{workspace});
+        const w = &doc.writer;
+        try w.writeAll("{ container { from(address:");
+        try std.json.Stringify.value(opts.image, .{}, w);
+        try w.print(") {{ withWorkdir(path:\"{s}\") {{ ", .{workspace});
+        const defaults = try ev.defaultEnv();
+        for (defaults) |e| {
+            try w.writeAll("withEnvVariable(name:");
+            try std.json.Stringify.value(e.name, .{}, w);
+            try w.writeAll(",value:");
+            try std.json.Stringify.value(e.value, .{}, w);
+            try w.writeAll(") { ");
+        }
+        try w.writeAll("id");
+        for (0..defaults.len + 4) |_| try w.writeAll(" }");
         const data = gql(arena, transport, doc.written(), &err_msg) catch return fail(&sh, results, err_msg);
         break :blk jsonFindString(data, "id") orelse return fail(&sh, results, "Dagger returned no container");
     };
 
-    var ev = try Evaluator.init(arena, &job);
     for (job.steps, results, 1..) |step, *res, n| {
         const num: u32 = @intCast(n);
         res.name = step.name;
@@ -663,7 +753,7 @@ pub fn run(
         };
         if (!should_run) {
             res.outcome = .skipped;
-            try ev.record(step, .skipped, false);
+            try ev.record(step, .skipped, false, &.{});
             continue;
         }
 
@@ -718,13 +808,31 @@ pub fn run(
             },
         }
 
-        const script = try stepScript(arena, num, resolved);
+        const script = try stepScript(arena, num, resolved, if (step.context_name.len > 0) step.context_name else step.id);
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
         try w.writeAll("{ loadContainerFromID(id:");
         try std.json.Stringify.value(container_id, .{}, w);
         try w.writeAll(") { ");
         var braces: usize = 2; // query + loadContainerFromID
+        // Variables and PATH entries the previous steps asked for through $GITHUB_ENV / $GITHUB_PATH.
+        for (ev.pending_env.items) |e| {
+            try w.writeAll("withEnvVariable(name:");
+            try std.json.Stringify.value(e.name, .{}, w);
+            try w.writeAll(",value:");
+            try std.json.Stringify.value(e.value, .{}, w);
+            try w.writeAll(") { ");
+            braces += 1;
+        }
+        if (ev.pending_path.items.len > 0) {
+            const joined = try std.mem.join(arena, ":", ev.pending_path.items);
+            try w.writeAll("withEnvVariable(name:\"PATH\",value:");
+            try std.json.Stringify.value(try std.fmt.allocPrint(arena, "{s}:$PATH", .{joined}), .{}, w);
+            try w.writeAll(",expand:true) { ");
+            braces += 1;
+        }
+        ev.pending_env.clearRetainingCapacity();
+        ev.pending_path.clearRetainingCapacity();
         if (fetched) |f| {
             try w.writeAll("withDirectory(path:");
             try std.json.Stringify.value(f.mount, .{}, w);
@@ -735,7 +843,11 @@ pub fn run(
         }
         try w.writeAll("withExec(args:");
         try std.json.Stringify.value([_][]const u8{ "sh", "-c", script }, .{}, w);
-        try w.writeAll(",expect:ANY) { id exitCode stdout stderr }");
+        try w.writeAll(",expect:ANY) { id exitCode stdout stderr");
+        for ([_][]const u8{ "output", "env", "path" }) |kind| {
+            try w.print(" fc_{s}: file(path:\"{s}\") {{ contents }}", .{ kind, try fcPath(arena, kind, num) });
+        }
+        try w.writeAll(" }");
         for (0..braces) |_| try w.writeAll(" }");
 
         res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
@@ -752,7 +864,34 @@ pub fn run(
 
         // A cached step prints no log lines. Wait briefly for a live stream, then replay the result.
         awaitLiveOrReplay(io, &sh, num, jsonFindString(data, "stdout") orelse "", jsonFindString(data, "stderr") orelse "");
-        try ev.record(step, res.outcome, coe);
+
+        // File commands: outputs for `steps.<id>.outputs`, env and PATH for the steps that follow.
+        var outputs: []const job_mod.EnvVar = &.{};
+        var cmd_error: ?[]const u8 = null;
+        if (fileCommand(data, "fc_output")) |text| switch (try commands.parseKeyValues(arena, text)) {
+            .ok => |kv| outputs = kv,
+            .invalid => |why| cmd_error = try std.fmt.allocPrint(arena, "Unable to process the GITHUB_OUTPUT file command: {s}", .{why}),
+        };
+        if (fileCommand(data, "fc_env")) |text| switch (try commands.parseKeyValues(arena, text)) {
+            .ok => |kv| for (kv) |e| {
+                if (commands.isProtectedEnvName(e.name)) {
+                    sh.append(num, try std.fmt.allocPrint(arena, "Warning: ignored GITHUB_ENV entry '{s}' (reserved name)", .{e.name}));
+                    continue;
+                }
+                try Evaluator.putEnv(arena, &ev.job_env, e.name, e.value);
+                try ev.pending_env.append(arena, e);
+            },
+            .invalid => |why| cmd_error = try std.fmt.allocPrint(arena, "Unable to process the GITHUB_ENV file command: {s}", .{why}),
+        };
+        if (fileCommand(data, "fc_path")) |text| for (try commands.parsePaths(arena, text)) |dir| try ev.pending_path.append(arena, dir);
+        if (cmd_error) |msg| {
+            sh.append(num, msg);
+            if (res.outcome == .success) {
+                res.outcome = .failure;
+                res.exit_code = 1;
+            }
+        }
+        try ev.record(step, res.outcome, coe, outputs);
         if (res.outcome == .failure and !coe) ev.job_failed = true;
     }
     return finish(arena, &sh, results, "");
@@ -763,6 +902,13 @@ pub fn run(
 /// it arrives, so only cached steps pay this. If the stream is later than this, lines show up twice
 /// rather than being lost.
 const live_grace_ms = 60;
+
+/// The contents of a file command read by the step's query ("" when the field is absent).
+fn fileCommand(data: std.json.Value, alias: []const u8) ?[]const u8 {
+    const f = jsonFind(data, alias) orelse return null;
+    const text = jsonFindString(f, "contents") orelse return null;
+    return if (text.len == 0) null else text;
+}
 
 /// Gives the reader a moment to deliver this step's lines; if none show up the step was served from
 /// cache, so its recorded stdout and stderr are logged instead.
@@ -792,7 +938,7 @@ fn failStep(ev: *Evaluator, sh: *Shared, step: job_mod.Step, res: *StepResult, n
     sh.append(num, msg);
     const name = res.name;
     res.* = .{ .name = name, .continued = coe, .outcome = .failure, .exit_code = 1 };
-    try ev.record(step, .failure, coe);
+    try ev.record(step, .failure, coe, &.{});
     if (!coe) ev.job_failed = true;
 }
 
@@ -869,8 +1015,12 @@ test "script quotes, applies env, shell and working directory, and propagates th
         .shell = "sh",
         .working_directory = "sub dir",
         .env = &.{.{ .name = "X", .value = "a b" }},
-    } });
-    try std.testing.expect(std.mem.indexOf(u8, w, "cd 'sub dir' && env 'X=a b' sh -e -c 'echo '\\''hi'\\'' && echo $X'") != null);
+    } }, "build");
+    try std.testing.expect(std.mem.indexOf(u8, w, "cd 'sub dir' && env 'X=a b' 'GITHUB_OUTPUT=/github/file_commands/output_2'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, "'GITHUB_ACTION=build' sh -e -c 'echo '\\''hi'\\'' && echo $X'") != null);
+    // The file commands exist before the step and are touched again after it.
+    try std.testing.expect(std.mem.indexOf(u8, w, ": > /github/file_commands/output_2 > /github/file_commands/env_2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, ">> /github/file_commands/path_2") != null);
     try std.testing.expect(std.mem.indexOf(u8, w, marker ++ "begin 2") != null);
     try std.testing.expect(std.mem.endsWith(u8, w, "exit $rc\n"));
 }
@@ -1138,4 +1288,62 @@ test "run evaluates expressions in conditions, names, env, scripts and the steps
     try std.testing.expectEqual(@as(usize, 5), fake.seen.items.len);
     // The unsupported context is reported in that step's log.
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "the 'secrets' context is not supported yet") != null);
+}
+
+fn execFc(arena: Allocator, id: []const u8, out: []const u8, fc_output: []const u8, fc_env: []const u8, fc_path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":{{\"id\":\"{s}\",\"exitCode\":0,\"stdout\":\"{s}\",\"stderr\":\"\",\"fc_output\":{{\"contents\":\"{s}\"}},\"fc_env\":{{\"contents\":\"{s}\"}},\"fc_path\":{{\"contents\":\"{s}\"}}}}}}}}}}", .{ id, out, fc_output, fc_env, fc_path });
+}
+
+test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH reach later steps" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const json =
+        \\{"plan":{"planId":"p"},"jobId":"j","resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
+        \\ "contextData":{"github":{"t":2,"d":[{"k":"sha","v":"abc"},{"k":"repository","v":"o/r"},{"k":"ref_name","v":"main"}]}},
+        \\ "steps":[
+        \\  {"type":"action","reference":{"type":"script"},"id":"s1","contextName":"build","name":"build","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo producing"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s2","contextName":"use","name":"use","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo version={0} multi={1} env=$FROM_ENV', steps.build.outputs.version, steps.build.outputs.notes)"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s3","contextName":"bad","name":"bad","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo writes garbage"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s4","contextName":"after","name":"after","condition":"always()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo done"}}]}}
+        \\ ]}
+    ;
+    const job = try job_mod.parse(arena, json);
+    const answers = [_][]const u8{
+        base_answer,
+        try execFc(arena, "C1", "producing\\n", "version=1.2.3\\nnotes<<EOF\\nline a\\nline b\\nEOF\\n", "FROM_ENV=hello\\nGITHUB_SHA=evil\\n", "/opt/tool/bin\\n"),
+        try execFc(arena, "C2", "x\\n", "", "", ""),
+        try execFc(arena, "C3", "y\\n", "this is not valid\\n", "", ""),
+        try execFc(arena, "C4", "z\\n", "", "", ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+
+    for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
+    // Default environment is set once on the base container.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "withEnvVariable(name:\"GITHUB_SHA\",value:\"abc\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "name:\"CI\",value:\"true\"") != null);
+    // Step 1's query reads the file commands.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_output: file(path:\"/github/file_commands/output_1\")") != null);
+    // Outputs (including a multi-line one) were evaluated into step 2's script.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo version=1.2.3 multi=line a\\nline b env=$FROM_ENV") != null);
+    // GITHUB_ENV and GITHUB_PATH apply to the next step's container; reserved names are refused.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withEnvVariable(name:\"FROM_ENV\",value:\"hello\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withEnvVariable(name:\"PATH\",value:\"/opt/tool/bin:$PATH\",expand:true)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "name:\"GITHUB_SHA\",value:\"evil\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "ignored GITHUB_ENV entry 'GITHUB_SHA'") != null);
+    // ...and only once: step 3 no longer re-applies them.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "withEnvVariable") == null);
+    // A malformed GITHUB_OUTPUT fails the step that wrote it; always() still runs.
+    try std.testing.expectEqual(Outcome.failure, res.steps[2].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Unable to process the GITHUB_OUTPUT file command: invalid format 'this is not valid' on line 1") != null);
+    try std.testing.expectEqual(Outcome.success, res.steps[3].outcome);
 }
