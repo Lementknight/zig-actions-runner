@@ -29,6 +29,9 @@ pub const Config = struct {
     /// Absent means "log to stdout only" (StdoutSink).
     database_url: ?[]const u8 = null,
     dagger_cmd: []const u8 = "dagger",
+    /// Base image for jobs. The default gets git, curl and CA certificates installed (cached by Dagger);
+    /// a custom image is used as is.
+    image: []const u8 = "ubuntu:24.04",
     log_flush_lines: u32 = 200,
     log_flush_ms: u32 = 500,
     dry_run: bool = false,
@@ -50,6 +53,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_NAME_PREFIX")) |v| c.name_prefix = v;
         if (environ.get("DATABASE_URL")) |v| c.database_url = v;
         if (environ.get("DAGGER_CMD")) |v| c.dagger_cmd = v;
+        if (environ.get("RUNNER_IMAGE")) |v| c.image = v;
         if (environ.get("LOG_FLUSH_LINES")) |v| c.log_flush_lines = try num(u32, v);
         if (environ.get("LOG_FLUSH_MS")) |v| c.log_flush_ms = try num(u32, v);
 
@@ -83,6 +87,7 @@ pub const Config = struct {
             else if (std.mem.eql(u8, key, "name-prefix")) c.name_prefix = val //
             else if (std.mem.eql(u8, key, "database-url")) c.database_url = val //
             else if (std.mem.eql(u8, key, "dagger-cmd")) c.dagger_cmd = val //
+            else if (std.mem.eql(u8, key, "image")) c.image = val //
             else if (std.mem.eql(u8, key, "log-flush-lines")) c.log_flush_lines = try num(u32, val) //
             else if (std.mem.eql(u8, key, "log-flush-ms")) c.log_flush_ms = try num(u32, val) //
             else return error.UnknownFlag;

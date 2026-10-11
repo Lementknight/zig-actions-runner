@@ -35,6 +35,7 @@ Environment variables (flags override):
 | `RUNNER_NAME_PREFIX` | no | Name becomes `<prefix>-<hostname>-<n>` |
 | `DATABASE_URL` | no | Tiger Data connection string (TLS required). If unset, logs go to `StdoutSink` (§5.1) |
 | `DAGGER_CMD` | no | Path to the `dagger` CLI, default `dagger` |
+| `RUNNER_IMAGE` | no | Base image for jobs, default `ubuntu:24.04` (flag `--image`). The default gets `git`, `curl` and CA certificates installed; a custom image is used as is |
 | `LOG_FLUSH_LINES` | no | Default `200` |
 | `LOG_FLUSH_MS` | no | Default `500` |
 
@@ -203,7 +204,7 @@ The client polls with `next_after` until `job_done` is true.
 
 ## 6. Dagger execution
 
-- One Dagger pipeline per job; base image defaults to `ubuntu:24.04` unless the job specifies `container:`.
+- One Dagger pipeline per job; base image defaults to `ubuntu:24.04` unless the job specifies `container:` (not supported yet) or `RUNNER_IMAGE` is set. The default image has `git`, `curl` and `ca-certificates` installed by one `apt-get` exec at the start of the job's container (cached by Dagger: about 13 s the first time, nothing after); a custom `RUNNER_IMAGE` is used as is, so it must bring its own tools.
 - Workspace: the checked-out repo mounted at `/github/workspace`.
 - `run:` steps become `withExec(["sh","-e","-c", script])`, honoring `working-directory`, `env` and `shell: bash|sh`.
 - Step stdout/stderr lines go to `LogSink` as they arrive, in order.
@@ -240,7 +241,7 @@ Executor design (verified live against Dagger v0.21.10, offline with `runner --e
 - Defaults: `repository` = the workflow's repo, `ref` = the triggering sha (`github.sha`; another repository defaults to its HEAD), `fetch-depth` = 1 (0 = full history). `ref` may be a sha, a branch, a tag or `refs/...` (for example `refs/pull/N/merge`); `path` must be relative and stay inside the workspace.
 - Accepted and ignored: `persist-credentials`, `token`, `clean`, `show-progress`, `set-safe-directory`, `fetch-tags`, `filter`, `sparse-checkout-cone-mode`, `ssh-strict`, `ssh-user`. Accepted only when off: `submodules`, `lfs`, `sparse-checkout`, `ssh-key`, `ssh-known-hosts`. Any other input, or `submodules: recursive` and the like, fails the step with "unsupported ...". Other `uses:` actions fail with "uses: <name>@<ref> is not supported".
 - Scope: public repositories only. Private-repository access is not part of the MVP: a fetch that needs credentials fails that step with git's own message plus "(private repositories are not supported in v0)", and the rest of the job continues. Dagger prints URLs in its progress output and its Secret ids do not survive across `dagger query` sessions, so a future implementation must not put a token in a URL or rely on a secret created by an earlier query. `GIT_TERMINAL_PROMPT=0` is set so a fetch can never block on a prompt.
-- Differences from the real action: no credentials are left in `.git/config`; a failed fetch fails only that step, with the reason in its log; the base image (`ubuntu:24.04`) has no `git` binary, so steps that run `git` need an image that has it.
+- Differences from the real action: no credentials are left in `.git/config`; a failed fetch fails only that step, with the reason in its log; the default base image gets `git` (see §6 Dagger execution), so `git log` and friends work in the checked-out workspace.
 - A skipped checkout (`if:` false) still mounts the tree; only `success()`/`always()`/`failure()`/`cancelled()` are evaluated, as for other steps.
 
 Supported v0 subset: `run`, `env`, `working-directory`, `shell` (bash/sh), `name`, `continue-on-error`, `if:`, `${{ }}` expressions (see above) and `uses: actions/checkout`. Anything else fails the step with a clear "unsupported" message in the log. Expressions are described below.

@@ -33,6 +33,10 @@ pub const default_image = "ubuntu:24.04";
 pub const workspace = "/github/workspace";
 pub const marker = "::zig-step::";
 
+/// Makes `ubuntu:24.04` usable for typical steps: git (checked-out workspaces are real repositories),
+/// curl and CA certificates. Dagger caches this exec, so only the first run pays for it.
+pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends git ca-certificates curl >/dev/null && rm -rf /var/lib/apt/lists/*";
+
 pub const Marker = union(enum) {
     begin: u32,
     end: u32,
@@ -214,6 +218,9 @@ pub const Options = struct {
     /// The `dagger` command.
     dagger_cmd: []const u8 = "dagger",
     image: []const u8 = default_image,
+    /// Installed into the image before the job (one cached exec). Used for the default image only,
+    /// which has no git; a custom image is expected to bring what it needs.
+    provision: bool = true,
     /// Key under which output lines are written to the sink.
     sink_job_id: u64 = 0,
     /// Tests only: replaces `dagger run ...` (it must print "<port> <token>" first) and the HTTP transport.
@@ -724,7 +731,14 @@ pub fn run(
         const w = &doc.writer;
         try w.writeAll("{ container { from(address:");
         try std.json.Stringify.value(opts.image, .{}, w);
-        try w.print(") {{ withWorkdir(path:\"{s}\") {{ ", .{workspace});
+        try w.writeAll(") { ");
+        const provision = opts.provision and std.mem.eql(u8, opts.image, default_image);
+        if (provision) {
+            try w.writeAll("withExec(args:");
+            try std.json.Stringify.value([_][]const u8{ "sh", "-c", provision_script }, .{}, w);
+            try w.writeAll(") { ");
+        }
+        try w.print("withWorkdir(path:\"{s}\") {{ ", .{workspace});
         const defaults = try ev.defaultEnv();
         for (defaults) |e| {
             try w.writeAll("withEnvVariable(name:");
@@ -734,7 +748,7 @@ pub fn run(
             try w.writeAll(") { ");
         }
         try w.writeAll("id");
-        for (0..defaults.len + 4) |_| try w.writeAll(" }");
+        for (0..defaults.len + 4 + @as(usize, if (provision) 1 else 0)) |_| try w.writeAll(" }");
         const data = gql(arena, transport, doc.written(), &err_msg) catch return fail(&sh, results, err_msg);
         break :blk jsonFindString(data, "id") orelse return fail(&sh, results, "Dagger returned no container");
     };
@@ -1346,4 +1360,27 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
     try std.testing.expectEqual(Outcome.failure, res.steps[2].outcome);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Unable to process the GITHUB_OUTPUT file command: invalid format 'this is not valid' on line 1") != null);
     try std.testing.expectEqual(Outcome.success, res.steps[3].outcome);
+}
+
+test "the default image is provisioned with git; a custom image is left alone" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("true")};
+    for ([_]struct { image: []const u8, expect_provision: bool }{
+        .{ .image = default_image, .expect_provision = true },
+        .{ .image = "custom/image:1", .expect_provision = false },
+    }) |case| {
+        const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "") };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var buf: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        _ = try run(arena, std.testing.io, &env, .{ .image = case.image, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+        const base = fake.seen.items[0];
+        try std.testing.expect(braceBalanced(base));
+        try std.testing.expectEqual(case.expect_provision, std.mem.indexOf(u8, base, "apt-get install") != null);
+        try std.testing.expect(std.mem.indexOf(u8, base, case.image) != null);
+    }
 }

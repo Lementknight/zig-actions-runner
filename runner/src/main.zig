@@ -93,6 +93,7 @@ fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log
     };
     const res = try dagger.run(arena, io, init.environ_map, .{
         .dagger_cmd = cfg.dagger_cmd,
+        .image = cfg.image,
         .sink_job_id = job.check_run_id,
     }, job, log);
     for (res.steps, job.steps, 1..) |r, st, n| {
