@@ -1,27 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { createApp } from '../src/app'
 import type { Queryable } from '../src/db'
+import { get, stubDb } from './support'
 
 // The routes against a stub database: parameter handling, response shapes and error bodies.
-// No Postgres needed; runs.db.test.ts covers the same routes against a real one.
-
-interface Call {
-  sql: string
-  params: unknown[]
-}
-
-/** Answers each query with the first handler whose pattern matches its SQL, and records it. */
-function stubDb(handlers: [RegExp, (params: unknown[]) => unknown[]][] = []) {
-  const calls: Call[] = []
-  const db: Queryable = {
-    async query(sql: string, params: unknown[] = []) {
-      calls.push({ sql, params })
-      const handler = handlers.find(([pattern]) => pattern.test(sql))
-      return { rows: (handler ? handler[1](params) : []) as never[] }
-    },
-  }
-  return { db, calls }
-}
+// No Postgres needed; runs.db.test.ts covers the same routes against a real one, and
+// logs.test.ts covers the logs route.
 
 const at = (iso: string) => new Date(iso)
 
@@ -58,11 +41,6 @@ const step = (job_id: number, number: number) => ({
   started_at: null,
   completed_at: null,
 })
-
-async function get(db: Queryable, path: string) {
-  const response = await createApp(db).request(path)
-  return { status: response.status, body: (await response.json()) as unknown }
-}
 
 describe('GET /api/health', () => {
   it('answers { ok: true } after the database answers', async () => {

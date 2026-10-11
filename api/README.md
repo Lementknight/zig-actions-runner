@@ -21,13 +21,19 @@ DATABASE_URL=... npm --prefix api start      # PORT defaults to 8080
 | `GET /api/health` | `{ "ok": true }` after a `SELECT 1`; 503 `{ "ok": false, ... }` when the database does not answer |
 | `GET /api/runs?repo=&limit=&before=` | A bare array of runs, newest first (`created_at DESC, id DESC`) |
 | `GET /api/runs/:id` | The run with `jobs[]` (by id), each with `steps[]` (by `number`) |
+| `GET /api/jobs/:id/logs?after=&limit=` | `{ lines: [{ seq, step, stream, ts, line }], next_after, job_done }`, lines with `seq > after` by `seq` |
 
 - Fields are the table columns, snake_case. BIGINT ids are JSON numbers. Timestamps are ISO 8601
   (`2026-10-11T12:00:00.000Z`); nullable columns are `null`.
 - `limit` defaults to 50; larger values are capped at 200. `before` is a run id and returns the
   runs that sort after it, that is older. An empty parameter (`?repo=`) means absent.
-- A non-numeric or non-positive id, `limit` or `before` answers 400 `{ "error": "..." }`. An
-  unknown run or path answers 404 `{ "error": "not found" }`. A database failure answers 500
+- Logs: `after` defaults to 0, `limit` to 1000, capped at 5000. `next_after` is the last `seq`
+  returned, or echoes `after` on an empty page. `job_done` is true only when the job is
+  `completed` and no line past `next_after` exists. The query bounds `ts` from the job's
+  `started_at` less an hour, so TimescaleDB scans only the job's chunks.
+- docs/SPEC.md §5.3 is the contract; this list is a summary of it.
+- A malformed id, `limit`, `before` or `after` answers 400 `{ "error": "..." }`. An
+  unknown run, job or path answers 404 `{ "error": "not found" }`. A database failure answers 500
   `{ "error": "internal error" }` and logs only the error message.
 
 ## Test

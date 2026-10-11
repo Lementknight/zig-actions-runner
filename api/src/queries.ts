@@ -96,3 +96,58 @@ export async function getRun(db: Queryable, id: number): Promise<RunDetail | nul
     jobs: jobs.map((job) => ({ ...job, steps: byJob.get(job.id)!.sort((a, b) => a.number - b.number) })),
   }
 }
+
+export interface LogLineRow {
+  seq: number
+  step: number
+  stream: string
+  ts: Date
+  line: string
+}
+
+export interface LogPage {
+  lines: LogLineRow[]
+  next_after: number
+  job_done: boolean
+}
+
+/**
+ * One page of a job's log, lines with seq > after in seq order, or null when no such job.
+ *
+ * `job_done` is true only when the job is completed and nothing past `next_after` remains. The
+ * job's status is read before its lines: the runner flushes a job's log before it marks the job
+ * completed (SPEC §5.1, §5.2), so a status already completed means every line is already written.
+ * Fetching one row past `limit` tells whether more remain without a second query.
+ */
+export async function getJobLogs(db: Queryable, jobId: number, after: number, limit: number): Promise<LogPage | null> {
+  const job = (
+    await db.query<{ status: string; started_at: Date | null }>('SELECT status, started_at FROM jobs WHERE id = $1', [
+      jobId,
+    ])
+  ).rows[0]
+  if (job === undefined) return null
+
+  // job_logs is a hypertable on ts. Bounding ts from below lets TimescaleDB skip every chunk older
+  // than the job; the hour of slack covers a runner clock that stamps lines before started_at.
+  const params: unknown[] = [jobId, after, limit + 1]
+  let tsBound = ''
+  if (job.started_at !== null) {
+    params.push(job.started_at)
+    tsBound = ` AND ts >= $4::timestamptz - interval '1 hour'`
+  }
+  const rows = (
+    await db.query<LogLineRow>(
+      `SELECT seq, step_number AS step, stream, ts, line FROM job_logs` +
+        ` WHERE job_id = $1 AND seq > $2${tsBound} ORDER BY seq LIMIT $3`,
+      params,
+    )
+  ).rows
+
+  const more = rows.length > limit
+  const lines = more ? rows.slice(0, limit) : rows
+  return {
+    lines,
+    next_after: lines.at(-1)?.seq ?? after,
+    job_done: job.status === 'completed' && !more,
+  }
+}

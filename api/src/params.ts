@@ -13,6 +13,14 @@ export function parseId(raw: string | undefined, name: string): number | undefin
   return value
 }
 
+/** A log cursor: a seq to read after, 0 (from the start) when absent. */
+export function parseAfter(raw: string | undefined): number {
+  if (raw === undefined || raw === '') return 0
+  const value = DIGITS.test(raw) ? Number(raw) : NaN
+  if (!Number.isSafeInteger(value)) throw new BadRequest('invalid after')
+  return value
+}
+
 /** A page size: `fallback` when absent, at least 1, and quietly capped at `max`. */
 export function parseLimit(raw: string | undefined, fallback: number, max: number): number {
   if (raw === undefined || raw === '') return fallback
