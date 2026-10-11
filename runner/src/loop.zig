@@ -160,12 +160,12 @@ pub fn stepResultsJson(arena: Allocator, job: job_mod.Job, result: dagger.Result
         it.* = .{
             .external_id = step.id,
             .number = @intCast(n),
-            .name = step.name,
+            .name = if (r.name.len > 0) r.name else step.name,
             .status = "completed",
             // Same vocabulary as the job conclusion (verified live): succeeded / failed / skipped.
             .conclusion = switch (r.outcome) {
                 .success => "succeeded",
-                .failure => if (step.continue_on_error) "succeeded" else "failed",
+                .failure => if (r.continued) "succeeded" else "failed",
                 .skipped, .not_run => "skipped",
             },
             .started_at = if (r.started_ms > 0) try timefmt.isoTime(arena, r.started_ms) else null,
@@ -216,14 +216,15 @@ test "stepResultsJson maps outcomes and continue-on-error" {
     const arena = a.allocator();
     const mk = struct {
         fn step(id: []const u8, coe: bool) job_mod.Step {
-            return .{ .id = id, .name = id, .condition = "success()", .continue_on_error = coe, .env = &.{}, .action = .{ .unsupported = "x" } };
+            _ = coe;
+            return .{ .id = id, .name = id, .condition = "success()", .action = .{ .unsupported = "x" } };
         }
     };
     const steps = [_]job_mod.Step{ mk.step("a", false), mk.step("b", true), mk.step("c", false), mk.step("d", false) };
     const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 1, .has_container = false, .secrets = &.{}, .steps = &steps };
     var rs = [_]dagger.StepResult{
         .{ .outcome = .success, .started_ms = 1000, .completed_ms = 2000 },
-        .{ .outcome = .failure, .exit_code = 5 },
+        .{ .outcome = .failure, .exit_code = 5, .continued = true },
         .{ .outcome = .failure, .exit_code = 2 },
         .{ .outcome = .skipped },
     };

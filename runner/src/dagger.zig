@@ -23,6 +23,8 @@ const std = @import("std");
 const job_mod = @import("job.zig");
 const sink = @import("sink.zig");
 const broker = @import("github/broker.zig");
+const expr = @import("expr.zig");
+const context = @import("context.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -101,22 +103,34 @@ pub const Fetched = struct {
     mount: []const u8,
 };
 
-/// The `sh -c` script of a `run:` or checkout step number `n` (1-based). Its exit code is the step's.
-pub fn stepScript(arena: Allocator, n: u32, step: job_mod.Step, fetched: ?Fetched) ![]const u8 {
+/// A step with its expressions evaluated, ready to become a script.
+pub const Resolved = union(enum) {
+    run: struct {
+        script: []const u8,
+        /// `bash`, `sh`, or null for the default.
+        shell: ?[]const u8,
+        working_directory: ?[]const u8,
+        env: []const job_mod.EnvVar,
+    },
+    checkout: Fetched,
+};
+
+/// The `sh -c` script of step number `n` (1-based). Its exit code is the step's.
+pub fn stepScript(arena: Allocator, n: u32, r: Resolved) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.print("echo '{s}begin {d}'\n", .{ marker, n });
-    switch (step.action) {
-        .script => |sc| {
+    switch (r) {
+        .run => |sc| {
             try w.writeAll("( ");
             if (sc.working_directory) |wd| {
                 try w.writeAll("cd ");
                 try shellQuote(w, wd);
                 try w.writeAll(" && ");
             }
-            if (step.env.len > 0) {
+            if (sc.env.len > 0) {
                 try w.writeAll("env ");
-                for (step.env) |e| {
+                for (sc.env) |e| {
                     const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
                     try shellQuote(w, pair);
                     try w.writeByte(' ');
@@ -130,16 +144,14 @@ pub fn stepScript(arena: Allocator, n: u32, step: job_mod.Step, fetched: ?Fetche
             try shellQuote(w, sc.script);
             try w.writeAll(" )\nrc=$?\n");
         },
-        .checkout => {
+        .checkout => |f| {
             // The tree is mounted by the query (`withDirectory`); the step only reports it.
-            const f = fetched.?;
             try w.writeAll("printf '%s\\n' ");
             try shellQuote(w, try std.fmt.allocPrint(arena, "Syncing repository: {s}", .{f.repo}));
             try w.writeAll("\nprintf '%s\\n' ");
             try shellQuote(w, try std.fmt.allocPrint(arena, "Checked out {s} into {s} (the runner's built-in checkout replaces actions/checkout)", .{ f.ref_label, f.mount }));
             try w.writeAll("\nrc=0\n");
         },
-        .unsupported => unreachable,
     }
     try w.print("echo '{s}end {d}'\nexit $rc\n", .{ marker, n });
     return aw.written();
@@ -148,6 +160,10 @@ pub fn stepScript(arena: Allocator, n: u32, step: job_mod.Step, fetched: ?Fetche
 pub const Outcome = enum { not_run, success, failure, skipped };
 
 pub const StepResult = struct {
+    /// The step's display name with expressions evaluated; empty when it was never evaluated.
+    name: []const u8 = "",
+    /// Whether `continue-on-error` applied (evaluated), so a failure does not fail the job.
+    continued: bool = false,
     outcome: Outcome = .not_run,
     exit_code: i32 = 0,
     started_ms: i64 = 0,
@@ -312,6 +328,126 @@ fn fetchCheckout(arena: Allocator, t: Transport, job: job_mod.Job, co: job_mod.C
     }) };
     return f;
 }
+
+// --- expression evaluation ---
+
+const StepCtx = struct { id: []const u8, outcome: []const u8, conclusion: []const u8 };
+
+/// Holds what expressions can see while a job runs and evaluates the templates of each step.
+const Evaluator = struct {
+    arena: Allocator,
+    job: *const job_mod.Job,
+    /// github, inputs, matrix, needs, strategy, vars from the job's contextData.
+    github: expr.Value,
+    inputs: expr.Value,
+    matrix: expr.Value,
+    needs: expr.Value,
+    strategy: expr.Value,
+    vars: expr.Value,
+    job_context: expr.Value,
+    /// Workflow- and job-level env, evaluated once.
+    job_env: std.ArrayList(job_mod.EnvVar) = .empty,
+    steps: std.ArrayList(StepCtx) = .empty,
+    job_failed: bool = false,
+    diag: []const u8 = "",
+
+    fn init(arena: Allocator, job: *const job_mod.Job) !Evaluator {
+        var ev: Evaluator = .{
+            .arena = arena,
+            .job = job,
+            .github = try context.named(arena, job.context_data, "github"),
+            .inputs = try context.named(arena, job.context_data, "inputs"),
+            .matrix = try context.named(arena, job.context_data, "matrix"),
+            .needs = try context.named(arena, job.context_data, "needs"),
+            .strategy = try context.named(arena, job.context_data, "strategy"),
+            .vars = try context.named(arena, job.context_data, "vars"),
+            .job_context = try context.named(arena, job.context_data, "job"),
+        };
+        for (job.env) |in| {
+            const sc = try ev.scope(&.{});
+            const val = ev.render(in.value, sc) catch continue; // an env value that cannot be evaluated stays unset
+            try putEnv(arena, &ev.job_env, in.name, val);
+        }
+        return ev;
+    }
+
+    fn putEnv(arena: Allocator, list: *std.ArrayList(job_mod.EnvVar), name: []const u8, value: []const u8) !void {
+        for (list.items) |*e| if (std.mem.eql(u8, e.name, name)) {
+            e.value = value;
+            return;
+        };
+        try list.append(arena, .{ .name = name, .value = value });
+    }
+
+    /// The scope for evaluating one step: `step_env` is applied on top of the job's env.
+    fn scope(ev: *Evaluator, step_env: []const job_mod.EnvVar) !expr.Scope {
+        const arena = ev.arena;
+        var env_list: std.ArrayList(job_mod.EnvVar) = .empty;
+        try env_list.appendSlice(arena, ev.job_env.items);
+        for (step_env) |e| try putEnv(arena, &env_list, e.name, e.value);
+        const env_entries = try arena.alloc(expr.Value.Entry, env_list.items.len);
+        for (env_list.items, env_entries) |e, *o| o.* = .{ .key = e.name, .value = .{ .string = e.value } };
+
+        const step_entries = try arena.alloc(expr.Value.Entry, ev.steps.items.len);
+        for (ev.steps.items, step_entries) |sc, *o| {
+            const fields = try arena.alloc(expr.Value.Entry, 3);
+            fields[0] = .{ .key = "outputs", .value = .{ .object = &.{} } };
+            fields[1] = .{ .key = "outcome", .value = .{ .string = sc.outcome } };
+            fields[2] = .{ .key = "conclusion", .value = .{ .string = sc.conclusion } };
+            o.* = .{ .key = sc.id, .value = .{ .object = fields } };
+        }
+
+        const job_fields = try arena.alloc(expr.Value.Entry, 1);
+        job_fields[0] = .{ .key = "status", .value = .{ .string = if (ev.job_failed) "failure" else "success" } };
+        const runner_fields = try arena.alloc(expr.Value.Entry, 5);
+        runner_fields[0] = .{ .key = "os", .value = .{ .string = "Linux" } };
+        runner_fields[1] = .{ .key = "arch", .value = .{ .string = "X64" } };
+        runner_fields[2] = .{ .key = "name", .value = .{ .string = "zig-runner" } };
+        runner_fields[3] = .{ .key = "temp", .value = .{ .string = "/tmp" } };
+        runner_fields[4] = .{ .key = "tool_cache", .value = .{ .string = "/opt/hostedtoolcache" } };
+
+        const ctxs = try arena.alloc(expr.Value.Entry, 10);
+        ctxs[0] = .{ .key = "github", .value = ev.github };
+        ctxs[1] = .{ .key = "env", .value = .{ .object = env_entries } };
+        ctxs[2] = .{ .key = "steps", .value = .{ .object = step_entries } };
+        ctxs[3] = .{ .key = "job", .value = .{ .object = job_fields } };
+        ctxs[4] = .{ .key = "runner", .value = .{ .object = runner_fields } };
+        ctxs[5] = .{ .key = "inputs", .value = ev.inputs };
+        ctxs[6] = .{ .key = "matrix", .value = ev.matrix };
+        ctxs[7] = .{ .key = "needs", .value = ev.needs };
+        ctxs[8] = .{ .key = "strategy", .value = ev.strategy };
+        ctxs[9] = .{ .key = "vars", .value = ev.vars };
+        return .{
+            .contexts = ctxs,
+            .job_failed = ev.job_failed,
+            .unsupported_contexts = &.{"secrets"},
+            .diag = &ev.diag,
+        };
+    }
+
+    fn render(ev: *Evaluator, t: job_mod.Template, sc: expr.Scope) ![]const u8 {
+        return switch (t) {
+            .lit => |l| l,
+            .expr => |e| expr.evalString(ev.arena, e, sc),
+        };
+    }
+
+    fn renderEnv(ev: *Evaluator, inputs: []const job_mod.Input, sc: expr.Scope) ![]const job_mod.EnvVar {
+        const out = try ev.arena.alloc(job_mod.EnvVar, inputs.len);
+        for (inputs, out) |in, *o| o.* = .{ .name = in.name, .value = try ev.render(in.value, sc) };
+        return out;
+    }
+
+    fn record(ev: *Evaluator, step: job_mod.Step, outcome: Outcome, continued: bool) !void {
+        const raw: []const u8 = switch (outcome) {
+            .success => "success",
+            .failure => "failure",
+            .skipped, .not_run => "skipped",
+        };
+        const conclusion: []const u8 = if (outcome == .failure and continued) "success" else raw;
+        try ev.steps.append(ev.arena, .{ .id = if (step.context_name.len > 0) step.context_name else step.id, .outcome = raw, .conclusion = conclusion });
+    }
+};
 
 // --- the log reader ---
 
@@ -512,39 +648,77 @@ pub fn run(
         break :blk jsonFindString(data, "id") orelse return fail(&sh, results, "Dagger returned no container");
     };
 
-    var job_failed = false;
+    var ev = try Evaluator.init(arena, &job);
     for (job.steps, results, 1..) |step, *res, n| {
         const num: u32 = @intCast(n);
-        const should_run = evalCondition(step.condition, job_failed);
-        if (should_run == null) {
-            sh.append(num, try std.fmt.allocPrint(arena, "unsupported condition '{s}' (v0 supports success(), always(), failure(), cancelled())", .{step.condition}));
-            res.* = .{ .outcome = .failure, .exit_code = 1 };
-            job_failed = true;
+        res.name = step.name;
+
+        // 1. The condition, with the job env visible.
+        ev.diag = "";
+        const sc0 = try ev.scope(&.{});
+        if (step.name_expr) |ne| res.name = expr.evalString(arena, ne, sc0) catch step.name;
+        const should_run = expr.evalCondition(arena, step.condition, sc0) catch {
+            try failStep(&ev, &sh, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the condition '{s}': {s}", .{ step.condition, ev.diag }), false);
             continue;
-        }
-        if (!should_run.?) {
+        };
+        if (!should_run) {
             res.outcome = .skipped;
-            continue;
-        }
-        if (step.action == .unsupported) {
-            sh.append(num, step.action.unsupported);
-            res.* = .{ .outcome = .failure, .exit_code = 1 };
-            if (!step.continue_on_error) job_failed = true;
+            try ev.record(step, .skipped, false);
             continue;
         }
 
+        // 2. Step env and continue-on-error, then the step's own inputs.
+        const step_env = ev.renderEnv(step.env, sc0) catch {
+            try failStep(&ev, &sh, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate env: {s}", .{ev.diag}), false);
+            continue;
+        };
+        const sc1 = try ev.scope(step_env);
+        const coe = std.mem.eql(u8, ev.render(step.continue_on_error, sc1) catch "false", "true");
+        res.continued = coe;
+
+        var resolved: Resolved = undefined;
         var fetched: ?Fetched = null;
-        if (step.action == .checkout) {
-            fetched = try fetchCheckout(arena, transport, job, step.action.checkout);
-            if (fetched.?.result == .failed) {
-                sh.append(num, fetched.?.result.failed);
-                res.* = .{ .outcome = .failure, .exit_code = 1 };
-                if (!step.continue_on_error) job_failed = true;
+        switch (step.action) {
+            .unsupported => |why| {
+                try failStep(&ev, &sh, step, res, num, why, coe);
                 continue;
-            }
+            },
+            .script => |sc| {
+                const script = ev.render(sc.script, sc1) catch {
+                    try failStep(&ev, &sh, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the script: {s}", .{ev.diag}), coe);
+                    continue;
+                };
+                const shell: ?[]const u8 = if (sc.shell) |t| (ev.render(t, sc1) catch null) else null;
+                if (shell) |sh_name| if (!job_mod.validShell(sh_name)) {
+                    try failStep(&ev, &sh, step, res, num, try std.fmt.allocPrint(arena, "unsupported shell '{s}' (v0 supports bash and sh)", .{sh_name}), coe);
+                    continue;
+                };
+                const wd: ?[]const u8 = if (sc.working_directory) |t| (ev.render(t, sc1) catch null) else null;
+                resolved = .{ .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = step_env } };
+            },
+            .checkout => |inputs| {
+                const rendered = ev.renderEnv(inputs, sc1) catch {
+                    try failStep(&ev, &sh, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the checkout inputs: {s}", .{ev.diag}), coe);
+                    continue;
+                };
+                const co = switch (try job_mod.checkoutFromInputs(arena, rendered)) {
+                    .ok => |c| c,
+                    .unsupported => |why| {
+                        try failStep(&ev, &sh, step, res, num, why, coe);
+                        continue;
+                    },
+                };
+                const f = try fetchCheckout(arena, transport, job, co);
+                if (f.result == .failed) {
+                    try failStep(&ev, &sh, step, res, num, f.result.failed, coe);
+                    continue;
+                }
+                fetched = f;
+                resolved = .{ .checkout = f };
+            },
         }
 
-        const script = try stepScript(arena, num, step, fetched);
+        const script = try stepScript(arena, num, resolved);
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
         try w.writeAll("{ loadContainerFromID(id:");
@@ -566,9 +740,9 @@ pub fn run(
 
         res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
         const data = gql(arena, transport, doc.written(), &err_msg) catch {
-            res.* = .{ .outcome = .failure, .exit_code = 1, .started_ms = res.started_ms, .completed_ms = std.Io.Clock.real.now(io).toMilliseconds() };
+            res.* = .{ .name = res.name, .continued = coe, .outcome = .failure, .exit_code = 1, .started_ms = res.started_ms, .completed_ms = std.Io.Clock.real.now(io).toMilliseconds() };
             sh.append(num, try std.fmt.allocPrint(arena, "Dagger error: {s}", .{err_msg}));
-            return finish(arena, &sh, results, job, err_msg);
+            return finish(arena, &sh, results, err_msg);
         };
         res.completed_ms = std.Io.Clock.real.now(io).toMilliseconds();
         const code: i32 = if (jsonFind(data, "exitCode")) |c| (if (c == .integer) @intCast(c.integer) else 1) else 1;
@@ -578,9 +752,10 @@ pub fn run(
 
         // A cached step prints no log lines. Wait briefly for a live stream, then replay the result.
         awaitLiveOrReplay(io, &sh, num, jsonFindString(data, "stdout") orelse "", jsonFindString(data, "stderr") orelse "");
-        if (res.outcome == .failure and !step.continue_on_error) job_failed = true;
+        try ev.record(step, res.outcome, coe);
+        if (res.outcome == .failure and !coe) ev.job_failed = true;
     }
-    return finish(arena, &sh, results, job, "");
+    return finish(arena, &sh, results, "");
 }
 
 /// How long to wait for a step's live lines before assuming it was served from cache. The log stream
@@ -612,17 +787,26 @@ fn awaitLiveOrReplay(io: std.Io, sh: *Shared, step: u32, stdout: []const u8, std
     sh.flush();
 }
 
+/// Logs why a step could not run and marks it failed (the job too, unless continue-on-error).
+fn failStep(ev: *Evaluator, sh: *Shared, step: job_mod.Step, res: *StepResult, num: u32, msg: []const u8, coe: bool) !void {
+    sh.append(num, msg);
+    const name = res.name;
+    res.* = .{ .name = name, .continued = coe, .outcome = .failure, .exit_code = 1 };
+    try ev.record(step, .failure, coe);
+    if (!coe) ev.job_failed = true;
+}
+
 fn fail(sh: *Shared, results: []StepResult, msg: []const u8) !Result {
     sh.flush();
     return .{ .steps = results, .engine_error = msg, .succeeded = false };
 }
 
-fn finish(arena: Allocator, sh: *Shared, results: []StepResult, job: job_mod.Job, engine_msg: []const u8) !Result {
+fn finish(arena: Allocator, sh: *Shared, results: []StepResult, engine_msg: []const u8) !Result {
     sh.flush();
     var any_failed = false;
     var any_not_run = false;
-    for (results, job.steps) |res, step| {
-        if (res.outcome == .failure and !step.continue_on_error) any_failed = true;
+    for (results) |res| {
+        if (res.outcome == .failure and !res.continued) any_failed = true;
         if (res.outcome == .not_run) any_not_run = true;
     }
     var engine_error: ?[]const u8 = null;
@@ -641,7 +825,7 @@ fn finish(arena: Allocator, sh: *Shared, results: []StepResult, job: job_mod.Job
 // --- tests ---
 
 fn testStep(script: []const u8) job_mod.Step {
-    return .{ .id = "x", .name = "n", .condition = "success()", .continue_on_error = false, .env = &.{}, .action = .{ .script = .{ .script = script, .shell = null, .working_directory = null } } };
+    return .{ .id = "x", .name = "n", .condition = "success()", .action = .{ .script = .{ .script = .{ .lit = script }, .shell = null, .working_directory = null } } };
 }
 
 fn testJob(steps: []const job_mod.Step) job_mod.Job {
@@ -680,11 +864,12 @@ test "evalCondition" {
 test "script quotes, applies env, shell and working directory, and propagates the exit code" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
-    var s = testStep("echo 'hi' && echo $X");
-    s.env = &.{.{ .name = "X", .value = "a b" }};
-    s.action.script.shell = "sh";
-    s.action.script.working_directory = "sub dir";
-    const w = try stepScript(a.allocator(), 2, s, null);
+    const w = try stepScript(a.allocator(), 2, .{ .run = .{
+        .script = "echo 'hi' && echo $X",
+        .shell = "sh",
+        .working_directory = "sub dir",
+        .env = &.{.{ .name = "X", .value = "a b" }},
+    } });
     try std.testing.expect(std.mem.indexOf(u8, w, "cd 'sub dir' && env 'X=a b' sh -e -c 'echo '\\''hi'\\'' && echo $X'") != null);
     try std.testing.expect(std.mem.indexOf(u8, w, marker ++ "begin 2") != null);
     try std.testing.expect(std.mem.endsWith(u8, w, "exit $rc\n"));
@@ -845,7 +1030,7 @@ test "run mounts a fetched checkout, and a failed fetch fails only that step" {
     var env: std.process.Environ.Map = .init(arena);
     var co = testStep("x");
     co.name = "Run actions/checkout@v4";
-    co.action = .{ .checkout = .{} };
+    co.action = .{ .checkout = &.{} };
     var after = testStep("echo after");
     after.condition = "always()";
     const steps = [_]job_mod.Step{ co, after };
@@ -893,4 +1078,64 @@ test "run reports an engine error when the session cannot start" {
     try std.testing.expect(!res.succeeded);
     try std.testing.expect(res.engine_error != null);
     try std.testing.expectEqual(Outcome.not_run, res.steps[0].outcome);
+}
+
+test "run evaluates expressions in conditions, names, env, scripts and the steps context" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+
+    const json =
+        \\{"plan":{"planId":"p"},"jobId":"j","resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
+        \\ "environmentVariables":[{"type":2,"map":[{"Key":{"lit":"JOB_ENV"},"Value":{"type":3,"expr":"format('{0}-job', github.ref_name)"}}]}],
+        \\ "contextData":{"matrix":null,"github":{"t":2,"d":[{"k":"ref","v":"refs/heads/main"},{"k":"ref_name","v":"main"},{"k":"sha","v":"abc123"},{"k":"repository","v":"o/r"}]}},
+        \\ "steps":[
+        \\  {"type":"action","reference":{"type":"script"},"id":"s1","contextName":"first","name":"first","condition":"success()",
+        \\   "displayNameToken":{"type":3,"expr":"format('Build {0}', github.ref_name)"},
+        \\   "environment":{"type":2,"map":[{"Key":{"lit":"STEP_ENV"},"Value":{"type":3,"expr":"github.sha"}}]},
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo {0} $STEP_ENV {1}', github.sha, env.JOB_ENV)"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s2","contextName":"__run","name":"__run","condition":"success() && (github.ref == 'refs/heads/main')",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo on-main"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s3","contextName":"__run_2","name":"__run_2","condition":"success() && (github.ref == 'refs/heads/other')",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo never"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s4","contextName":"__run_3","name":"__run_3","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo outcome={0} skipped={1}', steps.first.outcome, steps.__run_2.outcome)"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s5","contextName":"__run_4","name":"__run_4","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo {0}', secrets.TOKEN)"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s6","contextName":"__run_5","name":"__run_5","condition":"always()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo cleanup"}}]}}
+        \\ ]}
+    ;
+    const job = try job_mod.parse(arena, json);
+    const answers = [_][]const u8{
+        base_answer,
+        try exec(arena, "C1", 0, "ok\\n"),
+        try exec(arena, "C2", 0, "ok\\n"),
+        try exec(arena, "C3", 0, "ok\\n"),
+        try exec(arena, "C4", 0, "ok\\n"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+
+    // Names, outcomes.
+    try std.testing.expectEqualStrings("Build main", res.steps[0].name);
+    try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
+    try std.testing.expectEqual(Outcome.success, res.steps[1].outcome);
+    try std.testing.expectEqual(Outcome.skipped, res.steps[2].outcome); // condition false
+    try std.testing.expectEqual(Outcome.success, res.steps[3].outcome);
+    try std.testing.expectEqual(Outcome.failure, res.steps[4].outcome); // secrets are unsupported
+    try std.testing.expectEqual(Outcome.success, res.steps[5].outcome); // always()
+    try std.testing.expect(!res.succeeded);
+    // Evaluated scripts reached Dagger: sha, step env, job env (from an expression), and steps.* outcomes.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "echo abc123 $STEP_ENV main-job") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "STEP_ENV=abc123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "echo outcome=success skipped=skipped") != null);
+    // 5 queries: base + steps 1, 2, 4, 6 (the skipped step and the failed one send nothing).
+    try std.testing.expectEqual(@as(usize, 5), fake.seen.items.len);
+    // The unsupported context is reported in that step's log.
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "the 'secrets' context is not supported yet") != null);
 }
