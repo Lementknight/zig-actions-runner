@@ -242,6 +242,17 @@ pub const Options = struct {
     image: []const u8 = default_image,
     /// Key under which output lines are written to the sink.
     sink_job_id: u64 = 0,
+    /// Called on every step transition (SPEC §5.2), live or replayed from the report.
+    on_step: ?StepHook = null,
+};
+
+/// A step transition: after a `begin` marker the result has `started_ms` and outcome `not_run`;
+/// after `end` or `skip` it has the final outcome. `now_ms` is when the marker arrived (a skip
+/// marker sets no time of its own). Steps are numbered from 1. The hook must not fail the job, so it
+/// returns nothing.
+pub const StepHook = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, step: u32, result: StepResult, now_ms: i64) void,
 };
 
 // --- checkout ---
@@ -402,12 +413,17 @@ const Demux = struct {
     results: []StepResult,
     /// Steps already reported by the live stream; their lines are dropped while replaying.
     already_done: ?[]const bool = null,
+    on_step: ?StepHook = null,
 
     /// Step whose span header was printed last (Dagger interleaves spans), and header parsing state.
     span_step: ?u32 = null,
     in_header: bool = false,
     tail: [20][]const u8 = undefined,
     tail_len: usize = 0,
+
+    fn notify(d: *Demux, step: u32, now: i64) void {
+        if (d.on_step) |h| h.call(h.ctx, step, d.results[step - 1], now);
+    }
 
     fn emit(d: *Demux, step: u32, text: []const u8) !void {
         if (d.already_done) |done| if (step >= 1 and step <= done.len and done[step - 1]) return;
@@ -437,19 +453,27 @@ const Demux = struct {
             switch (sc.marker) {
                 .begin => |n| {
                     d.span_step = n;
-                    if (n >= 1 and n <= d.results.len and !skipped(d.already_done, n)) d.results[n - 1].started_ms = now;
+                    if (n >= 1 and n <= d.results.len and !skipped(d.already_done, n)) {
+                        d.results[n - 1].started_ms = now;
+                        d.notify(n, now);
+                    }
                 },
                 .skip => |n| {
-                    if (n >= 1 and n <= d.results.len and !skipped(d.already_done, n)) d.results[n - 1].outcome = .skipped;
+                    if (n >= 1 and n <= d.results.len and !skipped(d.already_done, n)) {
+                        d.results[n - 1].outcome = .skipped;
+                        d.notify(n, now);
+                    }
                     d.span_step = null;
                 },
                 .end => |e| {
+                    // The step's lines are flushed before its end is announced.
+                    try d.log.flush();
                     if (e.step >= 1 and e.step <= d.results.len and !skipped(d.already_done, e.step)) {
                         d.results[e.step - 1].outcome = if (e.rc == 0) .success else .failure;
                         d.results[e.step - 1].exit_code = e.rc;
                         d.results[e.step - 1].completed_ms = now;
+                        d.notify(e.step, now);
                     }
-                    try d.log.flush();
                     d.span_step = null;
                 },
             }
@@ -513,7 +537,7 @@ pub fn run(
 
     const results = try arena.alloc(StepResult, job.steps.len);
     @memset(results, .{});
-    var demux: Demux = .{ .io = io, .arena = arena, .log = log, .sink_job_id = opts.sink_job_id, .results = results };
+    var demux: Demux = .{ .io = io, .arena = arena, .log = log, .sink_job_id = opts.sink_job_id, .results = results, .on_step = opts.on_step };
 
     var rbuf: [64 * 1024]u8 = undefined;
     var fr = child.stderr.?.readerStreaming(io, &rbuf);
@@ -759,6 +783,48 @@ test "replay does not duplicate steps already reported live" {
     try std.testing.expect(res.succeeded);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "live\n"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "replayed\n"));
+}
+
+const HookLog = struct {
+    events: [16][]const u8 = undefined,
+    n: usize = 0,
+    arena: Allocator,
+
+    fn call(ctx: *anyopaque, step: u32, r: StepResult, now_ms: i64) void {
+        const h: *HookLog = @ptrCast(@alignCast(ctx));
+        std.debug.assert(now_ms > 0);
+        h.events[h.n] = std.fmt.allocPrint(h.arena, "{d}:{s}:{s}", .{ step, @tagName(r.outcome), if (r.started_ms > 0) "t" else "-" }) catch unreachable;
+        h.n += 1;
+    }
+
+    fn hook(h: *HookLog) StepHook {
+        return .{ .ctx = h, .call = call };
+    }
+};
+
+test "on_step announces each transition once, live and replayed" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{ testStep("a"), testStep("b"), testStep("c") };
+    const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 1, .has_container = false, .secrets = &.{}, .steps = &steps };
+
+    // Step 1 live; steps 2 (failed) and 3 (skipped) only in the report, as for a cached chain.
+    const fake =
+        \\q=$(cat)
+        \\echo "::zig-step::begin 1" >&2; echo "live" >&2; echo "::zig-step::end 1 0" >&2
+        \\printf '%s' '{"x":{"contents":"::zig-step::begin 1\nlive\n::zig-step::end 1 0\n::zig-step::begin 2\nboom\n::zig-step::end 2 4\n::zig-step::skip 3\n"}}'
+    ;
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    var h: HookLog = .{ .arena = arena };
+    _ = try run(arena, std.testing.io, &env, .{ .argv = &.{ "sh", "-c", fake }, .on_step = h.hook() }, job, &log);
+
+    const want = [_][]const u8{ "1:not_run:t", "1:success:t", "2:not_run:t", "2:failure:t", "3:skipped:-" };
+    try std.testing.expectEqual(want.len, h.n);
+    for (want, h.events[0..h.n]) |e, got| try std.testing.expectEqualStrings(e, got);
 }
 
 fn testJob(steps: []const job_mod.Step) job_mod.Job {
