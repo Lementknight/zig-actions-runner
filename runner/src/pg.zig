@@ -10,6 +10,8 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+/// std's TLS client plus CertificateRequest support (needed for Tiger Data); see the file header.
+const TlsClient = @import("vendor/tls_client.zig");
 const Io = std.Io;
 
 pub const SslMode = enum {
@@ -331,7 +333,7 @@ pub const Client = struct {
     stream: Io.net.Stream,
     stream_reader: Io.net.Stream.Reader,
     stream_writer: Io.net.Stream.Writer,
-    tls: ?std.crypto.tls.Client = null,
+    tls: ?TlsClient = null,
     r: *Io.Reader,
     w: *Io.Writer,
     buffers: []u8,
@@ -347,7 +349,7 @@ pub const Client = struct {
         const stream = try host.connect(io, cfg.port, .{ .mode = .stream });
         errdefer stream.close(io);
 
-        const tls_len = std.crypto.tls.Client.min_buffer_len;
+        const tls_len = TlsClient.min_buffer_len;
         const total = 2 * tls_len + (tls_len + plain_buf_len) + tls_len + 2 * plain_buf_len;
         const buffers = try gpa.alloc(u8, total);
         errdefer gpa.free(buffers);
@@ -389,7 +391,7 @@ pub const Client = struct {
     }
 
     fn startTls(c: *Client, cfg: Config, rest: []u8) Error!void {
-        const tls_len = std.crypto.tls.Client.min_buffer_len;
+        const tls_len = TlsClient.min_buffer_len;
         // SSLRequest: int32 length 8, int32 code 80877103.
         c.w.writeInt(u32, 8, .big) catch return error.ConnectionClosed;
         c.w.writeInt(u32, 80877103, .big) catch return error.ConnectionClosed;
@@ -397,10 +399,10 @@ pub const Client = struct {
         const answer = c.r.takeByte() catch return error.ConnectionClosed;
         if (answer != 'S') return error.TlsRefused;
 
-        var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
+        var entropy: [TlsClient.Options.entropy_len]u8 = undefined;
         c.io.random(&entropy);
         const now = Io.Clock.real.now(c.io);
-        var opts: std.crypto.tls.Client.Options = .{
+        var opts: TlsClient.Options = .{
             .host = .no_verification,
             .ca = .no_verification,
             .write_buffer = rest[0..tls_len],
@@ -414,7 +416,7 @@ pub const Client = struct {
             opts.host = .{ .explicit = cfg.host };
             opts.ca = .{ .bundle = .{ .gpa = c.gpa, .io = c.io, .lock = &lock, .bundle = &c.ca_bundle } };
         }
-        c.tls = std.crypto.tls.Client.init(c.r, c.w, opts) catch return error.TlsFailed;
+        c.tls = TlsClient.init(c.r, c.w, opts) catch return error.TlsFailed;
         c.r = &c.tls.?.reader;
         c.w = &c.tls.?.writer;
     }
