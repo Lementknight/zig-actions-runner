@@ -65,8 +65,12 @@ retention policies. Any error fails the job. It never touches Tiger.
 **Manual dispatch only** (`Migrate Tiger Data`) runs `dbmate --wait up` against the shared Tiger
 Data database. Nothing else runs migrations there. To trigger it:
 
-- GitHub: Actions → `db` → Run workflow → pick the branch whose `db/migrations` you want applied.
-- CLI: `gh workflow run db.yml --ref <branch>`, then `gh run watch`.
+- First, `db.yml` must be on the default branch (`main`). GitHub offers Run workflow, and accepts
+  `gh workflow run`, only for a `workflow_dispatch` workflow whose file is on the default branch,
+  so until `db.yml` reaches `main` the dispatch job cannot be triggered from any branch.
+- Once it is there, a run can target any branch, and it applies that branch's `db/migrations`:
+  - GitHub: Actions → `db` → Run workflow → pick the branch.
+  - CLI: `gh workflow run db.yml --ref <branch>`, then `gh run watch`.
 
 It needs five repository secrets: `TIGER_HOST`, `TIGER_PORT`, `TIGER_DB_NAME`,
 `TIGER_USERNAME` and `TIGER_PASSWORD`. `.github/scripts/with_tiger_url.py` assembles
