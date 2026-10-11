@@ -3,23 +3,9 @@ import { PlayIcon } from '@primer/octicons-react'
 import { Link, Route, Switch } from 'wouter'
 import { JobView } from './views/JobView'
 import { RunList } from './views/RunList'
+import { RunPage } from './views/RunPage'
 
-// The three routes (R16). The run page placeholder is replaced by its real view in U6.
-
-function Placeholder({ title, body }: { title: string; body: string }) {
-  return (
-    <>
-      <div className="ar-page-header">
-        <h1 className="ar-page-title">{title}</h1>
-      </div>
-      <div className="ar-box">
-        <div className="ar-blankslate">
-          <p className="ar-blankslate__body">{body}</p>
-        </div>
-      </div>
-    </>
-  )
-}
+// The three routes (R16): RunList (U5), RunPage (U6), JobView (U4).
 
 function NotFoundPage() {
   return (
@@ -54,9 +40,7 @@ export default function App() {
             <RunList />
           </Route>
           <Route path="/runs/:id">
-            {(params) => (
-              <Placeholder title={`Run ${params.id}`} body="This run's jobs will appear here." />
-            )}
+            {(params) => <RunPage key={params.id} runId={Number(params.id)} />}
           </Route>
           <Route path="/runs/:runId/jobs/:jobId">
             {(params) => (
