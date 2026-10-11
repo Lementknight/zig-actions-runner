@@ -12,6 +12,8 @@ const results = @import("github/results.zig");
 const sink = @import("sink.zig");
 const redact = @import("redact.zig");
 const timefmt = @import("timefmt.zig");
+const record = @import("record.zig");
+const Db = @import("db/Db.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -28,6 +30,8 @@ pub const Context = struct {
     /// Config secrets; the job's own secrets are appended once it is acquired.
     secrets: []const []const u8,
     name: []const u8,
+    /// Where runs, jobs and steps are recorded (SPEC §5.2); null without `DATABASE_URL`.
+    db: ?*Db = null,
 };
 
 fn say(c: Context, comptime fmt: []const u8, args: anytype) !void {
@@ -92,10 +96,14 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8, runne
     job.runner_name = runner_name;
     // Everything the job logs is also kept (redacted, timestamped) so it can be uploaded to GitHub.
     var collect: sink.LogSink = .{ .collect = .{ .arena = c.arena, .io = c.io, .inner = c.log } };
-    collect.setSecrets(try std.mem.concat(c.arena, []const u8, &.{ c.secrets, job.secrets }));
+    const all_secrets = try std.mem.concat(c.arena, []const u8, &.{ c.secrets, job.secrets });
+    collect.setSecrets(all_secrets);
     const log = &collect;
+    // Database failures are reported on stderr and never fail the job.
+    var rec: record.Recorder = .init(c.db, c.arena, c.io, &job, c.err, all_secrets);
+    rec.jobStart();
     try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job acquired: {d} steps", .{job.steps.len}));
-    if (job.run_id == null) try log.append(job.check_run_id, 0, .stderr, "job definition has no github.run_id; the job runs but no run, job or step rows are recorded");
+    if (record.unrecordable(job)) |why| try log.append(job.check_run_id, 0, .stderr, try std.fmt.allocPrint(c.arena, "job definition has {s}; the job runs but no run, job or step rows are recorded", .{why}));
 
     var result: dagger.Result = undefined;
     if (job.has_container) {
@@ -107,6 +115,7 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8, runne
         result = try dagger.run(c.arena, c.io, c.environ, .{
             .argv = &.{ c.cfg.dagger_cmd, "--progress=logs", "query" },
             .sink_job_id = job.check_run_id,
+            .on_step = rec.hook(),
         }, job, log);
         if (result.engine_error) |msg| {
             try log.append(job.check_run_id, 0, .stderr, "dagger failed before running the steps:");
@@ -114,6 +123,18 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8, runne
         }
     }
     try log.flush();
+
+    const exit = completeWithGitHub(c, jr, job, log, result);
+    // The job-end write comes last: after the job's final log flush, because the API reports
+    // `job_done` once the job is completed (SPEC §5.3), and after `completejob`, which a slow
+    // database must never delay. It runs whether or not GitHub accepted the completion.
+    log.flush() catch {};
+    rec.jobEnd(result, job.has_container or result.engine_error != null);
+    return exit;
+}
+
+/// Uploads the logs and reports the job's result to GitHub.
+fn completeWithGitHub(c: Context, jr: runservice.JobRequest, job: job_mod.Job, log: *sink.LogSink, result: dagger.Result) !Exit {
     try uploadLogs(c, job, log.collect.lines.items);
 
     const conclusion: runservice.Conclusion = if (result.succeeded) .succeeded else .failed;
@@ -165,10 +186,11 @@ pub fn stepResultsJson(arena: Allocator, job: job_mod.Job, result: dagger.Result
             .name = step.name,
             .status = "completed",
             // Same vocabulary as the job conclusion (verified live): succeeded / failed / skipped.
-            .conclusion = switch (r.outcome) {
+            // The rule is the one the database records (record.zig), in GitHub's words.
+            .conclusion = switch (record.Conclusion.ofStep(r.outcome, step.continue_on_error)) {
                 .success => "succeeded",
-                .failure => if (step.continue_on_error) "succeeded" else "failed",
-                .skipped, .not_run => "skipped",
+                .failure => "failed",
+                .skipped => "skipped",
             },
             .started_at = if (r.started_ms > 0) try timefmt.isoTime(arena, r.started_ms) else null,
             .completed_at = if (r.completed_ms > 0) try timefmt.isoTime(arena, r.completed_ms) else null,

@@ -8,6 +8,8 @@ const redact = @import("redact.zig");
 const sink = @import("sink.zig");
 const DbUrl = @import("db/url.zig");
 const DbClient = @import("db/Client.zig");
+const Db = @import("db/Db.zig");
+const record = @import("record.zig");
 
 comptime {
     _ = @import("sink.zig");
@@ -28,6 +30,7 @@ comptime {
     _ = @import("db/scram.zig");
     _ = @import("db/Client.zig");
     _ = @import("db/Db.zig");
+    _ = @import("record.zig");
 }
 
 const Exit = loop.Exit;
@@ -85,14 +88,21 @@ pub fn main(init: std.process.Init) !u8 {
             return @backingInt(Exit.db);
         };
     }
-    defer if (db) |d| d.close();
+    // The startup connection becomes the runner's write handle, which reconnects as needed.
+    var store: ?Db = null;
+    if (db_url) |u| {
+        store = .init(init.gpa, io, u);
+        store.?.client = db;
+    }
+    defer if (store) |*s| s.deinit();
+    const store_ptr: ?*Db = if (store) |*s| s else null;
     const db_versions: ?DbClient.Versions = if (db) |d| try d.versions(arena) else null;
 
     var suffix: [4]u8 = undefined;
     io.random(&suffix);
     const name = try std.fmt.allocPrint(arena, "{s}-{x}", .{ cfg.name_prefix, suffix });
 
-    if (cfg.exec_job) |path| return execJobFile(init, &cfg, path, &log, err);
+    if (cfg.exec_job) |path| return execJobFile(init, &cfg, path, &log, err, store_ptr, name, secrets);
 
     if (cfg.dry_run) {
         try log.append(0, 0, .stdout, try std.fmt.allocPrint(arena, "dry run: would register runner '{s}' with labels '{s}'", .{ name, cfg.labels }));
@@ -122,25 +132,33 @@ pub fn main(init: std.process.Init) !u8 {
         .err = err,
         .secrets = secrets,
         .name = name,
+        .db = store_ptr,
     }));
 }
 
 /// Dev helper: runs a saved acquirejob response through the Dagger executor.
-fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log: *sink.LogSink, err: *std.Io.Writer) !u8 {
+/// With `DATABASE_URL` set the run, job and steps are recorded as for a real job (SPEC §5.2).
+fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log: *sink.LogSink, err: *std.Io.Writer, db: ?*Db, name: []const u8, secrets: []const []const u8) !u8 {
     const arena = init.arena.allocator();
     const io = init.io;
     const json = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch |e| {
         try err.print("cannot read {s}: {s}\n", .{ path, @errorName(e) });
         return @backingInt(Exit.config);
     };
-    const job = job_mod.parse(arena, json) catch |e| {
+    var job = job_mod.parse(arena, json) catch |e| {
         try err.print("cannot parse job: {s}\n", .{@errorName(e)});
         return @backingInt(Exit.config);
     };
+    job.runner_name = name;
+    var rec: record.Recorder = .init(db, arena, io, &job, err, secrets);
+    rec.jobStart();
     const res = try dagger.run(arena, io, init.environ_map, .{
         .argv = &.{ cfg.dagger_cmd, "--progress=logs", "query" },
         .sink_job_id = job.check_run_id,
+        .on_step = rec.hook(),
     }, job, log);
+    try log.flush();
+    rec.jobEnd(res, res.engine_error != null);
     for (res.steps, job.steps, 1..) |r, st, n| {
         try err.print("step {d} [{s}] {s}: {s} (exit {d})\n", .{ n, st.name, @tagName(st.action), @tagName(r.outcome), r.exit_code });
     }
