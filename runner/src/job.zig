@@ -2,8 +2,10 @@
 //!
 //! Step inputs use the compact template-token encoding: `{"type":N, ...}` where 0 is a string
 //! (`lit`), 1 a sequence (`seq`), 2 a mapping (`map` of `{Key,Value}`), 3 a basic expression
-//! (`expr`), 5 a boolean (`bool`), 6 a number (`num`) and 7 null. Only literals are supported
-//! in v0; anything else marks the step unsupported so it fails loudly instead of running wrong.
+//! (`expr`), 5 a boolean (`bool`), 6 a number (`num`) and 7 null. Strings and booleans are literals;
+//! a type 3 token is an expression (the server rewrites `echo ${{ github.sha }}` into
+//! `format('echo {0}', github.sha)`), kept as a `Template` and evaluated when the step runs.
+//! Anything else marks the step unsupported so it fails loudly instead of running wrong.
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -11,15 +13,25 @@ const Value = std.json.Value;
 
 pub const EnvVar = struct { name: []const u8, value: []const u8 };
 
+/// A value that is either fixed or computed from an expression when the step runs.
+pub const Template = union(enum) {
+    lit: []const u8,
+    expr: []const u8,
+};
+
+/// A named input or environment variable. The name is always literal.
+pub const Input = struct { name: []const u8, value: Template };
+
 pub const Action = union(enum) {
     script: struct {
-        script: []const u8,
+        script: Template,
         /// `bash`, `sh`, or null for the default.
-        shell: ?[]const u8,
-        working_directory: ?[]const u8,
+        shell: ?Template,
+        working_directory: ?Template,
     },
-    /// `uses: actions/checkout`, replaced by a built-in checkout (Dagger's git support).
-    checkout: Checkout,
+    /// `uses: actions/checkout`, replaced by a built-in checkout (Dagger's git support). The raw
+    /// inputs are validated and turned into a `Checkout` when the step runs (`checkoutFromInputs`).
+    checkout: []const Input,
     /// Why the step cannot run. The executor logs this and fails the step.
     unsupported: []const u8,
 };
@@ -37,13 +49,18 @@ pub const Checkout = struct {
 };
 
 pub const Step = struct {
+    /// GitHub's step id (a GUID), used for log uploads.
     id: []const u8,
+    /// The workflow's `id:` (or an internal `__run` name): the key in the `steps` context.
+    context_name: []const u8 = "",
     /// Display name. GitHub's internal `__run` names are replaced by `Run <first script line>`.
     name: []const u8,
-    /// `success()` when the workflow sets no `if:`.
+    /// Set when the workflow's `name:` contains an expression; it overrides `name` when evaluated.
+    name_expr: ?[]const u8 = null,
+    /// `success()` when the workflow sets no `if:`. An expression.
     condition: []const u8,
-    continue_on_error: bool,
-    env: []const EnvVar,
+    continue_on_error: Template = .{ .lit = "false" },
+    env: []const Input = &.{},
     action: Action,
 };
 
@@ -54,12 +71,21 @@ pub const Job = struct {
     job_token: []const u8,
     /// GitHub's numeric job id (`contextData.job.check_run_id`), 0 when absent. Used as the DB key.
     check_run_id: u64,
+    /// The job's name as shown on GitHub (`jobDisplayName`).
+    display_name: []const u8 = "",
     /// `container:` jobs are not supported in v0.
     has_container: bool,
     /// Literal values that must never reach a log: the job token and every variable marked `isSecret`.
     secrets: []const []const u8,
+    /// The `secrets` context: user secrets by name (they arrive as variables flagged `isSecret`),
+    /// plus `GITHUB_TOKEN`. Values are credentials; never log them.
+    secret_vars: []const EnvVar = &.{},
     /// The `github` context values the built-in checkout needs.
     github: Github = .{},
+    /// Workflow- and job-level `env`, in order (later entries override earlier ones).
+    env: []const Input = &.{},
+    /// The job's `contextData` (github, inputs, job, matrix, needs, strategy, vars) as parsed JSON.
+    context_data: Value = .null,
     /// Base URL of the results service (`system.github.results_endpoint`), where logs are uploaded.
     results_endpoint: []const u8 = "",
     steps: []const Step,
@@ -70,6 +96,13 @@ pub const Github = struct {
     sha: []const u8 = "",
     ref: []const u8 = "",
     server_url: []const u8 = "https://github.com",
+    /// For the `runs` and `jobs` rows.
+    run_id: []const u8 = "",
+    workflow: []const u8 = "",
+    event_name: []const u8 = "",
+    ref_name: []const u8 = "",
+    /// The job's id in the workflow file (`github.job`).
+    job: []const u8 = "",
 };
 
 pub const Error = error{ MalformedJob, OutOfMemory };
@@ -92,8 +125,12 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .job_token = jobToken(root) orelse return error.MalformedJob,
         .check_run_id = checkRunId(root),
         .secrets = try collectSecrets(arena, root),
+        .secret_vars = try collectSecretVars(arena, root),
         .results_endpoint = variable(root, "system.github.results_endpoint") orelse "",
-        .github = githubContext(root),
+        .github = githubContext(arena, root),
+        .env = try jobEnv(arena, root),
+        .context_data = root.object.get("contextData") orelse .null,
+        .display_name = path(root, &.{"jobDisplayName"}) orelse "",
         .has_container = if (root.object.get("jobContainer")) |c| c != .null else false,
         .steps = steps,
     };
@@ -105,12 +142,16 @@ fn parseStep(arena: Allocator, sv: Value) Error!Step {
     const id = path(sv, &.{"id"}) orelse return error.MalformedJob;
     const condition = path(sv, &.{"condition"}) orelse "success()";
 
-    var env: std.ArrayList(EnvVar) = .empty;
+    var env: []const Input = &.{};
     var unsupported: ?[]const u8 = null;
-
-    if (o.get("environment")) |envv| mapping(arena, envv, &env) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Unsupported => unsupported = "env value is not a plain string (expressions are not supported yet)",
+    if (o.get("environment")) |envv| if (envv != .null) {
+        env = mappingInputs(arena, envv) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unsupported => blk: {
+                unsupported = "env must be a mapping of names to strings or expressions";
+                break :blk &.{};
+            },
+        };
     };
 
     const reference_type = path(sv, &.{ "reference", "type" }) orelse "";
@@ -121,13 +162,13 @@ fn parseStep(arena: Allocator, sv: Value) Error!Step {
         action = .{ .unsupported = why };
     } else if (std.mem.eql(u8, reference_type, "script")) {
         action = try parseScript(arena, o.get("inputs"));
-        if (action == .script) script_text = action.script.script;
+        if (action == .script and action.script.script == .lit) script_text = action.script.script.lit;
     } else if (std.mem.eql(u8, reference_type, "repository")) {
         const uses_name = path(sv, &.{ "reference", "name" }) orelse "";
         const uses_ref = path(sv, &.{ "reference", "ref" }) orelse "";
         uses_label = try std.fmt.allocPrint(arena, "{s}@{s}", .{ uses_name, uses_ref });
         if (std.ascii.eqlIgnoreCase(uses_name, "actions/checkout")) {
-            action = try parseCheckout(arena, o.get("inputs"));
+            action = try parseCheckoutInputs(arena, o.get("inputs"));
         } else {
             action = .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s} is not supported (v0 supports run: steps and actions/checkout)", .{uses_label}) };
         }
@@ -135,35 +176,61 @@ fn parseStep(arena: Allocator, sv: Value) Error!Step {
         action = .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported step reference type '{s}' (v0 supports run: steps)", .{reference_type}) };
     }
 
+    var name_expr: ?[]const u8 = null;
+    var explicit: ?[]const u8 = null;
+    if (o.get("displayNameToken")) |t| if (tokenTemplate(t)) |tpl| switch (tpl) {
+        .lit => |l| if (l.len > 0) {
+            explicit = l;
+        },
+        .expr => |e| name_expr = e,
+    };
+    if (explicit == null and o.get("name") != null and o.get("name").? == .string) explicit = o.get("name").?.string;
+
     return .{
         .id = id,
-        .name = try displayName(arena, explicitName(o) orelse "", script_text, uses_label),
+        .context_name = path(sv, &.{"contextName"}) orelse "",
+        .name = try displayName(arena, explicit orelse "", script_text, uses_label),
+        .name_expr = name_expr,
         .condition = condition,
-        .continue_on_error = boolToken(o.get("continueOnError")),
-        .env = env.items,
+        .continue_on_error = if (o.get("continueOnError")) |c| (tokenTemplate(c) orelse .{ .lit = "false" }) else .{ .lit = "false" },
+        .env = env,
         .action = action,
     };
 }
 
 fn parseScript(arena: Allocator, inputs: ?Value) Error!Action {
     const iv = inputs orelse return .{ .unsupported = "run step has no inputs" };
-    var kv: std.ArrayList(EnvVar) = .empty;
-    mapping(arena, iv, &kv) catch |e| switch (e) {
+    const kv = mappingInputs(arena, iv) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.Unsupported => return .{ .unsupported = "run step input is not a plain string (expressions are not supported yet)" },
+        error.Unsupported => return .{ .unsupported = "run step inputs must be strings or expressions" },
     };
-    var script: ?[]const u8 = null;
-    var shell: ?[]const u8 = null;
-    var wd: ?[]const u8 = null;
-    for (kv.items) |e| {
+    var script: ?Template = null;
+    var shell: ?Template = null;
+    var wd: ?Template = null;
+    for (kv) |e| {
         if (std.mem.eql(u8, e.name, "script")) script = e.value //
         else if (std.mem.eql(u8, e.name, "shell")) shell = e.value //
         else if (std.mem.eql(u8, e.name, "workingDirectory")) wd = e.value;
     }
     const s = script orelse return .{ .unsupported = "run step has no script" };
-    if (shell) |sh| if (!std.mem.eql(u8, sh, "bash") and !std.mem.eql(u8, sh, "sh"))
-        return .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported shell '{s}' (v0 supports bash and sh)", .{sh}) };
+    // A literal shell is validated now; an expression is validated when the step runs.
+    if (shell) |sh| if (sh == .lit and !validShell(sh.lit))
+        return .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported shell '{s}' (v0 supports bash and sh)", .{sh.lit}) };
     return .{ .script = .{ .script = s, .shell = shell, .working_directory = wd } };
+}
+
+pub fn validShell(sh: []const u8) bool {
+    return std.mem.eql(u8, sh, "bash") or std.mem.eql(u8, sh, "sh");
+}
+
+fn parseCheckoutInputs(arena: Allocator, inputs: ?Value) Error!Action {
+    const iv = inputs orelse return .{ .checkout = &.{} };
+    if (iv == .null) return .{ .checkout = &.{} };
+    const kv = mappingInputs(arena, iv) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unsupported => return .{ .unsupported = "actions/checkout inputs must be strings or expressions" },
+    };
+    return .{ .checkout = kv };
 }
 
 /// Inputs that change nothing we do (we never persist credentials or run the action's own git).
@@ -171,16 +238,12 @@ const ignored_checkout_inputs = [_][]const u8{ "persist-credentials", "token", "
 /// Inputs that are only acceptable when they ask for the default (off) behaviour.
 const off_only_checkout_inputs = [_][]const u8{ "submodules", "lfs", "sparse-checkout", "ssh-key", "ssh-known-hosts", "github-server-url" };
 
-fn parseCheckout(arena: Allocator, inputs: ?Value) Error!Action {
+pub const CheckoutResult = union(enum) { ok: Checkout, unsupported: []const u8 };
+
+/// Validates checkout inputs after their expressions were evaluated.
+pub fn checkoutFromInputs(arena: Allocator, kv: []const EnvVar) Allocator.Error!CheckoutResult {
     var co: Checkout = .{};
-    const iv = inputs orelse return .{ .checkout = co };
-    if (iv == .null) return .{ .checkout = co };
-    var kv: std.ArrayList(EnvVar) = .empty;
-    mapping(arena, iv, &kv) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Unsupported => return .{ .unsupported = "actions/checkout input is not a plain string (expressions are not supported yet)" },
-    };
-    for (kv.items) |e| {
+    for (kv) |e| {
         if (std.mem.eql(u8, e.name, "repository")) co.repository = nonEmpty(e.value) //
         else if (std.mem.eql(u8, e.name, "ref")) co.ref = nonEmpty(e.value) //
         else if (std.mem.eql(u8, e.name, "path")) {
@@ -201,7 +264,7 @@ fn parseCheckout(arena: Allocator, inputs: ?Value) Error!Action {
             return .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported actions/checkout input '{s}'", .{e.name}) };
         }
     }
-    return .{ .checkout = co };
+    return .{ .ok = co };
 }
 
 fn isDefaultServer(e: EnvVar) bool {
@@ -218,7 +281,7 @@ fn inList(list: []const []const u8, name: []const u8) bool {
 }
 
 /// `contextData.github` is `{t, d:[{k, v}]}` with plain string values.
-fn githubContext(root: Value) Github {
+fn githubContext(arena: Allocator, root: Value) Github {
     var g: Github = .{};
     const cd = root.object.get("contextData") orelse return g;
     if (cd != .object) return g;
@@ -230,8 +293,18 @@ fn githubContext(root: Value) Github {
         if (e != .object) continue;
         const k = e.object.get("k") orelse continue;
         const v = e.object.get("v") orelse continue;
-        if (k != .string or v != .string) continue;
-        if (std.mem.eql(u8, k.string, "repository")) g.repository = v.string //
+        if (k != .string) continue;
+        // run_id and friends may arrive as numbers.
+        if (std.mem.eql(u8, k.string, "run_id")) {
+            if (v == .string) g.run_id = v.string else if (v == .integer) g.run_id = std.fmt.allocPrint(arena, "{d}", .{v.integer}) catch "";
+            continue;
+        }
+        if (v != .string) continue;
+        if (std.mem.eql(u8, k.string, "workflow")) g.workflow = v.string //
+        else if (std.mem.eql(u8, k.string, "event_name")) g.event_name = v.string //
+        else if (std.mem.eql(u8, k.string, "ref_name")) g.ref_name = v.string //
+        else if (std.mem.eql(u8, k.string, "job")) g.job = v.string //
+        else if (std.mem.eql(u8, k.string, "repository")) g.repository = v.string //
         else if (std.mem.eql(u8, k.string, "sha")) g.sha = v.string //
         else if (std.mem.eql(u8, k.string, "ref")) g.ref = v.string //
         else if (std.mem.eql(u8, k.string, "server_url") and v.string.len > 0) g.server_url = v.string;
@@ -239,17 +312,34 @@ fn githubContext(root: Value) Github {
     return g;
 }
 
-/// Flattens a mapping token whose keys and values are all string literals.
-fn mapping(arena: Allocator, v: Value, out: *std.ArrayList(EnvVar)) error{ OutOfMemory, Unsupported }!void {
+/// A mapping token as inputs: keys must be literal; values are literals or expressions.
+fn mappingInputs(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![]const Input {
     if (tokenType(v) != 2) return error.Unsupported;
-    const map = v.object.get("map") orelse return;
+    var out: std.ArrayList(Input) = .empty;
+    const map = v.object.get("map") orelse return out.items;
     if (map != .array) return error.Unsupported;
     for (map.array.items) |pair| {
         if (pair != .object) return error.Unsupported;
         const k = literal(pair.object.get("Key") orelse return error.Unsupported) orelse return error.Unsupported;
-        const val = literal(pair.object.get("Value") orelse return error.Unsupported) orelse return error.Unsupported;
+        const val = tokenTemplate(pair.object.get("Value") orelse return error.Unsupported) orelse return error.Unsupported;
         try out.append(arena, .{ .name = k, .value = val });
     }
+    return out.items;
+}
+
+/// Workflow- and job-level env: `environmentVariables` is a list of mapping tokens.
+fn jobEnv(arena: Allocator, root: Value) Error![]const Input {
+    var out: std.ArrayList(Input) = .empty;
+    const ev = root.object.get("environmentVariables") orelse return out.items;
+    if (ev != .array) return out.items;
+    for (ev.array.items) |m| {
+        const inputs = mappingInputs(arena, m) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unsupported => continue, // an unreadable env block is skipped, not fatal
+        };
+        try out.appendSlice(arena, inputs);
+    }
+    return out.items;
 }
 
 fn tokenType(v: Value) i64 {
@@ -258,7 +348,7 @@ fn tokenType(v: Value) i64 {
     return if (t == .integer) t.integer else -1;
 }
 
-/// String, boolean and number literals as text; null for expressions and containers.
+/// String and boolean literals as text; null for expressions, containers and null.
 fn literal(v: Value) ?[]const u8 {
     if (v != .object) return null;
     switch (tokenType(v)) {
@@ -274,16 +364,13 @@ fn literal(v: Value) ?[]const u8 {
     }
 }
 
-fn boolToken(v: ?Value) bool {
-    const t = v orelse return false;
-    const l = literal(t) orelse return false;
-    return std.mem.eql(u8, l, "true");
-}
-
-/// The workflow's `name:` arrives as a `displayNameToken` literal; `name` is GitHub's internal `__run`.
-fn explicitName(o: std.json.ObjectMap) ?[]const u8 {
-    if (o.get("displayNameToken")) |t| if (literal(t)) |l| if (l.len > 0) return l;
-    if (o.get("name")) |n| if (n == .string) return n.string;
+/// A literal or an expression token as a `Template`; null for containers and null.
+pub fn tokenTemplate(v: Value) ?Template {
+    if (literal(v)) |l| return .{ .lit = l };
+    if (v == .object and tokenType(v) == 3) {
+        const e = v.object.get("expr") orelse return null;
+        if (e == .string) return .{ .expr = e.string };
+    }
     return null;
 }
 
@@ -309,6 +396,27 @@ fn variable(root: Value, name: []const u8) ?[]const u8 {
     if (vars != .object) return null;
     const v = vars.object.get(name) orelse return null;
     return path(v, &.{"value"});
+}
+
+/// User secrets are delivered as variables flagged `isSecret`, named like the secret. GitHub's own
+/// bookkeeping variables (`system.*`) are not part of the `secrets` context; `github_token` is
+/// exposed as `GITHUB_TOKEN`.
+fn collectSecretVars(arena: Allocator, root: Value) Allocator.Error![]const EnvVar {
+    var out: std.ArrayList(EnvVar) = .empty;
+    const vars = root.object.get("variables") orelse return out.items;
+    if (vars != .object) return out.items;
+    var it = vars.object.iterator();
+    while (it.next()) |e| {
+        const v = e.value_ptr.*;
+        if (v != .object) continue;
+        const secret = v.object.get("isSecret") orelse continue;
+        if (secret != .bool or !secret.bool) continue;
+        const name = e.key_ptr.*;
+        if (std.mem.startsWith(u8, name, "system.")) continue;
+        const val = path(v, &.{"value"}) orelse continue;
+        try out.append(arena, .{ .name = if (std.mem.eql(u8, name, "github_token")) "GITHUB_TOKEN" else name, .value = val });
+    }
+    return out.items;
 }
 
 fn collectSecrets(arena: Allocator, root: Value) Allocator.Error![]const []const u8 {
@@ -358,7 +466,7 @@ fn jobToken(root: Value) ?[]const u8 {
 
 const fixture =
     \\{"plan":{"planId":"plan-1"},"jobId":"job-1","jobContainer":null,
-    \\ "variables":{"github_token":{"value":"ghs_secret","isSecret":true},"plain":{"value":"x"},"system.github.results_endpoint":{"value":"https://results.test/"}},
+    \\ "variables":{"github_token":{"value":"ghs_secret","isSecret":true},"TIGER_HOST":{"value":"db.example","isSecret":true},"system.github.token":{"value":"ghs_secret","isSecret":true},"plain":{"value":"x"},"system.github.results_endpoint":{"value":"https://results.test/"}},
     \\ "contextData":{"job":{"t":2,"d":[{"k":"status","v":"success"},{"k":"check_run_id","v":777}]},"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"sha","v":"0123456789012345678901234567890123456789"},{"k":"ref","v":"refs/heads/x"},{"k":"event_name","v":"push"}]}},
     \\ "resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"jobtok"},"scheme":"OAuth"}}]},
     \\ "steps":[
@@ -390,40 +498,84 @@ test "parse job fixture" {
     try std.testing.expectEqualStrings("https://results.test/", job.results_endpoint);
     try std.testing.expectEqualStrings("o/r", job.github.repository);
     try std.testing.expectEqualStrings("https://github.com", job.github.server_url);
-    try std.testing.expectEqual(@as(usize, 2), job.secrets.len);
     try std.testing.expectEqualStrings("jobtok", job.secrets[0]);
-    try std.testing.expectEqualStrings("ghs_secret", job.secrets[1]);
+    // The secrets context: user secrets and GITHUB_TOKEN, without GitHub's system.* bookkeeping or plain variables.
+    try std.testing.expectEqual(@as(usize, 2), job.secret_vars.len);
+    var seen_host = false;
+    var seen_token = false;
+    for (job.secret_vars) |sv| {
+        if (std.mem.eql(u8, sv.name, "TIGER_HOST")) seen_host = std.mem.eql(u8, sv.value, "db.example");
+        if (std.mem.eql(u8, sv.name, "GITHUB_TOKEN")) seen_token = std.mem.eql(u8, sv.value, "ghs_secret");
+    }
+    try std.testing.expect(seen_host and seen_token);
     try std.testing.expect(!job.has_container);
     try std.testing.expectEqual(@as(usize, 8), job.steps.len);
 
     const s1 = job.steps[0];
     try std.testing.expectEqualStrings("Run echo hello && sleep 2 && echo done", s1.name);
-    try std.testing.expectEqualStrings("echo hello && sleep 2 && echo done", s1.action.script.script);
-    try std.testing.expect(!s1.continue_on_error);
+    try std.testing.expectEqualStrings("echo hello && sleep 2 && echo done", s1.action.script.script.lit);
+    try std.testing.expectEqualStrings("false", s1.continue_on_error.lit);
 
     const s2 = job.steps[1];
     try std.testing.expectEqualStrings("Build", s2.name);
     try std.testing.expectEqualStrings("always()", s2.condition);
-    try std.testing.expect(s2.continue_on_error);
-    try std.testing.expectEqualStrings("bash", s2.action.script.shell.?);
-    try std.testing.expectEqualStrings("sub", s2.action.script.working_directory.?);
+    try std.testing.expectEqualStrings("true", s2.continue_on_error.lit);
+    try std.testing.expectEqualStrings("bash", s2.action.script.shell.?.lit);
+    try std.testing.expectEqualStrings("sub", s2.action.script.working_directory.?.lit);
     try std.testing.expectEqualStrings("A", s2.env[0].name);
+    try std.testing.expectEqualStrings("1", s2.env[0].value.lit);
 
-    // checkout with inputs
-    const co = job.steps[2].action.checkout;
+    // checkout with inputs (validated once their expressions are evaluated)
+    const co = (try checkoutFromInputs(a.allocator(), try litEnv(a.allocator(), job.steps[2].action.checkout))).ok;
     try std.testing.expectEqualStrings("main", co.ref.?);
     try std.testing.expectEqualStrings("sub/dir", co.path.?);
     try std.testing.expectEqual(@as(u32, 0), co.fetch_depth);
     try std.testing.expect(co.repository == null);
-    // expression in a run step
-    try std.testing.expect(std.mem.indexOf(u8, job.steps[7].action.unsupported, "expressions") != null);
+    // an expression in a run step is kept as a template
+    try std.testing.expectEqualStrings("github.sha", job.steps[7].action.script.script.expr);
     // bare checkout: defaults and a "Run actions/checkout@v4" display name
-    try std.testing.expectEqual(@as(u32, 1), job.steps[3].action.checkout.fetch_depth);
+    const bare = (try checkoutFromInputs(a.allocator(), try litEnv(a.allocator(), job.steps[3].action.checkout))).ok;
+    try std.testing.expectEqual(@as(u32, 1), bare.fetch_depth);
     try std.testing.expectEqualStrings("Run actions/checkout@v4", job.steps[3].name);
-    // other actions and unsupported checkout inputs fail loudly
+    // other actions fail loudly at parse time; unsupported checkout inputs once evaluated
     try std.testing.expect(std.mem.indexOf(u8, job.steps[4].action.unsupported, "actions/cache@v4 is not supported") != null);
-    try std.testing.expect(std.mem.indexOf(u8, job.steps[5].action.unsupported, "submodules: recursive") != null);
-    try std.testing.expect(std.mem.indexOf(u8, job.steps[6].action.unsupported, "inside the workspace") != null);
+    const sub = try checkoutFromInputs(a.allocator(), try litEnv(a.allocator(), job.steps[5].action.checkout));
+    try std.testing.expect(std.mem.indexOf(u8, sub.unsupported, "submodules: recursive") != null);
+    const escape = try checkoutFromInputs(a.allocator(), try litEnv(a.allocator(), job.steps[6].action.checkout));
+    try std.testing.expect(std.mem.indexOf(u8, escape.unsupported, "inside the workspace") != null);
+}
+
+fn litEnv(arena: Allocator, inputs: []const Input) ![]const EnvVar {
+    const out = try arena.alloc(EnvVar, inputs.len);
+    for (inputs, out) |in, *o| o.* = .{ .name = in.name, .value = in.value.lit };
+    return out;
+}
+
+test "expressions are kept as templates: step name, env, inputs, condition, job env and contexts" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const json =
+        \\{"plan":{"planId":"p"},"jobId":"j","resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
+        \\ "environmentVariables":[{"type":2,"map":[{"Key":{"lit":"W"},"Value":{"lit":"w"}}]},{"type":2,"map":[{"Key":{"lit":"J"},"Value":{"type":3,"expr":"format('{0}-job', github.ref_name)"}}]}],
+        \\ "contextData":{"matrix":null,"github":{"t":2,"d":[{"k":"ref_name","v":"main"}]}},
+        \\ "steps":[{"type":"action","reference":{"type":"script"},"id":"g","contextName":"first","name":"first",
+        \\   "displayNameToken":{"type":3,"expr":"format('Build {0}', github.ref_name)"},
+        \\   "condition":"success() && (github.ref == 'x')","continueOnError":{"type":3,"expr":"github.event_name == 'push'"},
+        \\   "environment":{"type":2,"map":[{"Key":{"lit":"STEP_ENV"},"Value":{"type":3,"expr":"github.sha"}}]},
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo {0}', github.sha)"}}]}}]}
+    ;
+    const job = try parse(a.allocator(), json);
+    const s = job.steps[0];
+    try std.testing.expectEqualStrings("first", s.context_name);
+    try std.testing.expectEqualStrings("format('Build {0}', github.ref_name)", s.name_expr.?);
+    try std.testing.expectEqualStrings("success() && (github.ref == 'x')", s.condition);
+    try std.testing.expectEqualStrings("github.event_name == 'push'", s.continue_on_error.expr);
+    try std.testing.expectEqualStrings("github.sha", s.env[0].value.expr);
+    try std.testing.expectEqualStrings("format('echo {0}', github.sha)", s.action.script.script.expr);
+    try std.testing.expectEqual(@as(usize, 2), job.env.len);
+    try std.testing.expectEqualStrings("w", job.env[0].value.lit);
+    try std.testing.expectEqualStrings("format('{0}-job', github.ref_name)", job.env[1].value.expr);
+    try std.testing.expect(job.context_data == .object);
 }
 
 test "malformed job" {
