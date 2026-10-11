@@ -1,0 +1,55 @@
+# Builds the web and api images and smoke tests them together through deploy/compose.yaml: the
+# local TimescaleDB is migrated and seeded, the API reads it, and the web server proxies /api to
+# the API. Nothing is pushed anywhere and no secret is used.
+name: docker
+
+on:
+  pull_request:
+    paths:
+      - web/**
+      - api/**
+      - deploy/**
+      - db/**
+      - .github/workflows/docker.yml
+
+permissions:
+  contents: read
+
+env:
+  COMPOSE_FILE: deploy/compose.yaml
+  # deploy/compose.yaml publishes web on 127.0.0.1:${WEB_PORT:-8080}.
+  WEB: http://127.0.0.1:8080
+
+jobs:
+  smoke:
+    name: Build and smoke test the images
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the images and start the stack
+        run: docker compose up --build --wait --wait-timeout 300
+
+      - name: Web serves the app at /
+        run: curl -fsS "$WEB/" | grep -q '<div id="root">'
+
+      - name: Web serves the app at a deep link
+        run: curl -fsS "$WEB/runs/1/jobs/2" | grep -q '<div id="root">'
+
+      - name: API health through the web proxy
+        run: |
+          curl -fsS "$WEB/api/health" | grep -Eq '"ok": ?true'
+
+      - name: Seeded run through the web proxy
+        run: curl -fsS "$WEB/api/runs?limit=5" | grep -q '9000000001'
+
+      - name: Compose logs
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v
