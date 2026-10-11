@@ -214,7 +214,22 @@ pub const Transport = struct {
     }
 };
 
+/// Told when each step starts and finishes, so run state can be recorded at those transitions.
+pub const Observer = struct {
+    ptr: *anyopaque,
+    startedFn: *const fn (ptr: *anyopaque, number: u32, name: []const u8, started_ms: i64) void,
+    finishedFn: *const fn (ptr: *anyopaque, number: u32, result: StepResult) void,
+
+    fn started(o: Observer, number: u32, name: []const u8, started_ms: i64) void {
+        o.startedFn(o.ptr, number, name, started_ms);
+    }
+    fn finished(o: Observer, number: u32, result: StepResult) void {
+        o.finishedFn(o.ptr, number, result);
+    }
+};
+
 pub const Options = struct {
+    observer: ?Observer = null,
     /// The `dagger` command.
     dagger_cmd: []const u8 = "dagger",
     image: []const u8 = default_image,
@@ -837,18 +852,19 @@ pub fn run(
         const sc0 = try ev.scope(&.{});
         if (step.name_expr) |ne| res.name = expr.evalString(arena, ne, sc0) catch step.name;
         const should_run = expr.evalCondition(arena, step.condition, sc0) catch {
-            try failStep(&ev, &sh, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the condition '{s}': {s}", .{ step.condition, ev.diag }), false);
+            try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the condition '{s}': {s}", .{ step.condition, ev.diag }), false);
             continue;
         };
         if (!should_run) {
             res.outcome = .skipped;
             try ev.record(step, .skipped, false, &.{});
+            if (opts.observer) |o| o.finished(num, res.*);
             continue;
         }
 
         // 2. Step env and continue-on-error, then the step's own inputs.
         const step_env = ev.renderEnv(step.env, sc0) catch {
-            try failStep(&ev, &sh, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate env: {s}", .{ev.diag}), false);
+            try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate env: {s}", .{ev.diag}), false);
             continue;
         };
         const sc1 = try ev.scope(step_env);
@@ -859,7 +875,7 @@ pub fn run(
         var plain_step_env: std.ArrayList(job_mod.EnvVar) = .empty;
         var secret_step_env: std.ArrayList(SecretRef) = .empty;
         splitEnv(arena, transport, job, &secret_counter, step_env, &plain_step_env, &secret_step_env, &err_msg) catch {
-            try failStep(&ev, &sh, step, res, num, try std.fmt.allocPrint(arena, "Dagger could not register a secret: {s}", .{err_msg}), coe);
+            try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "Dagger could not register a secret: {s}", .{err_msg}), coe);
             continue;
         };
 
@@ -867,17 +883,17 @@ pub fn run(
         var fetched: ?Fetched = null;
         switch (step.action) {
             .unsupported => |why| {
-                try failStep(&ev, &sh, step, res, num, why, coe);
+                try failStep(&ev, &sh, opts.observer, step, res, num, why, coe);
                 continue;
             },
             .script => |sc| {
                 const script = ev.render(sc.script, sc1) catch {
-                    try failStep(&ev, &sh, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the script: {s}", .{ev.diag}), coe);
+                    try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the script: {s}", .{ev.diag}), coe);
                     continue;
                 };
                 const shell: ?[]const u8 = if (sc.shell) |t| (ev.render(t, sc1) catch null) else null;
                 if (shell) |sh_name| if (!job_mod.validShell(sh_name)) {
-                    try failStep(&ev, &sh, step, res, num, try std.fmt.allocPrint(arena, "unsupported shell '{s}' (v0 supports bash and sh)", .{sh_name}), coe);
+                    try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "unsupported shell '{s}' (v0 supports bash and sh)", .{sh_name}), coe);
                     continue;
                 };
                 const wd: ?[]const u8 = if (sc.working_directory) |t| (ev.render(t, sc1) catch null) else null;
@@ -885,19 +901,19 @@ pub fn run(
             },
             .checkout => |inputs| {
                 const rendered = ev.renderEnv(inputs, sc1) catch {
-                    try failStep(&ev, &sh, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the checkout inputs: {s}", .{ev.diag}), coe);
+                    try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the checkout inputs: {s}", .{ev.diag}), coe);
                     continue;
                 };
                 const co = switch (try job_mod.checkoutFromInputs(arena, rendered)) {
                     .ok => |c| c,
                     .unsupported => |why| {
-                        try failStep(&ev, &sh, step, res, num, why, coe);
+                        try failStep(&ev, &sh, opts.observer, step, res, num, why, coe);
                         continue;
                     },
                 };
                 const f = try fetchCheckout(arena, transport, job, co);
                 if (f.result == .failed) {
-                    try failStep(&ev, &sh, step, res, num, f.result.failed, coe);
+                    try failStep(&ev, &sh, opts.observer, step, res, num, f.result.failed, coe);
                     continue;
                 }
                 fetched = f;
@@ -949,9 +965,11 @@ pub fn run(
         for (0..braces) |_| try w.writeAll(" }");
 
         res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
+        if (opts.observer) |o| o.started(num, res.name, res.started_ms);
         const data = gql(arena, transport, doc.written(), &err_msg) catch {
             res.* = .{ .name = res.name, .continued = coe, .outcome = .failure, .exit_code = 1, .started_ms = res.started_ms, .completed_ms = std.Io.Clock.real.now(io).toMilliseconds() };
             sh.append(num, try std.fmt.allocPrint(arena, "Dagger error: {s}", .{err_msg}));
+            if (opts.observer) |o| o.finished(num, res.*);
             return finish(arena, &sh, results, err_msg);
         };
         res.completed_ms = std.Io.Clock.real.now(io).toMilliseconds();
@@ -991,6 +1009,7 @@ pub fn run(
         }
         try ev.record(step, res.outcome, coe, outputs);
         if (res.outcome == .failure and !coe) ev.job_failed = true;
+        if (opts.observer) |o| o.finished(num, res.*);
     }
     return finish(arena, &sh, results, "");
 }
@@ -1032,12 +1051,13 @@ fn awaitLiveOrReplay(io: std.Io, sh: *Shared, step: u32, stdout: []const u8, std
 }
 
 /// Logs why a step could not run and marks it failed (the job too, unless continue-on-error).
-fn failStep(ev: *Evaluator, sh: *Shared, step: job_mod.Step, res: *StepResult, num: u32, msg: []const u8, coe: bool) !void {
+fn failStep(ev: *Evaluator, sh: *Shared, observer: ?Observer, step: job_mod.Step, res: *StepResult, num: u32, msg: []const u8, coe: bool) !void {
     sh.append(num, msg);
     const name = res.name;
     res.* = .{ .name = name, .continued = coe, .outcome = .failure, .exit_code = 1 };
     try ev.record(step, .failure, coe, &.{});
     if (!coe) ev.job_failed = true;
+    if (observer) |o| o.finished(num, res.*);
 }
 
 fn fail(sh: *Shared, results: []StepResult, msg: []const u8) !Result {
@@ -1483,4 +1503,55 @@ test "the default image is provisioned with git; a custom image is left alone" {
         try std.testing.expectEqual(case.expect_provision, std.mem.indexOf(u8, base, "apt-get install") != null);
         try std.testing.expect(std.mem.indexOf(u8, base, case.image) != null);
     }
+}
+
+const Recorder = struct {
+    events: std.ArrayList([]const u8) = .empty,
+    arena: Allocator,
+
+    fn started(ptr: *anyopaque, number: u32, name: []const u8, started_ms: i64) void {
+        const self: *Recorder = @ptrCast(@alignCast(ptr));
+        const msg = std.fmt.allocPrint(self.arena, "start {d} {s} {s}", .{ number, name, if (started_ms > 0) "t" else "-" }) catch return;
+        self.events.append(self.arena, msg) catch {};
+    }
+
+    fn finished(ptr: *anyopaque, number: u32, r: StepResult) void {
+        const self: *Recorder = @ptrCast(@alignCast(ptr));
+        const msg = std.fmt.allocPrint(self.arena, "finish {d} {s} {s}", .{ number, r.name, @tagName(r.outcome) }) catch return;
+        self.events.append(self.arena, msg) catch {};
+    }
+};
+
+test "the observer sees each step start and finish, including skipped and failed-to-evaluate steps" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var s2 = testStep("never");
+    s2.condition = "failure()";
+    var s3 = testStep("x");
+    s3.action = .{ .unsupported = "not supported here" };
+    const steps = [_]job_mod.Step{ testStep("ok"), s2, s3, testStep("bad") };
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "a\\n"), try exec(arena, "C2", 1, "b\\n") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var rec: Recorder = .{ .arena = arena };
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    // step 3 is unsupported (fails without running); step 4 is skipped by success() afterwards.
+    _ = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+        .observer = .{ .ptr = &rec, .startedFn = Recorder.started, .finishedFn = Recorder.finished },
+    }, testJob(&steps), &log);
+
+    const want = [_][]const u8{
+        "start 1 n t", // the step has begun, with a start time
+        "finish 1 n success",
+        "finish 2 n skipped", // failure() was false: reported once, never "started"
+        "finish 3 n failure", // unsupported: reported once, never "started"
+        "finish 4 n skipped", // success() after a failure
+    };
+    try std.testing.expectEqual(want.len, rec.events.items.len);
+    for (want, rec.events.items) |expected, got| try std.testing.expectEqualStrings(expected, got);
 }

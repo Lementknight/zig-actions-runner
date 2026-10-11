@@ -20,6 +20,8 @@ pub const Scope = union(enum) {
     }
 };
 
+const pg = @import("pg.zig");
+
 pub const Config = struct {
     gh_token: []const u8,
     scope: Scope,
@@ -102,6 +104,13 @@ pub const Config = struct {
         c.gh_token = token orelse return error.MissingGhToken;
         c.scope = try Scope.parse(scope_str orelse return error.MissingGhScope);
         return c;
+    }
+
+    /// Where logs and run state go: `DATABASE_URL` / `--database-url`, else the standard PG* variables.
+    /// Null means the runner logs to stdout only (StdoutSink).
+    pub fn pgConfig(c: *const Config, arena: std.mem.Allocator, environ: *const std.process.Environ.Map) pg.ParseError!?pg.Config {
+        if (c.database_url) |u| return try pg.parseUrl(arena, u);
+        return pg.fromEnv(environ);
     }
 
     /// Secrets that must never appear in output (SPEC §9).

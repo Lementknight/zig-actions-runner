@@ -9,6 +9,7 @@ const runservice = @import("github/runservice.zig");
 const job_mod = @import("job.zig");
 const dagger = @import("dagger.zig");
 const results = @import("github/results.zig");
+const db = @import("db.zig");
 const sink = @import("sink.zig");
 const redact = @import("redact.zig");
 const timefmt = @import("timefmt.zig");
@@ -28,6 +29,8 @@ pub const Context = struct {
     /// Config secrets; the job's own secrets are appended once it is acquired.
     secrets: []const []const u8,
     name: []const u8,
+    /// Where run state is written (SPEC §5.2); null when the runner has no database.
+    store: ?*db.Store = null,
 };
 
 fn say(c: Context, comptime fmt: []const u8, args: anytype) !void {
@@ -82,6 +85,119 @@ pub fn run(c: Context) !Exit {
     }
 }
 
+/// Writes run state at the transitions SPEC §5.2 names: job start, step start, step end, job end.
+/// Database errors are counted and reported at the end; they never fail the job.
+const Reporter = struct {
+    store: *db.Store,
+    arena: Allocator,
+    io: std.Io,
+    job_id: u64,
+    run_id: u64,
+    failures: usize = 0,
+    last_error: []const u8 = "",
+
+    fn observer(r: *Reporter) dagger.Observer {
+        return .{ .ptr = r, .startedFn = stepStartedFn, .finishedFn = stepFinishedFn };
+    }
+
+    fn iso(r: *Reporter, ms: i64) ?[]const u8 {
+        if (ms <= 0) return null;
+        return timefmt.isoTime(r.arena, ms) catch null;
+    }
+
+    fn note(r: *Reporter, e: anyerror) void {
+        r.failures += 1;
+        r.last_error = if (r.store.client.lastErrorText().len > 0) r.store.client.lastErrorText() else @errorName(e);
+    }
+
+    fn stepStartedFn(ptr: *anyopaque, number: u32, name: []const u8, started_ms: i64) void {
+        const r: *Reporter = @ptrCast(@alignCast(ptr));
+        r.store.upsertStep(.{ .job_id = r.job_id, .number = number, .name = name, .status = "in_progress", .started_at = r.iso(started_ms) }) catch |e| r.note(e);
+    }
+
+    fn stepFinishedFn(ptr: *anyopaque, number: u32, res: dagger.StepResult) void {
+        const r: *Reporter = @ptrCast(@alignCast(ptr));
+        r.store.upsertStep(.{
+            .job_id = r.job_id,
+            .number = number,
+            .name = res.name,
+            .status = "completed",
+            .conclusion = stepConclusion(res),
+            .started_at = r.iso(res.started_ms),
+            .completed_at = r.iso(res.completed_ms),
+        }) catch |e| r.note(e);
+    }
+
+    fn jobStarted(r: *Reporter, job: job_mod.Job, runner_name: []const u8, now_ms: i64) void {
+        const g = job.github;
+        r.store.upsertRun(.{
+            .id = r.run_id,
+            .repo = g.repository,
+            .workflow = if (g.workflow.len > 0) g.workflow else "(unknown)",
+            .event = nonEmpty(g.event_name),
+            .branch = nonEmpty(g.ref_name),
+            .sha = nonEmpty(g.sha),
+            .status = "in_progress",
+        }) catch |e| r.note(e);
+        r.store.upsertJob(.{
+            .id = r.job_id,
+            .run_id = r.run_id,
+            .name = jobName(job),
+            .runner_name = runner_name,
+            .status = "in_progress",
+            .started_at = r.iso(now_ms),
+        }) catch |e| r.note(e);
+        // Step 0 is "Set up job" (db/migrations/001_init.sql): registration, acquiring and parsing.
+        r.store.upsertStep(.{ .job_id = r.job_id, .number = 0, .name = "Set up job", .status = "completed", .conclusion = "success", .started_at = r.iso(now_ms), .completed_at = r.iso(now_ms) }) catch |e| r.note(e);
+    }
+
+    fn jobFinished(r: *Reporter, job: job_mod.Job, runner_name: []const u8, succeeded: bool, started_ms: i64, now_ms: i64) void {
+        const conclusion: []const u8 = if (succeeded) "success" else "failure";
+        r.store.upsertJob(.{
+            .id = r.job_id,
+            .run_id = r.run_id,
+            .name = jobName(job),
+            .runner_name = runner_name,
+            .status = "completed",
+            .conclusion = conclusion,
+            .started_at = r.iso(started_ms),
+            .completed_at = r.iso(now_ms),
+        }) catch |e| r.note(e);
+        // One runner handles one job, so the run's state follows this job (SPEC §5.2).
+        const g = job.github;
+        r.store.upsertRun(.{
+            .id = r.run_id,
+            .repo = g.repository,
+            .workflow = if (g.workflow.len > 0) g.workflow else "(unknown)",
+            .event = nonEmpty(g.event_name),
+            .branch = nonEmpty(g.ref_name),
+            .sha = nonEmpty(g.sha),
+            .status = "completed",
+            .conclusion = conclusion,
+            .completed_at = r.iso(now_ms),
+        }) catch |e| r.note(e);
+    }
+};
+
+fn nonEmpty(s: []const u8) ?[]const u8 {
+    return if (s.len == 0) null else s;
+}
+
+fn jobName(job: job_mod.Job) []const u8 {
+    if (job.display_name.len > 0) return job.display_name;
+    if (job.github.job.len > 0) return job.github.job;
+    return "job";
+}
+
+/// Same vocabulary as the DB's `steps.conclusion`: success | failure | skipped.
+fn stepConclusion(res: dagger.StepResult) []const u8 {
+    return switch (res.outcome) {
+        .success => "success",
+        .failure => if (res.continued) "success" else "failure",
+        .skipped, .not_run => "skipped",
+    };
+}
+
 fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit {
     const jr = runservice.parseJobRequest(c.arena, inner_body) catch |e| return fail(c, "job request", e);
     const acq = runservice.acquire(c.arena, c.io, jr, runner_token) catch |e| return fail(c, "acquirejob", e);
@@ -95,6 +211,16 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit
     const log = &collect;
     try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job acquired: {d} steps", .{job.steps.len}));
 
+    var reporter: ?Reporter = null;
+    const job_started_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
+    if (c.store) |st| {
+        const run_id = std.fmt.parseInt(u64, job.github.run_id, 10) catch 0;
+        if (run_id != 0 and job.check_run_id != 0) {
+            reporter = .{ .store = st, .arena = c.arena, .io = c.io, .job_id = job.check_run_id, .run_id = run_id };
+            reporter.?.jobStarted(job, c.name, job_started_ms);
+        } else try c.err.writeAll("run state not recorded: the job has no run id or job id\n");
+    }
+
     var result: dagger.Result = undefined;
     if (job.has_container) {
         const step_results = try c.arena.alloc(dagger.StepResult, job.steps.len);
@@ -105,6 +231,7 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit
         result = try dagger.run(c.arena, c.io, c.environ, .{
             .dagger_cmd = c.cfg.dagger_cmd,
             .image = c.cfg.image,
+            .observer = if (reporter) |*r| r.observer() else null,
             .sink_job_id = job.check_run_id,
         }, job, log);
         if (result.engine_error) |msg| {
@@ -113,6 +240,10 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit
         }
     }
     try log.flush();
+    if (reporter) |*r| {
+        r.jobFinished(job, c.name, result.succeeded, job_started_ms, std.Io.Clock.real.now(c.io).toMilliseconds());
+        if (r.failures > 0) try c.err.print("run state: {d} database write(s) failed (last: {s})\n", .{ r.failures, r.last_error });
+    }
     try uploadLogs(c, job, log.collect.lines.items);
 
     const conclusion: runservice.Conclusion = if (result.succeeded) .succeeded else .failed;

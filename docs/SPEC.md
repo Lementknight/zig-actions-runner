@@ -33,7 +33,7 @@ Environment variables (flags override):
 | `RUNNER_LABELS` | no | Comma-separated, default `self-hosted,linux,zig` |
 | `RUNNER_GROUP_ID` | no | Default `1` |
 | `RUNNER_NAME_PREFIX` | no | Name becomes `<prefix>-<hostname>-<n>` |
-| `DATABASE_URL` | no | Tiger Data connection string (TLS required). If unset, logs go to `StdoutSink` (§5.1) |
+| `DATABASE_URL` | no | `postgres://user:password@host:port/database?sslmode=require` (Tiger Data; user and password percent-encoded). `sslmode` is `require` (TLS verified against the system CAs and the host name, the default), `no-verify` (TLS without verification) or `disable` (plain TCP, local containers). Instead of a URL the standard `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` and `PGSSLMODE` variables work. If neither is set, logs go to stdout only (`StdoutSink`, §5.1) |
 | `DAGGER_CMD` | no | Path to the `dagger` CLI, default `dagger` |
 | `RUNNER_IMAGE` | no | Base image for jobs, default `ubuntu:24.04` (flag `--image`). The default gets `git`, `curl` and CA certificates installed; a custom image is used as is |
 | `LOG_FLUSH_LINES` | no | Default `200` |
@@ -41,7 +41,7 @@ Environment variables (flags override):
 
 Flags: `--token`, `--scope`, `--labels`, `--group-id`, `--name-prefix`, `--database-url`, `--dagger-cmd`, `--log-flush-lines`, `--log-flush-ms` (as `--flag value` or `--flag=value`), plus `--dry-run` (validate config, register nothing).
 
-Exit codes: `0` job done (ephemeral exit), `1` config error, `2` GitHub auth/protocol error, `3` DB unavailable.
+Exit codes: `0` job done (ephemeral exit), `1` config error (including an unparsable database URL), `2` GitHub auth/protocol error, `3` DB unavailable when the runner starts (a database that fails later never fails a job; see §5.1).
 
 ## 3. GitHub interaction
 
@@ -194,9 +194,22 @@ LogSink
 ```
 Implementations: `PostgresSink` (batched insert/COPY) and `StdoutSink` (for local dev without a DB). The runner must work with `StdoutSink` alone.
 
+`PostgresSink` (verified against the schema in `db/migrations/001_init.sql` on TimescaleDB 2.30 / Postgres 17, and in a live job):
+- Every line is first passed to the console sink, then redacted, stamped with a timestamp and a per-job `seq` (1, 2, 3, ... assigned when appended, so gapless unless lines are dropped, see below), and buffered. A batch is written with one `COPY job_logs (ts, job_id, step_number, seq, stream, line) FROM STDIN` when it reaches `LOG_FLUSH_LINES` (default 200), when `LOG_FLUSH_MS` (default 500) has passed since the last write (checked on every append and by a background flusher, so a quiet job's last line is not stuck), and at every step end and job end. `job_id` is GitHub's numeric job id (`check_run_id`).
+- Messages that belong to no job (registering the runner, waiting for work) have job id 0 and go to the console only.
+- Step numbering follows the schema: step 0 is "Set up job" (the runner's own messages about the job, such as acquiring it); the workflow's steps are 1..n.
+- The database must never fail a job. A failed write keeps the lines buffered; the next flush reconnects and retries, at most every 2 s. If the buffer grows past 100 000 lines the oldest are dropped and counted, which is the only way a `seq` gap appears. A database that is unavailable when the runner starts is an error (exit code 3); one that fails later is not.
+- The live stdout and stderr of a step are merged, so every streamed line is stored with `stream = 'stdout'` (the column allows `stderr`).
+- Values are written with quoted literals and COPY text escaping; NUL bytes and invalid UTF-8, which Postgres rejects, are replaced with U+FFFD. ANSI escape codes are stored intact.
+
 ### 5.2 Job state updates
 
-The runner updates `runs`, `jobs` and `steps` at these transitions only: job start, step start, step end, job end. Each is a single upsert, idempotent on primary key.
+The runner updates `runs`, `jobs` and `steps` at these transitions only: job start, step start, step end, job end. Each is a single upsert, idempotent on the primary key (`INSERT ... ON CONFLICT DO UPDATE`), and writes happen in foreign-key order (run, then job, then steps).
+- Job start: `runs` (status `in_progress`, repo, workflow, event, branch, sha from the `github` context), `jobs` (name from `jobDisplayName`, runner name, `started_at`), and step 0 "Set up job" as completed.
+- Step start: `steps` row `in_progress` with `started_at`. Step end: `completed` with its conclusion (`success`, `failure`, or `skipped`; a failed step with `continue-on-error` is `success`) and `completed_at`. A skipped step, or one that fails before running, is written once, already completed.
+- Job end: `jobs` completed with `success` or `failure`, and `runs` completed with the same conclusion. One runner handles one job, so the run's state follows its job; a workflow with several jobs is therefore reported by whichever job finishes last.
+- `runs.created_at` is when the run was first seen and is never overwritten; `jobs.started_at` and `steps.started_at` are kept when a later upsert omits them.
+- A write that fails is counted and reported once at the end (`run state: N database write(s) failed`); it never fails the job.
 
 ### 5.3 Read API (`api/`)
 

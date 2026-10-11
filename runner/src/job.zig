@@ -71,6 +71,8 @@ pub const Job = struct {
     job_token: []const u8,
     /// GitHub's numeric job id (`contextData.job.check_run_id`), 0 when absent. Used as the DB key.
     check_run_id: u64,
+    /// The job's name as shown on GitHub (`jobDisplayName`).
+    display_name: []const u8 = "",
     /// `container:` jobs are not supported in v0.
     has_container: bool,
     /// Literal values that must never reach a log: the job token and every variable marked `isSecret`.
@@ -94,6 +96,13 @@ pub const Github = struct {
     sha: []const u8 = "",
     ref: []const u8 = "",
     server_url: []const u8 = "https://github.com",
+    /// For the `runs` and `jobs` rows.
+    run_id: []const u8 = "",
+    workflow: []const u8 = "",
+    event_name: []const u8 = "",
+    ref_name: []const u8 = "",
+    /// The job's id in the workflow file (`github.job`).
+    job: []const u8 = "",
 };
 
 pub const Error = error{ MalformedJob, OutOfMemory };
@@ -118,9 +127,10 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .secrets = try collectSecrets(arena, root),
         .secret_vars = try collectSecretVars(arena, root),
         .results_endpoint = variable(root, "system.github.results_endpoint") orelse "",
-        .github = githubContext(root),
+        .github = githubContext(arena, root),
         .env = try jobEnv(arena, root),
         .context_data = root.object.get("contextData") orelse .null,
+        .display_name = path(root, &.{"jobDisplayName"}) orelse "",
         .has_container = if (root.object.get("jobContainer")) |c| c != .null else false,
         .steps = steps,
     };
@@ -271,7 +281,7 @@ fn inList(list: []const []const u8, name: []const u8) bool {
 }
 
 /// `contextData.github` is `{t, d:[{k, v}]}` with plain string values.
-fn githubContext(root: Value) Github {
+fn githubContext(arena: Allocator, root: Value) Github {
     var g: Github = .{};
     const cd = root.object.get("contextData") orelse return g;
     if (cd != .object) return g;
@@ -283,8 +293,18 @@ fn githubContext(root: Value) Github {
         if (e != .object) continue;
         const k = e.object.get("k") orelse continue;
         const v = e.object.get("v") orelse continue;
-        if (k != .string or v != .string) continue;
-        if (std.mem.eql(u8, k.string, "repository")) g.repository = v.string //
+        if (k != .string) continue;
+        // run_id and friends may arrive as numbers.
+        if (std.mem.eql(u8, k.string, "run_id")) {
+            if (v == .string) g.run_id = v.string else if (v == .integer) g.run_id = std.fmt.allocPrint(arena, "{d}", .{v.integer}) catch "";
+            continue;
+        }
+        if (v != .string) continue;
+        if (std.mem.eql(u8, k.string, "workflow")) g.workflow = v.string //
+        else if (std.mem.eql(u8, k.string, "event_name")) g.event_name = v.string //
+        else if (std.mem.eql(u8, k.string, "ref_name")) g.ref_name = v.string //
+        else if (std.mem.eql(u8, k.string, "job")) g.job = v.string //
+        else if (std.mem.eql(u8, k.string, "repository")) g.repository = v.string //
         else if (std.mem.eql(u8, k.string, "sha")) g.sha = v.string //
         else if (std.mem.eql(u8, k.string, "ref")) g.ref = v.string //
         else if (std.mem.eql(u8, k.string, "server_url") and v.string.len > 0) g.server_url = v.string;

@@ -4,6 +4,7 @@ const loop = @import("loop.zig");
 const inspect = @import("inspect.zig");
 const dagger = @import("dagger.zig");
 const job_mod = @import("job.zig");
+const db = @import("db.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
 
@@ -26,6 +27,9 @@ comptime {
     _ = @import("context.zig");
     _ = @import("commands.zig");
     _ = @import("pg.zig");
+    _ = @import("db.zig");
+    _ = @import("pgsink.zig");
+    _ = @import("dbtest.zig");
 }
 
 const Exit = loop.Exit;
@@ -45,18 +49,56 @@ pub fn main(init: std.process.Init) !u8 {
         return @backingInt(Exit.config);
     };
     var secret_buf: [2][]const u8 = undefined;
-    const secrets = cfg.secrets(&secret_buf);
+    const base_secrets = cfg.secrets(&secret_buf);
+
+    // Where logs and run state go: DATABASE_URL / PG* when set, else stdout only.
+    const pg_cfg = cfg.pgConfig(arena, init.environ_map) catch |e| {
+        try err.print("config error: invalid database settings ({s})\n", .{@errorName(e)});
+        return @backingInt(Exit.config);
+    };
+    var secrets_list: std.ArrayList([]const u8) = .empty;
+    try secrets_list.appendSlice(arena, base_secrets);
+    if (pg_cfg) |p| if (p.password.len > 0) try secrets_list.append(arena, p.password);
+    const secrets = secrets_list.items;
 
     var out_buf: [4096]u8 = undefined;
     var out_w: std.Io.File.Writer = .init(.stdout(), io, &out_buf);
-    var log: sink.LogSink = .{ .stdout = .{ .writer = &out_w.interface, .secrets = secrets } };
-    defer log.close();
+    var console: sink.LogSink = .{ .stdout = .{ .writer = &out_w.interface, .secrets = secrets } };
+    defer console.close();
+
+    var db_sink: sink.LogSink = undefined;
+    var log: *sink.LogSink = &console;
+    var store: ?db.Store = null;
+    const live = !cfg.dry_run and !cfg.inspect and cfg.exec_job == null;
+    if (pg_cfg) |dbcfg| if (live) {
+        store = db.Store.open(init.gpa, io, dbcfg, null) catch |e| {
+            try err.writeAll("database unavailable: ");
+            try redact.write(err, @errorName(e), secrets);
+            try err.writeByte('\n');
+            return @backingInt(Exit.db);
+        };
+        db_sink = .{ .postgres = .{
+            .gpa = init.gpa,
+            .io = io,
+            .cfg = dbcfg,
+            .inner = &console,
+            .secrets = secrets,
+            .flush_lines = cfg.log_flush_lines,
+            .flush_ms = cfg.log_flush_ms,
+        } };
+        try db_sink.postgres.startFlusher();
+        log = &db_sink;
+    };
+    defer if (store != null) {
+        log.close();
+        store.?.close();
+    };
 
     var suffix: [4]u8 = undefined;
     io.random(&suffix);
     const name = try std.fmt.allocPrint(arena, "{s}-{x}", .{ cfg.name_prefix, suffix });
 
-    if (cfg.exec_job) |path| return execJobFile(init, &cfg, path, &log, err);
+    if (cfg.exec_job) |path| return execJobFile(init, &cfg, path, log, err);
 
     if (cfg.dry_run) {
         try log.append(0, 0, .stdout, try std.fmt.allocPrint(arena, "dry run: would register runner '{s}' with labels '{s}'", .{ name, cfg.labels }));
@@ -73,10 +115,11 @@ pub fn main(init: std.process.Init) !u8 {
         .io = io,
         .environ = init.environ_map,
         .cfg = &cfg,
-        .log = &log,
+        .log = log,
         .err = err,
         .secrets = secrets,
         .name = name,
+        .store = if (store) |*st| st else null,
     }));
 }
 
