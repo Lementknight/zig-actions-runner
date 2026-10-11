@@ -1,0 +1,73 @@
+# The whole read stack on one machine: a local TimescaleDB loaded with the seed, the read API and
+# the web app. deploy/README.md has the commands; compose.tiger.yaml swaps the local database for
+# Tiger Data. The runner itself is not here (M7).
+#
+#   docker compose -f deploy/compose.yaml up --build      # then open http://localhost:8080
+#   docker compose -f deploy/compose.yaml down -v         # removes containers, network and data
+name: zig-actions
+
+services:
+  db:
+    image: timescale/timescaledb:latest-pg17
+    environment:
+      # A throwaway database that lives only in this stack's volume; not a secret.
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # One shot: apply db/migrations, then db/seed.sql, then exit 0. Both are idempotent, so every
+  # `up` runs it again harmlessly (dbmate skips applied migrations; the seed skips existing rows).
+  migrate:
+    build:
+      dockerfile_inline: |
+        FROM ghcr.io/amacneil/dbmate:2.36.0 AS dbmate
+        FROM timescale/timescaledb:latest-pg17
+        COPY --from=dbmate /usr/local/bin/dbmate /usr/local/bin/dbmate
+    entrypoint: ["sh", "-c"]
+    command:
+      - dbmate --wait up && psql "$$DATABASE_URL" -q -v ON_ERROR_STOP=1 -f /db/seed.sql && echo "migrated and seeded"
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/postgres?sslmode=disable
+      DBMATE_MIGRATIONS_DIR: /db/migrations
+      DBMATE_NO_DUMP_SCHEMA: "true"
+    volumes:
+      - ../db:/db:ro
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    build: ../api
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/postgres?sslmode=disable
+    ports:
+      # Published for curl and debugging; the browser goes through web's /api proxy.
+      - "127.0.0.1:${API_PORT:-8081}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    build:
+      context: ../web
+      args:
+        VITE_DATA_SOURCE: http
+        VITE_API_BASE_URL: /api
+    environment:
+      API_UPSTREAM: http://api:8080
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:3000"
+    depends_on:
+      api:
+        # api/Dockerfile's HEALTHCHECK passes only once the database answers.
+        condition: service_healthy
+
+volumes:
+  db-data:
