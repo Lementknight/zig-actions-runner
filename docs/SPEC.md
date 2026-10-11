@@ -233,6 +233,13 @@ Implementations: `PostgresSink` (batched insert/COPY) and `StdoutSink` (for loca
 
 The runner updates `runs`, `jobs` and `steps` at these transitions only: job start, step start, step end, job end. Each is a single upsert, idempotent on primary key.
 
+How the runner writes them (#28, `runner/src/record.zig`):
+- **Job start**, right after `acquirejob`: `runs` upserted `in_progress` with `repo`, `workflow`, `event`, `branch`, `sha` (§3); on conflict those are refreshed, `conclusion` and `completed_at` cleared, and `created_at` kept, so a re-run of the same workflow run updates the existing row. `jobs` upserted `in_progress` with `name`, `runner_name` and `started_at`. Step 0, **Set up job**, written `in_progress`; it holds the runner's own lines.
+- **Step start and end** come from Dagger's step markers as they arrive (§6): `begin` writes the step `in_progress` with `started_at`; `end` writes it `completed` with `completed_at`; `skip` writes it `completed`, `skipped`. The first `begin` also completes step 0 as `success`. Conclusions follow what `completejob` tells GitHub: `success`, `failure`, `skipped`, a failure under `continue-on-error` is `success`, and a step that never ran or never ended is `skipped`. A fully cached chain is replayed from the report after Dagger exits, so its step rows appear together. A NULL timestamp never overwrites one already written.
+- **Job end**, after the job's final log flush and after `completejob`: step 0 and every step rewritten in their final state (step 0 `failure` when the engine failed or the job is unsupported), the job `completed` with `success` or `failure` and `completed_at`, then the run recomputed from the jobs the database holds for it: `completed` once all are, `failure` if any failed, else `cancelled` if any was, else `success`, `completed_at` the latest job's. The runner only sees its own jobs, so jobs that ran elsewhere are not counted.
+- A job without `run_id`, `check_run_id`, `repository` or `workflow` gets no rows (the job log says which is missing).
+- A database failure is reported on stderr and never fails the job or delays `completejob`. After a failed live write the remaining step writes are skipped, and the job-end write rewrites every row. Statements go through `Db` (§2.1), which retries once on a fresh connection.
+
 ### 5.3 Read API (`api/`)
 
 Hono on Node with `pg` (`api/README.md`). It only reads: every connection starts with `default_transaction_read_only=on`. `DATABASE_URL` is required; `PORT` defaults to `8080`.
