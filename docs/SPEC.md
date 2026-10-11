@@ -9,7 +9,7 @@ This is the contract between components. If you change anything here, tell the t
 ```
 hackathon/
   docs/                 DESIGN.md, SPEC.md
-  hello-world/          current Zig scaffold → rename to runner/
+  runner/               Zig runner
     src/
       main.zig          CLI entry
       config.zig        env/flags
@@ -33,10 +33,12 @@ Environment variables (flags override):
 | `RUNNER_LABELS` | no | Comma-separated, default `self-hosted,linux,zig` |
 | `RUNNER_GROUP_ID` | no | Default `1` |
 | `RUNNER_NAME_PREFIX` | no | Name becomes `<prefix>-<hostname>-<n>` |
-| `DATABASE_URL` | yes | Tiger Data connection string (TLS required) |
+| `DATABASE_URL` | no | Tiger Data connection string (TLS required). If unset, logs go to `StdoutSink` (§5.1) |
 | `DAGGER_CMD` | no | Path to the `dagger` CLI, default `dagger` |
 | `LOG_FLUSH_LINES` | no | Default `200` |
 | `LOG_FLUSH_MS` | no | Default `500` |
+
+Flags: `--token`, `--scope`, `--labels`, `--group-id`, `--name-prefix`, `--database-url`, `--dagger-cmd`, `--log-flush-lines`, `--log-flush-ms` (as `--flag value` or `--flag=value`), plus `--dry-run` (validate config, register nothing).
 
 Exit codes: `0` job done (ephemeral exit), `1` config error, `2` GitHub auth/protocol error, `3` DB unavailable.
 
