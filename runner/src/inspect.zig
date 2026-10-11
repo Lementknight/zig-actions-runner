@@ -6,6 +6,7 @@ const Config = @import("config.zig").Config;
 const jitconfig = @import("github/jitconfig.zig");
 const auth = @import("github/auth.zig");
 const broker = @import("github/broker.zig");
+const runservice = @import("github/runservice.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -81,6 +82,7 @@ pub fn run(arena: Allocator, io: std.Io, cfg: *const Config, name: []const u8, o
                         try shape(out, inner, 2, false);
                         if (inner == .object) if (inner.object.get("run_service_url")) |u| if (u == .string)
                             try out.print("  run_service_url host: {s}\n", .{hostOnly(u.string)});
+                        try probeRunService(arena, io, out, token, bv.string);
                     } else try out.writeAll("  body is not JSON\n");
                 };
                 if (mv == .object) for ([_][]const u8{ "messageType", "MessageType" }) |k| if (mv.object.get(k)) |t| if (t == .string)
@@ -125,6 +127,7 @@ fn shape(w: *std.Io.Writer, v: std.json.Value, depth: usize, show: bool) !void {
         .array => |a| {
             try w.splatByteAll(0x20, depth * 2);
             try w.print("[{d} items]\n", .{a.items.len});
+            if (a.items.len > 0 and (a.items[0] == .object or a.items[0] == .array)) try shape(w, a.items[0], depth + 1, show);
         },
         else => {},
     }
@@ -145,4 +148,78 @@ fn hostOnly(s: []const u8) []const u8 {
     const scheme = std.mem.indexOf(u8, s, "://") orelse return s;
     const path = std.mem.indexOfScalarPos(u8, s, scheme + 3, '/') orelse return s;
     return s[0..path];
+}
+
+/// Acknowledge, acquire and complete the job, printing only statuses and the shape of the response.
+/// Completes as `succeeded` without running anything: only for throwaway probe jobs.
+fn probeRunService(arena: Allocator, io: std.Io, out: *std.Io.Writer, token: []const u8, body: []const u8) !void {
+    const jr = runservice.parseJobRequest(arena, body) catch |e| {
+        try out.print("  parseJobRequest failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    // `acknowledge` is skipped: it needs an HMAC and acquirejob works without it (SPEC §3).
+    try out.flush();
+    const r = try runservice.acquire(arena, io, jr, token);
+    try out.print("POST acquirejob -> HTTP {d}, {d} body bytes\n", .{ @backingInt(r.status), r.body.len });
+    if (r.status.class() != .success) {
+        try out.print("  error body: {s}\n", .{r.body[0..@min(r.body.len, 600)]});
+        return;
+    }
+    const job = std.json.parseFromSliceLeaky(std.json.Value, arena, r.body, .{}) catch {
+        try out.writeAll("  (non-JSON body)\n");
+        return;
+    };
+    // The job definition holds tokens and secrets: key names, types and lengths only.
+    try shape(out, job, 1, false);
+    try out.flush();
+
+    const plan_id = nestedString(job, &.{ "plan", "planId" }) orelse "";
+    const job_id = nestedString(job, &.{"jobId"}) orelse "";
+    try out.print("  planId {d} chars, jobId {d} chars\n", .{ plan_id.len, job_id.len });
+    if (firstStepScript(job)) |sc| try out.print("  step[0] script: {s} = {s}\n", .{ sc.key, sc.value });
+    // The run service authorizes later calls with the job-scoped token from the job's endpoints.
+    const job_token = jobToken(job) orelse {
+        try out.writeAll("  no job token in resources.endpoints\n");
+        return;
+    };
+    try out.print("  job token: {d} chars\n", .{job_token.len});
+    const c = try runservice.complete(arena, io, jr, job_token, plan_id, job_id, .succeeded);
+    try out.print("POST completejob -> HTTP {d}\n", .{@backingInt(c.status)});
+    if (c.status.class() != .success) try out.print("  error body: {s}\n", .{c.body[0..@min(c.body.len, 400)]});
+}
+
+fn nestedString(v: std.json.Value, path: []const []const u8) ?[]const u8 {
+    var cur = v;
+    for (path) |k| {
+        if (cur != .object) return null;
+        cur = cur.object.get(k) orelse return null;
+    }
+    return if (cur == .string) cur.string else null;
+}
+
+fn jobToken(job: std.json.Value) ?[]const u8 {
+    const eps = (job.object.get("resources") orelse return null).object.get("endpoints") orelse return null;
+    if (eps != .array) return null;
+    for (eps.array.items) |ep| {
+        if (ep != .object) continue;
+        const authz = ep.object.get("authorization") orelse continue;
+        if (authz != .object) continue;
+        if (nestedString(authz, &.{ "parameters", "AccessToken" })) |t| return t;
+    }
+    return null;
+}
+
+const Script = struct { key: []const u8, value: []const u8 };
+
+/// `run:` steps arrive as an action step with reference.type "script" and a template-token map input.
+fn firstStepScript(job: std.json.Value) ?Script {
+    const steps = job.object.get("steps") orelse return null;
+    if (steps != .array or steps.array.items.len == 0) return null;
+    const map = (steps.array.items[0].object.get("inputs") orelse return null).object.get("map") orelse return null;
+    if (map != .array or map.array.items.len == 0) return null;
+    const kv = map.array.items[0];
+    return .{
+        .key = nestedString(kv.object.get("Key") orelse return null, &.{"lit"}) orelse return null,
+        .value = nestedString(kv.object.get("Value") orelse return null, &.{"lit"}) orelse return null,
+    };
 }
