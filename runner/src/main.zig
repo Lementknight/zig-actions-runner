@@ -6,6 +6,8 @@ const dagger = @import("dagger.zig");
 const job_mod = @import("job.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
+const DbUrl = @import("db/url.zig");
+const DbClient = @import("db/Client.zig");
 
 comptime {
     _ = @import("sink.zig");
@@ -22,6 +24,9 @@ comptime {
     _ = @import("dagger.zig");
     _ = @import("loop.zig");
     _ = @import("timefmt.zig");
+    _ = @import("db/url.zig");
+    _ = @import("db/scram.zig");
+    _ = @import("db/Client.zig");
 }
 
 const Exit = loop.Exit;
@@ -40,13 +45,47 @@ pub fn main(init: std.process.Init) !u8 {
         try err.print("config error: {s}\n", .{@errorName(e)});
         return @backingInt(Exit.config);
     };
-    var secret_buf: [2][]const u8 = undefined;
-    const secrets = cfg.secrets(&secret_buf);
+    var secret_buf: [3][]const u8 = undefined;
+    var secrets = cfg.secrets(&secret_buf);
+
+    // DATABASE_URL (SPEC §2): a malformed URL is a config error; the password joins the redaction
+    // list because it may appear decoded in server messages. The URL itself is never printed.
+    var db_url: ?DbUrl.Url = null;
+    if (cfg.database_url) |raw| {
+        const u = DbUrl.parse(arena, raw) catch |e| {
+            try err.print("config error: DATABASE_URL {s}\n", .{@errorName(e)});
+            return @backingInt(Exit.config);
+        };
+        if (u.password.len > 0) {
+            secret_buf[secrets.len] = u.password;
+            secrets = secret_buf[0 .. secrets.len + 1];
+        }
+        db_url = u;
+    }
 
     var out_buf: [4096]u8 = undefined;
     var out_w: std.Io.File.Writer = .init(.stdout(), io, &out_buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &out_w.interface, .secrets = secrets } };
     defer log.close();
+
+    // With DATABASE_URL set the database must be reachable at startup; otherwise exit 3 (SPEC §2).
+    // Without it nothing here runs and the runner behaves as before.
+    var db: ?*DbClient = null;
+    if (db_url) |u| {
+        var detail: ?[]const u8 = null;
+        db = DbClient.connect(arena, io, u, .{ .error_detail = &detail }) catch |e| {
+            try err.writeAll("database unreachable: ");
+            try redact.write(err, @errorName(e), secrets);
+            if (detail) |d| {
+                try err.writeAll(": ");
+                try redact.write(err, d, secrets);
+            }
+            try err.writeByte('\n');
+            return @backingInt(Exit.db);
+        };
+    }
+    defer if (db) |d| d.close();
+    const db_versions: ?DbClient.Versions = if (db) |d| try d.versions(arena) else null;
 
     var suffix: [4]u8 = undefined;
     io.random(&suffix);
@@ -56,13 +95,22 @@ pub fn main(init: std.process.Init) !u8 {
 
     if (cfg.dry_run) {
         try log.append(0, 0, .stdout, try std.fmt.allocPrint(arena, "dry run: would register runner '{s}' with labels '{s}'", .{ name, cfg.labels }));
+        if (db_versions) |v| try log.append(0, 0, .stdout, try describeDb(arena, v));
         return @backingInt(Exit.done);
     }
 
     if (cfg.inspect) {
+        if (db_versions) |v| {
+            try out_w.interface.print("database: {s}\n", .{try describeDb(arena, v)});
+            try out_w.interface.flush();
+        }
+        // DATABASE_URL alone: the database probe is the whole inspection.
+        if (cfg.gh_token.len == 0) return @backingInt(Exit.done);
         const code = try inspect.run(arena, io, &cfg, name, &out_w.interface);
         return code;
     }
+
+    if (db_versions) |v| try log.append(0, 0, .stderr, try describeDb(arena, v));
 
     return @backingInt(try loop.run(.{
         .arena = arena,
@@ -98,4 +146,9 @@ fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log
     if (res.engine_error) |m| try err.print("dagger error:\n{s}\n", .{m});
     try err.print("job {s}\n", .{if (res.succeeded) "succeeded" else "failed"});
     return @backingInt(if (res.succeeded) Exit.done else Exit.github);
+}
+
+/// "PostgreSQL 17.6, timescaledb 2.17.2": what `--inspect` prints and the runner logs on start.
+fn describeDb(arena: std.mem.Allocator, v: DbClient.Versions) ![]const u8 {
+    return std.fmt.allocPrint(arena, "PostgreSQL {s}, timescaledb {s}", .{ v.server, v.timescaledb orelse "not installed" });
 }

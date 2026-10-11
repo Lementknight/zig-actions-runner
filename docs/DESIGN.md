@@ -90,6 +90,8 @@ M0, M5 and M6 do not need GitHub access and can start immediately, in parallel w
 ## 9. Open questions
 
 - Frontend and API stack confirmation (React / TypeScript proposed).
-- Postgres client for Zig: pure-Zig library vs. linking `libpq`. Needs a Zig 0.17.0 build check.
+- ~~Postgres client for Zig: pure-Zig library vs. linking `libpq`. Needs a Zig 0.17.0 build check.~~
+  Closed 2026-10-11, see SPEC §2.1: a minimal client on `std`. `pg.zig` builds on 0.17.0 but its TLS
+  is OpenSSL only, and `libpq` fails the static binary target (§7).
 - Dagger integration: `dagger` CLI vs. GraphQL API from Zig.
 - Where do operator secrets (GitHub token, DB URL) live?
