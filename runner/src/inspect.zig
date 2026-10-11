@@ -7,6 +7,7 @@ const jitconfig = @import("github/jitconfig.zig");
 const auth = @import("github/auth.zig");
 const broker = @import("github/broker.zig");
 const runservice = @import("github/runservice.zig");
+const loop = @import("loop.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -183,9 +184,38 @@ fn probeRunService(arena: Allocator, io: std.Io, out: *std.Io.Writer, token: []c
         return;
     };
     try out.print("  job token: {d} chars\n", .{job_token.len});
-    const c = try runservice.complete(arena, io, jr, job_token, plan_id, job_id, .succeeded);
-    try out.print("POST completejob -> HTTP {d}\n", .{@backingInt(c.status)});
-    if (c.status.class() != .success) try out.print("  error body: {s}\n", .{c.body[0..@min(c.body.len, 400)]});
+    // The shape of `stepResults` is not documented: try candidates on this one acquired job until
+    // completejob accepts one (a rejected attempt leaves the job held, so we can keep trying).
+    const step_id = firstStepId(job) orelse "00000000-0000-0000-0000-000000000000";
+    const t1 = try loop.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds() - 2000);
+    const t2 = try loop.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds());
+    const secs_only = try std.fmt.allocPrint(arena, "{s}Z", .{t1[0 .. t1.len - 5]});
+    const secs_only2 = try std.fmt.allocPrint(arena, "{s}Z", .{t2[0 .. t2.len - 5]});
+    const candidates = [_][]const u8{
+        try std.fmt.allocPrint(arena, "[{{\"external_id\":\"{s}\",\"number\":1,\"name\":\"probe\",\"status\":\"completed\",\"conclusion\":\"succeeded\",\"started_at\":\"{s}\",\"completed_at\":\"{s}\"}}]", .{ step_id, t1, t2 }),
+        try std.fmt.allocPrint(arena, "[{{\"external_id\":\"{s}\",\"number\":1,\"name\":\"probe\",\"status\":\"completed\",\"conclusion\":\"succeeded\"}}]", .{step_id}),
+        try std.fmt.allocPrint(arena, "[{{\"external_id\":\"{s}\",\"number\":1,\"name\":\"probe\",\"status\":\"completed\",\"conclusion\":\"succeeded\",\"started_at\":\"{s}\",\"completed_at\":\"{s}\"}}]", .{ step_id, secs_only, secs_only2 }),
+        try std.fmt.allocPrint(arena, "[{{\"external_id\":\"{s}\",\"number\":1,\"name\":\"probe\",\"status\":\"completed\",\"conclusion\":\"success\"}}]", .{step_id}),
+        try std.fmt.allocPrint(arena, "[{{\"external_id\":\"{s}\",\"number\":1,\"name\":\"probe\",\"status\":\"Completed\",\"conclusion\":\"Succeeded\"}}]", .{step_id}),
+        try std.fmt.allocPrint(arena, "[{{\"external_id\":\"{s}\",\"number\":1,\"name\":\"probe\",\"status\":2,\"conclusion\":2}}]", .{step_id}),
+        "[]",
+    };
+    for (candidates, 0..) |cand, i| {
+        const c = try runservice.complete(arena, io, jr, job_token, plan_id, job_id, .succeeded, cand);
+        try out.print("POST completejob (stepResults variant {d}) -> HTTP {d}\n", .{ i, @backingInt(c.status) });
+        if (c.status.class() == .success) {
+            try out.print("  accepted shape: {s}\n", .{cand});
+            break;
+        }
+        try out.print("  error body: {s}\n", .{c.body[0..@min(c.body.len, 300)]});
+        try out.flush();
+    }
+}
+
+fn firstStepId(job: std.json.Value) ?[]const u8 {
+    const steps = job.object.get("steps") orelse return null;
+    if (steps != .array or steps.array.items.len == 0) return null;
+    return nestedString(steps.array.items[0], &.{"id"});
 }
 
 fn nestedString(v: std.json.Value, path: []const []const u8) ?[]const u8 {

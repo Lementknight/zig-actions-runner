@@ -36,6 +36,13 @@ pub const LogSink = union(enum) {
         }
     }
 
+    /// Replaces the redaction list (e.g. with a job's secrets once it is known).
+    pub fn setSecrets(s: *LogSink, secrets: []const []const u8) void {
+        switch (s.*) {
+            inline else => |*impl| impl.secrets = secrets,
+        }
+    }
+
     pub fn flush(s: *LogSink) !void {
         switch (s.*) {
             inline else => |*impl| try impl.flush(),

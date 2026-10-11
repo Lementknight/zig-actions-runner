@@ -1,6 +1,6 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
-const jitconfig = @import("github/jitconfig.zig");
+const loop = @import("loop.zig");
 const inspect = @import("inspect.zig");
 const dagger = @import("dagger.zig");
 const job_mod = @import("job.zig");
@@ -19,10 +19,10 @@ comptime {
     _ = @import("github/runservice.zig");
     _ = @import("job.zig");
     _ = @import("dagger.zig");
+    _ = @import("loop.zig");
 }
 
-/// SPEC §2 exit codes.
-const Exit = enum(u8) { done = 0, config = 1, github = 2, db = 3 };
+const Exit = loop.Exit;
 
 pub fn main(init: std.process.Init) !u8 {
     const arena = init.arena.allocator();
@@ -62,21 +62,16 @@ pub fn main(init: std.process.Init) !u8 {
         return code;
     }
 
-    var status: std.http.Status = .ok;
-    const jit = jitconfig.generate(arena, io, &cfg, name, &status) catch |e| {
-        try err.writeAll("github error: ");
-        try redact.write(err, @errorName(e), secrets);
-        try err.print(" (HTTP {d})\n", .{@backingInt(status)});
-        return @backingInt(Exit.github);
-    };
-
-    // Never print file contents: they hold RSA keys and OAuth credentials.
-    try log.append(0, 0, .stdout, try std.fmt.allocPrint(arena, "registered runner '{s}' (id {d}) with {d} config files", .{ jit.runner_name, jit.runner_id, jit.files.len }));
-    for (jit.files) |f| {
-        try log.append(0, 0, .stdout, try std.fmt.allocPrint(arena, "  {s} ({d} bytes)", .{ f.name, f.content.len }));
-    }
-    try err.writeAll("broker session not implemented yet (M2); exiting\n");
-    return @backingInt(Exit.github);
+    return @backingInt(try loop.run(.{
+        .arena = arena,
+        .io = io,
+        .environ = init.environ_map,
+        .cfg = &cfg,
+        .log = &log,
+        .err = err,
+        .secrets = secrets,
+        .name = name,
+    }));
 }
 
 /// Dev helper: runs a saved acquirejob response through the Dagger executor.

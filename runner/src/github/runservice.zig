@@ -54,11 +54,13 @@ pub fn complete(
     plan_id: []const u8,
     job_id: []const u8,
     conclusion: Conclusion,
+    /// JSON array of step results (see `loop.zig`).
+    step_results: []const u8,
 ) !broker.Response {
     const body = try std.fmt.allocPrint(
         arena,
-        "{{\"planId\":\"{s}\",\"jobId\":\"{s}\",\"conclusion\":\"{s}\",\"outputs\":{{}},\"stepResults\":[],\"annotations\":[],\"telemetry\":[]}}",
-        .{ plan_id, job_id, @tagName(conclusion) },
+        "{{\"planId\":\"{s}\",\"jobId\":\"{s}\",\"conclusion\":\"{s}\",\"outputs\":{{}},\"stepResults\":{s},\"annotations\":[],\"telemetry\":[]}}",
+        .{ plan_id, job_id, @tagName(conclusion), step_results },
     );
     return post(arena, io, req, token, "completejob", body);
 }
