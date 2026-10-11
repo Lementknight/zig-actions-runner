@@ -107,7 +107,7 @@ CREATE TABLE runs (
   sha           TEXT,
   status        TEXT NOT NULL,               -- queued|in_progress|completed
   conclusion    TEXT,                        -- success|failure|cancelled|NULL
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(), -- first seen; never overwritten by upserts
   completed_at  TIMESTAMPTZ
 );
 
@@ -124,7 +124,7 @@ CREATE TABLE jobs (
 
 CREATE TABLE steps (
   job_id        BIGINT NOT NULL REFERENCES jobs(id),
-  number        INT NOT NULL,
+  number        INT NOT NULL,                -- step 0 is a real row, "Set up job", written by the runner
   name          TEXT NOT NULL,
   status        TEXT NOT NULL,
   conclusion    TEXT,
@@ -138,12 +138,12 @@ CREATE TABLE job_logs (
   job_id        BIGINT NOT NULL,
   step_number   INT NOT NULL,
   seq           BIGINT NOT NULL,             -- monotonic per job, assigned by runner
-  stream        TEXT NOT NULL,               -- stdout|stderr
+  stream        TEXT NOT NULL CHECK (stream IN ('stdout', 'stderr')),
   line          TEXT NOT NULL,
   PRIMARY KEY (job_id, seq, ts)
 );
 
-SELECT create_hypertable('job_logs', by_range('ts'));
+SELECT create_hypertable('job_logs', by_range('ts', INTERVAL '1 day'));
 ALTER TABLE job_logs SET (
   timescaledb.compress,
   timescaledb.compress_segmentby = 'job_id',
@@ -152,16 +152,20 @@ ALTER TABLE job_logs SET (
 SELECT add_compression_policy('job_logs', INTERVAL '1 day');
 SELECT add_retention_policy('job_logs', INTERVAL '30 days');
 
-CREATE INDEX ON jobs (run_id);
-CREATE INDEX ON runs (repo, created_at DESC);
+CREATE INDEX runs_created_at_idx      ON runs (created_at DESC, id DESC);        -- unfiltered list and its `before` cursor
+CREATE INDEX runs_repo_created_at_idx ON runs (repo, created_at DESC, id DESC);
+CREATE INDEX jobs_run_id_id_idx       ON jobs (run_id, id);
 ```
+
+`job_logs` uses 1 day chunks (the default is 7). The primary key keeps `ts` because TimescaleDB requires the partition column in unique constraints.
 
 Rules:
 - Only the runner writes. The API is read-only.
 - `seq` starts at 1 per job and has no gaps; the frontend relies on it for ordering and resume.
 - Log lines are stored with ANSI codes intact; the frontend renders them.
 - Migrations live in `db/migrations/NNN_name.sql`, forward-only.
-- Exact TimescaleDB function syntax should be verified against the Tiger Data version in use before the first migration is merged.
+- Migrations are applied with dbmate (`db/README.md`); `db/seed.sql` holds demo data for the API and contract test.
+- Exact TimescaleDB function syntax should be verified against the Tiger Data version in use before the first migration is merged. The Tiger service runs TimescaleDB 2.30.2 on PostgreSQL 18.6 (checked 2026-10-11). `001_init.sql` applied cleanly there (via SQL), and via `dbmate up` (second run a no-op) on a fresh `timescale/timescaledb:latest-pg17` container.
 
 ## 5. Component interfaces
 
