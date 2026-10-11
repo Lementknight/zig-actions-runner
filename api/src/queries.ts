@@ -151,3 +151,86 @@ export async function getJobLogs(db: Queryable, jobId: number, after: number, li
     job_done: job.status === 'completed' && !more,
   }
 }
+
+export interface RunnerRow {
+  name: string
+  /** What the runners row says: idle, busy or offline. */
+  status: string
+  labels: string[]
+  registered_at: Date
+  last_seen_at: Date
+  /** last_seen_at is older than two minutes, by the database's clock. */
+  stale: boolean
+  current_job_id: number | null
+  current_job_run_id: number | null
+  current_job_name: string | null
+  running_jobs: number
+  completed_jobs: number
+}
+
+export interface Runner {
+  name: string
+  status: string
+  labels: string[]
+  registered_at: Date
+  last_seen_at: Date
+  current_job: { id: number; run_id: number; name: string } | null
+  running_jobs: number
+  completed_jobs: number
+}
+
+/**
+ * The status the API reports (SPEC §4): offline when the row says so or the heartbeat is stale,
+ * busy only when the row says busy and the runner has an in-progress job, idle otherwise. So
+ * current_job is set exactly when the status is busy, and a job left in_progress by a crashed run
+ * never makes an idle runner look busy.
+ */
+export function toRunner(row: RunnerRow): Runner {
+  const status =
+    row.status === 'offline' || row.stale
+      ? 'offline'
+      : row.status === 'busy' && row.current_job_id !== null
+        ? 'busy'
+        : 'idle'
+  return {
+    name: row.name,
+    status,
+    labels: row.labels,
+    registered_at: row.registered_at,
+    last_seen_at: row.last_seen_at,
+    current_job:
+      status === 'busy'
+        ? { id: row.current_job_id!, run_id: row.current_job_run_id!, name: row.current_job_name! }
+        : null,
+    running_jobs: row.running_jobs,
+    completed_jobs: row.completed_jobs,
+  }
+}
+
+/**
+ * Every runner, ordered by name in byte order (COLLATE "C", the order JavaScript's sort gives).
+ * The current job and both counts come from jobs.runner_name through jobs_runner_name_idx.
+ */
+export async function listRunners(db: Queryable): Promise<Runner[]> {
+  const { rows } = await db.query<RunnerRow>(
+    `SELECT r.name, r.status, r.labels, r.registered_at, r.last_seen_at,
+            r.last_seen_at < now() - interval '2 minutes' AS stale,
+            cj.id AS current_job_id, cj.run_id AS current_job_run_id, cj.name AS current_job_name,
+            counts.running_jobs, counts.completed_jobs
+       FROM runners r
+       LEFT JOIN LATERAL (
+         SELECT id, run_id, name FROM jobs
+          WHERE runner_name = r.name AND status = 'in_progress'
+          ORDER BY started_at DESC NULLS LAST, id DESC
+          LIMIT 1
+       ) cj ON true
+       CROSS JOIN LATERAL (
+         SELECT count(*) FILTER (WHERE status = 'in_progress') AS running_jobs,
+                count(*) FILTER (WHERE status = 'completed') AS completed_jobs
+           FROM jobs
+          WHERE runner_name = r.name AND status IN ('in_progress', 'completed')
+       ) counts
+      ORDER BY r.name COLLATE "C"`,
+  )
+  return rows.map(toRunner)
+}

@@ -44,6 +44,36 @@ describe('httpApi requests', () => {
   })
 })
 
+describe('httpApi runners', () => {
+  it('requests /api/runners and converts bigint strings and a missing current_job', async () => {
+    const f = fakeFetch(() =>
+      json([
+        {
+          name: 'r1',
+          status: 'busy',
+          labels: ['zig'],
+          registered_at: 'a',
+          last_seen_at: 'b',
+          current_job: { id: '9100000002', run_id: '9000000002', name: 'build' },
+          running_jobs: '1',
+          completed_jobs: 2,
+        },
+        { name: 'r2', status: 'idle', labels: null, registered_at: 'a', last_seen_at: 'b', current_job: null },
+      ]),
+    )
+    const runners = await createHttpApi('/api', f.impl).listRunners()
+    expect(f.urls).toEqual(['/api/runners'])
+    expect(runners[0].current_job).toEqual({ id: 9100000002, run_id: 9000000002, name: 'build' })
+    expect(runners[0]).toMatchObject({ running_jobs: 1, completed_jobs: 2 })
+    expect(runners[1]).toMatchObject({ labels: [], current_job: null, running_jobs: 0, completed_jobs: 0 })
+  })
+
+  it('accepts the list wrapped in { runners }', async () => {
+    const f = fakeFetch(() => json({ runners: [] }))
+    expect(await createHttpApi('/api', f.impl).listRunners()).toEqual([])
+  })
+})
+
 describe('httpApi errors', () => {
   it('rejects a 404 with an ApiError whose status is 404', async () => {
     const f = fakeFetch(() => new Response('not found', { status: 404 }))
