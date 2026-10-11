@@ -1,6 +1,7 @@
 import { Label } from '@primer/react'
 import { PlayIcon } from '@primer/octicons-react'
 import { Link, Route, Switch } from 'wouter'
+import { RunList } from './views/RunList'
 
 // The three routes (R16). Each placeholder is replaced by its real view in a later unit:
 // RunList (U5), RunPage (U6), JobView (U4).
@@ -50,7 +51,7 @@ export default function App() {
       <main className="ar-page">
         <Switch>
           <Route path="/">
-            <Placeholder title="All workflows" body="Workflow runs will appear here." />
+            <RunList />
           </Route>
           <Route path="/runs/:id">
             {(params) => (

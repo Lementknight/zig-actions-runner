@@ -1,0 +1,25 @@
+/* Status icons (R3). Color comes from the status token on the element; see StatusIcon.tsx. */
+
+.ar-status-icon {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+
+.ar-status-icon__ring {
+  animation: ar-status-spin 1s linear infinite;
+}
+
+@keyframes ar-status-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ar-status-icon__ring {
+    animation: none;
+  }
+}
