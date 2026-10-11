@@ -1,0 +1,88 @@
+# Database migrations (SPEC §4, db/README.md).
+# - Every pull request: apply db/migrations and db/seed.sql to a throwaway TimescaleDB container.
+# - Manual dispatch only: apply db/migrations to the shared Tiger Data database.
+name: db
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DBMATE_VERSION: v2.36.0
+  DBMATE_MIGRATIONS_DIR: db/migrations
+  DBMATE_NO_DUMP_SCHEMA: "true"
+
+jobs:
+  container:
+    name: Migrate and seed a container
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      tsdb:
+        image: timescale/timescaledb:latest-pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      # A throwaway container on the runner; not a secret.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dbmate
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/dbmate \
+            "https://github.com/amacneil/dbmate/releases/download/${DBMATE_VERSION}/dbmate-linux-amd64"
+          sudo chmod +x /usr/local/bin/dbmate
+          dbmate --version
+      - name: Migrate
+        run: dbmate --wait up
+      - name: Migrate again (must be a no-op)
+        run: dbmate up
+      - name: Seed
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/seed.sql
+      - name: Seed again (must be re-runnable)
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/seed.sql
+      - name: Check the hypertable and its policies
+        run: |
+          psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -tA -c "
+            SELECT count(*) FROM timescaledb_information.jobs
+            WHERE hypertable_name = 'job_logs'
+              AND proc_name IN ('policy_compression', 'policy_retention')" | grep -qx 2
+
+  tiger:
+    name: Migrate Tiger Data
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Never two migrations against the shared database at once.
+    concurrency:
+      group: tiger-migrate
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dbmate
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/dbmate \
+            "https://github.com/amacneil/dbmate/releases/download/${DBMATE_VERSION}/dbmate-linux-amd64"
+          sudo chmod +x /usr/local/bin/dbmate
+          dbmate --version
+      - name: Migrate
+        # with_tiger_url.py builds DATABASE_URL (password percent-encoded, sslmode=require), masks
+        # it with ::add-mask::, and runs dbmate with it in the environment only.
+        env:
+          TIGER_HOST: ${{ secrets.TIGER_HOST }}
+          TIGER_PORT: ${{ secrets.TIGER_PORT }}
+          TIGER_DB_NAME: ${{ secrets.TIGER_DB_NAME }}
+          TIGER_USERNAME: ${{ secrets.TIGER_USERNAME }}
+          TIGER_PASSWORD: ${{ secrets.TIGER_PASSWORD }}
+        run: python3 .github/scripts/with_tiger_url.py dbmate --wait up
