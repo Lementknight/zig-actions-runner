@@ -1,0 +1,32 @@
+# Zig
+.zig-cache/
+zig-cache/
+zig-out/
+*.o
+*.obj
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.credentials*
+.runner
+
+# Node (api/, web/)
+node_modules/
+dist/
+build/
+.next/
+*.tsbuildinfo
+npm-debug.log*
+
+# Runner work directories
+_work/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
