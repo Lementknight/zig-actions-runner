@@ -174,6 +174,7 @@ fn probeRunService(arena: Allocator, io: std.Io, out: *std.Io.Writer, token: []c
     try shape(out, job, 1, false);
     try out.flush();
 
+    try dumpWorkflowFacts(out, job);
     const plan_id = nestedString(job, &.{ "plan", "planId" }) orelse "";
     const job_id = nestedString(job, &.{"jobId"}) orelse "";
     try out.print("  planId {d} chars, jobId {d} chars\n", .{ plan_id.len, job_id.len });
@@ -252,4 +253,36 @@ fn firstStepScript(job: std.json.Value) ?Script {
         .key = nestedString(kv.object.get("Key") orelse return null, &.{"lit"}) orelse return null,
         .value = nestedString(kv.object.get("Value") orelse return null, &.{"lit"}) orelse return null,
     };
+}
+
+/// Prints what the workflow file itself says (step references and inputs) and an allowlist of
+/// non-secret `github` context values. Nothing here is a credential.
+fn dumpWorkflowFacts(out: *std.Io.Writer, job: std.json.Value) !void {
+    const steps = job.object.get("steps") orelse return;
+    if (steps == .array) for (steps.array.items, 1..) |st, n| {
+        if (st != .object) continue;
+        try out.print("  step {d} reference: ", .{n});
+        if (st.object.get("reference")) |r| try std.json.Stringify.value(r, .{}, out);
+        try out.print("\n  step {d} inputs: ", .{n});
+        if (st.object.get("inputs")) |i| try std.json.Stringify.value(i, .{}, out) else try out.writeAll("(none)");
+        try out.writeByte('\n');
+    };
+    const allow = [_][]const u8{ "repository", "sha", "ref", "ref_name", "ref_type", "server_url", "event_name", "repository_owner", "base_ref", "head_ref", "workspace", "api_url" };
+    const cd = job.object.get("contextData") orelse return;
+    if (cd != .object) return;
+    const gh = cd.object.get("github") orelse return;
+    if (gh != .object) return;
+    const d = gh.object.get("d") orelse return;
+    if (d != .array) return;
+    for (d.array.items) |e| {
+        if (e != .object) continue;
+        const k = e.object.get("k") orelse continue;
+        if (k != .string) continue;
+        for (allow) |a| if (std.mem.eql(u8, a, k.string)) {
+            try out.print("  github.{s} = ", .{k.string});
+            if (e.object.get("v")) |v| try std.json.Stringify.value(v, .{}, out);
+            try out.writeByte('\n');
+        };
+    }
+    try out.flush();
 }

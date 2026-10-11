@@ -102,18 +102,34 @@ fn conditionTest(cond: []const u8) ?[]const u8 {
     return null;
 }
 
-/// The `sh -c` script for step number `n` (1-based).
-pub fn stepWrapper(arena: Allocator, n: u32, step: job_mod.Step) ![]const u8 {
+/// A checkout step after its repository was fetched, or failed to be.
+pub const Fetched = struct {
+    /// Dagger Directory id of the fetched tree, or why it could not be fetched.
+    result: union(enum) { dir: []const u8, failed: []const u8 },
+    repo: []const u8,
+    /// What was checked out, for the log (a short sha or the requested ref).
+    ref_label: []const u8,
+    /// Absolute directory inside the container.
+    mount: []const u8,
+};
+
+/// The `sh -c` script for step number `n` (1-based). `fetched` is set for checkout steps.
+pub fn stepWrapper(arena: Allocator, n: u32, step: job_mod.Step, fetched: ?Fetched) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
 
     const cond = conditionTest(step.condition);
+    const bad_condition = if (cond == null)
+        try std.fmt.allocPrint(arena, "unsupported condition '{s}' (v0 supports success(), always(), failure(), cancelled())", .{step.condition})
+    else
+        null;
     const why: ?[]const u8 = switch (step.action) {
         .unsupported => |r| r,
-        .script => if (cond == null)
-            try std.fmt.allocPrint(arena, "unsupported condition '{s}' (v0 supports success(), always(), failure(), cancelled())", .{step.condition})
-        else
-            null,
+        .script => bad_condition,
+        .checkout => if (fetched) |f| switch (f.result) {
+            .failed => |msg| msg,
+            .dir => bad_condition,
+        } else "checkout was not resolved",
     };
 
     try w.writeAll("mkdir -p " ++ report_dir ++ "\n{\n");
@@ -126,49 +142,80 @@ pub fn stepWrapper(arena: Allocator, n: u32, step: job_mod.Step) ![]const u8 {
         return aw.written();
     }
 
-    const sc = step.action.script;
-    try w.print("if {s}; then\necho '{s}begin {d}'\n( ", .{ cond.?, marker, n });
-    if (sc.working_directory) |wd| {
-        try w.writeAll("cd ");
-        try shellQuote(w, wd);
-        try w.writeAll(" && ");
+    try w.print("if {s}; then\necho '{s}begin {d}'\n", .{ cond.?, marker, n });
+    switch (step.action) {
+        .script => |sc| {
+            try w.writeAll("( ");
+            if (sc.working_directory) |wd| {
+                try w.writeAll("cd ");
+                try shellQuote(w, wd);
+                try w.writeAll(" && ");
+            }
+            if (step.env.len > 0) {
+                try w.writeAll("env ");
+                for (step.env) |e| {
+                    const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
+                    try shellQuote(w, pair);
+                    try w.writeByte(' ');
+                }
+            }
+            if (sc.shell != null and std.mem.eql(u8, sc.shell.?, "sh")) {
+                try w.writeAll("sh -e -c ");
+            } else {
+                try w.writeAll("bash --noprofile --norc -e -o pipefail -c ");
+            }
+            try shellQuote(w, sc.script);
+            try w.writeAll(" )\nrc=$?\n");
+        },
+        .checkout => {
+            // The tree was mounted by the chain (`withDirectory`); the step only reports it.
+            const f = fetched.?;
+            try w.writeAll("printf '%s\\n' ");
+            try shellQuote(w, try std.fmt.allocPrint(arena, "Syncing repository: {s}", .{f.repo}));
+            try w.writeAll("\nprintf '%s\\n' ");
+            try shellQuote(w, try std.fmt.allocPrint(arena, "Checked out {s} into {s} (the runner's built-in checkout replaces actions/checkout)", .{ f.ref_label, f.mount }));
+            try w.writeAll("\nrc=0\n");
+        },
+        .unsupported => unreachable,
     }
-    if (step.env.len > 0) {
-        try w.writeAll("env ");
-        for (step.env) |e| {
-            const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
-            try shellQuote(w, pair);
-            try w.writeByte(' ');
-        }
-    }
-    if (sc.shell != null and std.mem.eql(u8, sc.shell.?, "sh")) {
-        try w.writeAll("sh -e -c ");
-    } else {
-        try w.writeAll("bash --noprofile --norc -e -o pipefail -c ");
-    }
-    try shellQuote(w, sc.script);
-    try w.print(" )\nrc=$?\necho '{s}end {d} '\"$rc\"\n", .{ marker, n });
+    try w.print("echo '{s}end {d} '\"$rc\"\n", .{ marker, n });
     if (!step.continue_on_error) try w.print("[ \"$rc\" -eq 0 ] || touch {s}\n", .{fail_flag});
     try w.print("else\necho '{s}skip {d}'\nfi\n}} 2>&1 | tee -a " ++ report_path ++ "\nexit 0\n", .{ marker, n });
     return aw.written();
 }
 
 /// The GraphQL document for `dagger query`.
-pub fn buildQuery(arena: Allocator, job: job_mod.Job, image: []const u8) ![]const u8 {
+pub fn buildQuery(arena: Allocator, job: job_mod.Job, image: []const u8, fetched: []const ?Fetched) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.writeAll("{ container { from(address:");
     try std.json.Stringify.value(image, .{}, w);
     try w.print(") {{ withWorkdir(path:\"{s}\") {{ ", .{workspace});
+    var nodes: usize = 0;
     for (job.steps, 1..) |step, n| {
-        const script = try stepWrapper(arena, @intCast(n), step);
+        const f: ?Fetched = if (n <= fetched.len) fetched[n - 1] else null;
+        if (f) |fe| switch (fe.result) {
+            .dir => |id| {
+                // Content-addressed tree: the same commit yields the same workspace, so later
+                // steps keep hitting Dagger's cache.
+                try w.writeAll("withDirectory(path:");
+                try std.json.Stringify.value(fe.mount, .{}, w);
+                try w.writeAll(",source:");
+                try std.json.Stringify.value(id, .{}, w);
+                try w.writeAll(") { ");
+                nodes += 1;
+            },
+            .failed => {},
+        };
+        const script = try stepWrapper(arena, @intCast(n), step, f);
         try w.writeAll("withExec(args:");
         try std.json.Stringify.value([_][]const u8{ "sh", "-c", script }, .{}, w);
         try w.writeAll(") { ");
+        nodes += 1;
     }
     // Reading the report forces the whole chain to run (or be served from cache).
     if (job.steps.len > 0) try w.writeAll("file(path:\"" ++ report_path ++ "\") { contents }") else try w.writeAll("sync");
-    for (0..job.steps.len + 4) |_| try w.writeAll(" }");
+    for (0..nodes + 4) |_| try w.writeAll(" }");
     return aw.written();
 }
 
@@ -196,6 +243,154 @@ pub const Options = struct {
     /// Key under which output lines are written to the sink.
     sink_job_id: u64 = 0,
 };
+
+// --- checkout ---
+
+fn isSha(s: []const u8) bool {
+    if (s.len != 40) return false;
+    for (s) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
+}
+
+/// The `dagger query` document that resolves a checkout to a Directory id, or null with a reason.
+pub fn checkoutQuery(arena: Allocator, job: job_mod.Job, co: job_mod.Checkout) !union(enum) { doc: []const u8, err: []const u8 } {
+    const repo = co.repository orelse job.github.repository;
+    if (repo.len == 0) return .{ .err = "no repository to check out (the job has no github.repository)" };
+    const own = co.repository == null or std.mem.eql(u8, repo, job.github.repository);
+    const url = try std.fmt.allocPrint(arena, "{s}/{s}.git", .{ std.mem.trimEnd(u8, job.github.server_url, "/"), repo });
+
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("{ git(url:");
+    try std.json.Stringify.value(url, .{}, w);
+    try w.writeAll(",keepGitDir:true) { ");
+    if (co.ref orelse (if (own and job.github.sha.len > 0) job.github.sha else null)) |ref| {
+        if (isSha(ref)) {
+            try w.writeAll("commit(id:");
+        } else {
+            try w.writeAll("ref(name:");
+        }
+        try std.json.Stringify.value(ref, .{}, w);
+        try w.writeAll(")");
+    } else {
+        try w.writeAll("head");
+    }
+    if (co.fetch_depth == 0) try w.writeAll(" { tree { id } } } }") else try w.print(" {{ tree(depth:{d}) {{ id }} }} }} }}", .{co.fetch_depth});
+    return .{ .doc = aw.written() };
+}
+
+const Captured = struct { ok: bool, stdout: []const u8, stderr_tail: []const u8 };
+
+/// Runs one `dagger query`, returning its JSON result and, on failure, the last lines it printed.
+fn runCaptured(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, argv: []const []const u8, doc: []const u8) !Captured {
+    var rnd: [8]u8 = undefined;
+    io.random(&rnd);
+    const out_path = try std.fmt.allocPrint(arena, "/tmp/zig-runner-{x}.json", .{rnd});
+    const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .exclusive = true, .permissions = @fromBackingInt(0o600) });
+    defer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+
+    var child = try std.process.spawn(io, .{ .argv = argv, .environ_map = env, .stdin = .pipe, .stdout = .{ .file = out_file }, .stderr = .pipe });
+    out_file.close(io);
+    {
+        var wbuf: [4096]u8 = undefined;
+        var fw = child.stdin.?.writer(io, &wbuf);
+        try fw.interface.writeAll(doc);
+        try fw.interface.flush();
+        child.stdin.?.close(io);
+        child.stdin = null;
+    }
+    var tail: [8][]const u8 = undefined;
+    var tail_len: usize = 0;
+    var rbuf: [64 * 1024]u8 = undefined;
+    var fr = child.stderr.?.readerStreaming(io, &rbuf);
+    while (true) {
+        const raw = fr.interface.takeDelimiter('\n') catch |e| switch (e) {
+            error.StreamTooLong => {
+                _ = fr.interface.discardDelimiterInclusive('\n') catch break;
+                continue;
+            },
+            error.ReadFailed => break,
+        } orelse break;
+        const line = std.mem.trim(u8, raw, " \r");
+        // Keep only what the last span printed: that is where git and the engine report the error.
+        if (isSpanHeader(line)) {
+            tail_len = 0;
+            continue;
+        }
+        if (line.len == 0 or std.mem.indexOf(u8, line, " INF ") != null) continue;
+        if (tail_len == tail.len) {
+            std.mem.copyForwards([]const u8, tail[0 .. tail.len - 1], tail[1..]);
+            tail_len -= 1;
+        }
+        tail[tail_len] = try arena.dupe(u8, line);
+        tail_len += 1;
+    }
+    const term = try child.wait(io);
+    const ok = switch (term) {
+        .exited => |c| c == 0,
+        else => false,
+    };
+    const stdout = std.Io.Dir.cwd().readFileAlloc(io, out_path, arena, .limited(16 * 1024 * 1024)) catch "";
+    return .{ .ok = ok, .stdout = stdout, .stderr_tail = try std.mem.join(arena, " | ", tail[0..tail_len]) };
+}
+
+fn looksLikeAuthFailure(text: []const u8) bool {
+    const needles = [_][]const u8{ "not found", "authentication", "Authentication", "denied", "403", "401", "could not read Username" };
+    for (needles) |n| if (std.mem.indexOf(u8, text, n) != null) return true;
+    return false;
+}
+
+fn findKey(v: std.json.Value, key: []const u8) ?[]const u8 {
+    if (v != .object) return null;
+    var it = v.object.iterator();
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.key_ptr.*, key) and e.value_ptr.* == .string) return e.value_ptr.string;
+        if (findKey(e.value_ptr.*, key)) |c| return c;
+    }
+    return null;
+}
+
+/// Fetches the tree of every checkout step. A failure is recorded on that step (it then fails with
+/// the reason in its log) instead of aborting the job.
+fn resolveCheckouts(arena: Allocator, io: std.Io, base_env: *const std.process.Environ.Map, opts: Options, job: job_mod.Job) ![]?Fetched {
+    const out = try arena.alloc(?Fetched, job.steps.len);
+    @memset(out, null);
+    for (job.steps, out) |step, *slot| {
+        if (step.action != .checkout) continue;
+        const co = step.action.checkout;
+        const repo = co.repository orelse job.github.repository;
+        const mount = if (co.path) |pth|
+            try std.fmt.allocPrint(arena, "{s}/{s}", .{ workspace, std.mem.trim(u8, pth, "/") })
+        else
+            workspace;
+        const want = co.ref orelse (if (co.repository == null) job.github.sha else "HEAD");
+        const label = if (isSha(want)) want[0..7] else want;
+        var fetched: Fetched = .{ .result = .{ .failed = "" }, .repo = repo, .ref_label = label, .mount = mount };
+
+        switch (try checkoutQuery(arena, job, co)) {
+            .err => |msg| fetched.result = .{ .failed = msg },
+            .doc => |doc| {
+                // Never prompt for credentials: private repositories are out of scope for v0.
+                var env = try base_env.clone(arena);
+                try env.put("GIT_TERMINAL_PROMPT", "0");
+                const res = try runCaptured(arena, io, &env, opts.argv, doc);
+                const parsed = if (res.ok) std.json.parseFromSliceLeaky(std.json.Value, arena, res.stdout, .{}) catch null else null;
+                const id: ?[]const u8 = if (parsed) |pv| findKey(pv, "id") else null;
+                fetched.result = if (id) |i|
+                    .{ .dir = i }
+                else
+                    .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}@{s}: {s}{s}", .{
+                        repo,
+                        label,
+                        if (res.stderr_tail.len > 0) res.stderr_tail else "dagger returned no tree",
+                        if (looksLikeAuthFailure(res.stderr_tail)) " (private repositories are not supported in v0)" else "",
+                    }) };
+            },
+        }
+        slot.* = fetched;
+    }
+    return out;
+}
 
 /// Splits Dagger's log stream into per-step output. Used for the live stream and for replaying the
 /// in-container report, so both go through identical attribution rules.
@@ -280,11 +475,12 @@ pub fn run(
     job: job_mod.Job,
     log: *sink.LogSink,
 ) !Result {
-    const query = try buildQuery(arena, job, opts.image);
-
     var env = try environ.clone(arena);
     try env.put("NO_COLOR", "1");
     try env.put("DAGGER_NO_NAG", "1");
+
+    const fetched = try resolveCheckouts(arena, io, &env, opts, job);
+    const query = try buildQuery(arena, job, opts.image, fetched);
 
     // The query result (the report) goes to a private temp file: reading stdout and stderr from one
     // thread could deadlock once the report outgrows the pipe buffer.
@@ -424,7 +620,7 @@ test "wrapper quotes scripts and applies condition, env, shell and continue-on-e
     s.continue_on_error = true;
     s.action.script.shell = "sh";
     s.action.script.working_directory = "sub dir";
-    const w = try stepWrapper(a.allocator(), 2, s);
+    const w = try stepWrapper(a.allocator(), 2, s, null);
     try std.testing.expect(std.mem.indexOf(u8, w, "if true; then") != null);
     try std.testing.expect(std.mem.indexOf(u8, w, "cd 'sub dir' && env 'X=a b' sh -e -c 'echo '\\''hi'\\'' && echo $X'") != null);
     try std.testing.expect(std.mem.indexOf(u8, w, "touch") == null); // continue-on-error
@@ -436,13 +632,13 @@ test "unsupported step and condition fail with a message" {
     defer a.deinit();
     var s = testStep("true");
     s.action = .{ .unsupported = "unsupported step reference type 'repository'" };
-    const w1 = try stepWrapper(a.allocator(), 1, s);
+    const w1 = try stepWrapper(a.allocator(), 1, s, null);
     try std.testing.expect(std.mem.indexOf(u8, w1, "unsupported step reference type") != null);
     try std.testing.expect(std.mem.indexOf(u8, w1, marker ++ "end 1 1") != null);
 
     var s2 = testStep("true");
     s2.condition = "github.ref == 'refs/heads/main'";
-    const w2 = try stepWrapper(a.allocator(), 1, s2);
+    const w2 = try stepWrapper(a.allocator(), 1, s2, null);
     try std.testing.expect(std.mem.indexOf(u8, w2, "unsupported condition") != null);
 }
 
@@ -451,7 +647,7 @@ test "buildQuery is a balanced chain with one withExec per step" {
     defer a.deinit();
     const steps = [_]job_mod.Step{ testStep("echo \"a,b\""), testStep("exit 1") };
     const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 1, .has_container = false, .secrets = &.{}, .steps = &steps };
-    const q = try buildQuery(a.allocator(), job, "ubuntu:24.04");
+    const q = try buildQuery(a.allocator(), job, "ubuntu:24.04", &.{});
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, q, "withExec("));
     try std.testing.expectEqual(std.mem.count(u8, q, "{"), std.mem.count(u8, q, "}"));
     try std.testing.expect(std.mem.indexOf(u8, q, "echo \\\"a,b\\\"") != null); // JSON-escaped quote
@@ -563,4 +759,111 @@ test "replay does not duplicate steps already reported live" {
     try std.testing.expect(res.succeeded);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "live\n"));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "replayed\n"));
+}
+
+fn testJob(steps: []const job_mod.Step) job_mod.Job {
+    return .{
+        .plan_id = "p",
+        .job_id = "j",
+        .job_token = "t",
+        .check_run_id = 1,
+        .has_container = false,
+        .secrets = &.{},
+        .github = .{ .repository = "o/r", .sha = "0123456789012345678901234567890123456789", .ref = "refs/heads/x" },
+        .steps = steps,
+    };
+}
+
+test "checkoutQuery picks commit, ref or head and honours fetch-depth" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const job = testJob(&.{});
+    const own = (try checkoutQuery(a.allocator(), job, .{})).doc;
+    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { commit(id:\"0123456789012345678901234567890123456789\") { tree(depth:1) { id } } } }", own);
+    const by_ref = (try checkoutQuery(a.allocator(), job, .{ .ref = "refs/pull/7/merge", .fetch_depth = 0 })).doc;
+    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { ref(name:\"refs/pull/7/merge\") { tree { id } } } }", by_ref);
+    const other = (try checkoutQuery(a.allocator(), job, .{ .repository = "x/y", .fetch_depth = 3 })).doc;
+    try std.testing.expect(std.mem.indexOf(u8, other, "x/y.git") != null and std.mem.indexOf(u8, other, "{ head { tree(depth:3)") != null);
+    var empty = job;
+    empty.github.repository = "";
+    try std.testing.expect((try checkoutQuery(a.allocator(), empty, .{})) == .err);
+}
+
+test "checkout wrapper reports the checkout and a failed fetch fails the step" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var s = testStep("x");
+    s.name = "Run actions/checkout@v4";
+    s.action = .{ .checkout = .{} };
+    const ok = Fetched{ .result = .{ .dir = "ID" }, .repo = "o/r", .ref_label = "0123456", .mount = "/github/workspace" };
+    const w = try stepWrapper(a.allocator(), 1, s, ok);
+    try std.testing.expect(std.mem.indexOf(u8, w, "Syncing repository: o/r") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, "Checked out 0123456 into /github/workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, "rc=0") != null);
+
+    const bad = Fetched{ .result = .{ .failed = "could not fetch o/r@abc: denied" }, .repo = "o/r", .ref_label = "abc", .mount = "/github/workspace" };
+    const w2 = try stepWrapper(a.allocator(), 1, s, bad);
+    try std.testing.expect(std.mem.indexOf(u8, w2, "could not fetch o/r@abc: denied") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w2, marker ++ "end 1 1") != null);
+}
+
+test "buildQuery mounts the fetched tree before the checkout step and stays balanced" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var co = testStep("x");
+    co.name = "Run actions/checkout@v4";
+    co.action = .{ .checkout = .{} };
+    const steps = [_]job_mod.Step{ co, testStep("ls") };
+    const fetched = [_]?Fetched{ .{ .result = .{ .dir = "TREEID" }, .repo = "o/r", .ref_label = "abc", .mount = "/github/workspace/sub" }, null };
+    const q = try buildQuery(a.allocator(), testJob(&steps), "ubuntu:24.04", &fetched);
+    try std.testing.expect(std.mem.indexOf(u8, q, "withDirectory(path:\"/github/workspace/sub\",source:\"TREEID\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, q, "withDirectory").? < std.mem.indexOf(u8, q, "withExec").?);
+    try std.testing.expectEqual(std.mem.count(u8, q, "{"), std.mem.count(u8, q, "}"));
+}
+
+test "run fetches checkouts through dagger, mounts them, and fails the step when a fetch fails" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var co = testStep("x");
+    co.name = "Run actions/checkout@v4";
+    co.action = .{ .checkout = .{} };
+    const steps = [_]job_mod.Step{co};
+    const job = testJob(&steps);
+    // Fake dagger: git queries return a tree id; chain queries print the checkout step's markers.
+    const fake =
+        \\q=$(cat)
+        \\case "$q" in
+        \\  *'git(url'*) [ "$GIT_TERMINAL_PROMPT" = 0 ] || { echo "prompting for credentials is not disabled" >&2; exit 1; }
+        \\               printf '%s' '{"git":{"commit":{"tree":{"id":"TREE1"}}}}' ;;
+        \\  *) case "$q" in *'source:"TREE1"'*) ;; *) echo "tree not mounted" >&2; exit 1;; esac
+        \\     printf '%s\n' '::zig-step::begin 1' 'Syncing repository: o/r' '::zig-step::end 1 0' >&2 ;;
+        \\esac
+    ;
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .argv = &.{ "sh", "-c", fake } }, job, &log);
+    try std.testing.expect(res.succeeded);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Syncing repository: o/r") != null);
+
+    // A failing fetch becomes a failing step with the reason, not a crashed job.
+    var buf2: [1024]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var log2: sink.LogSink = .{ .stdout = .{ .writer = &w2 } };
+    const failing =
+        \\q=$(cat)
+        \\case "$q" in
+        \\  *'git(url'*) echo "remote: Repository not found." >&2; exit 1 ;;
+        \\  *) case "$q" in
+        \\       *'could not fetch o/r@0123456: remote: Repository not found. (private repositories are not supported in v0)'*) m=message-in-step ;;
+        \\       *) m=message-missing ;;
+        \\     esac
+        \\     printf '%s\n' '::zig-step::begin 1' "$m" '::zig-step::end 1 1' >&2 ;;
+        \\esac
+    ;
+    const res2 = try run(arena, std.testing.io, &env, .{ .argv = &.{ "sh", "-c", failing } }, job, &log2);
+    try std.testing.expect(!res2.succeeded);
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "message-in-step") != null);
 }

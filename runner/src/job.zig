@@ -18,8 +18,22 @@ pub const Action = union(enum) {
         shell: ?[]const u8,
         working_directory: ?[]const u8,
     },
+    /// `uses: actions/checkout`, replaced by a built-in checkout (Dagger's git support).
+    checkout: Checkout,
     /// Why the step cannot run. The executor logs this and fails the step.
     unsupported: []const u8,
+};
+
+/// Supported inputs of actions/checkout. Anything else makes the step unsupported.
+pub const Checkout = struct {
+    /// `owner/name`; null means the workflow's own repository.
+    repository: ?[]const u8 = null,
+    /// Branch, tag, `refs/...` or full sha; null means the commit that triggered the run.
+    ref: ?[]const u8 = null,
+    /// Relative directory inside the workspace; null means the workspace root.
+    path: ?[]const u8 = null,
+    /// Commits to fetch; 0 means full history. The real action's default is 1.
+    fetch_depth: u32 = 1,
 };
 
 pub const Step = struct {
@@ -44,9 +58,18 @@ pub const Job = struct {
     has_container: bool,
     /// Literal values that must never reach a log: the job token and every variable marked `isSecret`.
     secrets: []const []const u8,
+    /// The `github` context values the built-in checkout needs.
+    github: Github = .{},
     /// Base URL of the results service (`system.github.results_endpoint`), where logs are uploaded.
     results_endpoint: []const u8 = "",
     steps: []const Step,
+};
+
+pub const Github = struct {
+    repository: []const u8 = "",
+    sha: []const u8 = "",
+    ref: []const u8 = "",
+    server_url: []const u8 = "https://github.com",
 };
 
 pub const Error = error{ MalformedJob, OutOfMemory };
@@ -70,6 +93,7 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .check_run_id = checkRunId(root),
         .secrets = try collectSecrets(arena, root),
         .results_endpoint = variable(root, "system.github.results_endpoint") orelse "",
+        .github = githubContext(root),
         .has_container = if (root.object.get("jobContainer")) |c| c != .null else false,
         .steps = steps,
     };
@@ -92,18 +116,28 @@ fn parseStep(arena: Allocator, sv: Value) Error!Step {
     const reference_type = path(sv, &.{ "reference", "type" }) orelse "";
     var action: Action = .{ .unsupported = "unsupported step type" };
     var script_text: []const u8 = "";
+    var uses_label: []const u8 = "";
     if (unsupported) |why| {
         action = .{ .unsupported = why };
     } else if (std.mem.eql(u8, reference_type, "script")) {
         action = try parseScript(arena, o.get("inputs"));
         if (action == .script) script_text = action.script.script;
+    } else if (std.mem.eql(u8, reference_type, "repository")) {
+        const uses_name = path(sv, &.{ "reference", "name" }) orelse "";
+        const uses_ref = path(sv, &.{ "reference", "ref" }) orelse "";
+        uses_label = try std.fmt.allocPrint(arena, "{s}@{s}", .{ uses_name, uses_ref });
+        if (std.ascii.eqlIgnoreCase(uses_name, "actions/checkout")) {
+            action = try parseCheckout(arena, o.get("inputs"));
+        } else {
+            action = .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s} is not supported (v0 supports run: steps and actions/checkout)", .{uses_label}) };
+        }
     } else {
         action = .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported step reference type '{s}' (v0 supports run: steps)", .{reference_type}) };
     }
 
     return .{
         .id = id,
-        .name = try displayName(arena, explicitName(o) orelse "", script_text),
+        .name = try displayName(arena, explicitName(o) orelse "", script_text, uses_label),
         .condition = condition,
         .continue_on_error = boolToken(o.get("continueOnError")),
         .env = env.items,
@@ -130,6 +164,79 @@ fn parseScript(arena: Allocator, inputs: ?Value) Error!Action {
     if (shell) |sh| if (!std.mem.eql(u8, sh, "bash") and !std.mem.eql(u8, sh, "sh"))
         return .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported shell '{s}' (v0 supports bash and sh)", .{sh}) };
     return .{ .script = .{ .script = s, .shell = shell, .working_directory = wd } };
+}
+
+/// Inputs that change nothing we do (we never persist credentials or run the action's own git).
+const ignored_checkout_inputs = [_][]const u8{ "persist-credentials", "token", "clean", "show-progress", "set-safe-directory", "fetch-tags", "filter", "sparse-checkout-cone-mode", "ssh-strict", "ssh-user" };
+/// Inputs that are only acceptable when they ask for the default (off) behaviour.
+const off_only_checkout_inputs = [_][]const u8{ "submodules", "lfs", "sparse-checkout", "ssh-key", "ssh-known-hosts", "github-server-url" };
+
+fn parseCheckout(arena: Allocator, inputs: ?Value) Error!Action {
+    var co: Checkout = .{};
+    const iv = inputs orelse return .{ .checkout = co };
+    if (iv == .null) return .{ .checkout = co };
+    var kv: std.ArrayList(EnvVar) = .empty;
+    mapping(arena, iv, &kv) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unsupported => return .{ .unsupported = "actions/checkout input is not a plain string (expressions are not supported yet)" },
+    };
+    for (kv.items) |e| {
+        if (std.mem.eql(u8, e.name, "repository")) co.repository = nonEmpty(e.value) //
+        else if (std.mem.eql(u8, e.name, "ref")) co.ref = nonEmpty(e.value) //
+        else if (std.mem.eql(u8, e.name, "path")) {
+            if (nonEmpty(e.value)) |pth| {
+                if (std.fs.path.isAbsolute(pth) or std.mem.indexOf(u8, pth, "..") != null)
+                    return .{ .unsupported = try std.fmt.allocPrint(arena, "actions/checkout path '{s}' must be relative and stay inside the workspace", .{pth}) };
+                co.path = pth;
+            }
+        } else if (std.mem.eql(u8, e.name, "fetch-depth")) {
+            co.fetch_depth = std.fmt.parseInt(u32, e.value, 10) catch
+                return .{ .unsupported = try std.fmt.allocPrint(arena, "actions/checkout fetch-depth '{s}' is not a number", .{e.value}) };
+        } else if (inList(&ignored_checkout_inputs, e.name)) {
+            continue;
+        } else if (inList(&off_only_checkout_inputs, e.name)) {
+            if (e.value.len > 0 and !std.mem.eql(u8, e.value, "false") and !isDefaultServer(e))
+                return .{ .unsupported = try std.fmt.allocPrint(arena, "actions/checkout input '{s}: {s}' is not supported yet", .{ e.name, e.value }) };
+        } else {
+            return .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported actions/checkout input '{s}'", .{e.name}) };
+        }
+    }
+    return .{ .checkout = co };
+}
+
+fn isDefaultServer(e: EnvVar) bool {
+    return std.mem.eql(u8, e.name, "github-server-url") and std.mem.eql(u8, std.mem.trimEnd(u8, e.value, "/"), "https://github.com");
+}
+
+fn nonEmpty(s: []const u8) ?[]const u8 {
+    return if (s.len == 0) null else s;
+}
+
+fn inList(list: []const []const u8, name: []const u8) bool {
+    for (list) |l| if (std.mem.eql(u8, l, name)) return true;
+    return false;
+}
+
+/// `contextData.github` is `{t, d:[{k, v}]}` with plain string values.
+fn githubContext(root: Value) Github {
+    var g: Github = .{};
+    const cd = root.object.get("contextData") orelse return g;
+    if (cd != .object) return g;
+    const gh = cd.object.get("github") orelse return g;
+    if (gh != .object) return g;
+    const d = gh.object.get("d") orelse return g;
+    if (d != .array) return g;
+    for (d.array.items) |e| {
+        if (e != .object) continue;
+        const k = e.object.get("k") orelse continue;
+        const v = e.object.get("v") orelse continue;
+        if (k != .string or v != .string) continue;
+        if (std.mem.eql(u8, k.string, "repository")) g.repository = v.string //
+        else if (std.mem.eql(u8, k.string, "sha")) g.sha = v.string //
+        else if (std.mem.eql(u8, k.string, "ref")) g.ref = v.string //
+        else if (std.mem.eql(u8, k.string, "server_url") and v.string.len > 0) g.server_url = v.string;
+    }
+    return g;
 }
 
 /// Flattens a mapping token whose keys and values are all string literals.
@@ -180,8 +287,9 @@ fn explicitName(o: std.json.ObjectMap) ?[]const u8 {
     return null;
 }
 
-fn displayName(arena: Allocator, name: []const u8, script: []const u8) Allocator.Error![]const u8 {
+fn displayName(arena: Allocator, name: []const u8, script: []const u8, uses_label: []const u8) Allocator.Error![]const u8 {
     if (name.len > 0 and !std.mem.startsWith(u8, name, "__")) return name;
+    if (uses_label.len > 0) return std.fmt.allocPrint(arena, "Run {s}", .{uses_label});
     if (script.len == 0) return "Run step";
     const first = std.mem.sliceTo(script, '\n');
     return std.fmt.allocPrint(arena, "Run {s}", .{first});
@@ -251,7 +359,7 @@ fn jobToken(root: Value) ?[]const u8 {
 const fixture =
     \\{"plan":{"planId":"plan-1"},"jobId":"job-1","jobContainer":null,
     \\ "variables":{"github_token":{"value":"ghs_secret","isSecret":true},"plain":{"value":"x"},"system.github.results_endpoint":{"value":"https://results.test/"}},
-    \\ "contextData":{"job":{"t":2,"d":[{"k":"status","v":"success"},{"k":"check_run_id","v":777}]}},
+    \\ "contextData":{"job":{"t":2,"d":[{"k":"status","v":"success"},{"k":"check_run_id","v":777}]},"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"sha","v":"0123456789012345678901234567890123456789"},{"k":"ref","v":"refs/heads/x"},{"k":"event_name","v":"push"}]}},
     \\ "resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"jobtok"},"scheme":"OAuth"}}]},
     \\ "steps":[
     \\  {"type":"action","reference":{"type":"script"},"id":"s1","contextName":"__run","name":"__run","condition":"success()","continueOnError":null,
@@ -259,7 +367,14 @@ const fixture =
     \\  {"type":"action","reference":{"type":"script"},"id":"s2","name":"__run_2","displayNameToken":{"type":0,"lit":"Build"},"condition":"always()","continueOnError":{"type":5,"bool":true},
     \\   "environment":{"type":2,"map":[{"Key":{"lit":"A"},"Value":{"lit":"1"}}]},
     \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"make"}},{"Key":{"lit":"shell"},"Value":{"lit":"bash"}},{"Key":{"lit":"workingDirectory"},"Value":{"lit":"sub"}}]}},
-    \\  {"type":"action","reference":{"type":"repository","name":"actions/checkout"},"id":"s3","name":"Checkout","condition":"success()"},
+    \\  {"type":"action","reference":{"type":"repository","name":"actions/checkout","ref":"v4"},"id":"s3","name":"Checkout","condition":"success()",
+    \\   "inputs":{"type":2,"map":[{"Key":{"lit":"ref"},"Value":{"lit":"main"}},{"Key":{"lit":"path"},"Value":{"lit":"sub/dir"}},{"Key":{"lit":"fetch-depth"},"Value":{"lit":"0"}},{"Key":{"lit":"persist-credentials"},"Value":{"lit":"false"}}]}},
+    \\  {"type":"action","reference":{"type":"repository","name":"actions/checkout","ref":"v4"},"id":"s5","name":"__run_3","condition":"success()"},
+    \\  {"type":"action","reference":{"type":"repository","name":"actions/cache","ref":"v4"},"id":"s6","name":"__run_4","condition":"success()"},
+    \\  {"type":"action","reference":{"type":"repository","name":"actions/checkout","ref":"v4"},"id":"s7","name":"x","condition":"success()",
+    \\   "inputs":{"type":2,"map":[{"Key":{"lit":"submodules"},"Value":{"lit":"recursive"}}]}},
+    \\  {"type":"action","reference":{"type":"repository","name":"actions/checkout","ref":"v4"},"id":"s8","name":"y","condition":"success()",
+    \\   "inputs":{"type":2,"map":[{"Key":{"lit":"path"},"Value":{"lit":"../escape"}}]}},
     \\  {"type":"action","reference":{"type":"script"},"id":"s4","name":"Expr","condition":"success()",
     \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"github.sha"}}]}}
     \\ ]}
@@ -273,11 +388,13 @@ test "parse job fixture" {
     try std.testing.expectEqualStrings("jobtok", job.job_token);
     try std.testing.expectEqual(@as(u64, 777), job.check_run_id);
     try std.testing.expectEqualStrings("https://results.test/", job.results_endpoint);
+    try std.testing.expectEqualStrings("o/r", job.github.repository);
+    try std.testing.expectEqualStrings("https://github.com", job.github.server_url);
     try std.testing.expectEqual(@as(usize, 2), job.secrets.len);
     try std.testing.expectEqualStrings("jobtok", job.secrets[0]);
     try std.testing.expectEqualStrings("ghs_secret", job.secrets[1]);
     try std.testing.expect(!job.has_container);
-    try std.testing.expectEqual(@as(usize, 4), job.steps.len);
+    try std.testing.expectEqual(@as(usize, 8), job.steps.len);
 
     const s1 = job.steps[0];
     try std.testing.expectEqualStrings("Run echo hello && sleep 2 && echo done", s1.name);
@@ -292,8 +409,21 @@ test "parse job fixture" {
     try std.testing.expectEqualStrings("sub", s2.action.script.working_directory.?);
     try std.testing.expectEqualStrings("A", s2.env[0].name);
 
-    try std.testing.expect(std.mem.indexOf(u8, job.steps[2].action.unsupported, "repository") != null);
-    try std.testing.expect(std.mem.indexOf(u8, job.steps[3].action.unsupported, "expressions") != null);
+    // checkout with inputs
+    const co = job.steps[2].action.checkout;
+    try std.testing.expectEqualStrings("main", co.ref.?);
+    try std.testing.expectEqualStrings("sub/dir", co.path.?);
+    try std.testing.expectEqual(@as(u32, 0), co.fetch_depth);
+    try std.testing.expect(co.repository == null);
+    // expression in a run step
+    try std.testing.expect(std.mem.indexOf(u8, job.steps[7].action.unsupported, "expressions") != null);
+    // bare checkout: defaults and a "Run actions/checkout@v4" display name
+    try std.testing.expectEqual(@as(u32, 1), job.steps[3].action.checkout.fetch_depth);
+    try std.testing.expectEqualStrings("Run actions/checkout@v4", job.steps[3].name);
+    // other actions and unsupported checkout inputs fail loudly
+    try std.testing.expect(std.mem.indexOf(u8, job.steps[4].action.unsupported, "actions/cache@v4 is not supported") != null);
+    try std.testing.expect(std.mem.indexOf(u8, job.steps[5].action.unsupported, "submodules: recursive") != null);
+    try std.testing.expect(std.mem.indexOf(u8, job.steps[6].action.unsupported, "inside the workspace") != null);
 }
 
 test "malformed job" {
