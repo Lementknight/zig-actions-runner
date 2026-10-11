@@ -43,50 +43,6 @@ Flags: `--token`, `--scope`, `--labels`, `--group-id`, `--name-prefix`, `--datab
 
 Exit codes: `0` job done (ephemeral exit), `1` config error (including an unparsable database URL), `2` GitHub auth/protocol error, `3` DB unavailable when the runner starts (a database that fails later never fails a job; see §5.1).
 
-### 2.1 Database connection (`DATABASE_URL`)
-
-`DATABASE_URL` is a libpq-style URL, `postgres://user:password@host:port/database?sslmode=require`
-(`postgresql://` is also accepted). `user`, `password`, `host` and `database` are percent-decoded,
-so a password holding `@`, `/` or `%` is written `%40`, `%2F`, `%25`. Defaults: port `5432`,
-database = user, `sslmode=require`. `sslmode` follows libpq: `disable`; `allow` and `prefer` (TLS
-when the server offers it, plaintext otherwise); `require` (TLS, no certificate check; the setting
-Tiger Data documents); `verify-ca` (chain checked against the system CA store); `verify-full` (chain
-and host name). Only `sslmode` is read from the query string; other parameters are ignored. A
-malformed URL is a config error (exit 1).
-
-With `DATABASE_URL` set the runner connects at startup, before registering anything, and exits 3
-when the server is unreachable, refuses TLS, or rejects the credentials. `--dry-run` and `--inspect`
-make the same check. `--inspect` prints `database: PostgreSQL <server_version>, timescaledb
-<extversion>` and, when only `DATABASE_URL` is set (no `GH_TOKEN`), stops there with exit 0. Without
-`DATABASE_URL` nothing database-related runs and the runner behaves as before.
-
-The URL and the decoded password are on the redaction list (§9); neither appears in any output.
-
-**Client, decided 2026-10-11 (closes the DESIGN §9 question).** The runner speaks the PostgreSQL
-wire protocol itself from `std`, in `runner/src/db/`: SSLRequest, `std.crypto.tls.Client`, the
-startup message, SCRAM-SHA-256 (`std.crypto` PBKDF2, HMAC and SHA-256, checked against the RFC 7677
-test vector) and the simple query protocol; #27 adds the extended protocol and batched inserts on
-the same connection. libpq was already ruled out by §7 (dynamic libpq and OpenSSL). `pg.zig` was
-checked the same day: it builds and its tests run on Zig 0.17.0 and it speaks SCRAM, but its TLS is
-OpenSSL only (libc plus dynamic system libraries), which loses the single static binary for the same
-reason as libpq, and Tiger Data requires TLS. Not supported, by choice: MD5 password authentication,
-channel binding (`SCRAM-SHA-256-PLUS`), passwords that SASLprep would alter (non-ASCII), and a
-connect timeout, which Zig 0.17's `std.Io` does not implement for TCP connects (it panics), so the
-operating system's TCP timeout applies.
-
-**Writes (#27).** `Client.exec(sql, params)` runs one statement through the extended query protocol
-(Parse, Bind, Execute, Sync in one write) with text parameters, `null` for NULL, types inferred by
-the server, and returns the affected row count. `Db` (`runner/src/db/Db.zig`) is the runner's write
-handle: it connects on first use, reopens a dropped connection and retries the statement once, so
-every statement sent through it must be idempotent (upserts, `ON CONFLICT DO NOTHING`). After a
-failed connect it fails fast with `DatabaseUnavailable` for 5 s instead of dialling on every call.
-`Db.insertMany` builds `INSERT ... VALUES ($1, ...), (...)` and splits rows across statements at the
-protocol's 65535-parameter limit (10922 rows of `job_logs`' six columns); each statement commits on
-its own. A server error is `error.QueryFailed` with the SQLSTATE and message kept on the handle; the
-message has the statement's parameter values scrubbed (a quoted value becomes `"***"`, a value of 6
-bytes or more is removed anywhere), and the DETAIL field, where PostgreSQL echoes row values, is
-never kept. The caller still prints it through the redaction list.
-
 ## 3. GitHub interaction
 
 Documented:
@@ -124,12 +80,6 @@ Verified live (run service, 2026-10-11), `run_service_url` from the `RunnerJobRe
 - `stepResults` (verified live; GitHub then lists exactly these steps): `[{"external_id": <step id>, "number": N, "name": "...", "status": "completed", "conclusion": "succeeded"|"failed"|"skipped", "started_at": "<ISO-8601 UTC, ms>", "completed_at": "..."}]`, numbered from 1. `"success"`/`"failure"` as conclusions get HTTP 400 "Bad Request" (the vocabulary is the same as the job conclusion). A rejected `completejob` leaves the job held, so the runner retries with `"stepResults": []`. GitHub does not add synthetic "Set up job" / "Complete job" steps.
 - A step's display name is the literal `displayNameToken` when the workflow sets `name:`; otherwise `name` is the internal `__run` and the runner shows `Run <first line of script>` (what GitHub shows for unnamed steps).
 - `contextData.job` is `{t, d:[{k, v}]}` and holds `check_run_id`, which is GitHub's numeric job id (the REST `jobs/{id}`); it is the key used for logs.
-- Run metadata for the `runs` and `jobs` tables (§4), parsed by `job.zig` into `job.Job`. `contextData.github` uses the same `{t, d:[{k, v}]}` encoding with plain string values (nested objects such as `event` are dictionaries and are skipped):
-  - `run_id` ← `github.run_id`, a decimal string (`runs.id`, `jobs.run_id`). When it is missing or not a number the runner says so on step 0, still runs and completes the job, and writes no rows for it.
-  - `repo` ← `github.repository`; `workflow` ← `github.workflow` (the workflow's `name:`, or its file path when unnamed); `event` ← `github.event_name`; `branch` ← `github.ref_name`; `sha` ← `github.sha`. A missing or empty value is null.
-  - `name` (`jobs.name`) ← the top-level `jobDisplayName`, else `jobName`, else `github.job` (the job's key in the workflow), else `job`. `jobDisplayName` and `jobName` follow `actions/runner`'s `AgentJobRequestMessage` and are not yet verified against a live `acquirejob` response.
-  - `runner_name` (`jobs.runner_name`) ← `AgentName` from the JIT config's `.runner` file, set by the job loop.
-  - None of these are secret, and the job definition itself is still never logged.
 - Variables flagged `isSecret` (`github_token`, `system.github.token`) and the job token must be masked in all output; the `mask` array uses a regex encoding and is not used.
 - End to end (runner started, commit pushed, job runs through Dagger, GitHub shows the run and both steps `success`, the ephemeral runner is gone): about 4 s from `acquirejob` to completion for a 3 s script; about 0.8 s when the identical steps are served from Dagger's cache.
 - Log upload to GitHub (verified live; without it the Actions UI shows empty steps and `GET .../jobs/{id}/logs` is 404):
@@ -260,13 +210,6 @@ The runner updates `runs`, `jobs` and `steps` at these transitions only: job sta
 - Job end: `jobs` completed with `success` or `failure`, and `runs` completed with the same conclusion. One runner handles one job, so the run's state follows its job; a workflow with several jobs is therefore reported by whichever job finishes last.
 - `runs.created_at` is when the run was first seen and is never overwritten; `jobs.started_at` and `steps.started_at` are kept when a later upsert omits them.
 - A write that fails is counted and reported once at the end (`run state: N database write(s) failed`); it never fails the job.
-
-How the runner writes them (#28, `runner/src/record.zig`):
-- **Job start**, right after `acquirejob`: `runs` upserted `in_progress` with `repo`, `workflow`, `event`, `branch`, `sha` (§3); on conflict those are refreshed, `conclusion` and `completed_at` cleared, and `created_at` kept, so a re-run of the same workflow run updates the existing row. `jobs` upserted `in_progress` with `name`, `runner_name` and `started_at`. Step 0, **Set up job**, written `in_progress`; it holds the runner's own lines.
-- **Step start and end** come from Dagger's step markers as they arrive (§6): `begin` writes the step `in_progress` with `started_at`; `end` writes it `completed` with `completed_at`; `skip` writes it `completed`, `skipped`. The first `begin` also completes step 0 as `success`. Conclusions follow what `completejob` tells GitHub: `success`, `failure`, `skipped`, a failure under `continue-on-error` is `success`, and a step that never ran or never ended is `skipped`. A fully cached chain is replayed from the report after Dagger exits, so its step rows appear together. A NULL timestamp never overwrites one already written.
-- **Job end**, after the job's final log flush and after `completejob`: step 0 and every step rewritten in their final state (step 0 `failure` when the engine failed or the job is unsupported), the job `completed` with `success` or `failure` and `completed_at`, then the run recomputed from the jobs the database holds for it: `completed` once all are, `failure` if any failed, else `cancelled` if any was, else `success`, `completed_at` the latest job's. The runner only sees its own jobs, so jobs that ran elsewhere are not counted.
-- A job without `run_id`, `check_run_id`, `repository` or `workflow` gets no rows (the job log says which is missing).
-- A database failure is reported on stderr and never fails the job or delays `completejob`. After a failed live write the remaining step writes are skipped, and the job-end write rewrites every row. Statements go through `Db` (§2.1), which retries once on a fresh connection.
 
 ### 5.3 Read API (`api/`)
 
