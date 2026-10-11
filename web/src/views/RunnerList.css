@@ -87,3 +87,49 @@
   color: var(--ar-fg-muted);
   font-size: var(--ar-text-sm);
 }
+
+.ar-runner-list__toggle {
+  display: flex;
+  flex-basis: 100%;
+  align-items: center;
+  gap: var(--ar-space-2);
+  margin-top: var(--ar-space-3);
+  font-size: var(--ar-text-sm);
+}
+
+/* The jobs of one runner, under its row, when "Show all jobs" is on. */
+.ar-runner-row__jobs {
+  grid-column: 1 / -1;
+  padding: var(--ar-space-2) 0 0 var(--ar-space-4);
+  border-top: var(--ar-border-width) solid var(--ar-border-muted);
+}
+
+.ar-runner-jobs {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ar-runner-job {
+  display: flex;
+  align-items: center;
+  gap: var(--ar-space-2);
+  padding: var(--ar-space-1) 0;
+  font-size: var(--ar-text-sm);
+}
+
+.ar-runner-job__name {
+  font-weight: var(--ar-weight-semibold);
+}
+
+.ar-runner-job__run {
+  flex: 1;
+  min-width: 0;
+  color: var(--ar-fg-muted);
+  overflow-wrap: anywhere;
+}
+
+.ar-runner-job__time {
+  color: var(--ar-fg-muted);
+  white-space: nowrap;
+}

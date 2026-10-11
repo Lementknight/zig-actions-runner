@@ -1,8 +1,11 @@
-import { Label, Spinner } from '@primer/react'
+import { useState } from 'react'
+import { Label, Spinner, ToggleSwitch } from '@primer/react'
 import { Link } from 'wouter'
 import type { Runner } from '../api'
 import { RetryNotice } from '../components/RetryNotice'
-import { formatAge } from '../lib/format'
+import { StatusIcon } from '../components/StatusIcon'
+import { elapsedSeconds, formatAge, formatDuration } from '../lib/format'
+import { useRunnerJobs, type RunnerJob } from '../hooks/useRunnerJobs'
 import { useRunners } from '../hooks/useRunners'
 import './RunnerList.css'
 
@@ -15,13 +18,32 @@ const BADGE: Record<string, { variant: 'success' | 'accent' | 'secondary'; label
 /** `/runners`: every runner, its state, current job and job counts, refreshing itself. */
 export function RunnerList() {
   const { runners, error, fetchedAt } = useRunners()
+  const [showJobs, setShowJobs] = useState(false)
+  const runnerJobs = useRunnerJobs(showJobs)
 
   return (
     <>
       <div className="ar-page-header">
         <h1 className="ar-page-title">Runners</h1>
         <p className="ar-page-subtitle">Self-hosted runners and the jobs they pick up</p>
+        <div className="ar-runner-list__toggle">
+          <span id="ar-show-jobs-label">Show all jobs</span>
+          <ToggleSwitch
+            size="small"
+            statusLabelPosition="end"
+            checked={showJobs}
+            onClick={() => setShowJobs((on) => !on)}
+            aria-labelledby="ar-show-jobs-label"
+          />
+        </div>
       </div>
+      {showJobs && runnerJobs.error != null && (
+        <RetryNotice>
+          {runnerJobs.jobs
+            ? "Can't refresh jobs. Showing the last list loaded and retrying every few seconds."
+            : "Can't load jobs. Retrying every few seconds."}
+        </RetryNotice>
+      )}
       {error != null && (
         <RetryNotice>
           {runners
@@ -49,7 +71,13 @@ export function RunnerList() {
           </div>
           <ul className="ar-runner-list" aria-label="Runners">
             {runners.map((runner) => (
-              <RunnerRow key={runner.name} runner={runner} now={fetchedAt} />
+              <RunnerRow
+                key={runner.name}
+                runner={runner}
+                now={fetchedAt}
+                jobs={showJobs ? (runnerJobs.jobs?.filter((j) => j.job.runner_name === runner.name) ?? null) : undefined}
+                jobsNow={runnerJobs.fetchedAt}
+              />
             ))}
           </ul>
         </div>
@@ -58,7 +86,24 @@ export function RunnerList() {
   )
 }
 
-function RunnerRow({ runner, now }: { runner: Runner; now: number }) {
+/** Running jobs first, then finished ones, newest first. */
+function byActivity(a: RunnerJob, b: RunnerJob): number {
+  const running = (j: RunnerJob) => (j.job.status === 'completed' ? 1 : 0)
+  return running(a) - running(b) || Date.parse(b.job.started_at ?? b.run.created_at) - Date.parse(a.job.started_at ?? a.run.created_at)
+}
+
+/** `jobs` undefined hides the job list; null shows it loading. */
+function RunnerRow({
+  runner,
+  now,
+  jobs,
+  jobsNow,
+}: {
+  runner: Runner
+  now: number
+  jobs: RunnerJob[] | null | undefined
+  jobsNow: number
+}) {
   const badge = BADGE[runner.status] ?? { variant: 'secondary' as const, label: runner.status }
   const job = runner.current_job
   return (
@@ -96,6 +141,33 @@ function RunnerRow({ runner, now }: { runner: Runner; now: number }) {
           </time>
         </span>
       </div>
+      {jobs !== undefined && (
+        <div className="ar-runner-row__jobs">
+          {jobs === null ? (
+            <Spinner size="small" srText={`Loading jobs for ${runner.name}`} />
+          ) : jobs.length === 0 ? (
+            <span className="ar-runner-row__none">No jobs yet</span>
+          ) : (
+            <ul className="ar-runner-jobs" aria-label={`Jobs on ${runner.name}`}>
+              {[...jobs].sort(byActivity).map(({ job, run }) => {
+                const seconds = elapsedSeconds(job.started_at, job.completed_at, jobsNow)
+                return (
+                  <li key={job.id} className="ar-runner-job" data-testid={`runner-job-${job.id}`}>
+                    <StatusIcon status={job.status} conclusion={job.conclusion} />
+                    <Link href={`/runs/${run.id}/jobs/${job.id}`} className="ar-runner-job__name">
+                      {job.name}
+                    </Link>
+                    <span className="ar-runner-job__run">
+                      {run.workflow} #{run.id}
+                    </span>
+                    <span className="ar-runner-job__time">{seconds === null ? '' : formatDuration(seconds)}</span>
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+        </div>
+      )}
     </li>
   )
 }

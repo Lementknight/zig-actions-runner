@@ -225,7 +225,7 @@ Runners response (a bare array, ordered by `name`):
 ### 5.4 Frontend pages
 
 - `/` run list: status icon, workflow, repo, branch, sha, age, duration.
-- `/runners` runner list: status badge, name, labels, last seen, current job (links to its run), running and completed job counts.
+- `/runners` runner list: status badge, name, labels, last seen, current job (links to its run), running and completed job counts. A "Show all jobs" switch (off by default) lists every running and finished job under its runner; there is no jobs endpoint, so it walks `GET /api/runs` and `GET /api/runs/:id`.
 - `/runs/:id` job list/graph with per-job status; selecting a job shows its steps.
 - Job view: collapsible steps, ANSI-colored log viewer, live tail while `in_progress`, timestamps toggle.
 - Must work with fake data from the M0 seed script.

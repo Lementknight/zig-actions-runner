@@ -31,7 +31,9 @@ export default function App() {
           <PlayIcon size={24} />
           Zig runner
         </Link>
-        <span className="ar-app-header__section">Actions</span>
+        <Link href="/" className="ar-app-header__link">
+          Actions
+        </Link>
         <Link href="/runners" className="ar-app-header__link">
           Runners
         </Link>

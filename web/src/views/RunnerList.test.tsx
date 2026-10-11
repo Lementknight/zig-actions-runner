@@ -1,8 +1,8 @@
-import { act, render, screen, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Router } from 'wouter'
 import { memoryLocation } from 'wouter/memory-location'
-import { ApiError, ApiProvider, type Runner } from '../api'
+import { ApiError, ApiProvider, type Run, type RunDetail, type Runner } from '../api'
 import { RUNNERS_POLL_MS } from '../hooks/useRunners'
 import { createScriptedApi, type ScriptedApi } from '../test/scriptedApi'
 import { RunnerList } from './RunnerList'
@@ -134,5 +134,99 @@ describe('RunnerList', () => {
     s.runners.push([runner('r1')])
     await elapse(RUNNERS_POLL_MS)
     expect(screen.queryByText(/Can't refresh runners/)).toBeNull()
+  })
+
+  describe('Show all jobs', () => {
+    const run: Run = {
+      id: 12,
+      repo: 'o/r',
+      workflow: 'CI',
+      event: 'push',
+      branch: 'main',
+      sha: 'abc',
+      status: 'in_progress',
+      conclusion: null,
+      created_at: '2026-10-11T11:55:00Z',
+      completed_at: null,
+    }
+    const job = (id: number, over: Record<string, unknown> = {}) => ({
+      id,
+      run_id: 12,
+      name: `job-${id}`,
+      runner_name: 'r1',
+      status: 'completed',
+      conclusion: 'success',
+      started_at: '2026-10-11T11:56:00Z',
+      completed_at: '2026-10-11T11:56:30Z',
+      steps: [],
+      ...over,
+    })
+    const detail: RunDetail = {
+      ...run,
+      jobs: [
+        job(1),
+        job(2, { status: 'in_progress', conclusion: null, completed_at: null, started_at: '2026-10-11T11:59:00Z' }),
+        job(3, { runner_name: 'other' }),
+        job(4, { runner_name: null, status: 'queued', conclusion: null, started_at: null, completed_at: null }),
+      ],
+    }
+
+    it('is off by default: no job list and no run requests', async () => {
+      s.runners.push([runner('r1')])
+      renderList()
+      await flush()
+      expect(screen.getByRole('button', { name: 'Show all jobs' })).toHaveAttribute('aria-pressed', 'false')
+      expect(screen.queryByRole('list', { name: 'Jobs on r1' })).toBeNull()
+      expect(s.runs.calls).toHaveLength(0)
+    })
+
+    it("lists each runner's running job first, then finished ones, and skips other runners' and unassigned jobs", async () => {
+      s.runners.always([runner('r1'), runner('other')])
+      s.runs.push([run])
+      s.run.push(detail)
+      renderList()
+      await flush()
+
+      fireEvent.click(screen.getByRole('button', { name: 'Show all jobs' }))
+      await flush()
+
+      const mine = within(screen.getByRole('list', { name: 'Jobs on r1' }))
+      expect(mine.getAllByRole('link').map((l) => l.textContent)).toEqual(['job-2', 'job-1'])
+      expect(mine.getByRole('link', { name: 'job-1' })).toHaveAttribute('href', '/runs/12/jobs/1')
+      expect(within(screen.getByTestId('runner-job-2')).getByRole('img', { name: 'In progress' })).toBeInTheDocument()
+      expect(within(screen.getByTestId('runner-job-1')).getByText('30s')).toBeInTheDocument()
+      expect(screen.getByTestId('runner-job-1')).toHaveTextContent('CI #12')
+      expect(screen.queryByTestId('runner-job-4')).toBeNull()
+      const other = within(screen.getByRole('list', { name: 'Jobs on other' }))
+      expect(other.getAllByRole('link').map((l) => l.textContent)).toEqual(['job-3'])
+    })
+
+    it('hides the jobs again and stops requesting runs when switched off', async () => {
+      s.runners.always([runner('r1')])
+      s.runs.always([run])
+      s.run.always(detail)
+      renderList()
+      await flush()
+      const toggle = screen.getByRole('button', { name: 'Show all jobs' })
+      fireEvent.click(toggle)
+      await flush()
+      expect(screen.getByRole('list', { name: 'Jobs on r1' })).toBeInTheDocument()
+
+      fireEvent.click(toggle)
+      const calls = s.runs.calls.length
+      await elapse(10_000)
+      expect(screen.queryByRole('list', { name: 'Jobs on r1' })).toBeNull()
+      expect(s.runs.calls).toHaveLength(calls)
+    })
+
+    it('says so when a runner has no jobs', async () => {
+      s.runners.always([runner('r1')])
+      s.runs.push([])
+      renderList()
+      await flush()
+      fireEvent.click(screen.getByRole('button', { name: 'Show all jobs' }))
+      await flush()
+      expect(screen.getByText('No jobs yet')).toBeInTheDocument()
+    })
   })
 })
