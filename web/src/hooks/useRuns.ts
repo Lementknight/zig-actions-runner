@@ -52,7 +52,7 @@ export function useRuns(): RunsState {
 }
 
 /** Resolves after `ms`, or as soon as the signal aborts. */
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
+export function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     const timer = setTimeout(done, ms)
     signal.addEventListener('abort', done, { once: true })

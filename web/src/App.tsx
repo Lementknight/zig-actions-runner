@@ -3,9 +3,10 @@ import { PlayIcon } from '@primer/octicons-react'
 import { Link, Route, Switch } from 'wouter'
 import { JobView } from './views/JobView'
 import { RunList } from './views/RunList'
+import { RunnerList } from './views/RunnerList'
 import { RunPage } from './views/RunPage'
 
-// The three routes (R16): RunList (U5), RunPage (U6), JobView (U4).
+// The routes (R16): RunList (U5), RunPage (U6), JobView (U4), RunnerList (U8).
 
 function NotFoundPage() {
   return (
@@ -31,6 +32,9 @@ export default function App() {
           Zig runner
         </Link>
         <span className="ar-app-header__section">Actions</span>
+        <Link href="/runners" className="ar-app-header__link">
+          Runners
+        </Link>
         <span className="ar-app-header__spacer" />
         {dataSource === 'fake' && <Label variant="attention">Fake data</Label>}
       </header>
@@ -38,6 +42,9 @@ export default function App() {
         <Switch>
           <Route path="/">
             <RunList />
+          </Route>
+          <Route path="/runners">
+            <RunnerList />
           </Route>
           <Route path="/runs/:id">
             {(params) => <RunPage key={params.id} runId={Number(params.id)} />}

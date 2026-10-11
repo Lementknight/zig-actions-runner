@@ -56,6 +56,11 @@ a:hover {
   color: var(--ar-fg-muted);
 }
 
+.ar-app-header__link {
+  color: var(--ar-fg-default);
+  font-size: var(--ar-text-sm);
+}
+
 .ar-app-header__spacer {
   flex: 1;
 }
