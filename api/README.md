@@ -1,0 +1,49 @@
+# api
+
+The read API over the runner's data (docs/SPEC.md §5.3): Hono on Node, `pg` for Postgres. It
+only reads. Every connection starts with `default_transaction_read_only=on`, so a write fails
+even if a route tried one (SPEC §4: only the runner writes).
+
+## Run
+
+```sh
+npm --prefix api ci
+DATABASE_URL=... npm --prefix api start      # PORT defaults to 8080
+```
+
+`DATABASE_URL` is required and is never printed. `web/`'s dev server proxies `/api` to
+`http://localhost:8080` (`API_PROXY_TARGET` overrides it).
+
+## Endpoints
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/health` | `{ "ok": true }` after a `SELECT 1`; 503 `{ "ok": false, ... }` when the database does not answer |
+| `GET /api/runs?repo=&limit=&before=` | A bare array of runs, newest first (`created_at DESC, id DESC`) |
+| `GET /api/runs/:id` | The run with `jobs[]` (by id), each with `steps[]` (by `number`) |
+
+- Fields are the table columns, snake_case. BIGINT ids are JSON numbers. Timestamps are ISO 8601
+  (`2026-10-11T12:00:00.000Z`); nullable columns are `null`.
+- `limit` defaults to 50; larger values are capped at 200. `before` is a run id and returns the
+  runs that sort after it, that is older. An empty parameter (`?repo=`) means absent.
+- A non-numeric or non-positive id, `limit` or `before` answers 400 `{ "error": "..." }`. An
+  unknown run or path answers 404 `{ "error": "not found" }`. A database failure answers 500
+  `{ "error": "internal error" }` and logs only the error message.
+
+## Test
+
+```sh
+npm --prefix api test
+```
+
+This typechecks, then runs the unit tests, which stub the database. The tests in
+`test/*.db.test.ts` run only when `DATABASE_URL` points at a database migrated and seeded as in
+`db/README.md`, and skip otherwise. Against a local container:
+
+```sh
+docker run -d --name tsdb -e POSTGRES_PASSWORD=postgres -p 5432:5432 timescale/timescaledb:latest-pg17
+export DATABASE_URL='postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable'
+dbmate --migrations-dir db/migrations --no-dump-schema --wait up
+psql "$DATABASE_URL" -f db/seed.sql
+npm --prefix api test
+```
