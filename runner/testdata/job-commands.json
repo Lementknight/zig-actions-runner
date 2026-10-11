@@ -1,0 +1,165 @@
+{
+ "plan": {
+  "planId": "p"
+ },
+ "jobId": "j",
+ "jobContainer": null,
+ "contextData": {
+  "job": {
+   "t": 2,
+   "d": [
+    {
+     "k": "check_run_id",
+     "v": 4250
+    }
+   ]
+  },
+  "github": {
+   "t": 2,
+   "d": [
+    {
+     "k": "repository",
+     "v": "Open-Blue/blog_cicd_test"
+    },
+    {
+     "k": "sha",
+     "v": "0bbbe3f5f48a35df62561b1f2eced354e1844544"
+    },
+    {
+     "k": "ref",
+     "v": "refs/heads/main"
+    },
+    {
+     "k": "ref_name",
+     "v": "main"
+    },
+    {
+     "k": "event_name",
+     "v": "push"
+    },
+    {
+     "k": "server_url",
+     "v": "https://github.com"
+    }
+   ]
+  }
+ },
+ "resources": {
+  "endpoints": [
+   {
+    "authorization": {
+     "parameters": {
+      "AccessToken": "fixture-token"
+     },
+     "scheme": "OAuth"
+    }
+   }
+  ]
+ },
+ "steps": [
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "id-1",
+   "contextName": "build",
+   "name": "build",
+   "condition": "success()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "script"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "mkdir -p /opt/mytool/bin && printf '#!/bin/sh\\necho mytool-ran\\n' > /opt/mytool/bin/mytool && chmod +x /opt/mytool/bin/mytool\necho \"version=1.2.3\" >> \"$GITHUB_OUTPUT\"\n{ echo \"notes<<EOF\"; echo \"line a\"; echo \"line b\"; echo \"EOF\"; } >> \"$GITHUB_OUTPUT\"\necho \"FROM_ENV=hello-from-env\" >> \"$GITHUB_ENV\"\necho \"GITHUB_SHA=evil\" >> \"$GITHUB_ENV\"\necho \"/opt/mytool/bin\" >> \"$GITHUB_PATH\"\necho \"wrote file commands in step $GITHUB_ACTION\" "
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "id-2",
+   "contextName": "use",
+   "name": "use",
+   "condition": "success()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "script"
+      },
+      "Value": {
+       "type": 3,
+       "expr": "format('echo version={0}; printf \"notes=%s\\\\n\" \"{1}\"; echo env=$FROM_ENV; mytool; echo sha=$GITHUB_SHA ci=$CI os=$RUNNER_OS repo=$GITHUB_REPOSITORY ws=$GITHUB_WORKSPACE', steps.build.outputs.version, steps.build.outputs.notes)"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "id-3",
+   "contextName": "bad",
+   "name": "bad",
+   "condition": "success()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "script"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "echo 'not a valid line' >> \"$GITHUB_OUTPUT\"; echo wrote-bad-output"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "id-4",
+   "contextName": "after",
+   "name": "after",
+   "condition": "always()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "script"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "echo after-bad"
+      }
+     }
+    ]
+   }
+  }
+ ]
+}
