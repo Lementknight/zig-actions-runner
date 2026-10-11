@@ -53,3 +53,26 @@ dbmate --migrations-dir db/migrations --no-dump-schema --wait up
 psql "$DATABASE_URL" -f db/seed.sql
 npm --prefix api test
 ```
+
+## Contract check
+
+`web/src/api/contract.test.ts` asserts the read API contract the frontend relies on. With
+`CONTRACT_API_URL` set it also runs against a real API. `scripts/contract-check.sh` starts this
+API on `CONTRACT_PORT` (default 8080), waits for `/api/health`, runs
+`CONTRACT_API_URL=http://localhost:<port>/api npm --prefix web test`, and stops the API. If
+anything fails, it prints the API's log. From the repo root, with the container above migrated
+and seeded and `DATABASE_URL` still exported:
+
+```sh
+npm --prefix api ci && npm --prefix web ci
+sh api/scripts/contract-check.sh
+```
+
+The contract needs the seed: it looks for a completed job with at least three log lines.
+
+## CI
+
+`.github/workflows/api.yml` runs the same check on every pull request. It starts a
+`timescale/timescaledb` service container, migrates and seeds it, runs `npm --prefix api test`
+with `DATABASE_URL` set (so the database tests run), then runs `api/scripts/contract-check.sh`.
+A failed api test or contract test fails the job. It never touches Tiger.

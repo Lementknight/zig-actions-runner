@@ -1,0 +1,65 @@
+# Read API (SPEC §5.3, api/README.md).
+# Every pull request: migrate and seed a throwaway TimescaleDB container, run api/'s tests against
+# it, then start api/ and run web/'s contract test against it. Never touches Tiger.
+name: api
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  DBMATE_VERSION: v2.36.0
+  DBMATE_MIGRATIONS_DIR: db/migrations
+  DBMATE_NO_DUMP_SCHEMA: "true"
+
+jobs:
+  contract:
+    name: API tests and web contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      tsdb:
+        image: timescale/timescaledb:latest-pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      # A throwaway container on the runner; not a secret.
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            api/package-lock.json
+            web/package-lock.json
+      - name: Install dbmate
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/dbmate \
+            "https://github.com/amacneil/dbmate/releases/download/${DBMATE_VERSION}/dbmate-linux-amd64"
+          sudo chmod +x /usr/local/bin/dbmate
+          dbmate --version
+      - name: Migrate
+        run: dbmate --wait up
+      - name: Seed
+        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f db/seed.sql
+      - name: Install api and web
+        run: |
+          npm --prefix api ci --no-audit --no-fund
+          npm --prefix web ci --no-audit --no-fund
+      - name: Test api
+        # DATABASE_URL is set, so the test/*.db.test.ts suites run against the seeded container.
+        run: npm --prefix api test
+      - name: Web contract test against the API
+        # Starts api/ on 8080 and runs CONTRACT_API_URL=http://localhost:8080/api npm --prefix web test.
+        run: sh api/scripts/contract-check.sh
