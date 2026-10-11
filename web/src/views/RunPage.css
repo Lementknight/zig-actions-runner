@@ -1,0 +1,123 @@
+/* Run page (U6), after GitHub's run summary: the jobs rail on the left (shared with the job
+   view, JobView.css), then a summary strip and the job cards on the right. */
+
+.ar-run-page__loading {
+  display: flex;
+  justify-content: center;
+  padding: var(--ar-space-12) var(--ar-space-6);
+}
+
+.ar-run-page__number {
+  color: var(--ar-fg-muted);
+}
+
+.ar-job-rail__summary[aria-current='page'] {
+  background: var(--ar-bg-selected);
+  font-weight: var(--ar-weight-semibold);
+}
+
+.ar-run-page__main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ar-space-4);
+  min-width: 0;
+}
+
+/* Summary strip */
+
+.ar-run-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ar-space-4) var(--ar-space-8);
+  padding: var(--ar-space-4);
+}
+
+.ar-run-summary__item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ar-space-1);
+  min-width: 0;
+}
+
+.ar-run-summary__item--wide {
+  flex: 1 1 auto;
+}
+
+.ar-run-summary__label {
+  color: var(--ar-fg-muted);
+  font-size: var(--ar-text-xs);
+}
+
+.ar-run-summary__value {
+  font-size: var(--ar-text-md);
+  font-weight: var(--ar-weight-semibold);
+  overflow-wrap: anywhere;
+}
+
+.ar-run-summary__status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ar-space-2);
+}
+
+.ar-run-summary__sha {
+  font-family: var(--ar-font-mono);
+  font-size: var(--ar-text-sm);
+  font-weight: var(--ar-weight-normal);
+  color: var(--ar-fg-muted);
+}
+
+/* Job cards: a vertical stack, no connectors, since jobs carry no dependencies (R4). */
+
+.ar-run-jobs {
+  padding: var(--ar-space-4);
+  background: var(--ar-bg-subtle);
+}
+
+.ar-run-jobs__heading {
+  margin: 0 0 var(--ar-space-3);
+  font-size: var(--ar-text-sm);
+  font-weight: var(--ar-weight-semibold);
+}
+
+.ar-run-jobs__list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ar-space-3);
+  max-width: var(--ar-sidebar-width);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ar-run-job {
+  display: flex;
+  align-items: center;
+  gap: var(--ar-space-2);
+  padding: var(--ar-space-2) var(--ar-space-3);
+  color: var(--ar-fg-default);
+  background: var(--ar-bg-canvas);
+  border: var(--ar-border-width) solid var(--ar-border-default);
+  border-radius: var(--ar-radius-md);
+  box-shadow: var(--ar-shadow-resting);
+  font-size: var(--ar-text-sm);
+}
+
+.ar-run-job:hover {
+  border-color: var(--ar-focus-outline);
+  text-decoration: none;
+}
+
+.ar-run-job__name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: var(--ar-weight-semibold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ar-run-job__duration {
+  color: var(--ar-fg-muted);
+  white-space: nowrap;
+}
