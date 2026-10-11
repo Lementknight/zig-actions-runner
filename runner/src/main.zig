@@ -15,6 +15,7 @@ comptime {
     _ = @import("inspect.zig");
     _ = @import("github/broker.zig");
     _ = @import("github/runservice.zig");
+    _ = @import("job.zig");
 }
 
 /// SPEC §2 exit codes.
