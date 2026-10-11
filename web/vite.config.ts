@@ -23,6 +23,9 @@ export default defineConfig(({ mode }) => {
       // and it shadows jsdom's working one. Turn Node's off in the test workers.
       execArgv: ['--no-experimental-webstorage'],
       css: true,
+      // @primer/react's dist imports its own .css files, which Node cannot load. Inlining it
+      // sends those imports through Vite's pipeline instead.
+      server: { deps: { inline: [/@primer\/react/] } },
     },
   }
 })
