@@ -32,6 +32,8 @@ pub const Config = struct {
     log_flush_lines: u32 = 200,
     log_flush_ms: u32 = 500,
     dry_run: bool = false,
+    /// Register one runner, print the shape of its config, delete it, exit.
+    inspect: bool = false,
 
     pub const Error = error{ MissingGhToken, MissingGhScope, InvalidScope, InvalidNumber, UnknownFlag, MissingFlagValue };
 
@@ -54,6 +56,10 @@ pub const Config = struct {
             const arg: []const u8 = args[i];
             if (std.mem.eql(u8, arg, "--dry-run")) {
                 c.dry_run = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--inspect")) {
+                c.inspect = true;
                 continue;
             }
             if (!std.mem.startsWith(u8, arg, "--")) return error.UnknownFlag;

@@ -1,6 +1,7 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const jitconfig = @import("github/jitconfig.zig");
+const inspect = @import("inspect.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
 
@@ -11,6 +12,8 @@ comptime {
     _ = @import("github/jitconfig.zig");
     _ = @import("github/rsa_sign.zig");
     _ = @import("github/auth.zig");
+    _ = @import("inspect.zig");
+    _ = @import("github/broker.zig");
 }
 
 /// SPEC §2 exit codes.
@@ -45,6 +48,11 @@ pub fn main(init: std.process.Init) !u8 {
     if (cfg.dry_run) {
         try log.append(0, 0, .stdout, try std.fmt.allocPrint(arena, "dry run: would register runner '{s}' with labels '{s}'", .{ name, cfg.labels }));
         return @backingInt(Exit.done);
+    }
+
+    if (cfg.inspect) {
+        const code = try inspect.run(arena, io, &cfg, name, &out_w.interface);
+        return code;
     }
 
     var status: std.http.Status = .ok;

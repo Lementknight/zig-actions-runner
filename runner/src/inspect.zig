@@ -1,0 +1,148 @@
+//! `--inspect`: probe the live JIT/OAuth flow without exposing secrets.
+//! Prints the shape of every decoded config file (key names, types, lengths). Only `.runner`,
+//! which holds URLs and ids, has its values printed. Always deletes the runner it registered.
+const std = @import("std");
+const Config = @import("config.zig").Config;
+const jitconfig = @import("github/jitconfig.zig");
+const auth = @import("github/auth.zig");
+const broker = @import("github/broker.zig");
+
+const Allocator = std.mem.Allocator;
+
+pub fn run(arena: Allocator, io: std.Io, cfg: *const Config, name: []const u8, out: *std.Io.Writer) !u8 {
+    broker.trace = true;
+    var status: std.http.Status = .ok;
+    const jit = jitconfig.generate(arena, io, cfg, name, &status) catch |e| {
+        try out.print("generate-jitconfig failed: {s} (HTTP {d})\n", .{ @errorName(e), @backingInt(status) });
+        return 2;
+    };
+    defer cleanup(arena, io, cfg, jit.runner_id, out);
+
+    try out.print("registered runner '{s}' id={d}, {d} files\n", .{ jit.runner_name, jit.runner_id, jit.files.len });
+    for (jit.files) |f| {
+        try out.print("\n== {s} ({d} bytes)\n", .{ f.name, f.content.len });
+        const show_values = std.mem.eql(u8, f.name, ".runner");
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, f.content, .{}) catch {
+            try out.writeAll("  (not JSON)\n");
+            continue;
+        };
+        try shape(out, parsed, 1, show_values);
+    }
+
+    const creds = auth.parseCredentials(arena, jit.files) catch |e| {
+        try out.print("\nparseCredentials failed: {s}\n", .{@errorName(e)});
+        return 2;
+    };
+    var jti: [8]u8 = undefined;
+    io.random(&jti);
+    const jti_hex = try std.fmt.allocPrint(arena, "{x}", .{jti});
+    const now = std.Io.Clock.real.now(io).toSeconds();
+    const jwt = try auth.buildJwt(arena, creds, now, jti_hex);
+    const token = auth.fetchAccessToken(arena, io, creds, jwt, &status) catch |e| {
+        try out.print("\nOAuth token exchange failed: {s} (HTTP {d})\n", .{ @errorName(e), @backingInt(status) });
+        return 2;
+    };
+    try out.print("\nOAuth token exchange: HTTP {d}, access_token {d} chars\n", .{ @backingInt(status), token.len });
+
+    const settings = try broker.parseSettings(arena, jit.files);
+    const base = try std.fmt.allocPrint(arena, "{s}{s}", .{ settings.broker_url, if (std.mem.endsWith(u8, settings.broker_url, "/")) "" else "/" });
+    const body = try broker.sessionBody(arena, settings, "zig-inspect");
+    const url = try std.fmt.allocPrint(arena, "{s}session", .{base});
+    try out.print("\nPOST session ... (body {d} bytes)\n", .{body.len});
+    try out.flush();
+    const resp = try broker.call(arena, io, .POST, url, token, body);
+    try out.print("\nPOST session -> HTTP {d}\n", .{@backingInt(resp.status)});
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, resp.body, .{}) catch null;
+    if (resp.status.class() == .success) {
+        // Session responses can carry an encryption key: shape only.
+        if (parsed) |v| try shape(out, v, 1, false) else try out.print("  (non-JSON, {d} bytes)\n", .{resp.body.len});
+        if (parsed) |v| if (v == .object) if (v.object.get("sessionId")) |sid| if (sid == .string) {
+            // Poll until a message arrives (up to ~5 min). Message bodies can hold tokens: shape only.
+            var polls: usize = 0;
+            while (polls < 6) : (polls += 1) {
+                try out.print("GET message (poll {d}, long-poll ~50s) ...\n", .{polls + 1});
+                try out.flush();
+                const m = try broker.call(arena, io, .GET, try broker.messageUrl(arena, base, sid.string, "Online"), token, null);
+                try out.print("GET message -> HTTP {d}, {d} body bytes\n", .{ @backingInt(m.status), m.body.len });
+                if (m.status.class() != .success) {
+                    try out.print("  error body: {s}\n", .{m.body[0..@min(m.body.len, 400)]});
+                    break;
+                }
+                if (m.body.len == 0) continue;
+                const mv = std.json.parseFromSliceLeaky(std.json.Value, arena, m.body, .{}) catch {
+                    try out.writeAll("  (non-JSON body)\n");
+                    break;
+                };
+                try shape(out, mv, 1, false);
+                // v2 job requests nest another JSON document in `body`.
+                if (mv == .object) if (mv.object.get("body")) |bv| if (bv == .string) {
+                    if (std.json.parseFromSliceLeaky(std.json.Value, arena, bv.string, .{}) catch null) |inner| {
+                        try out.writeAll("  body (parsed):\n");
+                        try shape(out, inner, 2, false);
+                        if (inner == .object) if (inner.object.get("run_service_url")) |u| if (u == .string)
+                            try out.print("  run_service_url host: {s}\n", .{hostOnly(u.string)});
+                    } else try out.writeAll("  body is not JSON\n");
+                };
+                if (mv == .object) for ([_][]const u8{ "messageType", "MessageType" }) |k| if (mv.object.get(k)) |t| if (t == .string)
+                    try out.print("  message type: {s}\n", .{t.string});
+                break;
+            }
+            const q = try std.fmt.allocPrint(arena, "{s}session?sessionId={s}", .{ base, sid.string });
+            const d = try broker.call(arena, io, .DELETE, q, token, null);
+            try out.print("DELETE session -> HTTP {d}\n", .{@backingInt(d.status)});
+        };
+    } else {
+        // Error bodies are small and carry no credentials.
+        try out.print("  body: {s}\n", .{resp.body[0..@min(resp.body.len, 600)]});
+    }
+    return 0;
+}
+
+fn cleanup(arena: Allocator, io: std.Io, cfg: *const Config, runner_id: u64, out: *std.Io.Writer) void {
+    const st = jitconfig.deleteRunner(arena, io, cfg, runner_id) catch |e| {
+        out.print("!! cleanup failed: {s}; delete runner id {d} manually\n", .{ @errorName(e), runner_id }) catch {};
+        return;
+    };
+    out.print("cleanup: DELETE runner {d} -> HTTP {d}\n", .{ runner_id, @backingInt(st) }) catch {};
+}
+
+fn shape(w: *std.Io.Writer, v: std.json.Value, depth: usize, show: bool) !void {
+    switch (v) {
+        .object => |o| {
+            var it = o.iterator();
+            while (it.next()) |e| {
+                try w.splatByteAll(0x20, depth * 2);
+                try w.print("{s}: ", .{e.key_ptr.*});
+                switch (e.value_ptr.*) {
+                    .object, .array => {
+                        try w.print("{s}\n", .{@tagName(e.value_ptr.*)});
+                        try shape(w, e.value_ptr.*, depth + 1, show);
+                    },
+                    else => try scalar(w, e.value_ptr.*, show),
+                }
+            }
+        },
+        .array => |a| {
+            try w.splatByteAll(0x20, depth * 2);
+            try w.print("[{d} items]\n", .{a.items.len});
+        },
+        else => {},
+    }
+}
+
+fn scalar(w: *std.Io.Writer, v: std.json.Value, show: bool) !void {
+    switch (v) {
+        .string => |s| if (show) try w.print("\"{s}\"\n", .{hostOnly(s)}) else try w.print("string({d})\n", .{s.len}),
+        .integer => |i| if (show) try w.print("{d}\n", .{i}) else try w.writeAll("integer\n"),
+        .bool => |b| if (show) try w.print("{}\n", .{b}) else try w.writeAll("bool\n"),
+        .null => try w.writeAll("null\n"),
+        else => try w.print("{s}\n", .{@tagName(v)}),
+    }
+}
+
+/// URLs often carry per-runner tokens in the path; keep scheme and host only.
+fn hostOnly(s: []const u8) []const u8 {
+    const scheme = std.mem.indexOf(u8, s, "://") orelse return s;
+    const path = std.mem.indexOfScalarPos(u8, s, scheme + 3, '/') orelse return s;
+    return s[0..path];
+}

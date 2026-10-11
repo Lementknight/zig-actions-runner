@@ -29,6 +29,24 @@ fn runnersUrl(arena: Allocator, cfg: *const Config) Allocator.Error![]const u8 {
     };
 }
 
+/// Removes a registered runner (cleanup for runners that never ran a job).
+pub fn deleteRunner(arena: Allocator, io: std.Io, cfg: *const Config, runner_id: u64) Error!std.http.Status {
+    const url = try std.fmt.allocPrint(arena, "{s}/{d}", .{ try runnersUrl(arena, cfg), runner_id });
+    const auth = try std.fmt.allocPrint(arena, "Bearer {s}", .{cfg.gh_token});
+    var client: std.http.Client = .{ .allocator = arena, .io = io };
+    defer client.deinit();
+    const result = try client.fetch(.{
+        .location = .{ .url = url },
+        .method = .DELETE,
+        .headers = .{ .authorization = .{ .override = auth } },
+        .extra_headers = &.{
+            .{ .name = "Accept", .value = "application/vnd.github+json" },
+            .{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" },
+        },
+    });
+    return result.status;
+}
+
 /// Request a JIT config for `name`. All returned memory is allocated from `arena`.
 /// `status_out` receives the HTTP status for diagnostics.
 pub fn generate(
