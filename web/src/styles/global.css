@@ -1,0 +1,133 @@
+/*
+ * App shell styles. Read only --ar-* tokens from tokens.css; no hex or pixel literals here.
+ */
+
+html,
+body {
+  margin: 0;
+  background: var(--ar-bg-canvas);
+  color: var(--ar-fg-default);
+  font-family: var(--ar-font-sans);
+  font-size: var(--ar-text-md);
+  line-height: var(--ar-line-normal);
+}
+
+a {
+  color: var(--ar-fg-link);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+:focus-visible {
+  outline: var(--ar-border-width-thick) solid var(--ar-focus-outline);
+  outline-offset: calc(-1 * var(--ar-border-width-thick));
+}
+
+/* Header bar across the top of every page */
+
+.ar-app-header {
+  display: flex;
+  align-items: center;
+  gap: var(--ar-space-3);
+  min-height: var(--ar-header-height);
+  padding: 0 var(--ar-space-4);
+  background: var(--ar-bg-subtle);
+  border-bottom: var(--ar-border-width) solid var(--ar-border-default);
+  box-sizing: border-box;
+}
+
+.ar-app-header__brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ar-space-2);
+  color: var(--ar-fg-default);
+  font-size: var(--ar-text-md);
+  font-weight: var(--ar-weight-semibold);
+}
+
+.ar-app-header__brand:hover {
+  text-decoration: none;
+}
+
+.ar-app-header__section {
+  color: var(--ar-fg-muted);
+}
+
+.ar-app-header__spacer {
+  flex: 1;
+}
+
+/* Page body */
+
+.ar-page {
+  max-width: var(--ar-page-max-width);
+  margin: 0 auto;
+  padding: var(--ar-space-6) var(--ar-space-4);
+  box-sizing: border-box;
+}
+
+@media (min-width: 48em) {
+  .ar-app-header {
+    padding: 0 var(--ar-space-6);
+  }
+
+  .ar-page {
+    padding: var(--ar-space-6) var(--ar-space-8);
+  }
+}
+
+.ar-page-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--ar-space-2);
+  margin-bottom: var(--ar-space-4);
+}
+
+.ar-page-title {
+  margin: 0;
+  font-size: var(--ar-text-xl);
+  font-weight: var(--ar-weight-normal);
+  line-height: var(--ar-line-tight);
+}
+
+.ar-page-subtitle {
+  margin: 0;
+  color: var(--ar-fg-muted);
+  font-size: var(--ar-text-sm);
+}
+
+/* Bordered box, GitHub's container for lists of runs, jobs and steps */
+
+.ar-box {
+  background: var(--ar-bg-canvas);
+  border: var(--ar-border-width) solid var(--ar-border-default);
+  border-radius: var(--ar-radius-md);
+}
+
+/* Empty and placeholder states */
+
+.ar-blankslate {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--ar-space-2);
+  padding: var(--ar-space-12) var(--ar-space-6);
+  text-align: center;
+  color: var(--ar-fg-muted);
+}
+
+.ar-blankslate__title {
+  margin: 0;
+  color: var(--ar-fg-default);
+  font-size: var(--ar-text-lg);
+  font-weight: var(--ar-weight-semibold);
+}
+
+.ar-blankslate__body {
+  margin: 0;
+  max-width: 60ch;
+}
