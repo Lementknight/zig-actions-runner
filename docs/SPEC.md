@@ -42,6 +42,37 @@ Flags: `--token`, `--scope`, `--labels`, `--group-id`, `--name-prefix`, `--datab
 
 Exit codes: `0` job done (ephemeral exit), `1` config error, `2` GitHub auth/protocol error, `3` DB unavailable.
 
+### 2.1 Database connection (`DATABASE_URL`)
+
+`DATABASE_URL` is a libpq-style URL, `postgres://user:password@host:port/database?sslmode=require`
+(`postgresql://` is also accepted). `user`, `password`, `host` and `database` are percent-decoded,
+so a password holding `@`, `/` or `%` is written `%40`, `%2F`, `%25`. Defaults: port `5432`,
+database = user, `sslmode=require`. `sslmode` follows libpq: `disable`; `allow` and `prefer` (TLS
+when the server offers it, plaintext otherwise); `require` (TLS, no certificate check; the setting
+Tiger Data documents); `verify-ca` (chain checked against the system CA store); `verify-full` (chain
+and host name). Only `sslmode` is read from the query string; other parameters are ignored. A
+malformed URL is a config error (exit 1).
+
+With `DATABASE_URL` set the runner connects at startup, before registering anything, and exits 3
+when the server is unreachable, refuses TLS, or rejects the credentials. `--dry-run` and `--inspect`
+make the same check. `--inspect` prints `database: PostgreSQL <server_version>, timescaledb
+<extversion>` and, when only `DATABASE_URL` is set (no `GH_TOKEN`), stops there with exit 0. Without
+`DATABASE_URL` nothing database-related runs and the runner behaves as before.
+
+The URL and the decoded password are on the redaction list (§9); neither appears in any output.
+
+**Client, decided 2026-10-11 (closes the DESIGN §9 question).** The runner speaks the PostgreSQL
+wire protocol itself from `std`, in `runner/src/db/`: SSLRequest, `std.crypto.tls.Client`, the
+startup message, SCRAM-SHA-256 (`std.crypto` PBKDF2, HMAC and SHA-256, checked against the RFC 7677
+test vector) and the simple query protocol; #27 adds the extended protocol and batched inserts on
+the same connection. libpq was already ruled out by §7 (dynamic libpq and OpenSSL). `pg.zig` was
+checked the same day: it builds and its tests run on Zig 0.17.0 and it speaks SCRAM, but its TLS is
+OpenSSL only (libc plus dynamic system libraries), which loses the single static binary for the same
+reason as libpq, and Tiger Data requires TLS. Not supported, by choice: MD5 password authentication,
+channel binding (`SCRAM-SHA-256-PLUS`), passwords that SASLprep would alter (non-ASCII), and a
+connect timeout, which Zig 0.17's `std.Io` does not implement for TCP connects (it panics), so the
+operating system's TCP timeout applies.
+
 ## 3. GitHub interaction
 
 Documented:
