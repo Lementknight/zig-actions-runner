@@ -4,12 +4,13 @@ Status: draft v0.1 · Audience: the whole team · Companion: [SPEC.md](SPEC.md)
 
 ## 1. Problem
 
-The official GitHub Actions runner is a .NET listener plus a worker process per job. It is CPU- and memory-heavy, which makes running many runners on one self-hosted machine impractical. Its logs are also only viewable in GitHub's UI.
+Small engineering teams want CI/CD built into their normal workflow without paying a hosted provider, so they self-host GitHub Actions runners. That breaks down at their scale. The official runner is a .NET listener plus a worker process per job, and it is CPU- and memory-heavy. A small team has one machine, not a cluster of servers, so the CPU is the bottleneck. It caps how many runners can poll for jobs concurrently, and once it does, self-hosting no longer beats the hosted option. The official runner's logs are also only viewable in GitHub's UI.
 
 ## 2. Goals
 
 - A single static **Zig** binary that registers as a real self-hosted runner and claims jobs natively (`runs-on: self-hosted`).
-- Low idle cost, so one machine can host many runners.
+- Low idle cost, so one machine can host many runners, including the machines a team already develops on when it has no server.
+- Drop-in for teams that know GitHub Actions: the runner accepts the same workflow syntax, so migrating needs no change to what they already know. Parity is a documented subset (see Non-goals and SPEC §6).
 - Each job executes as a **Dagger** pipeline, so repeated work is cached.
 - Logs and run state are stored in **Tiger Data** (Postgres + TimescaleDB).
 - A **new frontend** that reproduces the GitHub Actions experience (run list, job graph, live logs) from that data.
