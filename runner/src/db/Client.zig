@@ -1,7 +1,8 @@
 //! Minimal PostgreSQL client on std alone (#26): TCP, SSLRequest then `std.crypto.tls.Client`,
-//! the startup message, SCRAM-SHA-256 (scram.zig) and the simple query protocol. Enough to reach
-//! Tiger Data, which requires TLS and SCRAM, from a single static binary (SPEC §7). Card #27 adds
-//! parameterized queries and batched inserts on top of `send`/`recv`.
+//! the startup message, SCRAM-SHA-256 (scram.zig), the simple query protocol and, for writes, the
+//! extended query protocol (`exec`: Parse / Bind / Execute / Sync with text parameters). Enough to
+//! reach Tiger Data, which requires TLS and SCRAM, from a single static binary (SPEC §7).
+//! Reconnecting and batched inserts live in Db.zig.
 //!
 //! Nothing here writes to stdout or stderr. Server error text is kept in `last_error` for the
 //! caller to print through the redaction list; it never carries the URL or the password.
@@ -26,8 +27,11 @@ w: *Io.Writer,
 encrypted: bool,
 /// `server_version` from the startup ParameterStatus messages, e.g. "17.6".
 server_version: []const u8 = "",
-/// "SEVERITY SQLSTATE: message" of the last ErrorResponse, for diagnostics.
+/// "SEVERITY SQLSTATE: message" of the last ErrorResponse, for diagnostics. After `exec` the
+/// message has the statement's parameter values scrubbed out.
 last_error: ?[]const u8 = null,
+/// SQLSTATE of the last ErrorResponse, e.g. "23505".
+last_sqlstate: ?[]const u8 = null,
 
 pub const Options = struct {
     application_name: []const u8 = "zig-actions-runner",
@@ -51,8 +55,11 @@ pub const Error = error{
     AuthenticationFailed,
     /// Any other ErrorResponse during startup: see `last_error`.
     StartupFailed,
-    /// The query returned an ErrorResponse: see `last_error`.
+    /// The query returned an ErrorResponse: see `last_error` and `last_sqlstate`. The connection
+    /// stays usable.
     QueryFailed,
+    /// More than `max_params` parameters in one statement.
+    TooManyParameters,
     UnexpectedMessage,
     InvalidMessage,
 };
@@ -161,12 +168,17 @@ fn startTls(c: *Client, arena: Allocator, u: url_mod.Url) !void {
 /// Writes one frontend message: the type byte (none for the startup message), int32 length
 /// including itself, then `body`. Flushes through to the socket.
 pub fn send(c: *Client, msg_type: ?u8, body: []const u8) !void {
+    try c.write(msg_type, body);
+    try c.flush();
+}
+
+/// `send` without the flush, so several messages leave in one write.
+fn write(c: *Client, msg_type: ?u8, body: []const u8) !void {
     if (msg_type) |t| try c.w.writeByte(t);
     var len: [4]u8 = undefined;
     std.mem.writeInt(u32, &len, @intCast(body.len + 4), .big);
     try c.w.writeAll(&len);
     try c.w.writeAll(body);
-    try c.flush();
 }
 
 /// The TLS writer's flush only encrypts into the socket writer's buffer, so both are flushed.
@@ -352,6 +364,105 @@ pub fn queryScalar(c: *Client, arena: Allocator, sql: []const u8) !?[]const u8 {
     return res.rows[0][0];
 }
 
+/// A text parameter; null is SQL NULL.
+pub const Param = ?[]const u8;
+
+/// The protocol's parameter count is a 16-bit field.
+pub const max_params = 65535;
+
+/// Runs one statement through the extended query protocol with text parameters (`$1`, `$2`, ...)
+/// and returns the rows it affected (0 for statements without a count). Result rows are read and
+/// dropped. The types of the parameters are inferred by the server, as `psql` does with literals.
+///
+/// A server error returns `error.QueryFailed` with `last_error` and `last_sqlstate` set; the message
+/// is scrubbed of the parameter values (`scrub`), and the connection stays usable. Any other error
+/// means the connection is broken.
+pub fn exec(c: *Client, arena: Allocator, sql: []const u8, params: []const Param) !u64 {
+    if (params.len > max_params) return error.TooManyParameters;
+    // Encoded before anything is written, so a bad parameter cannot leave half a request buffered.
+    const parse = try encodeParse(arena, sql);
+    const bind = try encodeBind(arena, params);
+    try c.write('P', parse); // unnamed statement, types inferred
+    try c.write('B', bind); // unnamed portal
+    try c.write('E', "\x00\x00\x00\x00\x00"); // unnamed portal, no row limit
+    try c.write('S', ""); // Sync: end of the extended query; the server answers ReadyForQuery
+    try c.flush();
+
+    var affected: u64 = 0;
+    var failed = false;
+    while (true) {
+        const m = try c.recv(arena);
+        switch (m.kind) {
+            '1', '2', 'n', 'D', 'N', 'I', 's' => {}, // Parse/BindComplete, NoData, DataRow, Notice, EmptyQuery, PortalSuspended
+            'C' => affected = affectedRows(std.mem.sliceTo(m.body, 0)),
+            'E' => {
+                _ = c.recordError(arena, m.body);
+                if (c.last_error) |e| c.last_error = scrub(arena, e, params) catch null;
+                failed = true;
+            },
+            'Z' => break, // ReadyForQuery: after an error the server skipped to the Sync
+            else => return error.UnexpectedMessage,
+        }
+    }
+    if (failed) return error.QueryFailed;
+    return affected;
+}
+
+/// Parse: unnamed statement, the SQL, and no parameter type OIDs (the server infers them).
+fn encodeParse(arena: Allocator, sql: []const u8) ![]const u8 {
+    return std.mem.concat(arena, u8, &.{ "\x00", sql, "\x00", "\x00\x00" });
+}
+
+/// Bind: unnamed portal and statement, no format codes (all text), the parameters as int32 length
+/// plus bytes (-1 for NULL), no result format codes (all text).
+fn encodeBind(arena: Allocator, params: []const Param) ![]const u8 {
+    var size: usize = 2 + 2 + 2 + 2;
+    for (params) |p| size += 4 + if (p) |v| v.len else 0;
+    var b: std.ArrayList(u8) = try .initCapacity(arena, size);
+    b.appendSliceAssumeCapacity("\x00\x00\x00\x00"); // portal "", statement "", 0 format codes
+    var n: [4]u8 = undefined;
+    std.mem.writeInt(u16, n[0..2], @intCast(params.len), .big);
+    b.appendSliceAssumeCapacity(n[0..2]);
+    for (params) |p| {
+        if (p) |v| {
+            std.mem.writeInt(i32, &n, std.math.cast(i32, v.len) orelse return error.InvalidMessage, .big);
+            b.appendSliceAssumeCapacity(&n);
+            b.appendSliceAssumeCapacity(v);
+        } else {
+            std.mem.writeInt(i32, &n, -1, .big);
+            b.appendSliceAssumeCapacity(&n);
+        }
+    }
+    b.appendSliceAssumeCapacity("\x00\x00"); // 0 result format codes
+    return b.items;
+}
+
+/// The row count at the end of a CommandComplete tag ("INSERT 0 5", "UPDATE 3", "SELECT 2");
+/// 0 when the tag carries none ("CREATE TABLE").
+fn affectedRows(tag: []const u8) u64 {
+    const last = tag[(std.mem.lastIndexOfScalar(u8, tag, ' ') orelse return 0) + 1 ..];
+    return std.fmt.parseInt(u64, last, 10) catch 0;
+}
+
+/// Removes parameter values from a server error message. PostgreSQL quotes an offending input
+/// value whole (`invalid input syntax for type bigint: "abc"`), so a quoted parameter becomes
+/// `"***"`; values of `scrub_min_len` bytes or more are also removed wherever they appear. Shorter
+/// unquoted values are left, since they would also erase ordinary words and numbers. Row values in
+/// the DETAIL field never reach `last_error`.
+pub fn scrub(arena: Allocator, message: []const u8, params: []const Param) ![]const u8 {
+    var out: []const u8 = message;
+    for (params) |p| {
+        const v = p orelse continue;
+        if (v.len == 0) continue;
+        const quoted = try std.mem.concat(arena, u8, &.{ "\"", v, "\"" });
+        out = try std.mem.replaceOwned(u8, arena, out, quoted, "\"***\"");
+        if (v.len >= scrub_min_len) out = try std.mem.replaceOwned(u8, arena, out, v, "***");
+    }
+    return out;
+}
+
+const scrub_min_len = 6;
+
 pub const Versions = struct {
     /// PostgreSQL's `server_version`, e.g. "17.6".
     server: []const u8,
@@ -394,7 +505,9 @@ fn recordError(c: *Client, arena: Allocator, body: []const u8) []const u8 {
         p += 1 + val.len + 1;
     }
     c.last_error = std.fmt.allocPrint(arena, "{s} {s}: {s}", .{ severity, code, message }) catch null;
-    return arena.dupe(u8, code) catch "";
+    const owned = arena.dupe(u8, code) catch "";
+    c.last_sqlstate = owned;
+    return owned;
 }
 
 test "offersMechanism" {
@@ -408,9 +521,43 @@ test "recordError parses severity, code and message" {
     defer a.deinit();
     var c: Client = undefined;
     c.last_error = null;
+    c.last_sqlstate = null;
     const code = c.recordError(a.allocator(), "SFATAL\x00VFATAL\x00C28P01\x00Mpassword authentication failed for user \"x\"\x00Fauth.c\x00\x00");
     try std.testing.expectEqualStrings("28P01", code);
     try std.testing.expectEqualStrings("FATAL 28P01: password authentication failed for user \"x\"", c.last_error.?);
+}
+
+test "encodeBind writes text parameters and NULL" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const b = try encodeBind(a.allocator(), &.{ "ab", null, "" });
+    try std.testing.expectEqualSlices(u8, "\x00\x00\x00\x00" ++ "\x00\x03" ++
+        "\x00\x00\x00\x02ab" ++ "\xff\xff\xff\xff" ++ "\x00\x00\x00\x00" ++ "\x00\x00", b);
+    try std.testing.expectEqualSlices(u8, "\x00SELECT $1\x00\x00\x00", try encodeParse(a.allocator(), "SELECT $1"));
+}
+
+test "affectedRows reads the count from the command tag" {
+    try std.testing.expectEqual(@as(u64, 5), affectedRows("INSERT 0 5"));
+    try std.testing.expectEqual(@as(u64, 3), affectedRows("UPDATE 3"));
+    try std.testing.expectEqual(@as(u64, 2), affectedRows("SELECT 2"));
+    try std.testing.expectEqual(@as(u64, 0), affectedRows("CREATE TABLE"));
+    try std.testing.expectEqual(@as(u64, 0), affectedRows(""));
+}
+
+test "scrub removes parameter values from server messages" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    try std.testing.expectEqualStrings(
+        "invalid input syntax for type bigint: \"***\"",
+        try scrub(arena, "invalid input syntax for type bigint: \"abc\"", &.{ "1", "abc", null }),
+    );
+    // Long values go wherever they appear; short unquoted ones are left alone.
+    try std.testing.expectEqualStrings(
+        "value *** is too long for 1 column",
+        try scrub(arena, "value s3cr3t-line is too long for 1 column", &.{ "s3cr3t-line", "1" }),
+    );
+    try std.testing.expectEqualStrings("no values here", try scrub(arena, "no values here", &.{ null, "" }));
 }
 
 // Live check against a database. Skips unless `DATABASE_URL` is set; prints nothing from it.

@@ -73,6 +73,19 @@ channel binding (`SCRAM-SHA-256-PLUS`), passwords that SASLprep would alter (non
 connect timeout, which Zig 0.17's `std.Io` does not implement for TCP connects (it panics), so the
 operating system's TCP timeout applies.
 
+**Writes (#27).** `Client.exec(sql, params)` runs one statement through the extended query protocol
+(Parse, Bind, Execute, Sync in one write) with text parameters, `null` for NULL, types inferred by
+the server, and returns the affected row count. `Db` (`runner/src/db/Db.zig`) is the runner's write
+handle: it connects on first use, reopens a dropped connection and retries the statement once, so
+every statement sent through it must be idempotent (upserts, `ON CONFLICT DO NOTHING`). After a
+failed connect it fails fast with `DatabaseUnavailable` for 5 s instead of dialling on every call.
+`Db.insertMany` builds `INSERT ... VALUES ($1, ...), (...)` and splits rows across statements at the
+protocol's 65535-parameter limit (10922 rows of `job_logs`' six columns); each statement commits on
+its own. A server error is `error.QueryFailed` with the SQLSTATE and message kept on the handle; the
+message has the statement's parameter values scrubbed (a quoted value becomes `"***"`, a value of 6
+bytes or more is removed anywhere), and the DETAIL field, where PostgreSQL echoes row values, is
+never kept. The caller still prints it through the redaction list.
+
 ## 3. GitHub interaction
 
 Documented:
