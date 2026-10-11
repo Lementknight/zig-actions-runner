@@ -440,7 +440,10 @@ const Evaluator = struct {
         runner_fields[3] = .{ .key = "temp", .value = .{ .string = "/tmp" } };
         runner_fields[4] = .{ .key = "tool_cache", .value = .{ .string = "/opt/hostedtoolcache" } };
 
-        const ctxs = try arena.alloc(expr.Value.Entry, 10);
+        const secret_entries = try arena.alloc(expr.Value.Entry, ev.job.secret_vars.len);
+        for (ev.job.secret_vars, secret_entries) |sv, *o| o.* = .{ .key = sv.name, .value = .{ .string = sv.value } };
+
+        const ctxs = try arena.alloc(expr.Value.Entry, 11);
         ctxs[0] = .{ .key = "github", .value = ev.github };
         ctxs[1] = .{ .key = "env", .value = .{ .object = env_entries } };
         ctxs[2] = .{ .key = "steps", .value = .{ .object = step_entries } };
@@ -451,10 +454,10 @@ const Evaluator = struct {
         ctxs[7] = .{ .key = "needs", .value = ev.needs };
         ctxs[8] = .{ .key = "strategy", .value = ev.strategy };
         ctxs[9] = .{ .key = "vars", .value = ev.vars };
+        ctxs[10] = .{ .key = "secrets", .value = .{ .object = secret_entries } };
         return .{
             .contexts = ctxs,
             .job_failed = ev.job_failed,
-            .unsupported_contexts = &.{"secrets"},
             .diag = &ev.diag,
         };
     }
@@ -534,6 +537,72 @@ const Evaluator = struct {
         return out.items;
     }
 };
+
+// --- secrets in the environment ---
+
+/// Whether a value contains a secret. Such env values reach the step through a Dagger secret
+/// (`withSecretVariable`), so they are not written into the command (which Dagger would keep in its
+/// cache metadata and print in its progress log). Very short secret values are ignored: they would
+/// match unrelated text.
+fn containsSecret(job: job_mod.Job, value: []const u8) bool {
+    for (job.secrets) |sec| if (sec.len >= 3 and std.mem.indexOf(u8, value, sec) != null) return true;
+    return false;
+}
+
+const SecretRef = struct { name: []const u8, id: []const u8 };
+
+/// Registers `plaintext` as a Dagger secret in this session and returns its id.
+fn newSecret(arena: Allocator, t: Transport, counter: *u32, plaintext: []const u8, err_msg: *[]const u8) ![]const u8 {
+    counter.* += 1;
+    var doc: std.Io.Writer.Allocating = .init(arena);
+    const w = &doc.writer;
+    try w.print("{{ setSecret(name:\"zig-secret-{d}\",plaintext:", .{counter.*});
+    try std.json.Stringify.value(plaintext, .{}, w);
+    try w.writeAll(") { id } }");
+    const data = try gql(arena, t, doc.written(), err_msg);
+    return jsonFindString(data, "id") orelse {
+        err_msg.* = "Dagger returned no secret id";
+        return error.DaggerQueryFailed;
+    };
+}
+
+/// Splits env into plain variables and secret-bearing ones (registered as Dagger secrets).
+fn splitEnv(
+    arena: Allocator,
+    t: Transport,
+    job: job_mod.Job,
+    counter: *u32,
+    env: []const job_mod.EnvVar,
+    plain: *std.ArrayList(job_mod.EnvVar),
+    secret: *std.ArrayList(SecretRef),
+    err_msg: *[]const u8,
+) !void {
+    for (env) |e| {
+        if (containsSecret(job, e.value)) {
+            try secret.append(arena, .{ .name = e.name, .id = try newSecret(arena, t, counter, e.value, err_msg) });
+        } else {
+            try plain.append(arena, e);
+        }
+    }
+}
+
+fn writeEnvNodes(w: *std.Io.Writer, plain: []const job_mod.EnvVar, secret: []const SecretRef) !usize {
+    for (plain) |e| {
+        try w.writeAll("withEnvVariable(name:");
+        try std.json.Stringify.value(e.name, .{}, w);
+        try w.writeAll(",value:");
+        try std.json.Stringify.value(e.value, .{}, w);
+        try w.writeAll(") { ");
+    }
+    for (secret) |sr| {
+        try w.writeAll("withSecretVariable(name:");
+        try std.json.Stringify.value(sr.name, .{}, w);
+        try w.writeAll(",secret:");
+        try std.json.Stringify.value(sr.id, .{}, w);
+        try w.writeAll(") { ");
+    }
+    return plain.len + secret.len;
+}
 
 // --- the log reader ---
 
@@ -725,6 +794,7 @@ pub fn run(
     const transport: Transport = opts.test_transport orelse .{ .ptr = &http, .sendFn = HttpTransport.send };
 
     var ev = try Evaluator.init(arena, &job);
+    var secret_counter: u32 = 0;
     var err_msg: []const u8 = "";
     var container_id: []const u8 = blk: {
         var doc: std.Io.Writer.Allocating = .init(arena);
@@ -747,8 +817,13 @@ pub fn run(
             try std.json.Stringify.value(e.value, .{}, w);
             try w.writeAll(") { ");
         }
+        // Workflow- and job-level env is part of every step's environment.
+        var plain_job: std.ArrayList(job_mod.EnvVar) = .empty;
+        var secret_job: std.ArrayList(SecretRef) = .empty;
+        splitEnv(arena, transport, job, &secret_counter, ev.job_env.items, &plain_job, &secret_job, &err_msg) catch return fail(&sh, results, err_msg);
+        const job_env_nodes = try writeEnvNodes(w, plain_job.items, secret_job.items);
         try w.writeAll("id");
-        for (0..defaults.len + 4 + @as(usize, if (provision) 1 else 0)) |_| try w.writeAll(" }");
+        for (0..defaults.len + job_env_nodes + 4 + @as(usize, if (provision) 1 else 0)) |_| try w.writeAll(" }");
         const data = gql(arena, transport, doc.written(), &err_msg) catch return fail(&sh, results, err_msg);
         break :blk jsonFindString(data, "id") orelse return fail(&sh, results, "Dagger returned no container");
     };
@@ -780,6 +855,14 @@ pub fn run(
         const coe = std.mem.eql(u8, ev.render(step.continue_on_error, sc1) catch "false", "true");
         res.continued = coe;
 
+        // Env that carries a secret goes in as a Dagger secret, the rest in the script.
+        var plain_step_env: std.ArrayList(job_mod.EnvVar) = .empty;
+        var secret_step_env: std.ArrayList(SecretRef) = .empty;
+        splitEnv(arena, transport, job, &secret_counter, step_env, &plain_step_env, &secret_step_env, &err_msg) catch {
+            try failStep(&ev, &sh, step, res, num, try std.fmt.allocPrint(arena, "Dagger could not register a secret: {s}", .{err_msg}), coe);
+            continue;
+        };
+
         var resolved: Resolved = undefined;
         var fetched: ?Fetched = null;
         switch (step.action) {
@@ -798,7 +881,7 @@ pub fn run(
                     continue;
                 };
                 const wd: ?[]const u8 = if (sc.working_directory) |t| (ev.render(t, sc1) catch null) else null;
-                resolved = .{ .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = step_env } };
+                resolved = .{ .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = plain_step_env.items } };
             },
             .checkout => |inputs| {
                 const rendered = ev.renderEnv(inputs, sc1) catch {
@@ -847,6 +930,7 @@ pub fn run(
         }
         ev.pending_env.clearRetainingCapacity();
         ev.pending_path.clearRetainingCapacity();
+        braces += try writeEnvNodes(w, &.{}, secret_step_env.items);
         if (fetched) |f| {
             try w.writeAll("withDirectory(path:");
             try std.json.Stringify.value(f.mount, .{}, w);
@@ -1252,7 +1336,8 @@ test "run evaluates expressions in conditions, names, env, scripts and the steps
 
     const json =
         \\{"plan":{"planId":"p"},"jobId":"j","resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
-        \\ "environmentVariables":[{"type":2,"map":[{"Key":{"lit":"JOB_ENV"},"Value":{"type":3,"expr":"format('{0}-job', github.ref_name)"}}]}],
+        \\ "variables":{"TOKEN":{"value":"s3cr3t-value","isSecret":true}},
+        \\ "environmentVariables":[{"type":2,"map":[{"Key":{"lit":"JOB_ENV"},"Value":{"type":3,"expr":"format('{0}-job', github.ref_name)"}},{"Key":{"lit":"JOB_SECRET"},"Value":{"type":3,"expr":"secrets.TOKEN"}}]}],
         \\ "contextData":{"matrix":null,"github":{"t":2,"d":[{"k":"ref","v":"refs/heads/main"},{"k":"ref_name","v":"main"},{"k":"sha","v":"abc123"},{"k":"repository","v":"o/r"}]}},
         \\ "steps":[
         \\  {"type":"action","reference":{"type":"script"},"id":"s1","contextName":"first","name":"first","condition":"success()",
@@ -1266,18 +1351,23 @@ test "run evaluates expressions in conditions, names, env, scripts and the steps
         \\  {"type":"action","reference":{"type":"script"},"id":"s4","contextName":"__run_3","name":"__run_3","condition":"success()",
         \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo outcome={0} skipped={1}', steps.first.outcome, steps.__run_2.outcome)"}}]}},
         \\  {"type":"action","reference":{"type":"script"},"id":"s5","contextName":"__run_4","name":"__run_4","condition":"success()",
-        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo {0}', secrets.TOKEN)"}}]}},
+        \\   "environment":{"type":2,"map":[{"Key":{"lit":"DB_PASSWORD"},"Value":{"type":3,"expr":"secrets.TOKEN"}},{"Key":{"lit":"WITH_SECRET"},"Value":{"type":3,"expr":"format('user:{0}@host', secrets.TOKEN)"}}]},
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo uses-secret-env"}}]}},
         \\  {"type":"action","reference":{"type":"script"},"id":"s6","contextName":"__run_5","name":"__run_5","condition":"always()",
         \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo cleanup"}}]}}
         \\ ]}
     ;
     const job = try job_mod.parse(arena, json);
     const answers = [_][]const u8{
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_JOB\"}}}", // JOB_SECRET (job-level env), before the base container
         base_answer,
         try exec(arena, "C1", 0, "ok\\n"),
         try exec(arena, "C2", 0, "ok\\n"),
         try exec(arena, "C3", 0, "ok\\n"),
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_A\"}}}", // DB_PASSWORD
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_B\"}}}", // WITH_SECRET
         try exec(arena, "C4", 0, "ok\\n"),
+        try exec(arena, "C5", 0, "ok\\n"),
     };
     var fake: FakeSession = .{ .answers = &answers, .arena = arena };
     var buf: [4096]u8 = undefined;
@@ -1285,23 +1375,33 @@ test "run evaluates expressions in conditions, names, env, scripts and the steps
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
     const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
 
-    // Names, outcomes.
+    // Names and outcomes.
     try std.testing.expectEqualStrings("Build main", res.steps[0].name);
     try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
     try std.testing.expectEqual(Outcome.success, res.steps[1].outcome);
     try std.testing.expectEqual(Outcome.skipped, res.steps[2].outcome); // condition false
     try std.testing.expectEqual(Outcome.success, res.steps[3].outcome);
-    try std.testing.expectEqual(Outcome.failure, res.steps[4].outcome); // secrets are unsupported
-    try std.testing.expectEqual(Outcome.success, res.steps[5].outcome); // always()
-    try std.testing.expect(!res.succeeded);
-    // Evaluated scripts reached Dagger: sha, step env, job env (from an expression), and steps.* outcomes.
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "echo abc123 $STEP_ENV main-job") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "STEP_ENV=abc123") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "echo outcome=success skipped=skipped") != null);
-    // 5 queries: base + steps 1, 2, 4, 6 (the skipped step and the failed one send nothing).
-    try std.testing.expectEqual(@as(usize, 5), fake.seen.items.len);
-    // The unsupported context is reported in that step's log.
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "the 'secrets' context is not supported yet") != null);
+    try std.testing.expectEqual(Outcome.success, res.steps[4].outcome);
+    try std.testing.expectEqual(Outcome.success, res.steps[5].outcome);
+    try std.testing.expect(res.succeeded);
+    for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
+    // seen: 0 setSecret(job), 1 base, 2 s1, 3 s2, 4 s4, 5 setSecret, 6 setSecret, 7 s5, 8 s6
+    try std.testing.expectEqual(@as(usize, 9), fake.seen.items.len);
+    // Evaluated scripts reached Dagger: sha, step env, job env (from an expression), steps.* outcomes.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo abc123 $STEP_ENV main-job") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "STEP_ENV=abc123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "echo outcome=success skipped=skipped") != null);
+    // Job-level env is part of the base container: the plain value inline, the secret as a Dagger secret.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withEnvVariable(name:\"JOB_ENV\",value:\"main-job\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withSecretVariable(name:\"JOB_SECRET\",secret:\"SEC_JOB\")") != null);
+    // Secret-bearing step env is passed as Dagger secrets and appears nowhere in a command.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "withSecretVariable(name:\"DB_PASSWORD\",secret:\"SEC_A\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "withSecretVariable(name:\"WITH_SECRET\",secret:\"SEC_B\")") != null);
+    for (fake.seen.items, 0..) |d, i| {
+        const is_set_secret = std.mem.indexOf(u8, d, "setSecret") != null;
+        try std.testing.expectEqual(is_set_secret, std.mem.indexOf(u8, d, "s3cr3t-value") != null);
+        _ = i;
+    }
 }
 
 fn execFc(arena: Allocator, id: []const u8, out: []const u8, fc_output: []const u8, fc_env: []const u8, fc_path: []const u8) ![]const u8 {

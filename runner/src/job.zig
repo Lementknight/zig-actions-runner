@@ -75,6 +75,9 @@ pub const Job = struct {
     has_container: bool,
     /// Literal values that must never reach a log: the job token and every variable marked `isSecret`.
     secrets: []const []const u8,
+    /// The `secrets` context: user secrets by name (they arrive as variables flagged `isSecret`),
+    /// plus `GITHUB_TOKEN`. Values are credentials; never log them.
+    secret_vars: []const EnvVar = &.{},
     /// The `github` context values the built-in checkout needs.
     github: Github = .{},
     /// Workflow- and job-level `env`, in order (later entries override earlier ones).
@@ -113,6 +116,7 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .job_token = jobToken(root) orelse return error.MalformedJob,
         .check_run_id = checkRunId(root),
         .secrets = try collectSecrets(arena, root),
+        .secret_vars = try collectSecretVars(arena, root),
         .results_endpoint = variable(root, "system.github.results_endpoint") orelse "",
         .github = githubContext(root),
         .env = try jobEnv(arena, root),
@@ -374,6 +378,27 @@ fn variable(root: Value, name: []const u8) ?[]const u8 {
     return path(v, &.{"value"});
 }
 
+/// User secrets are delivered as variables flagged `isSecret`, named like the secret. GitHub's own
+/// bookkeeping variables (`system.*`) are not part of the `secrets` context; `github_token` is
+/// exposed as `GITHUB_TOKEN`.
+fn collectSecretVars(arena: Allocator, root: Value) Allocator.Error![]const EnvVar {
+    var out: std.ArrayList(EnvVar) = .empty;
+    const vars = root.object.get("variables") orelse return out.items;
+    if (vars != .object) return out.items;
+    var it = vars.object.iterator();
+    while (it.next()) |e| {
+        const v = e.value_ptr.*;
+        if (v != .object) continue;
+        const secret = v.object.get("isSecret") orelse continue;
+        if (secret != .bool or !secret.bool) continue;
+        const name = e.key_ptr.*;
+        if (std.mem.startsWith(u8, name, "system.")) continue;
+        const val = path(v, &.{"value"}) orelse continue;
+        try out.append(arena, .{ .name = if (std.mem.eql(u8, name, "github_token")) "GITHUB_TOKEN" else name, .value = val });
+    }
+    return out.items;
+}
+
 fn collectSecrets(arena: Allocator, root: Value) Allocator.Error![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     if (jobToken(root)) |t| try out.append(arena, t);
@@ -421,7 +446,7 @@ fn jobToken(root: Value) ?[]const u8 {
 
 const fixture =
     \\{"plan":{"planId":"plan-1"},"jobId":"job-1","jobContainer":null,
-    \\ "variables":{"github_token":{"value":"ghs_secret","isSecret":true},"plain":{"value":"x"},"system.github.results_endpoint":{"value":"https://results.test/"}},
+    \\ "variables":{"github_token":{"value":"ghs_secret","isSecret":true},"TIGER_HOST":{"value":"db.example","isSecret":true},"system.github.token":{"value":"ghs_secret","isSecret":true},"plain":{"value":"x"},"system.github.results_endpoint":{"value":"https://results.test/"}},
     \\ "contextData":{"job":{"t":2,"d":[{"k":"status","v":"success"},{"k":"check_run_id","v":777}]},"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"sha","v":"0123456789012345678901234567890123456789"},{"k":"ref","v":"refs/heads/x"},{"k":"event_name","v":"push"}]}},
     \\ "resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"jobtok"},"scheme":"OAuth"}}]},
     \\ "steps":[
@@ -453,9 +478,16 @@ test "parse job fixture" {
     try std.testing.expectEqualStrings("https://results.test/", job.results_endpoint);
     try std.testing.expectEqualStrings("o/r", job.github.repository);
     try std.testing.expectEqualStrings("https://github.com", job.github.server_url);
-    try std.testing.expectEqual(@as(usize, 2), job.secrets.len);
     try std.testing.expectEqualStrings("jobtok", job.secrets[0]);
-    try std.testing.expectEqualStrings("ghs_secret", job.secrets[1]);
+    // The secrets context: user secrets and GITHUB_TOKEN, without GitHub's system.* bookkeeping or plain variables.
+    try std.testing.expectEqual(@as(usize, 2), job.secret_vars.len);
+    var seen_host = false;
+    var seen_token = false;
+    for (job.secret_vars) |sv| {
+        if (std.mem.eql(u8, sv.name, "TIGER_HOST")) seen_host = std.mem.eql(u8, sv.value, "db.example");
+        if (std.mem.eql(u8, sv.name, "GITHUB_TOKEN")) seen_token = std.mem.eql(u8, sv.value, "ghs_secret");
+    }
+    try std.testing.expect(seen_host and seen_token);
     try std.testing.expect(!job.has_container);
     try std.testing.expectEqual(@as(usize, 8), job.steps.len);
 

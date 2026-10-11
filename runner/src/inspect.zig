@@ -271,11 +271,27 @@ fn dumpWorkflowFacts(out: *std.Io.Writer, job: std.json.Value) !void {
             try out.writeByte('\n');
         }
     }
+    // Variable names and whether they are secret, never values.
+    if (job.object.get("variables")) |vars| if (vars == .object) {
+        try out.writeAll("  variables flagged isSecret (names only):");
+        var it = vars.object.iterator();
+        while (it.next()) |e| {
+            if (e.value_ptr.* != .object) continue;
+            if (e.value_ptr.object.get("isSecret")) |sec| if (sec == .bool and sec.bool) try out.print(" {s}", .{e.key_ptr.*});
+        }
+        try out.writeByte('\n');
+    };
     // Contexts other than `github` (which holds the token): names and a truncated view.
     if (job.object.get("contextData")) |cd| if (cd == .object) {
         var it = cd.object.iterator();
         while (it.next()) |e| {
             if (std.mem.eql(u8, e.key_ptr.*, "github")) continue;
+            if (std.mem.eql(u8, e.key_ptr.*, "secrets")) {
+                // Names only: these are credentials.
+                try out.writeAll("  contextData.secrets (names only): ");
+                try printKeyNames(out, e.value_ptr.*);
+                continue;
+            }
             var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
             defer buf.deinit();
             try std.json.Stringify.value(e.value_ptr.*, .{}, &buf.writer);
@@ -301,4 +317,16 @@ fn dumpWorkflowFacts(out: *std.Io.Writer, job: std.json.Value) !void {
         };
     }
     try out.flush();
+}
+
+/// Prints the key names of a context-data dictionary (`{t:2, d:[{k, v}]}`) or object, without values.
+fn printKeyNames(out: *std.Io.Writer, v: std.json.Value) !void {
+    if (v != .object) return out.writeAll("(not a dictionary)\n");
+    if (v.object.get("d")) |d| if (d == .array) {
+        for (d.array.items) |e| if (e == .object) if (e.object.get("k")) |k| if (k == .string) try out.print("{s} ", .{k.string});
+        return out.writeByte('\n');
+    };
+    var it = v.object.iterator();
+    while (it.next()) |e| try out.print("{s} ", .{e.key_ptr.*});
+    try out.writeByte('\n');
 }

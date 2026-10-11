@@ -91,6 +91,7 @@ fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log
         try err.print("cannot parse job: {s}\n", .{@errorName(e)});
         return @backingInt(Exit.config);
     };
+    log.setSecrets(job.secrets);
     const res = try dagger.run(arena, io, init.environ_map, .{
         .dagger_cmd = cfg.dagger_cmd,
         .image = cfg.image,
