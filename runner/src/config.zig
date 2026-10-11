@@ -32,6 +32,8 @@ pub const Config = struct {
     log_flush_lines: u32 = 200,
     log_flush_ms: u32 = 500,
     dry_run: bool = false,
+    /// Dev: run a saved acquirejob response through the executor without contacting GitHub.
+    exec_job: ?[]const u8 = null,
     /// Register one runner, print the shape of its config, delete it, exit.
     inspect: bool = false,
 
@@ -75,6 +77,7 @@ pub const Config = struct {
             }
             if (std.mem.eql(u8, key, "token")) token = val //
             else if (std.mem.eql(u8, key, "scope")) scope_str = val //
+            else if (std.mem.eql(u8, key, "exec-job")) c.exec_job = val //
             else if (std.mem.eql(u8, key, "labels")) c.labels = val //
             else if (std.mem.eql(u8, key, "group-id")) c.runner_group_id = try num(u64, val) //
             else if (std.mem.eql(u8, key, "name-prefix")) c.name_prefix = val //
@@ -85,6 +88,12 @@ pub const Config = struct {
             else return error.UnknownFlag;
         }
 
+        if (c.exec_job != null) {
+            // Offline mode: no GitHub credentials needed.
+            c.gh_token = token orelse "";
+            c.scope = .{ .org = "offline" };
+            return c;
+        }
         c.gh_token = token orelse return error.MissingGhToken;
         c.scope = try Scope.parse(scope_str orelse return error.MissingGhScope);
         return c;

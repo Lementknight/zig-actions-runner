@@ -2,6 +2,8 @@ const std = @import("std");
 const Config = @import("config.zig").Config;
 const jitconfig = @import("github/jitconfig.zig");
 const inspect = @import("inspect.zig");
+const dagger = @import("dagger.zig");
+const job_mod = @import("job.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
 
@@ -16,6 +18,7 @@ comptime {
     _ = @import("github/broker.zig");
     _ = @import("github/runservice.zig");
     _ = @import("job.zig");
+    _ = @import("dagger.zig");
 }
 
 /// SPEC §2 exit codes.
@@ -47,6 +50,8 @@ pub fn main(init: std.process.Init) !u8 {
     io.random(&suffix);
     const name = try std.fmt.allocPrint(arena, "{s}-{x}", .{ cfg.name_prefix, suffix });
 
+    if (cfg.exec_job) |path| return execJobFile(init, &cfg, path, &log, err);
+
     if (cfg.dry_run) {
         try log.append(0, 0, .stdout, try std.fmt.allocPrint(arena, "dry run: would register runner '{s}' with labels '{s}'", .{ name, cfg.labels }));
         return @backingInt(Exit.done);
@@ -72,4 +77,28 @@ pub fn main(init: std.process.Init) !u8 {
     }
     try err.writeAll("broker session not implemented yet (M2); exiting\n");
     return @backingInt(Exit.github);
+}
+
+/// Dev helper: runs a saved acquirejob response through the Dagger executor.
+fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log: *sink.LogSink, err: *std.Io.Writer) !u8 {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const json = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch |e| {
+        try err.print("cannot read {s}: {s}\n", .{ path, @errorName(e) });
+        return @backingInt(Exit.config);
+    };
+    const job = job_mod.parse(arena, json) catch |e| {
+        try err.print("cannot parse job: {s}\n", .{@errorName(e)});
+        return @backingInt(Exit.config);
+    };
+    const res = try dagger.run(arena, io, init.environ_map, .{
+        .argv = &.{ cfg.dagger_cmd, "--progress=logs", "query" },
+        .sink_job_id = job.check_run_id,
+    }, job, log);
+    for (res.steps, job.steps, 1..) |r, st, n| {
+        try err.print("step {d} [{s}] {s}: {s} (exit {d})\n", .{ n, st.name, @tagName(st.action), @tagName(r.outcome), r.exit_code });
+    }
+    if (res.engine_error) |m| try err.print("dagger error:\n{s}\n", .{m});
+    try err.print("job {s}\n", .{if (res.succeeded) "succeeded" else "failed"});
+    return @backingInt(if (res.succeeded) Exit.done else Exit.github);
 }

@@ -13,6 +13,8 @@ pub const StdoutSink = struct {
         try s.writer.print("[job {d} step {d} {s}] ", .{ job_id, step_number, @tagName(stream) });
         try redact.write(s.writer, line, s.secrets);
         try s.writer.writeByte('\n');
+        // Dev sink: show lines as they arrive so streaming is visible.
+        try s.writer.flush();
     }
 
     pub fn flush(s: *StdoutSink) !void {
