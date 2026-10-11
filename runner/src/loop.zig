@@ -78,22 +78,24 @@ pub fn run(c: Context) !Exit {
             continue;
         }
         const inner = jsonString(c.arena, m.body, "body") orelse return fail(c, "job request", error.BadResponse);
-        return handleJob(c, token, inner);
+        return handleJob(c, token, inner, settings.agent_name);
     }
 }
 
-fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit {
+fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8, runner_name: []const u8) !Exit {
     const jr = runservice.parseJobRequest(c.arena, inner_body) catch |e| return fail(c, "job request", e);
     const acq = runservice.acquire(c.arena, c.io, jr, runner_token) catch |e| return fail(c, "acquirejob", e);
     if (acq.status.class() != .success) return failBody(c, "acquirejob", acq);
 
     // The definition holds secrets; it is parsed but never printed.
-    const job = job_mod.parse(c.arena, acq.body) catch |e| return fail(c, "parse job", e);
+    var job = job_mod.parse(c.arena, acq.body) catch |e| return fail(c, "parse job", e);
+    job.runner_name = runner_name;
     // Everything the job logs is also kept (redacted, timestamped) so it can be uploaded to GitHub.
     var collect: sink.LogSink = .{ .collect = .{ .arena = c.arena, .io = c.io, .inner = c.log } };
     collect.setSecrets(try std.mem.concat(c.arena, []const u8, &.{ c.secrets, job.secrets }));
     const log = &collect;
     try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job acquired: {d} steps", .{job.steps.len}));
+    if (job.run_id == null) try log.append(job.check_run_id, 0, .stderr, "job definition has no github.run_id; the job runs but no run, job or step rows are recorded");
 
     var result: dagger.Result = undefined;
     if (job.has_container) {
