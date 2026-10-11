@@ -25,6 +25,7 @@ comptime {
     _ = @import("expr.zig");
     _ = @import("context.zig");
     _ = @import("commands.zig");
+    _ = @import("pg.zig");
 }
 
 const Exit = loop.Exit;
