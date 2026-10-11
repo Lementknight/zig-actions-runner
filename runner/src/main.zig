@@ -27,6 +27,7 @@ comptime {
     _ = @import("db/url.zig");
     _ = @import("db/scram.zig");
     _ = @import("db/Client.zig");
+    _ = @import("db/Db.zig");
 }
 
 const Exit = loop.Exit;
