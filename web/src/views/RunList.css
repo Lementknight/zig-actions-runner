@@ -1,0 +1,154 @@
+/* Run list (U5), after GitHub's Actions runs list: a bordered box of rows, status icon left,
+   workflow bold, a muted meta line, the branch, then age and duration on the right. */
+
+.ar-run-list__subtitle {
+  flex-basis: 100%;
+}
+
+.ar-run-list__loading {
+  display: flex;
+  justify-content: center;
+  padding: var(--ar-space-12) var(--ar-space-6);
+}
+
+.ar-run-list__header {
+  padding: var(--ar-space-4);
+  background: var(--ar-bg-subtle);
+  border-bottom: var(--ar-border-width) solid var(--ar-border-default);
+  border-radius: var(--ar-radius-md) var(--ar-radius-md) 0 0;
+  font-size: var(--ar-text-sm);
+  font-weight: var(--ar-weight-semibold);
+}
+
+.ar-run-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ar-run-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-areas:
+    'status main'
+    '. branch'
+    '. times';
+  column-gap: var(--ar-space-3);
+  row-gap: var(--ar-space-2);
+  padding: var(--ar-space-3) var(--ar-space-4);
+  border-top: var(--ar-border-width) solid var(--ar-border-muted);
+}
+
+.ar-run-row:first-child {
+  border-top: 0;
+}
+
+.ar-run-row:last-child {
+  border-radius: 0 0 var(--ar-radius-md) var(--ar-radius-md);
+}
+
+.ar-run-row:hover {
+  background: var(--ar-bg-subtle);
+}
+
+@media (min-width: 48em) {
+  .ar-run-row {
+    grid-template-columns: auto minmax(0, 1fr) minmax(0, 12em) 9em;
+    grid-template-areas: 'status main branch times';
+    align-items: start;
+  }
+}
+
+.ar-run-row__status {
+  grid-area: status;
+  display: flex;
+  height: 1lh;
+  align-items: center;
+}
+
+.ar-run-row__main {
+  grid-area: main;
+  min-width: 0;
+}
+
+/* The workflow name is the row's link; its overlay makes the whole row clickable (R2). */
+.ar-run-row__title {
+  color: var(--ar-fg-default);
+  font-weight: var(--ar-weight-semibold);
+  overflow-wrap: anywhere;
+}
+
+.ar-run-row__title::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+}
+
+.ar-run-row__title:hover {
+  color: var(--ar-fg-link);
+}
+
+.ar-run-row__title:focus-visible {
+  outline: none;
+}
+
+.ar-run-row__title:focus-visible::after {
+  outline: var(--ar-border-width-thick) solid var(--ar-focus-outline);
+  outline-offset: calc(-1 * var(--ar-border-width-thick));
+}
+
+.ar-run-row__meta {
+  margin-top: var(--ar-space-1);
+  color: var(--ar-fg-muted);
+  font-size: var(--ar-text-sm);
+  overflow-wrap: anywhere;
+}
+
+.ar-run-row__sha {
+  font-family: var(--ar-font-mono);
+  font-size: var(--ar-text-xs);
+}
+
+.ar-run-row__branch {
+  grid-area: branch;
+  min-width: 0;
+}
+
+.ar-branch {
+  display: inline-block;
+  max-width: 100%;
+  padding: 0 var(--ar-space-1);
+  overflow: hidden;
+  color: var(--ar-fg-accent);
+  background: var(--ar-bg-selected);
+  border-radius: var(--ar-radius-sm);
+  font-family: var(--ar-font-mono);
+  font-size: var(--ar-text-xs);
+  line-height: var(--ar-line-relaxed);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.ar-run-row__times {
+  grid-area: times;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ar-space-1) var(--ar-space-4);
+  color: var(--ar-fg-muted);
+  font-size: var(--ar-text-sm);
+}
+
+@media (min-width: 48em) {
+  .ar-run-row__times {
+    flex-direction: column;
+  }
+}
+
+.ar-run-row__time {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--ar-space-1);
+  white-space: nowrap;
+}

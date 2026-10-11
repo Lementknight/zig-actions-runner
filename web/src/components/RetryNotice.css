@@ -1,0 +1,20 @@
+/* Retry notice (R17), GitHub's warning flash. */
+
+.ar-retry-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--ar-space-2);
+  margin-bottom: var(--ar-space-4);
+  padding: var(--ar-space-3) var(--ar-space-4);
+  color: var(--ar-fg-default);
+  background: var(--ar-bg-attention);
+  border: var(--ar-border-width) solid var(--ar-border-attention);
+  border-radius: var(--ar-radius-md);
+  font-size: var(--ar-text-sm);
+}
+
+.ar-retry-notice > svg {
+  flex: none;
+  margin-top: calc((1lh - var(--ar-icon-size)) / 2);
+  color: var(--ar-status-in-progress);
+}
