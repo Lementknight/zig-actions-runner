@@ -104,6 +104,7 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit
     } else {
         result = try dagger.run(c.arena, c.io, c.environ, .{
             .dagger_cmd = c.cfg.dagger_cmd,
+            .image = c.cfg.image,
             .sink_job_id = job.check_run_id,
         }, job, log);
         if (result.engine_error) |msg| {
