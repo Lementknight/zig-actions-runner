@@ -1,0 +1,118 @@
+/*
+ * The token layer (KTD7, R13).
+ *
+ * Every color, font, size and spacing value the app uses is named here as an --ar-* token.
+ * Component and view CSS reads only --ar-* names. No hex color or pixel literal appears in
+ * any CSS file except this one; the Verification Contract greps for it:
+ *
+ *   grep -rnE '#[0-9a-fA-F]{3,8}\b|[0-9]px' src --include='*.css' | grep -v styles/tokens.css
+ *
+ * Today every token aliases a Primer primitive from the GitHub light theme (R12), so the
+ * views read as GitHub Actions. A later restyle (card #9) changes the values here and
+ * nowhere else.
+ */
+
+:root {
+  /* Text */
+  --ar-fg-default: var(--fgColor-default);
+  --ar-fg-muted: var(--fgColor-muted);
+  --ar-fg-link: var(--fgColor-link);
+  --ar-fg-accent: var(--fgColor-accent);
+  --ar-fg-on-emphasis: var(--fgColor-onEmphasis);
+  --ar-fg-danger: var(--fgColor-danger);
+
+  /* Surfaces */
+  --ar-bg-canvas: var(--bgColor-default);
+  --ar-bg-subtle: var(--bgColor-muted);
+  --ar-bg-inset: var(--bgColor-inset);
+  --ar-bg-hover: var(--bgColor-neutral-muted);
+  --ar-bg-selected: var(--bgColor-accent-muted);
+  --ar-bg-danger: var(--bgColor-danger-muted);
+  --ar-bg-attention: var(--bgColor-attention-muted);
+
+  /* Borders */
+  --ar-border-default: var(--borderColor-default);
+  --ar-border-muted: var(--borderColor-muted);
+  --ar-border-danger: var(--borderColor-danger-muted);
+  --ar-border-attention: var(--borderColor-attention-muted);
+  --ar-border-width: var(--borderWidth-thin);
+  --ar-border-width-thick: var(--borderWidth-thick);
+  --ar-focus-outline: var(--borderColor-accent-emphasis);
+
+  /* Run, job and step status (R3). Queued and in progress use GitHub's attention yellow;
+     cancelled, skipped and anything unknown are neutral. */
+  --ar-status-success: var(--fgColor-success);
+  --ar-status-failure: var(--fgColor-danger);
+  --ar-status-in-progress: var(--fgColor-attention);
+  --ar-status-queued: var(--fgColor-attention);
+  --ar-status-cancelled: var(--fgColor-muted);
+  --ar-status-skipped: var(--fgColor-muted);
+  --ar-status-neutral: var(--fgColor-muted);
+
+  /* Type */
+  --ar-font-sans: var(--fontStack-sansSerif);
+  --ar-font-mono: var(--fontStack-monospace);
+  --ar-text-xs: var(--base-text-size-xs);
+  --ar-text-sm: var(--base-text-size-sm);
+  --ar-text-md: var(--base-text-size-md);
+  --ar-text-lg: var(--base-text-size-lg);
+  --ar-text-xl: var(--base-text-size-xl);
+  --ar-weight-normal: var(--base-text-weight-normal);
+  --ar-weight-medium: var(--base-text-weight-medium);
+  --ar-weight-semibold: var(--base-text-weight-semibold);
+  --ar-line-tight: var(--base-text-lineHeight-tight);
+  --ar-line-normal: var(--base-text-lineHeight-normal);
+  --ar-line-relaxed: var(--base-text-lineHeight-relaxed);
+
+  /* Spacing, a 4px rhythm */
+  --ar-space-1: var(--base-size-4);
+  --ar-space-2: var(--base-size-8);
+  --ar-space-3: var(--base-size-12);
+  --ar-space-4: var(--base-size-16);
+  --ar-space-5: var(--base-size-20);
+  --ar-space-6: var(--base-size-24);
+  --ar-space-8: var(--base-size-32);
+  --ar-space-10: var(--base-size-40);
+  --ar-space-12: var(--base-size-48);
+
+  /* Shape and depth */
+  --ar-radius-sm: var(--borderRadius-small);
+  --ar-radius-md: var(--borderRadius-medium);
+  --ar-radius-lg: var(--borderRadius-large);
+  --ar-radius-full: var(--borderRadius-full);
+  --ar-shadow-resting: var(--shadow-resting-small);
+  --ar-shadow-floating: var(--shadow-floating-small);
+
+  /* Layout */
+  --ar-page-max-width: 1280px;
+  --ar-header-height: 64px;
+  --ar-icon-size: 16px;
+  --ar-gutter-width: 48px;
+  --ar-sidebar-width: 320px;
+
+  /* Job log panel (U4). Light, like the rest of the app (R12). */
+  --ar-log-bg: var(--bgColor-default);
+  --ar-log-fg: var(--fgColor-default);
+  --ar-log-muted: var(--fgColor-muted);
+  --ar-log-line-hover: var(--bgColor-muted);
+  --ar-log-font-size: var(--text-codeBlock-size);
+  --ar-log-line-height: var(--base-text-lineHeight-normal);
+
+  /* ANSI 16 color palette for log lines (KTD5). Primer's light-theme ANSI values. */
+  --ar-ansi-black: var(--ansi-black);
+  --ar-ansi-red: var(--ansi-red);
+  --ar-ansi-green: var(--ansi-green);
+  --ar-ansi-yellow: var(--ansi-yellow);
+  --ar-ansi-blue: var(--ansi-blue);
+  --ar-ansi-magenta: var(--ansi-magenta);
+  --ar-ansi-cyan: var(--ansi-cyan);
+  --ar-ansi-white: var(--ansi-white);
+  --ar-ansi-bright-black: var(--ansi-blackBright);
+  --ar-ansi-bright-red: var(--ansi-redBright);
+  --ar-ansi-bright-green: var(--ansi-greenBright);
+  --ar-ansi-bright-yellow: var(--ansi-yellowBright);
+  --ar-ansi-bright-blue: var(--ansi-blueBright);
+  --ar-ansi-bright-magenta: var(--ansi-magentaBright);
+  --ar-ansi-bright-cyan: var(--ansi-cyanBright);
+  --ar-ansi-bright-white: var(--ansi-whiteBright);
+}
