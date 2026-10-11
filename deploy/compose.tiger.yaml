@@ -1,0 +1,14 @@
+# Tiger mode: layered on compose.yaml, the API reads DATABASE_URL from the environment (or
+# deploy/.env) and the local db and migrate services stay down. Migrations run against Tiger
+# only through the db workflow's manual dispatch (db/README.md), never from here.
+#
+#   docker compose -f deploy/compose.yaml -f deploy/compose.tiger.yaml up --build
+services:
+  db:
+    profiles: [local-db]
+  migrate:
+    profiles: [local-db]
+  api:
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL to the Tiger connection string, in the environment or deploy/.env}
+    depends_on: !reset {}
