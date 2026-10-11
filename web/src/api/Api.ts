@@ -1,4 +1,4 @@
-import type { ListRunsOptions, LogsResponse, Run, RunDetail } from './types'
+import type { ListRunsOptions, LogsResponse, Run, RunDetail, Runner } from './types'
 
 /**
  * Everything the views and hooks know about where data comes from (KTD2). Two
@@ -13,6 +13,8 @@ export interface Api {
   getRun(runId: number, signal?: AbortSignal): Promise<RunDetail>
   /** Log lines with `seq > after`, at most `limit`, ordered by `seq`. 404 for an unknown job. */
   getLogs(jobId: number, after: number, limit: number, signal?: AbortSignal): Promise<LogsResponse>
+  /** Every runner with its state and job counts, ordered by name. */
+  listRunners(signal?: AbortSignal): Promise<Runner[]>
 }
 
 /** A failed request. `status` is the HTTP status, or undefined when no response arrived. */

@@ -75,3 +75,25 @@ export interface ListRunsOptions {
   /** Return only runs older than the run with this id. */
   before?: number
 }
+
+/** `idle`, `busy` or `offline` per SPEC §4; kept open so an unknown value still renders (R3). */
+export type RunnerStatus = string
+
+/** The job a busy runner is running now. */
+export interface CurrentJob {
+  id: number
+  run_id: number
+  name: string
+}
+
+/** One entry of `GET /api/runners` (SPEC §5.3). */
+export interface Runner {
+  name: string
+  status: RunnerStatus
+  labels: string[]
+  registered_at: string
+  last_seen_at: string
+  current_job: CurrentJob | null
+  running_jobs: number
+  completed_jobs: number
+}

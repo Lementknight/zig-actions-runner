@@ -233,3 +233,44 @@ describe('fakeApi fixtures', () => {
     await expect(api.getRun(1)).rejects.toMatchObject({ status: 404 })
   })
 })
+
+describe('fakeApi runners', () => {
+  const runnerFixture = (jobStartMs: number): FakeRun => ({
+    ...oneJob(3),
+    jobs: [{ ...oneJob(3).jobs[0], runnerName: 'r1', startMs: jobStartMs }],
+  })
+
+  it('lists a runner busy while its job runs and idle with a completed count after', async () => {
+    const f = fakeAt([runnerFixture(0)], 5)
+    const [busy] = await f.api.listRunners()
+    expect(busy).toMatchObject({ name: 'r1', status: 'busy', running_jobs: 1, completed_jobs: 0 })
+    expect(busy.current_job).toEqual({ id: 10, run_id: 1, name: 'job' })
+
+    f.set(10_000)
+    const [idle] = await f.api.listRunners()
+    expect(idle).toMatchObject({ status: 'idle', running_jobs: 0, completed_jobs: 1, current_job: null })
+  })
+
+  it('includes extra runners, offline ones with an old last_seen_at, sorted by name', async () => {
+    const api = createFakeApi({
+      fixtures: [runnerFixture(0)],
+      extraRunners: [{ name: 'a-idle' }, { name: 'z-off', offline: true }],
+      origin: ORIGIN,
+      now: () => ORIGIN + 5,
+    })
+    const runners = await api.listRunners()
+    expect(runners.map((r) => [r.name, r.status])).toEqual([
+      ['a-idle', 'idle'],
+      ['r1', 'busy'],
+      ['z-off', 'offline'],
+    ])
+    expect(Date.parse(runners[2].last_seen_at)).toBeLessThan(ORIGIN - 60_000)
+  })
+
+  it('lists the default fixtures runners with one offline and one idle that never ran a job', async () => {
+    const f = fakeAt(defaultFixtures, 60_000)
+    const runners = await f.api.listRunners()
+    expect(runners.find((r) => r.name === 'zig-runner-04')).toMatchObject({ status: 'idle', completed_jobs: 0 })
+    expect(runners.find((r) => r.name === 'zig-runner-05')?.status).toBe('offline')
+  })
+})

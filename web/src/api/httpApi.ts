@@ -1,5 +1,5 @@
 import { ApiError, isAbort, type Api } from './Api'
-import type { JobWithSteps, ListRunsOptions, LogLine, LogsResponse, Run, RunDetail, Step } from './types'
+import type { JobWithSteps, ListRunsOptions, LogLine, LogsResponse, Run, RunDetail, Runner, Step } from './types'
 
 // The read API over fetch (SPEC §5.3, KTD2). Every view sees the same Api as with the fake;
 // the only difference is where the answers come from.
@@ -67,6 +67,20 @@ function toRunDetail(body: Json): RunDetail {
   return { ...run, jobs }
 }
 
+function toRunner(raw: Json): Runner {
+  const job = raw.current_job as Json | null | undefined
+  return {
+    name: raw.name as string,
+    status: raw.status as string,
+    labels: (raw.labels as string[] | null | undefined) ?? [],
+    registered_at: raw.registered_at as string,
+    last_seen_at: raw.last_seen_at as string,
+    current_job: job ? { id: num(job.id), run_id: num(job.run_id), name: job.name as string } : null,
+    running_jobs: numOrNull(raw.running_jobs) ?? 0,
+    completed_jobs: numOrNull(raw.completed_jobs) ?? 0,
+  }
+}
+
 function toLogLine(raw: Json): LogLine {
   return {
     seq: num(raw.seq),
@@ -127,6 +141,12 @@ export function createHttpApi(baseUrl: string, fetchImpl?: Fetch): Api {
 
     async getRun(runId: number, signal?: AbortSignal): Promise<RunDetail> {
       return toRunDetail(await get(`/runs/${encodeURIComponent(runId)}`, signal))
+    },
+
+    async listRunners(signal?: AbortSignal): Promise<Runner[]> {
+      const body = await get('/runners', signal)
+      const runners = Array.isArray(body) ? body : ((body.runners as Json[] | undefined) ?? [])
+      return (runners as Json[]).map(toRunner)
     },
 
     async getLogs(jobId: number, after: number, limit: number, signal?: AbortSignal): Promise<LogsResponse> {
