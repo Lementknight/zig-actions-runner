@@ -222,6 +222,8 @@ The runner updates `runs`, `jobs` and `steps` at these transitions only: job sta
 
 ### 5.3 Read API (`api/`)
 
+Hono on Node with `pg` (`api/README.md`). It only reads: every connection starts with `default_transaction_read_only=on`. `DATABASE_URL` is required; `PORT` defaults to `8080`.
+
 | Endpoint | Returns |
 |---|---|
 | `GET /api/runs?repo=&limit=&before=` | Run list, newest first |
@@ -229,17 +231,30 @@ The runner updates `runs`, `jobs` and `steps` at these transitions only: job sta
 | `GET /api/jobs/:id/logs?after=<seq>&limit=` | Log lines with `seq > after`, ordered by `seq` |
 | `GET /api/health` | `{ "ok": true }` |
 
-Response shapes mirror the table columns (snake_case JSON). Log response:
+Response shapes mirror the table columns (snake_case JSON). BIGINT ids and `seq` are JSON numbers; timestamps are ISO 8601; nullable columns are `null`. An empty query parameter (`?repo=`) counts as absent.
+
+- **Run list.** A bare array, ordered `created_at DESC, id DESC`. `repo` filters by repository. `before` is a run id and returns only runs older than it in that order (an unknown id gives `[]`). `limit` defaults to `50`; larger values are capped at `200`.
+- **Run.** The run's columns plus `jobs`, ordered by `id`, each with its `steps` ordered by `number`.
+- **Health.** Runs `SELECT 1`; answers `503 { "ok": false, ... }` when the database does not answer.
+
+Log response:
 ```json
 { "lines": [{"seq": 1, "step": 2, "stream": "stdout", "ts": "...", "line": "..."}], "next_after": 1, "job_done": false }
 ```
-The client polls with `next_after` until `job_done` is true.
+- `after` defaults to `0`. `limit` defaults to `1000`; larger values are capped at `5000`.
+- `next_after` is the `seq` of the last line returned. On an empty page it echoes `after`.
+- `job_done` is true only when the job's status is `completed` and no lines with `seq > next_after` exist. The API reads the job's status before its lines, so the runner must flush a job's log before it writes the job end transition (§5.1, §5.2).
+- The query bounds `ts >= jobs.started_at - interval '1 hour'`, so only the job's own chunks are scanned (the hour covers clock skew between runner and database).
+
+The client polls with `next_after` until `job_done` is true and a page comes back empty.
+
+Errors: an unknown run, job or path answers `404 { "error": "not found" }`. A non-numeric or non-positive id, or a malformed `limit`, `before` or `after`, answers `400 { "error": "invalid ..." }`. A database failure answers `500 { "error": "internal error" }`.
 
 ### 5.4 Frontend pages
 
 - `/` run list: status icon, workflow, repo, branch, sha, age, duration.
 - `/runs/:id` job list/graph with per-job status; selecting a job shows its steps.
-- Job view: collapsible steps, ANSI-colored log viewer, live tail while `in_progress`, timestamps toggle.
+- `/runs/:runId/jobs/:jobId` job view, linkable on its own: collapsible steps, ANSI-colored log viewer, live tail while `in_progress`, timestamps toggle.
 - Must work with fake data from the M0 seed script.
 
 ## 6. Dagger execution
