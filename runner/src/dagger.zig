@@ -33,9 +33,9 @@ pub const default_image = "ubuntu:24.04";
 pub const workspace = "/github/workspace";
 pub const marker = "::zig-step::";
 
-/// Makes `ubuntu:24.04` usable for typical steps: git (checked-out workspaces are real repositories),
+/// Makes `ubuntu:24.04` usable for typical steps: git (checked-out workspaces are real repositories), xz (to unpack toolchains),
 /// curl and CA certificates. Dagger caches this exec, so only the first run pays for it.
-pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends git ca-certificates curl >/dev/null && rm -rf /var/lib/apt/lists/*";
+pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends git ca-certificates curl xz-utils >/dev/null && rm -rf /var/lib/apt/lists/*";
 
 pub const Marker = union(enum) {
     begin: u32,

@@ -35,7 +35,7 @@ Environment variables (flags override):
 | `RUNNER_NAME_PREFIX` | no | Name becomes `<prefix>-<hostname>-<n>` |
 | `DATABASE_URL` | no | `postgres://user:password@host:port/database?sslmode=require` (Tiger Data; user and password percent-encoded). `sslmode` is `require` (TLS verified against the system CAs and the host name, the default), `no-verify` (TLS without verification) or `disable` (plain TCP, local containers). Instead of a URL the standard `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` and `PGSSLMODE` variables work. If neither is set, logs go to stdout only (`StdoutSink`, §5.1) |
 | `DAGGER_CMD` | no | Path to the `dagger` CLI, default `dagger` |
-| `RUNNER_IMAGE` | no | Base image for jobs, default `ubuntu:24.04` (flag `--image`). The default gets `git`, `curl` and CA certificates installed; a custom image is used as is |
+| `RUNNER_IMAGE` | no | Base image for jobs, default `ubuntu:24.04` (flag `--image`). The default gets `git`, `curl`, `xz-utils` and CA certificates installed; a custom image is used as is |
 | `LOG_FLUSH_LINES` | no | Default `200` |
 | `LOG_FLUSH_MS` | no | Default `500` |
 
@@ -246,7 +246,7 @@ Runners response (a bare array, ordered by `name`):
 
 ## 6. Dagger execution
 
-- One Dagger pipeline per job; base image defaults to `ubuntu:24.04` unless the job specifies `container:` (not supported yet) or `RUNNER_IMAGE` is set. The default image has `git`, `curl` and `ca-certificates` installed by one `apt-get` exec at the start of the job's container (cached by Dagger: about 13 s the first time, nothing after); a custom `RUNNER_IMAGE` is used as is, so it must bring its own tools.
+- One Dagger pipeline per job; base image defaults to `ubuntu:24.04` unless the job specifies `container:` (not supported yet) or `RUNNER_IMAGE` is set. The default image has `git`, `curl`, `xz-utils` and `ca-certificates` installed by one `apt-get` exec at the start of the job's container (cached by Dagger: about 13 s the first time, nothing after); a custom `RUNNER_IMAGE` is used as is, so it must bring its own tools.
 - Workspace: the checked-out repo mounted at `/github/workspace`.
 - `run:` steps become `withExec(["sh","-e","-c", script])`, honoring `working-directory`, `env` and `shell: bash|sh`.
 - Step stdout/stderr lines go to `LogSink` as they arrive, in order.
