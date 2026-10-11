@@ -35,6 +35,9 @@ pub const Scope = struct {
     /// True once a step failed without continue-on-error (drives `success()` / `failure()`).
     job_failed: bool = false,
     cancelled: bool = false,
+    /// Contexts that exist in GitHub but that this runner cannot provide yet (for example `secrets`).
+    /// Referencing one is an error instead of silently evaluating to an empty value.
+    unsupported_contexts: []const []const u8 = &.{},
     /// Receives a human-readable reason when an error is returned. Optional.
     diag: ?*[]const u8 = null,
 
@@ -440,7 +443,13 @@ fn deref(v: Value, key: Value, arena: Allocator) Allocator.Error!Value {
 fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
     switch (n.*) {
         .literal => |v| return v,
-        .ident => |name| return lookupEntry(scope.contexts, name) orelse .null,
+        .ident => |name| {
+            for (scope.unsupported_contexts) |u| if (std.ascii.eqlIgnoreCase(u, name)) {
+                if (scope.diag) |d| d.* = std.fmt.allocPrint(arena, "the '{s}' context is not supported yet", .{name}) catch "unsupported context";
+                return error.Unsupported;
+            };
+            return lookupEntry(scope.contexts, name) orelse .null;
+        },
         .prop => |p| return deref(try eval(arena, p.obj, scope), .{ .string = p.name }, arena),
         .index => |ix| {
             const o = try eval(arena, ix.obj, scope);
@@ -821,6 +830,16 @@ test "errors say what is wrong" {
     diag = "";
     try std.testing.expectError(error.Unsupported, evaluate(ar, "github.*.x", s));
     try std.testing.expect(std.mem.indexOf(u8, diag, "'*' object filter") != null);
+}
+
+test "unsupported contexts fail loudly" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var diag: []const u8 = "";
+    const s: Scope = .{ .unsupported_contexts = &.{"secrets"}, .diag = &diag };
+    try std.testing.expectError(error.Unsupported, evaluate(a.allocator(), "secrets.TOKEN", s));
+    try std.testing.expectEqualStrings("the 'secrets' context is not supported yet", diag);
+    try std.testing.expectError(error.Unsupported, evaluate(a.allocator(), "format('{0}', SECRETS['x'])", s));
 }
 
 test "numbers print like GitHub" {

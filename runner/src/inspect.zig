@@ -260,14 +260,30 @@ fn firstStepScript(job: std.json.Value) ?Script {
 fn dumpWorkflowFacts(out: *std.Io.Writer, job: std.json.Value) !void {
     const steps = job.object.get("steps") orelse return;
     if (steps == .array) for (steps.array.items, 1..) |st, n| {
-        if (st != .object) continue;
-        try out.print("  step {d} reference: ", .{n});
-        if (st.object.get("reference")) |r| try std.json.Stringify.value(r, .{}, out);
-        try out.print("\n  step {d} inputs: ", .{n});
-        if (st.object.get("inputs")) |i| try std.json.Stringify.value(i, .{}, out) else try out.writeAll("(none)");
+        try out.print("  step {d} json: ", .{n});
+        try std.json.Stringify.value(st, .{}, out);
         try out.writeByte('\n');
     };
-    const allow = [_][]const u8{ "repository", "sha", "ref", "ref_name", "ref_type", "server_url", "event_name", "repository_owner", "base_ref", "head_ref", "workspace", "api_url" };
+    for ([_][]const u8{ "environmentVariables", "defaults", "jobOutputs", "variables_note" }) |k| {
+        if (job.object.get(k)) |v| {
+            try out.print("  job.{s}: ", .{k});
+            try std.json.Stringify.value(v, .{}, out);
+            try out.writeByte('\n');
+        }
+    }
+    // Contexts other than `github` (which holds the token): names and a truncated view.
+    if (job.object.get("contextData")) |cd| if (cd == .object) {
+        var it = cd.object.iterator();
+        while (it.next()) |e| {
+            if (std.mem.eql(u8, e.key_ptr.*, "github")) continue;
+            var buf: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+            defer buf.deinit();
+            try std.json.Stringify.value(e.value_ptr.*, .{}, &buf.writer);
+            const t = buf.written();
+            try out.print("  contextData.{s}: {s}{s}\n", .{ e.key_ptr.*, t[0..@min(t.len, 400)], if (t.len > 400) "..." else "" });
+        }
+    };
+    const allow = [_][]const u8{ "repository", "sha", "ref", "ref_name", "ref_type", "server_url", "event_name", "repository_owner", "base_ref", "head_ref", "workspace", "api_url", "actor", "run_id", "run_number", "run_attempt", "job", "workflow", "event", "triggering_actor", "head_ref", "retention_days", "repository_id", "graphql_url", "action_path" };
     const cd = job.object.get("contextData") orelse return;
     if (cd != .object) return;
     const gh = cd.object.get("github") orelse return;
