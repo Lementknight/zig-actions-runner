@@ -1,6 +1,7 @@
 //! LogSink (SPEC §5.1). The runner must work with `StdoutSink` alone; `PostgresSink` comes with M5.
 const std = @import("std");
 const redact = @import("redact.zig");
+const pgsink = @import("pgsink.zig");
 
 pub const Stream = enum { stdout, stderr };
 
@@ -71,6 +72,7 @@ pub const CollectSink = struct {
 pub const LogSink = union(enum) {
     stdout: StdoutSink,
     collect: CollectSink,
+    postgres: pgsink.PgSink,
 
     pub fn append(s: *LogSink, job_id: u64, step_number: u32, stream: Stream, line: []const u8) Error!void {
         switch (s.*) {
@@ -84,6 +86,10 @@ pub const LogSink = union(enum) {
             .collect => |*c| {
                 c.secrets = secrets;
                 c.inner.setSecrets(secrets);
+            },
+            .postgres => |*p| {
+                p.secrets = secrets;
+                p.inner.setSecrets(secrets);
             },
             inline else => |*impl| impl.secrets = secrets,
         }

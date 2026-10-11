@@ -3,8 +3,6 @@
   "planId": "00000000-0000-0000-0000-000000000001"
  },
  "jobId": "00000000-0000-0000-0000-000000000002",
- "jobDisplayName": "Build and test",
- "jobName": "build",
  "jobContainer": null,
  "contextData": {
   "job": {
@@ -13,71 +11,6 @@
     {
      "k": "check_run_id",
      "v": 4242
-    }
-   ]
-  },
-  "github": {
-   "t": 2,
-   "d": [
-    {
-     "k": "run_id",
-     "v": "18400000042"
-    },
-    {
-     "k": "run_number",
-     "v": "7"
-    },
-    {
-     "k": "run_attempt",
-     "v": "1"
-    },
-    {
-     "k": "repository",
-     "v": "Lementknight/zig-actions-runner"
-    },
-    {
-     "k": "workflow",
-     "v": "CI"
-    },
-    {
-     "k": "event_name",
-     "v": "push"
-    },
-    {
-     "k": "ref",
-     "v": "refs/heads/feature/tiger-db"
-    },
-    {
-     "k": "ref_name",
-     "v": "feature/tiger-db"
-    },
-    {
-     "k": "sha",
-     "v": "5dc85102f3a1c0de5dc85102f3a1c0de5dc85102"
-    },
-    {
-     "k": "server_url",
-     "v": "https://github.com"
-    },
-    {
-     "k": "job",
-     "v": "build"
-    },
-    {
-     "k": "event",
-     "v": {
-      "t": 2,
-      "d": [
-       {
-        "k": "ref",
-        "v": "refs/heads/feature/tiger-db"
-       },
-       {
-        "k": "forced",
-        "v": false
-       }
-      ]
-     }
     }
    ]
   }

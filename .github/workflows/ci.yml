@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Runs the database integration tests; see the db-integration job.
+  workflow_dispatch:
+
+env:
+  ZIG_VERSION: "0.17.0"
+
+jobs:
+  unit:
+    name: Zig unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        run: |
+          arch=$(uname -m)
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /opt
+          echo "/opt/zig-${arch}-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      - name: Format check
+        working-directory: runner
+        run: zig fmt --check .
+
+      # Database tests skip themselves here: no PG* variables are set on this job.
+      - name: Test
+        working-directory: runner
+        run: zig build test --summary all
+
+  db-integration:
+    name: Database integration (Tiger Data)
+    # This project's own runner, so a workflow run exercises it too. Manual only: the job waits for a
+    # runner with these labels, so it must not be triggered by every push.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, zig]
+    env:
+      # The standard libpq variables; the tests read them. The secrets are the repository's
+      # TIGER_* secrets and never appear in logs (masked).
+      PGHOST: ${{ secrets.TIGER_HOST }}
+      PGPORT: ${{ secrets.TIGER_PORT }}
+      PGDATABASE: ${{ secrets.TIGER_DB_NAME }}
+      PGUSER: ${{ secrets.TIGER_USERNAME }}
+      PGPASSWORD: ${{ secrets.TIGER_PASSWORD }}
+      PGSSLMODE: require
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        run: |
+          arch=$(uname -m)
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /opt
+          echo "/opt/zig-${arch}-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
+
+      # Each database test creates a scratch schema ("zig_it_<random>"), applies db/migrations/001_init.sql
+      # inside it, and drops it afterwards, so real tables and data are never touched.
+      # `zig test` (not `zig build test`) so the run is never served from the build cache.
+      - name: Database tests over TLS
+        working-directory: runner
+        run: zig test src/main.zig
+
+      # Proves the tests cleaned up after themselves and shows what the database holds. Prints no
+      # credentials and no host name (this repository's logs are public).
+      - name: Database check
+        working-directory: runner
+        run: zig build run -- --db-check
