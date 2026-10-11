@@ -89,7 +89,7 @@ fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log
         return @backingInt(Exit.config);
     };
     const res = try dagger.run(arena, io, init.environ_map, .{
-        .argv = &.{ cfg.dagger_cmd, "--progress=logs", "query" },
+        .dagger_cmd = cfg.dagger_cmd,
         .sink_job_id = job.check_run_id,
     }, job, log);
     for (res.steps, job.steps, 1..) |r, st, n| {
