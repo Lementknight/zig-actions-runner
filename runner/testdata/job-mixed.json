@@ -1,0 +1,243 @@
+{
+ "plan": {
+  "planId": "00000000-0000-0000-0000-000000000001"
+ },
+ "jobId": "00000000-0000-0000-0000-000000000002",
+ "jobContainer": null,
+ "contextData": {
+  "job": {
+   "t": 2,
+   "d": [
+    {
+     "k": "check_run_id",
+     "v": 4242
+    }
+   ]
+  }
+ },
+ "resources": {
+  "endpoints": [
+   {
+    "authorization": {
+     "parameters": {
+      "AccessToken": "fixture-token"
+     },
+     "scheme": "OAuth"
+    }
+   }
+  ]
+ },
+ "steps": [
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "step-1",
+   "contextName": "__run",
+   "name": "__run",
+   "condition": "success()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "script"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "echo hello && sleep 1 && echo done"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "step-2",
+   "contextName": "__run",
+   "name": "__run",
+   "condition": "success()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "script"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "echo persisted > note.txt; echo 'wrote, with commas'"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "step-3",
+   "contextName": "__run",
+   "name": "__run",
+   "condition": "success()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "script"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "cat note.txt && pwd"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "step-4",
+   "contextName": "__run",
+   "name": "__run",
+   "condition": "success()",
+   "continueOnError": {
+    "type": 5,
+    "bool": true
+   },
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "script"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "echo 'allowed to fail' >&2; exit 5"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "step-5",
+   "contextName": "__run",
+   "name": "__run",
+   "condition": "success()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "script"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "echo 'still running after continue-on-error'"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "step-6",
+   "contextName": "__run",
+   "name": "__run",
+   "condition": "success()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "script"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "echo 'about to fail'; exit 2"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "step-7",
+   "contextName": "__run",
+   "name": "__run",
+   "condition": "success()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "script"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "echo 'should be skipped'"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "step-8",
+   "contextName": "__run",
+   "name": "__run",
+   "condition": "always()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "script"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "echo 'cleanup runs because always()'"
+      }
+     }
+    ]
+   }
+  }
+ ]
+}

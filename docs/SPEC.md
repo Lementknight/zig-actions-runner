@@ -9,7 +9,7 @@ This is the contract between components. If you change anything here, tell the t
 ```
 hackathon/
   docs/                 DESIGN.md, SPEC.md
-  hello-world/          current Zig scaffold → rename to runner/
+  runner/               Zig runner
     src/
       main.zig          CLI entry
       config.zig        env/flags
@@ -33,10 +33,12 @@ Environment variables (flags override):
 | `RUNNER_LABELS` | no | Comma-separated, default `self-hosted,linux,zig` |
 | `RUNNER_GROUP_ID` | no | Default `1` |
 | `RUNNER_NAME_PREFIX` | no | Name becomes `<prefix>-<hostname>-<n>` |
-| `DATABASE_URL` | yes | Tiger Data connection string (TLS required) |
+| `DATABASE_URL` | no | Tiger Data connection string (TLS required). If unset, logs go to `StdoutSink` (§5.1) |
 | `DAGGER_CMD` | no | Path to the `dagger` CLI, default `dagger` |
 | `LOG_FLUSH_LINES` | no | Default `200` |
 | `LOG_FLUSH_MS` | no | Default `500` |
+
+Flags: `--token`, `--scope`, `--labels`, `--group-id`, `--name-prefix`, `--database-url`, `--dagger-cmd`, `--log-flush-lines`, `--log-flush-ms` (as `--flag value` or `--flag=value`), plus `--dry-run` (validate config, register nothing).
 
 Exit codes: `0` job done (ephemeral exit), `1` config error, `2` GitHub auth/protocol error, `3` DB unavailable.
 
@@ -52,7 +54,44 @@ Undocumented (reverse-engineered from `actions/runner`, treat as unverified unti
 - Broker error kinds to handle: `RunnerNotFound`, `RunnerVersionTooOld`, `RunnerSessionInvalid`, `HostedRunnerDeprovisioned`.
 - Job message type `AgentJobRequestMessage`.
 
-Findings from M1–M4 must be written back into this section.
+Verified live (M1, 2026-10-11, repo scope):
+- `encoded_jit_config` decodes to three files: `.runner`, `.credentials`, `.credentials_rsaparams`.
+- `.runner` is JSON with PascalCase string values: `AgentId`, `AgentName`, `PoolId`, `ServerUrl`, `ServerUrlV2` (`https://broker.actions.githubusercontent.com/`), `UseV2Flow` (`"true"`), `Ephemeral`, `GitHubUrl`, `WorkFolder`, `DisableUpdate`.
+- `.credentials` is PascalCase: `Scheme` (`OAuth`), `Data.ClientId`, `Data.AuthorizationUrl`.
+- `.credentials_rsaparams` is lowercase base64: `modulus`, `exponent`, `d`, `p`, `q`, `dp`, `dq`, `inverseQ`.
+- OAuth: POST form `grant_type=client_credentials`, `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer`, `client_assertion=<RS256 JWT>` (claims `sub`=`iss`=ClientId, `aud`=AuthorizationUrl, `nbf`, `iat`, `exp`=+5min, `jti`) to `AuthorizationUrl` returns HTTP 200 with `access_token`.
+- `runner --inspect` reproduces these checks and deletes the runner it registers.
+
+Verified live (M2, 2026-10-11), broker base = `ServerUrlV2`, `Authorization: Bearer <access_token>`:
+- `POST {broker}session` with `{"ownerName","agent":{"id","name","version","osDescription","ephemeral","disableUpdate"},"useFipsEncryption":false}` returns 201 `{sessionId, ownerName, assignmentQueued, orchestrationId}`. The response carries no encryption key.
+- `GET {broker}message?sessionId=&status=Online&runnerVersion=&os=Linux&architecture=X64&disableUpdate=true` long-polls about 50 s, then returns 202 with an empty body when no job is queued.
+- `DELETE {broker}session?sessionId=` returns 204 with no body and no `Content-Length`.
+- The broker enforces a minimum `runnerVersion`: 2.328.0 gets 403 `{"source","errorMessage","errorKind":"RunnerVersionTooOld","statusCode":403}`; 2.338.0 (latest release on 2026-10-06) is accepted. Keep the claimed version current.
+- Verified with a real queued job (push to a throwaway branch with `runs-on: [self-hosted, <unique label>]`): `GET message` returns 200 `{messageId, messageType:"RunnerJobRequest", body:"<JSON string>"}`. The parsed `body` is `{runner_request_id, run_service_url, billing_owner_id, should_acknowledge}`; `run_service_url` is a `run-actions-*.actions.githubusercontent.com` host. The message itself is not encrypted.
+- The job is assigned to the runner when the message is delivered; deleting a runner then returns 422 until the run is cancelled or finishes.
+Verified live (run service, 2026-10-11), `run_service_url` from the `RunnerJobRequest` body, `?api-version=2024-11-01`:
+- `POST {run_service_url}/acquirejob` with `{"jobMessageId": <runner_request_id>, "runnerOS": "Linux", "billingOwnerId": <billing_owner_id>}` and the runner's access token returns 200 with the full job definition (about 35 KB). It holds secrets (`github_token`, a job-scoped `AccessToken`, `mask` values): never log it.
+- Job definition keys: `steps[]`, `variables{}`, `mask[]`, `plan{planId}`, `jobId`, `timeline{id}`, `requestId`, `lockedUntil`, `resources.endpoints[].authorization.parameters.AccessToken`, `contextData{github,inputs,job,matrix,needs,strategy,vars}`, `fileTable[]`, `billingOwnerId`.
+- A `run:` step is `{type:"action", reference:{type:"script"}, id, contextName, name, condition, inputs:{type, map:[{Key:{lit:"script"}, Value:{lit:"<script text>"}}]}}`. Inputs and `contextData` use the compact template-token encoding (`t`/`type` ints, `lit`, `k`/`v`, `d`).
+- `POST {run_service_url}/completejob` with `{"planId","jobId","conclusion":"succeeded","outputs":{},"stepResults":[],"annotations":[],"telemetry":[]}` returns 204 and GitHub marks the job and run `success`. It must be authorized with the job-scoped `AccessToken` from `resources.endpoints`; the runner's own token gets 401 "Not authorized for this job".
+- `POST .../acknowledge` returns 400 "request hmac is missing". It is not required: `acquirejob` works without it.
+- After `acquirejob`, the job is held by the runner. Cancelling the run (even force-cancel) did not release it for several minutes; always finish it with `completejob`.
+- `stepResults` (verified live; GitHub then lists exactly these steps): `[{"external_id": <step id>, "number": N, "name": "...", "status": "completed", "conclusion": "succeeded"|"failed"|"skipped", "started_at": "<ISO-8601 UTC, ms>", "completed_at": "..."}]`, numbered from 1. `"success"`/`"failure"` as conclusions get HTTP 400 "Bad Request" (the vocabulary is the same as the job conclusion). A rejected `completejob` leaves the job held, so the runner retries with `"stepResults": []`. GitHub does not add synthetic "Set up job" / "Complete job" steps.
+- A step's display name is the literal `displayNameToken` when the workflow sets `name:`; otherwise `name` is the internal `__run` and the runner shows `Run <first line of script>` (what GitHub shows for unnamed steps).
+- `contextData.job` is `{t, d:[{k, v}]}` and holds `check_run_id`, which is GitHub's numeric job id (the REST `jobs/{id}`); it is the key used for logs.
+- Variables flagged `isSecret` (`github_token`, `system.github.token`) and the job token must be masked in all output; the `mask` array uses a regex encoding and is not used.
+- End to end (runner started, commit pushed, job runs through Dagger, GitHub shows the run and both steps `success`, the ephemeral runner is gone): about 4 s from `acquirejob` to completion for a 3 s script; about 0.8 s when the identical steps are served from Dagger's cache.
+- Log upload to GitHub (verified live; without it the Actions UI shows empty steps and `GET .../jobs/{id}/logs` is 404):
+  - Base URL is the job variable `system.github.results_endpoint`; auth is the job-scoped token (`Authorization: Bearer`).
+  - Per step and for the whole job, all JSON over Twirp at `{base}/twirp/results.services.receiver.Receiver/<Method>`: `GetStepLogsSignedBlobURL` / `GetJobLogsSignedBlobURL` with `{workflow_run_backend_id: plan.planId, workflow_job_run_backend_id: jobId, step_backend_id: <step id>}` (no step id for the job) returns `{logs_url, ...}`.
+  - `PUT logs_url` with `x-ms-blob-type: BlockBlob` and no `Authorization` header; body lines are `<ISO-8601 UTC with 7 fractional digits> <text>\n`.
+  - Then `CreateStepLogsMetadata` / `CreateJobLogsMetadata` with the same ids plus `{uploaded_at, line_count}`.
+  - After this, `jobs/{id}/logs` returns the job log and the run's log archive has a file per step (named after the step) plus GitHub's own `system.txt`.
+  - Uploads happen after the steps finish and before `completejob`; a failed upload is reported and never blocks completion. Logs are kept in memory (redacted, capped at 64 MiB) until then, so a live console feed while the job runs is not provided.
+- Still unverified: `renewjob` (extends `lockedUntil` during long jobs), annotations, and the live console feed (`FeedStreamUrl`).
+- Zig 0.17 `std.http.Client` pitfalls: for 204 responses without `Content-Length`, `Request.deinit` blocks draining the body (set `connection.closing = true` first); the default 1 KiB write buffer is smaller than the ~1.6 KiB bearer token, so raise `write_buffer_size`.
+
+Findings from M2–M4 must be written back into this section.
 
 ## 4. Database schema (Tiger Data / TimescaleDB)
 
@@ -171,7 +210,26 @@ The client polls with `next_after` until `job_done` is true.
 - Step failure stops the job unless `continue-on-error` is set.
 - A single shared Dagger engine per machine serves all runners.
 
-Supported v0 subset: `run`, `env`, `working-directory`, `name`, `continue-on-error`, `actions/checkout`. Anything else fails the step with a clear "unsupported" message in the log. `${{ }}` expressions are limited to `github.*`, `env.*` and `secrets.*` lookups.
+Executor design (verified live against Dagger v0.21.10, offline with `runner --exec-job testdata/job-mixed.json` and end to end through GitHub):
+- The runner spawns `dagger --progress=logs query` and writes one GraphQL document to stdin: `container.from(image).withWorkdir("/github/workspace")` followed by one `withExec(args: ["sh","-c",<wrapper>])` per step, then a read of the report file (below). Scripts are JSON-escaped into the document, so commas and quotes are safe (`dagger core ... --args` splits on commas and is not used). Env `NO_COLOR=1` and `DAGGER_NO_NAG=1` are set. The query result goes to a private temp file (0600, deleted afterwards) so a large report cannot deadlock the stderr reader.
+- Each wrapper always exits 0 and prints marker lines `::zig-step::begin N`, `::zig-step::end N <rc>` and `::zig-step::skip N` around the step's output. The marker is a fixed string, not a per-run nonce: the wrapper text is part of the exec cache key, so a random value would defeat caching. A workflow author can forge markers in their own job's output, but already controls everything that job reports.
+- Dagger's log frontend prints each span's output in chunks and repeats the span header (a line starting with a block glyph, then the wrapper source, ending with a line holding just `'`) whenever it switches between spans. A step's trailing lines can therefore arrive after the next step has begun. Lines are attributed to the step named in the most recent span header (it contains that step's `begin N` text); `end` and `skip` markers clear it. Lines outside any step span are Dagger progress noise, kept only as a tail for engine errors.
+- `if:` supports `success()`, `always()`, `failure()` and `cancelled()` via a flag file in the container; `continue-on-error` decides whether a failed step sets that flag. Any other condition fails the step with an "unsupported" message.
+- `run:` uses `bash --noprofile --norc -e -o pipefail -c` by default and `sh -e -c` for `shell: sh`. Step `env` is applied with `env K=V`, and `working-directory` with `cd`. Filesystem state carries across steps because the steps form one container chain.
+- Each wrapper also appends its marker lines and output to `/tmp/zig-out/report` inside the container. Because that file is part of the cached filesystem, a fully cached chain (which replays no logs at all) can still be read back: steps the live stream never reported are replayed from the report, through the same attribution code. Verified: an identical re-run returns identical output and results, 0.70 s instead of 2.16 s offline and 0.84 s instead of 3.9 s through GitHub.
+- Output streams live (spacing of a script's own `sleep`s is preserved).
+- Limitations: stdout and stderr are merged (stream is always `stdout`); `seq` across steps that finish within milliseconds reflects arrival order, while order within a step is exact; `container:` jobs, `uses:` actions and expressions are unsupported.
+
+`uses: actions/checkout` is replaced by a built-in checkout (verified live):
+- The step arrives as `reference: {type:"repository", name:"actions/checkout", ref:"v4", repositoryType:"GitHub"}`; `inputs` is absent when the workflow has no `with:`. The pinned version is ignored.
+- Before the main query, the runner resolves each checkout with its own `dagger query`: `git(url:"<server_url>/<repo>.git", keepGitDir:true) { commit(id:<sha>) | ref(name:<ref>) | head { tree(depth:<n>) { id } } }`, which returns a Directory id (valid across `dagger query` sessions; Secret ids are not). The chain then mounts it with `withDirectory(path, source: id)` before the step's report exec. The tree is content-addressed, so the same commit gives the same workspace and later steps keep hitting Dagger's cache. The workspace contains a real `.git`.
+- Defaults: `repository` = the workflow's repo, `ref` = the triggering sha (`github.sha`; another repository defaults to its HEAD), `fetch-depth` = 1 (0 = full history). `ref` may be a sha, a branch, a tag or `refs/...` (for example `refs/pull/N/merge`); `path` must be relative and stay inside the workspace.
+- Accepted and ignored: `persist-credentials`, `token`, `clean`, `show-progress`, `set-safe-directory`, `fetch-tags`, `filter`, `sparse-checkout-cone-mode`, `ssh-strict`, `ssh-user`. Accepted only when off: `submodules`, `lfs`, `sparse-checkout`, `ssh-key`, `ssh-known-hosts`. Any other input, or `submodules: recursive` and the like, fails the step with "unsupported ...". Other `uses:` actions fail with "uses: <name>@<ref> is not supported".
+- Scope: public repositories only. Private-repository access is not part of the MVP: a fetch that needs credentials fails that step with git's own message plus "(private repositories are not supported in v0)", and the rest of the job continues. Dagger prints URLs in its progress output and its Secret ids do not survive across `dagger query` sessions, so a future implementation must not put a token in a URL or rely on a secret created by an earlier query. `GIT_TERMINAL_PROMPT=0` is set so a fetch can never block on a prompt.
+- Differences from the real action: no credentials are left in `.git/config`; a failed fetch fails only that step, with the reason in its log; the base image (`ubuntu:24.04`) has no `git` binary, so steps that run `git` need an image that has it.
+- A skipped checkout (`if:` false) still mounts the tree; only `success()`/`always()`/`failure()`/`cancelled()` are evaluated, as for other steps.
+
+Supported v0 subset: `run`, `env`, `working-directory`, `name`, `continue-on-error`, `if:` (`success()`, `always()`, `failure()`, `cancelled()`) and `uses: actions/checkout`. Anything else fails the step with a clear "unsupported" message in the log. `${{ }}` expressions are limited to `github.*`, `env.*` and `secrets.*` lookups.
 
 ## 7. Resource targets (to measure, not assumed)
 

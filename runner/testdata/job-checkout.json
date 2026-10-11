@@ -1,0 +1,167 @@
+{
+ "plan": {
+  "planId": "p"
+ },
+ "jobId": "j",
+ "jobContainer": null,
+ "contextData": {
+  "job": {
+   "t": 2,
+   "d": [
+    {
+     "k": "check_run_id",
+     "v": 4243
+    }
+   ]
+  },
+  "github": {
+   "t": 2,
+   "d": [
+    {
+     "k": "repository",
+     "v": "Open-Blue/blog_cicd_test"
+    },
+    {
+     "k": "sha",
+     "v": "0bbbe3f5f48a35df62561b1f2eced354e1844544"
+    },
+    {
+     "k": "ref",
+     "v": "refs/heads/zig-m2-test"
+    },
+    {
+     "k": "server_url",
+     "v": "https://github.com"
+    }
+   ]
+  }
+ },
+ "resources": {
+  "endpoints": [
+   {
+    "authorization": {
+     "parameters": {
+      "AccessToken": "fixture-token"
+     },
+     "scheme": "OAuth"
+    }
+   }
+  ]
+ },
+ "steps": [
+  {
+   "type": "action",
+   "reference": {
+    "type": "repository",
+    "name": "actions/checkout",
+    "ref": "v4",
+    "repositoryType": "GitHub"
+   },
+   "id": "co-1",
+   "name": "__run",
+   "condition": "success()",
+   "continueOnError": null
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "repository",
+    "name": "actions/checkout",
+    "ref": "v4",
+    "repositoryType": "GitHub"
+   },
+   "id": "co-2",
+   "name": "__run",
+   "condition": "success()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "ref"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "main"
+      }
+     },
+     {
+      "Key": {
+       "type": 0,
+       "lit": "path"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "other"
+      }
+     },
+     {
+      "Key": {
+       "type": 0,
+       "lit": "fetch-depth"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "1"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "run-3",
+   "name": "__run",
+   "condition": "success()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "script"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "pwd; ls -a | head -6; echo ---; ls other | head -3; echo ---; ls -a other/.git | head -3; test -f .gitignore && echo 'workspace root has repo files'"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "repository",
+    "name": "actions/checkout",
+    "ref": "v4",
+    "repositoryType": "GitHub"
+   },
+   "id": "co-4",
+   "name": "__run",
+   "condition": "success()",
+   "continueOnError": null,
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "type": 0,
+       "lit": "submodules"
+      },
+      "Value": {
+       "type": 0,
+       "lit": "recursive"
+      }
+     }
+    ]
+   }
+  }
+ ]
+}
