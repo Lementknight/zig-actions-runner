@@ -46,6 +46,7 @@ on Docker Desktop.
 | `GET /api/health` | `{ "ok": true }` after a `SELECT 1`; 503 `{ "ok": false, ... }` when the database does not answer |
 | `GET /api/runs?repo=&limit=&before=` | A bare array of runs, newest first (`created_at DESC, id DESC`) |
 | `GET /api/runs/:id` | The run with `jobs[]` (by id), each with `steps[]` (by `number`) |
+| `GET /api/runners` | A bare array of runners by name: status, labels, timestamps, `current_job` and job counts |
 | `GET /api/jobs/:id/logs?after=&limit=` | `{ lines: [{ seq, step, stream, ts, line }], next_after, job_done }`, lines with `seq > after` by `seq` |
 
 - Fields are the table columns, snake_case. BIGINT ids are JSON numbers. Timestamps are ISO 8601
@@ -56,6 +57,11 @@ on Docker Desktop.
   returned, or echoes `after` on an empty page. `job_done` is true only when the job is
   `completed` and no line past `next_after` exists. The query bounds `ts` from the job's
   `started_at` less an hour, so TimescaleDB scans only the job's chunks.
+- Runners: `status` is `offline` when the row says so or `last_seen_at` is more than 2 minutes
+  old by the database's clock, `busy` only when the row says busy and the runner has an
+  in-progress job, and `idle` otherwise. `current_job` (`{ id, run_id, name }`) is set exactly
+  when `status` is `busy`. `running_jobs` and `completed_jobs` count `jobs` by `runner_name`.
+  Names sort in byte order (`COLLATE "C"`), as JavaScript's `sort()` does.
 - docs/SPEC.md §5.3 is the contract; this list is a summary of it.
 - A malformed id, `limit`, `before` or `after` answers 400 `{ "error": "..." }`. An
   unknown run, job or path answers 404 `{ "error": "not found" }`. A database failure answers 500

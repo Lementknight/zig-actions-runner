@@ -1,44 +1,45 @@
-//! Runs a job's steps as one Dagger pipeline by shelling out to `dagger --progress=logs query`
-//! (DESIGN §4, SPEC §6).
+//! Runs a job's steps through Dagger (DESIGN §4, SPEC §6).
 //!
-//! The pipeline is a single GraphQL chain: base image, workspace dir, then one `withExec` per step.
-//! Every step is wrapped in a small `sh` script that always exits 0 and brackets its output with
-//! marker lines:
+//! One long-lived Dagger session hosts the whole job: the runner starts `dagger run`, which runs a
+//! tiny child that prints the session's port and token and then waits. The runner then speaks
+//! GraphQL to that session over HTTP (as the Dagger SDKs do), one query per step, threading the
+//! container through by id. Container ids only live as long as the session, which is why this is
+//! not one `dagger query` per step.
 //!
-//!     <marker>begin N     <marker>end N RC     <marker>skip N
+//! Compared to a single query for the whole job this lets the runner decide what to run next from
+//! earlier results (conditions, expressions, step outputs), and `withExec(expect: ANY)` returns the
+//! real exit code and separate stdout/stderr, even for steps served from Dagger's cache.
 //!
-//! The wrapper also implements `if:` (success/always/failure/cancelled) and `continue-on-error`
-//! with a flag file, which a chain of plain withExec calls cannot express.
+//! Live output comes from `dagger run`'s progress log on stderr, read by a reader task. Each step's
+//! script brackets its output with marker lines so lines can be attributed to the step:
 //!
-//! Dagger's log frontend prints each span's output in chunks and repeats the span header whenever it
-//! switches between spans, so a step's lines can arrive after another step has started. Lines are
-//! therefore attributed to the step named in the most recent span header (which contains that
-//! step's `begin N` marker text), not to "whatever began last". Output is streamed to the LogSink as
-//! it arrives; lines outside any step span are Dagger's progress noise, kept only as a tail for
-//! error reporting.
+//!     <marker>begin N      <marker>end N
 //!
-//! The marker is a fixed string, not a per-run nonce: the wrapper text is part of the exec's cache
-//! key, so a random value would defeat Dagger's cache. A workflow author can forge markers in their
-//! own job's output, but they already control everything that job reports.
+//! Dagger's log frontend may repeat a span's header when it switches spans, so lines are attributed
+//! to the step named in the most recent span header (a single line that contains the step's `begin`
+//! marker text), not simply the last `begin`. A step served
+//! from cache prints no log lines at all; its stdout/stderr from the query result are replayed.
 const std = @import("std");
 const job_mod = @import("job.zig");
 const sink = @import("sink.zig");
+const broker = @import("github/broker.zig");
+const expr = @import("expr.zig");
+const context = @import("context.zig");
+const commands = @import("commands.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const default_image = "ubuntu:24.04";
 pub const workspace = "/github/workspace";
-const fail_flag = "/tmp/.zig_failed";
 pub const marker = "::zig-step::";
-/// Every wrapper also appends its marker lines and output here. The file is part of the cached
-/// container filesystem, so a fully cached run (which replays no logs) can still be read back.
-const report_dir = "/tmp/zig-out";
-const report_path = report_dir ++ "/report";
+
+/// Makes `ubuntu:24.04` usable for typical steps: git (checked-out workspaces are real repositories), xz (to unpack toolchains),
+/// curl and CA certificates. Dagger caches this exec, so only the first run pays for it.
+pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends git ca-certificates curl xz-utils >/dev/null && rm -rf /var/lib/apt/lists/*";
 
 pub const Marker = union(enum) {
     begin: u32,
-    end: struct { step: u32, rc: i32 },
-    skip: u32,
+    end: u32,
 };
 
 pub const Scan = struct {
@@ -55,10 +56,8 @@ pub fn scan(line: []const u8) ?Scan {
     const step = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
     const m: Marker = if (std.mem.eql(u8, kind, "begin"))
         .{ .begin = step }
-    else if (std.mem.eql(u8, kind, "skip"))
-        .{ .skip = step }
     else if (std.mem.eql(u8, kind, "end"))
-        .{ .end = .{ .step = step, .rc = std.fmt.parseInt(i32, it.next() orelse return null, 10) catch return null } }
+        .{ .end = step }
     else
         return null;
     return .{ .before = line[0..i], .marker = m };
@@ -69,12 +68,7 @@ fn isSpanHeader(line: []const u8) bool {
     return line.len >= 4 and line[0] == 0xE2 and line[1] == 0x96;
 }
 
-/// A step's wrapper is shown as a multi-line header that ends with a line holding just `'`.
-fn headerIsMultiLine(line: []const u8) bool {
-    return std.mem.indexOf(u8, line, "withExec sh -c '") != null and !std.mem.endsWith(u8, line, "'");
-}
-
-/// Step number from a wrapper source line such as `echo '::zig-step::begin 2'`.
+/// Step number from a script line such as `echo '::zig-step::begin 2'`.
 fn headerStep(line: []const u8) ?u32 {
     const i = std.mem.indexOf(u8, line, marker ++ "begin ") orelse return null;
     const rest = line[i + marker.len + "begin ".len ..];
@@ -92,13 +86,14 @@ fn shellQuote(w: *std.Io.Writer, s: []const u8) !void {
     try w.writeByte('\'');
 }
 
-/// Shell test for an `if:` condition, or null when v0 cannot evaluate it.
-fn conditionTest(cond: []const u8) ?[]const u8 {
+/// Evaluates an `if:` condition. Null when v0 cannot evaluate it. `job_failed` is true once a step
+/// failed without continue-on-error.
+pub fn evalCondition(cond: []const u8, job_failed: bool) ?bool {
     const c = std.mem.trim(u8, cond, " ");
-    if (std.mem.eql(u8, c, "success()")) return "[ ! -e " ++ fail_flag ++ " ]";
-    if (std.mem.eql(u8, c, "always()")) return "true";
-    if (std.mem.eql(u8, c, "failure()")) return "[ -e " ++ fail_flag ++ " ]";
-    if (std.mem.eql(u8, c, "cancelled()")) return "false";
+    if (std.mem.eql(u8, c, "success()")) return !job_failed;
+    if (std.mem.eql(u8, c, "always()")) return true;
+    if (std.mem.eql(u8, c, "failure()")) return job_failed;
+    if (std.mem.eql(u8, c, "cancelled()")) return false;
     return null;
 }
 
@@ -113,52 +108,58 @@ pub const Fetched = struct {
     mount: []const u8,
 };
 
-/// The `sh -c` script for step number `n` (1-based). `fetched` is set for checkout steps.
-pub fn stepWrapper(arena: Allocator, n: u32, step: job_mod.Step, fetched: ?Fetched) ![]const u8 {
+/// A step with its expressions evaluated, ready to become a script.
+pub const Resolved = union(enum) {
+    run: struct {
+        script: []const u8,
+        /// `bash`, `sh`, or null for the default.
+        shell: ?[]const u8,
+        working_directory: ?[]const u8,
+        env: []const job_mod.EnvVar,
+    },
+    checkout: Fetched,
+};
+
+const fc_dir = "/github/file_commands";
+const fc_kinds = [_][]const u8{ "output", "env", "path", "step_summary" };
+
+fn fcPath(arena: Allocator, kind: []const u8, n: u32) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}/{s}_{d}", .{ fc_dir, kind, n });
+}
+
+/// The `sh -c` script of step number `n` (1-based). Its exit code is the step's.
+///
+/// The script creates the step's file commands first and touches them again afterwards, so the
+/// query can always read them even if the step deleted them. A `run:` step sees them as
+/// `$GITHUB_OUTPUT`, `$GITHUB_ENV`, `$GITHUB_PATH` and `$GITHUB_STEP_SUMMARY`.
+pub fn stepScript(arena: Allocator, n: u32, r: Resolved, action_name: []const u8) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
-
-    const cond = conditionTest(step.condition);
-    const bad_condition = if (cond == null)
-        try std.fmt.allocPrint(arena, "unsupported condition '{s}' (v0 supports success(), always(), failure(), cancelled())", .{step.condition})
-    else
-        null;
-    const why: ?[]const u8 = switch (step.action) {
-        .unsupported => |r| r,
-        .script => bad_condition,
-        .checkout => if (fetched) |f| switch (f.result) {
-            .failed => |msg| msg,
-            .dir => bad_condition,
-        } else "checkout was not resolved",
-    };
-
-    try w.writeAll("mkdir -p " ++ report_dir ++ "\n{\n");
-
-    if (why) |reason| {
-        // Fail loudly: the step "runs", prints why it cannot, and fails the job.
-        try w.print("echo '{s}begin {d}'\nprintf '%s\\n' ", .{ marker, n });
-        try shellQuote(w, reason);
-        try w.print("\necho '{s}end {d} 1'\ntouch {s}\n}} 2>&1 | tee -a " ++ report_path ++ "\nexit 0\n", .{ marker, n, fail_flag });
-        return aw.written();
-    }
-
-    try w.print("if {s}; then\necho '{s}begin {d}'\n", .{ cond.?, marker, n });
-    switch (step.action) {
-        .script => |sc| {
+    try w.print("echo '{s}begin {d}'\nmkdir -p " ++ fc_dir ++ " && : ", .{ marker, n });
+    for (fc_kinds) |k| try w.print("> {s} ", .{try fcPath(arena, k, n)});
+    try w.writeByte('\n');
+    switch (r) {
+        .run => |sc| {
             try w.writeAll("( ");
             if (sc.working_directory) |wd| {
                 try w.writeAll("cd ");
                 try shellQuote(w, wd);
                 try w.writeAll(" && ");
             }
-            if (step.env.len > 0) {
-                try w.writeAll("env ");
-                for (step.env) |e| {
-                    const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
-                    try shellQuote(w, pair);
-                    try w.writeByte(' ');
-                }
+            try w.writeAll("env ");
+            for (sc.env) |e| {
+                const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
+                try shellQuote(w, pair);
+                try w.writeByte(' ');
             }
+            // Set after the step's own env, so a step cannot point these somewhere else.
+            const names = [_][]const u8{ "GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY" };
+            for (names, fc_kinds) |name, kind| {
+                try shellQuote(w, try std.fmt.allocPrint(arena, "{s}={s}", .{ name, try fcPath(arena, kind, n) }));
+                try w.writeByte(' ');
+            }
+            try shellQuote(w, try std.fmt.allocPrint(arena, "GITHUB_ACTION={s}", .{action_name}));
+            try w.writeByte(' ');
             if (sc.shell != null and std.mem.eql(u8, sc.shell.?, "sh")) {
                 try w.writeAll("sh -e -c ");
             } else {
@@ -167,61 +168,28 @@ pub fn stepWrapper(arena: Allocator, n: u32, step: job_mod.Step, fetched: ?Fetch
             try shellQuote(w, sc.script);
             try w.writeAll(" )\nrc=$?\n");
         },
-        .checkout => {
-            // The tree was mounted by the chain (`withDirectory`); the step only reports it.
-            const f = fetched.?;
+        .checkout => |f| {
+            // The tree is mounted by the query (`withDirectory`); the step only reports it.
             try w.writeAll("printf '%s\\n' ");
             try shellQuote(w, try std.fmt.allocPrint(arena, "Syncing repository: {s}", .{f.repo}));
             try w.writeAll("\nprintf '%s\\n' ");
             try shellQuote(w, try std.fmt.allocPrint(arena, "Checked out {s} into {s} (the runner's built-in checkout replaces actions/checkout)", .{ f.ref_label, f.mount }));
             try w.writeAll("\nrc=0\n");
         },
-        .unsupported => unreachable,
     }
-    try w.print("echo '{s}end {d} '\"$rc\"\n", .{ marker, n });
-    if (!step.continue_on_error) try w.print("[ \"$rc\" -eq 0 ] || touch {s}\n", .{fail_flag});
-    try w.print("else\necho '{s}skip {d}'\nfi\n}} 2>&1 | tee -a " ++ report_path ++ "\nexit 0\n", .{ marker, n });
-    return aw.written();
-}
-
-/// The GraphQL document for `dagger query`.
-pub fn buildQuery(arena: Allocator, job: job_mod.Job, image: []const u8, fetched: []const ?Fetched) ![]const u8 {
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.writeAll("{ container { from(address:");
-    try std.json.Stringify.value(image, .{}, w);
-    try w.print(") {{ withWorkdir(path:\"{s}\") {{ ", .{workspace});
-    var nodes: usize = 0;
-    for (job.steps, 1..) |step, n| {
-        const f: ?Fetched = if (n <= fetched.len) fetched[n - 1] else null;
-        if (f) |fe| switch (fe.result) {
-            .dir => |id| {
-                // Content-addressed tree: the same commit yields the same workspace, so later
-                // steps keep hitting Dagger's cache.
-                try w.writeAll("withDirectory(path:");
-                try std.json.Stringify.value(fe.mount, .{}, w);
-                try w.writeAll(",source:");
-                try std.json.Stringify.value(id, .{}, w);
-                try w.writeAll(") { ");
-                nodes += 1;
-            },
-            .failed => {},
-        };
-        const script = try stepWrapper(arena, @intCast(n), step, f);
-        try w.writeAll("withExec(args:");
-        try std.json.Stringify.value([_][]const u8{ "sh", "-c", script }, .{}, w);
-        try w.writeAll(") { ");
-        nodes += 1;
-    }
-    // Reading the report forces the whole chain to run (or be served from cache).
-    if (job.steps.len > 0) try w.writeAll("file(path:\"" ++ report_path ++ "\") { contents }") else try w.writeAll("sync");
-    for (0..nodes + 4) |_| try w.writeAll(" }");
+    try w.writeAll("mkdir -p " ++ fc_dir ++ " && : ");
+    for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, n)});
+    try w.print("\necho '{s}end {d}'\nexit $rc\n", .{ marker, n });
     return aw.written();
 }
 
 pub const Outcome = enum { not_run, success, failure, skipped };
 
 pub const StepResult = struct {
+    /// The step's display name with expressions evaluated; empty when it was never evaluated.
+    name: []const u8 = "",
+    /// Whether `continue-on-error` applied (evaluated), so a failure does not fail the job.
+    continued: bool = false,
     outcome: Outcome = .not_run,
     exit_code: i32 = 0,
     started_ms: i64 = 0,
@@ -230,32 +198,110 @@ pub const StepResult = struct {
 
 pub const Result = struct {
     steps: []StepResult,
-    /// Set when the engine itself failed (pull error, engine down): the last lines it printed.
+    /// Set when the engine itself failed (pull error, session lost): what Dagger said.
     engine_error: ?[]const u8,
     /// False if any step failed without continue-on-error, or the engine failed before running them.
     succeeded: bool,
 };
 
+/// Sends one GraphQL document to the Dagger session and returns the response body.
+pub const Transport = struct {
+    ptr: *anyopaque,
+    sendFn: *const fn (ptr: *anyopaque, arena: Allocator, doc: []const u8) anyerror![]const u8,
+
+    fn send(t: Transport, arena: Allocator, doc: []const u8) ![]const u8 {
+        return t.sendFn(t.ptr, arena, doc);
+    }
+};
+
+/// Told when each step starts and finishes, so run state can be recorded at those transitions.
+pub const Observer = struct {
+    ptr: *anyopaque,
+    startedFn: *const fn (ptr: *anyopaque, number: u32, name: []const u8, started_ms: i64) void,
+    finishedFn: *const fn (ptr: *anyopaque, number: u32, result: StepResult) void,
+
+    fn started(o: Observer, number: u32, name: []const u8, started_ms: i64) void {
+        o.startedFn(o.ptr, number, name, started_ms);
+    }
+    fn finished(o: Observer, number: u32, result: StepResult) void {
+        o.finishedFn(o.ptr, number, result);
+    }
+};
+
 pub const Options = struct {
-    /// Full argv of the dagger process; the query is written to its stdin.
-    argv: []const []const u8,
+    observer: ?Observer = null,
+    /// The `dagger` command.
+    dagger_cmd: []const u8 = "dagger",
     image: []const u8 = default_image,
+    /// Installed into the image before the job (one cached exec). Used for the default image only,
+    /// which has no git; a custom image is expected to bring what it needs.
+    provision: bool = true,
     /// Key under which output lines are written to the sink.
     sink_job_id: u64 = 0,
-    /// Called on every step transition (SPEC §5.2), live or replayed from the report.
-    on_step: ?StepHook = null,
+    /// Tests only: replaces `dagger run ...` (it must print "<port> <token>" first) and the HTTP transport.
+    test_session_argv: ?[]const []const u8 = null,
+    test_transport: ?Transport = null,
 };
 
-/// A step transition: after a `begin` marker the result has `started_ms` and outcome `not_run`;
-/// after `end` or `skip` it has the final outcome. `now_ms` is when the marker arrived (a skip
-/// marker sets no time of its own). Steps are numbered from 1. The hook must not fail the job, so it
-/// returns nothing.
-pub const StepHook = struct {
-    ctx: *anyopaque,
-    call: *const fn (ctx: *anyopaque, step: u32, result: StepResult, now_ms: i64) void,
+// --- the HTTP transport to the session ---
+
+const HttpTransport = struct {
+    io: std.Io,
+    url: []const u8,
+    auth: []const u8,
+
+    fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8) anyerror![]const u8 {
+        const self: *HttpTransport = @ptrCast(@alignCast(ptr));
+        var body: std.Io.Writer.Allocating = .init(arena);
+        try body.writer.writeAll("{\"query\":");
+        try std.json.Stringify.value(doc, .{}, &body.writer);
+        try body.writer.writeByte('}');
+        const r = try broker.request(arena, self.io, .POST, self.url, body.written(), .{
+            .extra_headers = &.{.{ .name = "Authorization", .value = self.auth }},
+        });
+        // GraphQL errors can arrive with a non-2xx status; the body says what was wrong.
+        if (r.status.class() != .success and r.body.len == 0) return error.DaggerSessionHttpError;
+        return r.body;
+    }
 };
 
-// --- checkout ---
+fn jsonFind(v: std.json.Value, key: []const u8) ?std.json.Value {
+    if (v != .object) return null;
+    var it = v.object.iterator();
+    while (it.next()) |e| {
+        if (std.mem.eql(u8, e.key_ptr.*, key)) return e.value_ptr.*;
+        if (jsonFind(e.value_ptr.*, key)) |f| return f;
+    }
+    return null;
+}
+
+fn jsonFindString(v: std.json.Value, key: []const u8) ?[]const u8 {
+    const f = jsonFind(v, key) orelse return null;
+    return if (f == .string) f.string else null;
+}
+
+/// Runs a document and returns the parsed `data`, or the first GraphQL error message.
+fn gql(arena: Allocator, t: Transport, doc: []const u8, err_msg: *[]const u8) !std.json.Value {
+    const body = t.send(arena, doc) catch |e| {
+        err_msg.* = try std.fmt.allocPrint(arena, "could not reach the Dagger session: {s}", .{@errorName(e)});
+        return error.DaggerQueryFailed;
+    };
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch {
+        err_msg.* = "Dagger returned a response that is not JSON";
+        return error.DaggerQueryFailed;
+    };
+    if (root == .object) {
+        if (root.object.get("errors")) |errs| if (errs == .array and errs.array.items.len > 0) {
+            err_msg.* = jsonFindString(errs.array.items[0], "message") orelse "Dagger returned an error";
+            return error.DaggerQueryFailed;
+        };
+        if (root.object.get("data")) |d| return d;
+    }
+    err_msg.* = "Dagger returned no data";
+    return error.DaggerQueryFailed;
+}
+
+// --- checkout resolution ---
 
 fn isSha(s: []const u8) bool {
     if (s.len != 40) return false;
@@ -263,7 +309,7 @@ fn isSha(s: []const u8) bool {
     return true;
 }
 
-/// The `dagger query` document that resolves a checkout to a Directory id, or null with a reason.
+/// The query that resolves a checkout to a Directory id, or null with a reason.
 pub fn checkoutQuery(arena: Allocator, job: job_mod.Job, co: job_mod.Checkout) !union(enum) { doc: []const u8, err: []const u8 } {
     const repo = co.repository orelse job.github.repository;
     if (repo.len == 0) return .{ .err = "no repository to check out (the job has no github.repository)" };
@@ -290,206 +336,422 @@ pub fn checkoutQuery(arena: Allocator, job: job_mod.Job, co: job_mod.Checkout) !
     return .{ .doc = aw.written() };
 }
 
-const Captured = struct { ok: bool, stdout: []const u8, stderr_tail: []const u8 };
-
-/// Runs one `dagger query`, returning its JSON result and, on failure, the last lines it printed.
-fn runCaptured(arena: Allocator, io: std.Io, env: *const std.process.Environ.Map, argv: []const []const u8, doc: []const u8) !Captured {
-    var rnd: [8]u8 = undefined;
-    io.random(&rnd);
-    const out_path = try std.fmt.allocPrint(arena, "/tmp/zig-runner-{x}.json", .{rnd});
-    const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{ .exclusive = true, .permissions = @fromBackingInt(0o600) });
-    defer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
-
-    var child = try std.process.spawn(io, .{ .argv = argv, .environ_map = env, .stdin = .pipe, .stdout = .{ .file = out_file }, .stderr = .pipe });
-    out_file.close(io);
-    {
-        var wbuf: [4096]u8 = undefined;
-        var fw = child.stdin.?.writer(io, &wbuf);
-        try fw.interface.writeAll(doc);
-        try fw.interface.flush();
-        child.stdin.?.close(io);
-        child.stdin = null;
-    }
-    var tail: [8][]const u8 = undefined;
-    var tail_len: usize = 0;
-    var rbuf: [64 * 1024]u8 = undefined;
-    var fr = child.stderr.?.readerStreaming(io, &rbuf);
-    while (true) {
-        const raw = fr.interface.takeDelimiter('\n') catch |e| switch (e) {
-            error.StreamTooLong => {
-                _ = fr.interface.discardDelimiterInclusive('\n') catch break;
-                continue;
-            },
-            error.ReadFailed => break,
-        } orelse break;
-        const line = std.mem.trim(u8, raw, " \r");
-        // Keep only what the last span printed: that is where git and the engine report the error.
-        if (isSpanHeader(line)) {
-            tail_len = 0;
-            continue;
-        }
-        if (line.len == 0 or std.mem.indexOf(u8, line, " INF ") != null) continue;
-        if (tail_len == tail.len) {
-            std.mem.copyForwards([]const u8, tail[0 .. tail.len - 1], tail[1..]);
-            tail_len -= 1;
-        }
-        tail[tail_len] = try arena.dupe(u8, line);
-        tail_len += 1;
-    }
-    const term = try child.wait(io);
-    const ok = switch (term) {
-        .exited => |c| c == 0,
-        else => false,
-    };
-    const stdout = std.Io.Dir.cwd().readFileAlloc(io, out_path, arena, .limited(16 * 1024 * 1024)) catch "";
-    return .{ .ok = ok, .stdout = stdout, .stderr_tail = try std.mem.join(arena, " | ", tail[0..tail_len]) };
-}
-
 fn looksLikeAuthFailure(text: []const u8) bool {
     const needles = [_][]const u8{ "not found", "authentication", "Authentication", "denied", "403", "401", "could not read Username" };
     for (needles) |n| if (std.mem.indexOf(u8, text, n) != null) return true;
     return false;
 }
 
-fn findKey(v: std.json.Value, key: []const u8) ?[]const u8 {
-    if (v != .object) return null;
-    var it = v.object.iterator();
-    while (it.next()) |e| {
-        if (std.mem.eql(u8, e.key_ptr.*, key) and e.value_ptr.* == .string) return e.value_ptr.string;
-        if (findKey(e.value_ptr.*, key)) |c| return c;
-    }
-    return null;
-}
+fn fetchCheckout(arena: Allocator, t: Transport, job: job_mod.Job, co: job_mod.Checkout) !Fetched {
+    const repo = co.repository orelse job.github.repository;
+    const mount = if (co.path) |pth|
+        try std.fmt.allocPrint(arena, "{s}/{s}", .{ workspace, std.mem.trim(u8, pth, "/") })
+    else
+        workspace;
+    const want = co.ref orelse (if (co.repository == null) job.github.sha else "HEAD");
+    const label = if (isSha(want)) want[0..7] else want;
+    var f: Fetched = .{ .result = .{ .failed = "" }, .repo = repo, .ref_label = label, .mount = mount };
 
-/// Fetches the tree of every checkout step. A failure is recorded on that step (it then fails with
-/// the reason in its log) instead of aborting the job.
-fn resolveCheckouts(arena: Allocator, io: std.Io, base_env: *const std.process.Environ.Map, opts: Options, job: job_mod.Job) ![]?Fetched {
-    const out = try arena.alloc(?Fetched, job.steps.len);
-    @memset(out, null);
-    for (job.steps, out) |step, *slot| {
-        if (step.action != .checkout) continue;
-        const co = step.action.checkout;
-        const repo = co.repository orelse job.github.repository;
-        const mount = if (co.path) |pth|
-            try std.fmt.allocPrint(arena, "{s}/{s}", .{ workspace, std.mem.trim(u8, pth, "/") })
-        else
-            workspace;
-        const want = co.ref orelse (if (co.repository == null) job.github.sha else "HEAD");
-        const label = if (isSha(want)) want[0..7] else want;
-        var fetched: Fetched = .{ .result = .{ .failed = "" }, .repo = repo, .ref_label = label, .mount = mount };
-
-        switch (try checkoutQuery(arena, job, co)) {
-            .err => |msg| fetched.result = .{ .failed = msg },
-            .doc => |doc| {
-                // Never prompt for credentials: private repositories are out of scope for v0.
-                var env = try base_env.clone(arena);
-                try env.put("GIT_TERMINAL_PROMPT", "0");
-                const res = try runCaptured(arena, io, &env, opts.argv, doc);
-                const parsed = if (res.ok) std.json.parseFromSliceLeaky(std.json.Value, arena, res.stdout, .{}) catch null else null;
-                const id: ?[]const u8 = if (parsed) |pv| findKey(pv, "id") else null;
-                fetched.result = if (id) |i|
-                    .{ .dir = i }
-                else
-                    .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}@{s}: {s}{s}", .{
-                        repo,
-                        label,
-                        if (res.stderr_tail.len > 0) res.stderr_tail else "dagger returned no tree",
-                        if (looksLikeAuthFailure(res.stderr_tail)) " (private repositories are not supported in v0)" else "",
-                    }) };
-            },
+    const doc = switch (try checkoutQuery(arena, job, co)) {
+        .err => |msg| {
+            f.result = .{ .failed = msg };
+            return f;
+        },
+        .doc => |d| d,
+    };
+    var msg: []const u8 = "";
+    if (gql(arena, t, doc, &msg)) |data| {
+        if (jsonFindString(data, "id")) |id| {
+            f.result = .{ .dir = id };
+            return f;
         }
-        slot.* = fetched;
-    }
-    return out;
+        msg = "Dagger returned no tree";
+    } else |_| {}
+    f.result = .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}@{s}: {s}{s}", .{
+        repo, label, msg, if (looksLikeAuthFailure(msg)) " (private repositories are not supported in v0)" else "",
+    }) };
+    return f;
 }
 
-/// Splits Dagger's log stream into per-step output. Used for the live stream and for replaying the
-/// in-container report, so both go through identical attribution rules.
-const Demux = struct {
+// --- expression evaluation ---
+
+const StepCtx = struct { id: []const u8, outcome: []const u8, conclusion: []const u8, outputs: []const job_mod.EnvVar };
+
+/// Holds what expressions can see while a job runs and evaluates the templates of each step.
+const Evaluator = struct {
+    arena: Allocator,
+    job: *const job_mod.Job,
+    /// github, inputs, matrix, needs, strategy, vars from the job's contextData.
+    github: expr.Value,
+    inputs: expr.Value,
+    matrix: expr.Value,
+    needs: expr.Value,
+    strategy: expr.Value,
+    vars: expr.Value,
+    job_context: expr.Value,
+    /// Workflow- and job-level env, evaluated once.
+    job_env: std.ArrayList(job_mod.EnvVar) = .empty,
+    steps: std.ArrayList(StepCtx) = .empty,
+    /// Changes a step made through $GITHUB_ENV / $GITHUB_PATH, applied to the container before the next step.
+    pending_env: std.ArrayList(job_mod.EnvVar) = .empty,
+    pending_path: std.ArrayList([]const u8) = .empty,
+    job_failed: bool = false,
+    diag: []const u8 = "",
+
+    fn init(arena: Allocator, job: *const job_mod.Job) !Evaluator {
+        var ev: Evaluator = .{
+            .arena = arena,
+            .job = job,
+            .github = try context.named(arena, job.context_data, "github"),
+            .inputs = try context.named(arena, job.context_data, "inputs"),
+            .matrix = try context.named(arena, job.context_data, "matrix"),
+            .needs = try context.named(arena, job.context_data, "needs"),
+            .strategy = try context.named(arena, job.context_data, "strategy"),
+            .vars = try context.named(arena, job.context_data, "vars"),
+            .job_context = try context.named(arena, job.context_data, "job"),
+        };
+        for (job.env) |in| {
+            const sc = try ev.scope(&.{});
+            const val = ev.render(in.value, sc) catch continue; // an env value that cannot be evaluated stays unset
+            try putEnv(arena, &ev.job_env, in.name, val);
+        }
+        return ev;
+    }
+
+    fn putEnv(arena: Allocator, list: *std.ArrayList(job_mod.EnvVar), name: []const u8, value: []const u8) !void {
+        for (list.items) |*e| if (std.mem.eql(u8, e.name, name)) {
+            e.value = value;
+            return;
+        };
+        try list.append(arena, .{ .name = name, .value = value });
+    }
+
+    /// The scope for evaluating one step: `step_env` is applied on top of the job's env.
+    fn scope(ev: *Evaluator, step_env: []const job_mod.EnvVar) !expr.Scope {
+        const arena = ev.arena;
+        var env_list: std.ArrayList(job_mod.EnvVar) = .empty;
+        try env_list.appendSlice(arena, ev.job_env.items);
+        for (step_env) |e| try putEnv(arena, &env_list, e.name, e.value);
+        const env_entries = try arena.alloc(expr.Value.Entry, env_list.items.len);
+        for (env_list.items, env_entries) |e, *o| o.* = .{ .key = e.name, .value = .{ .string = e.value } };
+
+        const step_entries = try arena.alloc(expr.Value.Entry, ev.steps.items.len);
+        for (ev.steps.items, step_entries) |sc, *o| {
+            const outs = try arena.alloc(expr.Value.Entry, sc.outputs.len);
+            for (sc.outputs, outs) |ov, *oo| oo.* = .{ .key = ov.name, .value = .{ .string = ov.value } };
+            const fields = try arena.alloc(expr.Value.Entry, 3);
+            fields[0] = .{ .key = "outputs", .value = .{ .object = outs } };
+            fields[1] = .{ .key = "outcome", .value = .{ .string = sc.outcome } };
+            fields[2] = .{ .key = "conclusion", .value = .{ .string = sc.conclusion } };
+            o.* = .{ .key = sc.id, .value = .{ .object = fields } };
+        }
+
+        const job_fields = try arena.alloc(expr.Value.Entry, 1);
+        job_fields[0] = .{ .key = "status", .value = .{ .string = if (ev.job_failed) "failure" else "success" } };
+        const runner_fields = try arena.alloc(expr.Value.Entry, 5);
+        runner_fields[0] = .{ .key = "os", .value = .{ .string = "Linux" } };
+        runner_fields[1] = .{ .key = "arch", .value = .{ .string = "X64" } };
+        runner_fields[2] = .{ .key = "name", .value = .{ .string = "zig-runner" } };
+        runner_fields[3] = .{ .key = "temp", .value = .{ .string = "/tmp" } };
+        runner_fields[4] = .{ .key = "tool_cache", .value = .{ .string = "/opt/hostedtoolcache" } };
+
+        const secret_entries = try arena.alloc(expr.Value.Entry, ev.job.secret_vars.len);
+        for (ev.job.secret_vars, secret_entries) |sv, *o| o.* = .{ .key = sv.name, .value = .{ .string = sv.value } };
+
+        const ctxs = try arena.alloc(expr.Value.Entry, 11);
+        ctxs[0] = .{ .key = "github", .value = ev.github };
+        ctxs[1] = .{ .key = "env", .value = .{ .object = env_entries } };
+        ctxs[2] = .{ .key = "steps", .value = .{ .object = step_entries } };
+        ctxs[3] = .{ .key = "job", .value = .{ .object = job_fields } };
+        ctxs[4] = .{ .key = "runner", .value = .{ .object = runner_fields } };
+        ctxs[5] = .{ .key = "inputs", .value = ev.inputs };
+        ctxs[6] = .{ .key = "matrix", .value = ev.matrix };
+        ctxs[7] = .{ .key = "needs", .value = ev.needs };
+        ctxs[8] = .{ .key = "strategy", .value = ev.strategy };
+        ctxs[9] = .{ .key = "vars", .value = ev.vars };
+        ctxs[10] = .{ .key = "secrets", .value = .{ .object = secret_entries } };
+        return .{
+            .contexts = ctxs,
+            .job_failed = ev.job_failed,
+            .diag = &ev.diag,
+        };
+    }
+
+    fn render(ev: *Evaluator, t: job_mod.Template, sc: expr.Scope) ![]const u8 {
+        return switch (t) {
+            .lit => |l| l,
+            .expr => |e| expr.evalString(ev.arena, e, sc),
+        };
+    }
+
+    fn renderEnv(ev: *Evaluator, inputs: []const job_mod.Input, sc: expr.Scope) ![]const job_mod.EnvVar {
+        const out = try ev.arena.alloc(job_mod.EnvVar, inputs.len);
+        for (inputs, out) |in, *o| o.* = .{ .name = in.name, .value = try ev.render(in.value, sc) };
+        return out;
+    }
+
+    fn record(ev: *Evaluator, step: job_mod.Step, outcome: Outcome, continued: bool, outputs: []const job_mod.EnvVar) !void {
+        const raw: []const u8 = switch (outcome) {
+            .success => "success",
+            .failure => "failure",
+            .skipped, .not_run => "skipped",
+        };
+        const conclusion: []const u8 = if (outcome == .failure and continued) "success" else raw;
+        try ev.steps.append(ev.arena, .{ .id = if (step.context_name.len > 0) step.context_name else step.id, .outcome = raw, .conclusion = conclusion, .outputs = outputs });
+    }
+
+    /// A string from the `github` context ("" when absent).
+    fn githubString(ev: *const Evaluator, key: []const u8) []const u8 {
+        if (ev.github != .object) return "";
+        for (ev.github.object) |e| if (std.ascii.eqlIgnoreCase(e.key, key)) return switch (e.value) {
+            .string => |str| str,
+            else => "",
+        };
+        return "";
+    }
+
+    /// The variables every step sees, as on a GitHub-hosted runner.
+    fn defaultEnv(ev: *const Evaluator) ![]const job_mod.EnvVar {
+        var out: std.ArrayList(job_mod.EnvVar) = .empty;
+        const fixed = [_]job_mod.EnvVar{
+            .{ .name = "CI", .value = "true" },
+            .{ .name = "GITHUB_ACTIONS", .value = "true" },
+            .{ .name = "GITHUB_WORKSPACE", .value = workspace },
+            .{ .name = "RUNNER_OS", .value = "Linux" },
+            .{ .name = "RUNNER_ARCH", .value = "X64" },
+            .{ .name = "RUNNER_NAME", .value = "zig-runner" },
+            .{ .name = "RUNNER_TEMP", .value = "/tmp" },
+            .{ .name = "RUNNER_TOOL_CACHE", .value = "/opt/hostedtoolcache" },
+        };
+        try out.appendSlice(ev.arena, &fixed);
+        const from_github = [_][2][]const u8{
+            .{ "GITHUB_REPOSITORY", "repository" },
+            .{ "GITHUB_REPOSITORY_OWNER", "repository_owner" },
+            .{ "GITHUB_SHA", "sha" },
+            .{ "GITHUB_REF", "ref" },
+            .{ "GITHUB_REF_NAME", "ref_name" },
+            .{ "GITHUB_REF_TYPE", "ref_type" },
+            .{ "GITHUB_EVENT_NAME", "event_name" },
+            .{ "GITHUB_ACTOR", "actor" },
+            .{ "GITHUB_TRIGGERING_ACTOR", "triggering_actor" },
+            .{ "GITHUB_RUN_ID", "run_id" },
+            .{ "GITHUB_RUN_NUMBER", "run_number" },
+            .{ "GITHUB_RUN_ATTEMPT", "run_attempt" },
+            .{ "GITHUB_JOB", "job" },
+            .{ "GITHUB_WORKFLOW", "workflow" },
+            .{ "GITHUB_BASE_REF", "base_ref" },
+            .{ "GITHUB_HEAD_REF", "head_ref" },
+            .{ "GITHUB_SERVER_URL", "server_url" },
+            .{ "GITHUB_API_URL", "api_url" },
+            .{ "GITHUB_GRAPHQL_URL", "graphql_url" },
+        };
+        for (from_github) |m| {
+            const v = ev.githubString(m[1]);
+            if (v.len > 0) try out.append(ev.arena, .{ .name = m[0], .value = v });
+        }
+        return out.items;
+    }
+};
+
+// --- secrets in the environment ---
+
+/// Whether a value contains a secret. Such env values reach the step through a Dagger secret
+/// (`withSecretVariable`), so they are not written into the command (which Dagger would keep in its
+/// cache metadata and print in its progress log). Very short secret values are ignored: they would
+/// match unrelated text.
+fn containsSecret(job: job_mod.Job, value: []const u8) bool {
+    for (job.secrets) |sec| if (sec.len >= 3 and std.mem.indexOf(u8, value, sec) != null) return true;
+    return false;
+}
+
+const SecretRef = struct { name: []const u8, id: []const u8 };
+
+/// Registers `plaintext` as a Dagger secret in this session and returns its id.
+fn newSecret(arena: Allocator, t: Transport, counter: *u32, plaintext: []const u8, err_msg: *[]const u8) ![]const u8 {
+    counter.* += 1;
+    var doc: std.Io.Writer.Allocating = .init(arena);
+    const w = &doc.writer;
+    try w.print("{{ setSecret(name:\"zig-secret-{d}\",plaintext:", .{counter.*});
+    try std.json.Stringify.value(plaintext, .{}, w);
+    try w.writeAll(") { id } }");
+    const data = try gql(arena, t, doc.written(), err_msg);
+    return jsonFindString(data, "id") orelse {
+        err_msg.* = "Dagger returned no secret id";
+        return error.DaggerQueryFailed;
+    };
+}
+
+/// Splits env into plain variables and secret-bearing ones (registered as Dagger secrets).
+fn splitEnv(
+    arena: Allocator,
+    t: Transport,
+    job: job_mod.Job,
+    counter: *u32,
+    env: []const job_mod.EnvVar,
+    plain: *std.ArrayList(job_mod.EnvVar),
+    secret: *std.ArrayList(SecretRef),
+    err_msg: *[]const u8,
+) !void {
+    for (env) |e| {
+        if (containsSecret(job, e.value)) {
+            try secret.append(arena, .{ .name = e.name, .id = try newSecret(arena, t, counter, e.value, err_msg) });
+        } else {
+            try plain.append(arena, e);
+        }
+    }
+}
+
+fn writeEnvNodes(w: *std.Io.Writer, plain: []const job_mod.EnvVar, secret: []const SecretRef) !usize {
+    for (plain) |e| {
+        try w.writeAll("withEnvVariable(name:");
+        try std.json.Stringify.value(e.name, .{}, w);
+        try w.writeAll(",value:");
+        try std.json.Stringify.value(e.value, .{}, w);
+        try w.writeAll(") { ");
+    }
+    for (secret) |sr| {
+        try w.writeAll("withSecretVariable(name:");
+        try std.json.Stringify.value(sr.name, .{}, w);
+        try w.writeAll(",secret:");
+        try std.json.Stringify.value(sr.id, .{}, w);
+        try w.writeAll(") { ");
+    }
+    return plain.len + secret.len;
+}
+
+// --- the log reader ---
+
+/// Shared between the main task (which runs queries) and the reader task (which streams logs).
+const Shared = struct {
     io: std.Io,
     arena: Allocator,
     log: *sink.LogSink,
     sink_job_id: u64,
-    results: []StepResult,
-    /// Steps already reported by the live stream; their lines are dropped while replaying.
-    already_done: ?[]const bool = null,
-    on_step: ?StepHook = null,
-
-    /// Step whose span header was printed last (Dagger interleaves spans), and header parsing state.
-    span_step: ?u32 = null,
-    in_header: bool = false,
+    mu: std.Io.Mutex = .init,
+    /// Lines streamed live per step (index = step - 1) and whether the step's `end` marker was seen.
+    live_lines: []std.atomic.Value(u32),
+    ended: []std.atomic.Value(bool),
+    /// Dagger's own progress lines outside any step (guarded by `mu`), kept for engine errors.
     tail: [20][]const u8 = undefined,
     tail_len: usize = 0,
+    /// Lines replayed from a query result whose live copy may still arrive late (guarded by `mu`).
+    /// Key is "<step>:<text>"; the value is how many live copies to swallow.
+    replayed: std.StringHashMapUnmanaged(u32) = .empty,
 
-    fn notify(d: *Demux, step: u32, now: i64) void {
-        if (d.on_step) |h| h.call(h.ctx, step, d.results[step - 1], now);
+    fn append(sh: *Shared, step: u32, text: []const u8) void {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        sh.log.append(sh.sink_job_id, step, .stdout, text) catch {};
     }
 
-    fn emit(d: *Demux, step: u32, text: []const u8) !void {
-        if (d.already_done) |done| if (step >= 1 and step <= done.len and done[step - 1]) return;
-        try d.log.append(d.sink_job_id, step, .stdout, text);
+    fn flush(sh: *Shared) void {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        sh.log.flush() catch {};
     }
 
-    fn feed(d: *Demux, line: []const u8) !void {
-        if (d.in_header) {
-            if (std.mem.eql(u8, line, "'")) d.in_header = false else if (headerStep(line)) |n| d.span_step = n;
-            return;
-        }
-        if (isSpanHeader(line)) {
-            d.span_step = null;
-            d.in_header = headerIsMultiLine(line);
-            if (headerStep(line)) |n| d.span_step = n;
-            return;
-        }
+    fn emitLive(sh: *Shared, step: u32, text: []const u8) void {
+        if (step >= 1 and step <= sh.live_lines.len) _ = sh.live_lines[step - 1].fetchAdd(1, .monotonic);
+        if (sh.swallowIfReplayed(step, text)) return;
+        sh.append(step, text);
+    }
 
-        if (scan(line)) |sc| {
-            if (d.span_step) |c| if (sc.before.len > 0) try d.emit(c, sc.before);
-            const now = std.Io.Clock.real.now(d.io).toMilliseconds();
-            const skipped = struct {
-                fn is(done: ?[]const bool, n: u32) bool {
-                    return if (done) |dn| (n >= 1 and n <= dn.len and dn[n - 1]) else false;
+    /// True if this live line was already logged by a replay (the stream was just late).
+    fn swallowIfReplayed(sh: *Shared, step: u32, text: []const u8) bool {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        if (sh.replayed.count() == 0) return false;
+        var key_buf: [512]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{d}:{s}", .{ step, text }) catch return false;
+        const entry = sh.replayed.getPtr(key) orelse return false;
+        if (entry.* > 1) entry.* -= 1 else _ = sh.replayed.remove(key);
+        return true;
+    }
+
+    /// Logs a line taken from a query result and remembers it so a late live copy is dropped.
+    fn replay(sh: *Shared, step: u32, text: []const u8) void {
+        {
+            sh.mu.lockUncancelable(sh.io);
+            defer sh.mu.unlock(sh.io);
+            if (std.fmt.allocPrint(sh.arena, "{d}:{s}", .{ step, text })) |key| {
+                const gop = sh.replayed.getOrPut(sh.arena, key) catch null;
+                if (gop) |g| {
+                    if (!g.found_existing) g.value_ptr.* = 0;
+                    g.value_ptr.* += 1;
                 }
-            }.is;
+            } else |_| {}
+        }
+        sh.append(step, text);
+    }
+
+    fn noise(sh: *Shared, line: []const u8) void {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        if (sh.tail_len == sh.tail.len) {
+            std.mem.copyForwards([]const u8, sh.tail[0 .. sh.tail.len - 1], sh.tail[1..]);
+            sh.tail_len -= 1;
+        }
+        sh.tail[sh.tail_len] = sh.arena.dupe(u8, line) catch return;
+        sh.tail_len += 1;
+    }
+};
+
+/// Splits Dagger's log stream into per-step output.
+const Demux = struct {
+    sh: *Shared,
+    span_step: ?u32 = null,
+
+    fn feed(d: *Demux, line: []const u8) void {
+        // Span headers are one line (the script's newlines are escaped) and name the step.
+        if (isSpanHeader(line)) {
+            d.span_step = headerStep(line);
+            return;
+        }
+        if (scan(line)) |sc| {
+            if (d.span_step) |c| if (sc.before.len > 0) d.sh.emitLive(c, sc.before);
             switch (sc.marker) {
-                .begin => |n| {
-                    d.span_step = n;
-                    if (n >= 1 and n <= d.results.len and !skipped(d.already_done, n)) {
-                        d.results[n - 1].started_ms = now;
-                        d.notify(n, now);
-                    }
-                },
-                .skip => |n| {
-                    if (n >= 1 and n <= d.results.len and !skipped(d.already_done, n)) {
-                        d.results[n - 1].outcome = .skipped;
-                        d.notify(n, now);
-                    }
-                    d.span_step = null;
-                },
-                .end => |e| {
-                    // The step's lines are flushed before its end is announced.
-                    try d.log.flush();
-                    if (e.step >= 1 and e.step <= d.results.len and !skipped(d.already_done, e.step)) {
-                        d.results[e.step - 1].outcome = if (e.rc == 0) .success else .failure;
-                        d.results[e.step - 1].exit_code = e.rc;
-                        d.results[e.step - 1].completed_ms = now;
-                        d.notify(e.step, now);
-                    }
+                .begin => |n| d.span_step = n,
+                .end => |n| {
+                    if (n >= 1 and n <= d.sh.ended.len) d.sh.ended[n - 1].store(true, .release);
+                    d.sh.flush();
                     d.span_step = null;
                 },
             }
         } else if (d.span_step) |c| {
-            try d.emit(c, line);
+            d.sh.emitLive(c, line);
         } else if (line.len > 0) {
-            // Dagger progress noise outside any step: keep the last few lines for errors.
-            if (d.tail_len == d.tail.len) {
-                std.mem.copyForwards([]const u8, d.tail[0 .. d.tail.len - 1], d.tail[1..]);
-                d.tail_len -= 1;
-            }
-            d.tail[d.tail_len] = try d.arena.dupe(u8, line);
-            d.tail_len += 1;
+            d.sh.noise(line);
         }
     }
 };
+
+fn readLogs(io: std.Io, sh: *Shared, file: std.Io.File) void {
+    var demux: Demux = .{ .sh = sh };
+    var rbuf: [64 * 1024]u8 = undefined;
+    var fr = file.readerStreaming(io, &rbuf);
+    const r = &fr.interface;
+    while (true) {
+        const raw = r.takeDelimiter('\n') catch |e| switch (e) {
+            error.StreamTooLong => {
+                _ = r.discardDelimiterInclusive('\n') catch return;
+                continue;
+            },
+            error.ReadFailed => return,
+        } orelse return;
+        demux.feed(std.mem.trimEnd(u8, raw, "\r"));
+    }
+}
+
+// --- running a job ---
+
+/// Prints the session's port and token for the runner, then waits for stdin to close.
+const session_script = "printf '%s %s\\n' \"$DAGGER_SESSION_PORT\" \"$DAGGER_SESSION_TOKEN\"; cat >/dev/null";
+
+fn base64Encode(arena: Allocator, s: []const u8) ![]const u8 {
+    const enc = std.base64.standard.Encoder;
+    const buf = try arena.alloc(u8, enc.calcSize(s.len));
+    return enc.encode(buf, s);
+}
 
 pub fn run(
     arena: Allocator,
@@ -502,329 +764,332 @@ pub fn run(
     var env = try environ.clone(arena);
     try env.put("NO_COLOR", "1");
     try env.put("DAGGER_NO_NAG", "1");
-
-    const fetched = try resolveCheckouts(arena, io, &env, opts, job);
-    const query = try buildQuery(arena, job, opts.image, fetched);
-
-    // The query result (the report) goes to a private temp file: reading stdout and stderr from one
-    // thread could deadlock once the report outgrows the pipe buffer.
-    var rnd: [8]u8 = undefined;
-    io.random(&rnd);
-    const out_path = try std.fmt.allocPrint(arena, "/tmp/zig-runner-{x}.json", .{rnd});
-    const out_file = try std.Io.Dir.cwd().createFile(io, out_path, .{
-        .exclusive = true,
-        .permissions = @fromBackingInt(0o600),
-    });
-    defer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
-
-    var child = try std.process.spawn(io, .{
-        .argv = opts.argv,
-        .environ_map = &env,
-        .stdin = .pipe,
-        .stdout = .{ .file = out_file },
-        .stderr = .pipe,
-    });
-    out_file.close(io);
-
-    {
-        var wbuf: [4096]u8 = undefined;
-        var fw = child.stdin.?.writer(io, &wbuf);
-        try fw.interface.writeAll(query);
-        try fw.interface.flush();
-        child.stdin.?.close(io);
-        child.stdin = null;
-    }
+    try env.put("GIT_TERMINAL_PROMPT", "0");
 
     const results = try arena.alloc(StepResult, job.steps.len);
     @memset(results, .{});
-    var demux: Demux = .{ .io = io, .arena = arena, .log = log, .sink_job_id = opts.sink_job_id, .results = results, .on_step = opts.on_step };
+    const live = try arena.alloc(std.atomic.Value(u32), job.steps.len);
+    const ended = try arena.alloc(std.atomic.Value(bool), job.steps.len);
+    for (live, ended) |*l, *e| {
+        l.* = .init(0);
+        e.* = .init(false);
+    }
+    var sh: Shared = .{ .io = io, .arena = arena, .log = log, .sink_job_id = opts.sink_job_id, .live_lines = live, .ended = ended };
 
-    var rbuf: [64 * 1024]u8 = undefined;
-    var fr = child.stderr.?.readerStreaming(io, &rbuf);
-    const r = &fr.interface;
+    const argv: []const []const u8 = opts.test_session_argv orelse &.{ opts.dagger_cmd, "run", "--progress=logs", "sh", "-c", session_script };
+    var child = try std.process.spawn(io, .{ .argv = argv, .environ_map = &env, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe });
+    // The reader must run while we wait on queries.
+    var reader = io.concurrent(readLogs, .{ io, &sh, child.stderr.? }) catch |e| {
+        child.kill(io);
+        return e;
+    };
+    // Order matters: closing stdin ends the session child and `dagger run`, which gives the reader EOF.
+    defer {
+        if (child.stdin) |f| f.close(io);
+        child.stdin = null;
+        _ = child.wait(io) catch {};
+        reader.await(io);
+    }
 
-    while (true) {
-        const raw = r.takeDelimiter('\n') catch |e| switch (e) {
-            error.StreamTooLong => {
-                _ = r.discardDelimiterInclusive('\n') catch break;
+    // First line of the child's stdout: "<port> <token>".
+    var first: [512]u8 = undefined;
+    var out_reader = child.stdout.?.readerStreaming(io, &first);
+    const line = (out_reader.interface.takeDelimiter('\n') catch null) orelse {
+        return fail(&sh, results, "could not start a Dagger session (is the Docker daemon running?)");
+    };
+    var parts = std.mem.tokenizeScalar(u8, line, ' ');
+    const port = parts.next() orelse return fail(&sh, results, "Dagger session did not report a port");
+    const token = parts.next() orelse return fail(&sh, results, "Dagger session did not report a token");
+
+    var http: HttpTransport = .{
+        .io = io,
+        .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{s}/query", .{port}),
+        .auth = try std.fmt.allocPrint(arena, "Basic {s}", .{try base64Encode(arena, try std.fmt.allocPrint(arena, "{s}:", .{token}))}),
+    };
+    const transport: Transport = opts.test_transport orelse .{ .ptr = &http, .sendFn = HttpTransport.send };
+
+    var ev = try Evaluator.init(arena, &job);
+    var secret_counter: u32 = 0;
+    var err_msg: []const u8 = "";
+    var container_id: []const u8 = blk: {
+        var doc: std.Io.Writer.Allocating = .init(arena);
+        const w = &doc.writer;
+        try w.writeAll("{ container { from(address:");
+        try std.json.Stringify.value(opts.image, .{}, w);
+        try w.writeAll(") { ");
+        const provision = opts.provision and std.mem.eql(u8, opts.image, default_image);
+        if (provision) {
+            try w.writeAll("withExec(args:");
+            try std.json.Stringify.value([_][]const u8{ "sh", "-c", provision_script }, .{}, w);
+            try w.writeAll(") { ");
+        }
+        try w.print("withWorkdir(path:\"{s}\") {{ ", .{workspace});
+        const defaults = try ev.defaultEnv();
+        for (defaults) |e| {
+            try w.writeAll("withEnvVariable(name:");
+            try std.json.Stringify.value(e.name, .{}, w);
+            try w.writeAll(",value:");
+            try std.json.Stringify.value(e.value, .{}, w);
+            try w.writeAll(") { ");
+        }
+        // Workflow- and job-level env is part of every step's environment.
+        var plain_job: std.ArrayList(job_mod.EnvVar) = .empty;
+        var secret_job: std.ArrayList(SecretRef) = .empty;
+        splitEnv(arena, transport, job, &secret_counter, ev.job_env.items, &plain_job, &secret_job, &err_msg) catch return fail(&sh, results, err_msg);
+        const job_env_nodes = try writeEnvNodes(w, plain_job.items, secret_job.items);
+        try w.writeAll("id");
+        for (0..defaults.len + job_env_nodes + 4 + @as(usize, if (provision) 1 else 0)) |_| try w.writeAll(" }");
+        const data = gql(arena, transport, doc.written(), &err_msg) catch return fail(&sh, results, err_msg);
+        break :blk jsonFindString(data, "id") orelse return fail(&sh, results, "Dagger returned no container");
+    };
+
+    for (job.steps, results, 1..) |step, *res, n| {
+        const num: u32 = @intCast(n);
+        res.name = step.name;
+
+        // 1. The condition, with the job env visible.
+        ev.diag = "";
+        const sc0 = try ev.scope(&.{});
+        if (step.name_expr) |ne| res.name = expr.evalString(arena, ne, sc0) catch step.name;
+        const should_run = expr.evalCondition(arena, step.condition, sc0) catch {
+            try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the condition '{s}': {s}", .{ step.condition, ev.diag }), false);
+            continue;
+        };
+        if (!should_run) {
+            res.outcome = .skipped;
+            try ev.record(step, .skipped, false, &.{});
+            if (opts.observer) |o| o.finished(num, res.*);
+            continue;
+        }
+
+        // 2. Step env and continue-on-error, then the step's own inputs.
+        const step_env = ev.renderEnv(step.env, sc0) catch {
+            try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate env: {s}", .{ev.diag}), false);
+            continue;
+        };
+        const sc1 = try ev.scope(step_env);
+        const coe = std.mem.eql(u8, ev.render(step.continue_on_error, sc1) catch "false", "true");
+        res.continued = coe;
+
+        // Env that carries a secret goes in as a Dagger secret, the rest in the script.
+        var plain_step_env: std.ArrayList(job_mod.EnvVar) = .empty;
+        var secret_step_env: std.ArrayList(SecretRef) = .empty;
+        splitEnv(arena, transport, job, &secret_counter, step_env, &plain_step_env, &secret_step_env, &err_msg) catch {
+            try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "Dagger could not register a secret: {s}", .{err_msg}), coe);
+            continue;
+        };
+
+        var resolved: Resolved = undefined;
+        var fetched: ?Fetched = null;
+        switch (step.action) {
+            .unsupported => |why| {
+                try failStep(&ev, &sh, opts.observer, step, res, num, why, coe);
                 continue;
             },
-            error.ReadFailed => break,
-        } orelse break;
-        try demux.feed(std.mem.trimEnd(u8, raw, "\r"));
-    }
-    try log.flush();
-    const term = try child.wait(io);
-    const exit_ok = switch (term) {
-        .exited => |c| c == 0,
-        else => false,
-    };
-
-    // A fully cached chain replays no logs. The report inside the container still has everything, so
-    // fill in any step the live stream never reported.
-    if (exit_ok) {
-        var any_missing = false;
-        const done = try arena.alloc(bool, results.len);
-        for (results, done) |res, *d| {
-            d.* = res.outcome != .not_run;
-            if (!d.*) any_missing = true;
+            .script => |sc| {
+                const script = ev.render(sc.script, sc1) catch {
+                    try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the script: {s}", .{ev.diag}), coe);
+                    continue;
+                };
+                const shell: ?[]const u8 = if (sc.shell) |t| (ev.render(t, sc1) catch null) else null;
+                if (shell) |sh_name| if (!job_mod.validShell(sh_name)) {
+                    try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "unsupported shell '{s}' (v0 supports bash and sh)", .{sh_name}), coe);
+                    continue;
+                };
+                const wd: ?[]const u8 = if (sc.working_directory) |t| (ev.render(t, sc1) catch null) else null;
+                resolved = .{ .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = plain_step_env.items } };
+            },
+            .checkout => |inputs| {
+                const rendered = ev.renderEnv(inputs, sc1) catch {
+                    try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the checkout inputs: {s}", .{ev.diag}), coe);
+                    continue;
+                };
+                const co = switch (try job_mod.checkoutFromInputs(arena, rendered)) {
+                    .ok => |c| c,
+                    .unsupported => |why| {
+                        try failStep(&ev, &sh, opts.observer, step, res, num, why, coe);
+                        continue;
+                    },
+                };
+                const f = try fetchCheckout(arena, transport, job, co);
+                if (f.result == .failed) {
+                    try failStep(&ev, &sh, opts.observer, step, res, num, f.result.failed, coe);
+                    continue;
+                }
+                fetched = f;
+                resolved = .{ .checkout = f };
+            },
         }
-        if (any_missing) {
-            if (try readReport(arena, io, out_path)) |report| {
-                demux.already_done = done;
-                demux.span_step = null;
-                demux.in_header = false;
-                var lines = std.mem.splitScalar(u8, report, '\n');
-                while (lines.next()) |l| try demux.feed(std.mem.trimEnd(u8, l, "\r"));
-                try log.flush();
+
+        const script = try stepScript(arena, num, resolved, if (step.context_name.len > 0) step.context_name else step.id);
+        var doc: std.Io.Writer.Allocating = .init(arena);
+        const w = &doc.writer;
+        try w.writeAll("{ loadContainerFromID(id:");
+        try std.json.Stringify.value(container_id, .{}, w);
+        try w.writeAll(") { ");
+        var braces: usize = 2; // query + loadContainerFromID
+        // Variables and PATH entries the previous steps asked for through $GITHUB_ENV / $GITHUB_PATH.
+        for (ev.pending_env.items) |e| {
+            try w.writeAll("withEnvVariable(name:");
+            try std.json.Stringify.value(e.name, .{}, w);
+            try w.writeAll(",value:");
+            try std.json.Stringify.value(e.value, .{}, w);
+            try w.writeAll(") { ");
+            braces += 1;
+        }
+        if (ev.pending_path.items.len > 0) {
+            const joined = try std.mem.join(arena, ":", ev.pending_path.items);
+            try w.writeAll("withEnvVariable(name:\"PATH\",value:");
+            try std.json.Stringify.value(try std.fmt.allocPrint(arena, "{s}:$PATH", .{joined}), .{}, w);
+            try w.writeAll(",expand:true) { ");
+            braces += 1;
+        }
+        ev.pending_env.clearRetainingCapacity();
+        ev.pending_path.clearRetainingCapacity();
+        braces += try writeEnvNodes(w, &.{}, secret_step_env.items);
+        if (fetched) |f| {
+            try w.writeAll("withDirectory(path:");
+            try std.json.Stringify.value(f.mount, .{}, w);
+            try w.writeAll(",source:");
+            try std.json.Stringify.value(f.result.dir, .{}, w);
+            try w.writeAll(") { ");
+            braces += 1;
+        }
+        try w.writeAll("withExec(args:");
+        try std.json.Stringify.value([_][]const u8{ "sh", "-c", script }, .{}, w);
+        try w.writeAll(",expect:ANY) { id exitCode stdout stderr");
+        for ([_][]const u8{ "output", "env", "path" }) |kind| {
+            try w.print(" fc_{s}: file(path:\"{s}\") {{ contents }}", .{ kind, try fcPath(arena, kind, num) });
+        }
+        try w.writeAll(" }");
+        for (0..braces) |_| try w.writeAll(" }");
+
+        res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
+        if (opts.observer) |o| o.started(num, res.name, res.started_ms);
+        const data = gql(arena, transport, doc.written(), &err_msg) catch {
+            res.* = .{ .name = res.name, .continued = coe, .outcome = .failure, .exit_code = 1, .started_ms = res.started_ms, .completed_ms = std.Io.Clock.real.now(io).toMilliseconds() };
+            sh.append(num, try std.fmt.allocPrint(arena, "Dagger error: {s}", .{err_msg}));
+            if (opts.observer) |o| o.finished(num, res.*);
+            return finish(arena, &sh, results, err_msg);
+        };
+        res.completed_ms = std.Io.Clock.real.now(io).toMilliseconds();
+        const code: i32 = if (jsonFind(data, "exitCode")) |c| (if (c == .integer) @intCast(c.integer) else 1) else 1;
+        res.exit_code = code;
+        res.outcome = if (code == 0) .success else .failure;
+        if (jsonFindString(data, "id")) |id| container_id = id;
+
+        // A cached step prints no log lines. Wait briefly for a live stream, then replay the result.
+        awaitLiveOrReplay(io, &sh, num, jsonFindString(data, "stdout") orelse "", jsonFindString(data, "stderr") orelse "");
+
+        // File commands: outputs for `steps.<id>.outputs`, env and PATH for the steps that follow.
+        var outputs: []const job_mod.EnvVar = &.{};
+        var cmd_error: ?[]const u8 = null;
+        if (fileCommand(data, "fc_output")) |text| switch (try commands.parseKeyValues(arena, text)) {
+            .ok => |kv| outputs = kv,
+            .invalid => |why| cmd_error = try std.fmt.allocPrint(arena, "Unable to process the GITHUB_OUTPUT file command: {s}", .{why}),
+        };
+        if (fileCommand(data, "fc_env")) |text| switch (try commands.parseKeyValues(arena, text)) {
+            .ok => |kv| for (kv) |e| {
+                if (commands.isProtectedEnvName(e.name)) {
+                    sh.append(num, try std.fmt.allocPrint(arena, "Warning: ignored GITHUB_ENV entry '{s}' (reserved name)", .{e.name}));
+                    continue;
+                }
+                try Evaluator.putEnv(arena, &ev.job_env, e.name, e.value);
+                try ev.pending_env.append(arena, e);
+            },
+            .invalid => |why| cmd_error = try std.fmt.allocPrint(arena, "Unable to process the GITHUB_ENV file command: {s}", .{why}),
+        };
+        if (fileCommand(data, "fc_path")) |text| for (try commands.parsePaths(arena, text)) |dir| try ev.pending_path.append(arena, dir);
+        if (cmd_error) |msg| {
+            sh.append(num, msg);
+            if (res.outcome == .success) {
+                res.outcome = .failure;
+                res.exit_code = 1;
             }
         }
+        try ev.record(step, res.outcome, coe, outputs);
+        if (res.outcome == .failure and !coe) ev.job_failed = true;
+        if (opts.observer) |o| o.finished(num, res.*);
     }
+    return finish(arena, &sh, results, "");
+}
 
+/// How long to wait for a step's live lines before assuming it was served from cache. The log stream
+/// delivers a real step's `end` marker within milliseconds, and a real run stops waiting as soon as
+/// it arrives, so only cached steps pay this. If the stream is later than this, lines show up twice
+/// rather than being lost.
+const live_grace_ms = 60;
+
+/// The contents of a file command read by the step's query ("" when the field is absent).
+fn fileCommand(data: std.json.Value, alias: []const u8) ?[]const u8 {
+    const f = jsonFind(data, alias) orelse return null;
+    const text = jsonFindString(f, "contents") orelse return null;
+    return if (text.len == 0) null else text;
+}
+
+/// Gives the reader a moment to deliver this step's lines; if none show up the step was served from
+/// cache, so its recorded stdout and stderr are logged instead.
+fn awaitLiveOrReplay(io: std.Io, sh: *Shared, step: u32, stdout: []const u8, stderr: []const u8) void {
+    const idx = step - 1;
+    var waited: u32 = 0;
+    while (waited < live_grace_ms and !sh.ended[idx].load(.acquire)) : (waited += 10) {
+        io.sleep(.fromMilliseconds(10), .awake) catch {};
+    }
+    if (sh.live_lines[idx].load(.monotonic) > 0 or sh.ended[idx].load(.acquire)) return;
+    for ([_][]const u8{ stdout, stderr }) |text| {
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |l| {
+            const t = std.mem.trimEnd(u8, l, "\r");
+            if (scan(t)) |s| {
+                if (s.before.len > 0) sh.replay(step, s.before);
+                continue;
+            }
+            if (t.len > 0) sh.replay(step, t);
+        }
+    }
+    sh.flush();
+}
+
+/// Logs why a step could not run and marks it failed (the job too, unless continue-on-error).
+fn failStep(ev: *Evaluator, sh: *Shared, observer: ?Observer, step: job_mod.Step, res: *StepResult, num: u32, msg: []const u8, coe: bool) !void {
+    sh.append(num, msg);
+    const name = res.name;
+    res.* = .{ .name = name, .continued = coe, .outcome = .failure, .exit_code = 1 };
+    try ev.record(step, .failure, coe, &.{});
+    if (!coe) ev.job_failed = true;
+    if (observer) |o| o.finished(num, res.*);
+}
+
+fn fail(sh: *Shared, results: []StepResult, msg: []const u8) !Result {
+    sh.flush();
+    return .{ .steps = results, .engine_error = msg, .succeeded = false };
+}
+
+fn finish(arena: Allocator, sh: *Shared, results: []StepResult, engine_msg: []const u8) !Result {
+    sh.flush();
     var any_failed = false;
     var any_not_run = false;
-    for (results, job.steps) |res, step| {
-        if (res.outcome == .failure and !step.continue_on_error) any_failed = true;
+    for (results) |res| {
+        if (res.outcome == .failure and !res.continued) any_failed = true;
         if (res.outcome == .not_run) any_not_run = true;
     }
-    const engine_error: ?[]const u8 = if (any_not_run and !any_failed)
-        try std.mem.join(arena, "\n", demux.tail[0..demux.tail_len])
-    else
-        null;
-
-    return .{
-        .steps = results,
-        .engine_error = engine_error,
-        .succeeded = !any_failed and engine_error == null,
-    };
-}
-
-/// Finds the report text (`...{"contents": "<report>"}...`) in the query's JSON result.
-fn readReport(arena: Allocator, io: std.Io, path: []const u8) !?[]const u8 {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(256 * 1024 * 1024)) catch return null;
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch return null;
-    return findContents(root);
-}
-
-fn findContents(v: std.json.Value) ?[]const u8 {
-    if (v != .object) return null;
-    var it = v.object.iterator();
-    while (it.next()) |e| {
-        if (std.mem.eql(u8, e.key_ptr.*, "contents") and e.value_ptr.* == .string) return e.value_ptr.string;
-        if (findContents(e.value_ptr.*)) |c| return c;
+    var engine_error: ?[]const u8 = null;
+    if ((any_not_run and !any_failed) or engine_msg.len > 0) {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        const tail = try std.mem.join(arena, "\n", sh.tail[0..sh.tail_len]);
+        engine_error = if (engine_msg.len > 0)
+            try std.fmt.allocPrint(arena, "{s}{s}{s}", .{ engine_msg, if (tail.len > 0) "\n" else "", tail })
+        else
+            tail;
     }
-    return null;
+    return .{ .steps = results, .engine_error = engine_error, .succeeded = !any_failed and engine_error == null };
 }
 
 // --- tests ---
 
 fn testStep(script: []const u8) job_mod.Step {
-    return .{ .id = "x", .name = "n", .condition = "success()", .continue_on_error = false, .env = &.{}, .action = .{ .script = .{ .script = script, .shell = null, .working_directory = null } } };
-}
-
-test "scan finds markers, with and without leading output" {
-    try std.testing.expect(scan("plain output") == null);
-    try std.testing.expectEqual(@as(u32, 3), scan(marker ++ "begin 3").?.marker.begin);
-    const e = scan("tail without newline" ++ marker ++ "end 2 7").?;
-    try std.testing.expectEqualStrings("tail without newline", e.before);
-    try std.testing.expectEqual(@as(i32, 7), e.marker.end.rc);
-    try std.testing.expectEqual(@as(u32, 5), scan(marker ++ "skip 5").?.marker.skip);
-    try std.testing.expect(scan(marker ++ "bogus 1") == null);
-    // Wrapper source shown in a span header must not parse as a marker.
-    try std.testing.expect(scan("echo '" ++ marker ++ "begin 2'\\''") == null);
-    try std.testing.expectEqual(@as(?u32, 2), headerStep("echo '" ++ marker ++ "begin 2'\\''"));
-}
-
-test "wrapper quotes scripts and applies condition, env, shell and continue-on-error" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    var s = testStep("echo 'hi' && echo $X");
-    s.env = &.{.{ .name = "X", .value = "a b" }};
-    s.condition = "always()";
-    s.continue_on_error = true;
-    s.action.script.shell = "sh";
-    s.action.script.working_directory = "sub dir";
-    const w = try stepWrapper(a.allocator(), 2, s, null);
-    try std.testing.expect(std.mem.indexOf(u8, w, "if true; then") != null);
-    try std.testing.expect(std.mem.indexOf(u8, w, "cd 'sub dir' && env 'X=a b' sh -e -c 'echo '\\''hi'\\'' && echo $X'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, w, "touch") == null); // continue-on-error
-    try std.testing.expect(std.mem.indexOf(u8, w, marker ++ "end 2 ") != null);
-}
-
-test "unsupported step and condition fail with a message" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    var s = testStep("true");
-    s.action = .{ .unsupported = "unsupported step reference type 'repository'" };
-    const w1 = try stepWrapper(a.allocator(), 1, s, null);
-    try std.testing.expect(std.mem.indexOf(u8, w1, "unsupported step reference type") != null);
-    try std.testing.expect(std.mem.indexOf(u8, w1, marker ++ "end 1 1") != null);
-
-    var s2 = testStep("true");
-    s2.condition = "github.ref == 'refs/heads/main'";
-    const w2 = try stepWrapper(a.allocator(), 1, s2, null);
-    try std.testing.expect(std.mem.indexOf(u8, w2, "unsupported condition") != null);
-}
-
-test "buildQuery is a balanced chain with one withExec per step" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    const steps = [_]job_mod.Step{ testStep("echo \"a,b\""), testStep("exit 1") };
-    const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 1, .has_container = false, .secrets = &.{}, .steps = &steps };
-    const q = try buildQuery(a.allocator(), job, "ubuntu:24.04", &.{});
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, q, "withExec("));
-    try std.testing.expectEqual(std.mem.count(u8, q, "{"), std.mem.count(u8, q, "}"));
-    try std.testing.expect(std.mem.indexOf(u8, q, "echo \\\"a,b\\\"") != null); // JSON-escaped quote
-}
-
-test "run streams step output, exit codes and skips from a fake dagger" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    const arena = a.allocator();
-
-    var env: std.process.Environ.Map = .init(arena);
-    const steps = [_]job_mod.Step{ testStep("a"), testStep("b"), testStep("c") };
-    const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 1, .has_container = false, .secrets = &.{}, .steps = &steps };
-
-    // Reproduces Dagger's chunked log output: step 2's chunk arrives before step 1's trailing lines,
-    // and step 1's span header is printed again before them.
-    const fake =
-        \\cat >/dev/null
-        \\H() { printf '\342\226\274 withExec sh -c '\''if [ ! -e x ]; then\n'; echo "echo '::zig-step::begin $1'\\''"; echo "exit 0"; echo "'"; }
-        \\{
-        \\echo "noise before"
-        \\H 1; echo "::zig-step::begin 1"; echo "hello"
-        \\H 2; echo "::zig-step::begin 2"; echo "step two"; echo "::zig-step::end 2 3"
-        \\H 1; echo "done"; echo "no newline::zig-step::end 1 0"
-        \\H 3; echo "::zig-step::skip 3"
-        \\} >&2
-    ;
-    var buf: [2048]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    const res = try run(arena, std.testing.io, &env, .{ .argv = &.{ "sh", "-c", fake } }, job, &log);
-
-    try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
-    try std.testing.expectEqual(Outcome.failure, res.steps[1].outcome);
-    try std.testing.expectEqual(@as(i32, 3), res.steps[1].exit_code);
-    try std.testing.expectEqual(Outcome.skipped, res.steps[2].outcome);
-    try std.testing.expect(!res.succeeded);
-    try std.testing.expect(res.engine_error == null);
-    const out = w.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "[job 0 step 1 stdout] hello\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "[job 0 step 1 stdout] done\n") != null); // after step 2 began
-    try std.testing.expect(std.mem.indexOf(u8, out, "[job 0 step 1 stdout] no newline\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "withExec") == null); // headers never leak into logs
-    try std.testing.expect(std.mem.indexOf(u8, out, "[job 0 step 2 stdout] step two\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "noise before") == null);
-}
-
-test "run reports engine errors when no step ran" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    const arena = a.allocator();
-    var env: std.process.Environ.Map = .init(arena);
-    const steps = [_]job_mod.Step{testStep("a")};
-    const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 1, .has_container = false, .secrets = &.{}, .steps = &steps };
-    var buf: [256]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    const res = try run(arena, std.testing.io, &env, .{ .argv = &.{ "sh", "-c", "cat >/dev/null; echo 'pull access denied' >&2; exit 1" } }, job, &log);
-    try std.testing.expect(!res.succeeded);
-    try std.testing.expectEqualStrings("pull access denied", res.engine_error.?);
-    try std.testing.expectEqual(Outcome.not_run, res.steps[0].outcome);
-}
-
-test "run replays the in-container report when Dagger logged nothing (fully cached chain)" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    const arena = a.allocator();
-    var env: std.process.Environ.Map = .init(arena);
-    const steps = [_]job_mod.Step{ testStep("a"), testStep("b"), testStep("c") };
-    const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 1, .has_container = false, .secrets = &.{}, .steps = &steps };
-
-    const fake =
-        \\cat >/dev/null
-        \\printf '%s' '{"container":{"from":{"withWorkdir":{"file":{"contents":"::zig-step::begin 1\nhello\n::zig-step::end 1 0\n::zig-step::begin 2\nboom\n::zig-step::end 2 4\n::zig-step::skip 3\n"}}}}}'
-    ;
-    var buf: [1024]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    const res = try run(arena, std.testing.io, &env, .{ .argv = &.{ "sh", "-c", fake } }, job, &log);
-
-    try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
-    try std.testing.expectEqual(Outcome.failure, res.steps[1].outcome);
-    try std.testing.expectEqual(@as(i32, 4), res.steps[1].exit_code);
-    try std.testing.expectEqual(Outcome.skipped, res.steps[2].outcome);
-    try std.testing.expect(res.engine_error == null);
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[job 0 step 1 stdout] hello\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[job 0 step 2 stdout] boom\n") != null);
-}
-
-test "replay does not duplicate steps already reported live" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    const arena = a.allocator();
-    var env: std.process.Environ.Map = .init(arena);
-    const steps = [_]job_mod.Step{ testStep("a"), testStep("b") };
-    const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 1, .has_container = false, .secrets = &.{}, .steps = &steps };
-
-    // Step 1 shows up live; step 2 only exists in the report.
-    const fake =
-        \\q=$(cat)
-        \\echo "::zig-step::begin 1" >&2; echo "live" >&2; echo "::zig-step::end 1 0" >&2
-        \\printf '%s' '{"x":{"contents":"::zig-step::begin 1\nlive\n::zig-step::end 1 0\n::zig-step::begin 2\nreplayed\n::zig-step::end 2 0\n"}}'
-    ;
-    var buf: [1024]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    const res = try run(arena, std.testing.io, &env, .{ .argv = &.{ "sh", "-c", fake } }, job, &log);
-
-    try std.testing.expect(res.succeeded);
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "live\n"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "replayed\n"));
-}
-
-const HookLog = struct {
-    events: [16][]const u8 = undefined,
-    n: usize = 0,
-    arena: Allocator,
-
-    fn call(ctx: *anyopaque, step: u32, r: StepResult, now_ms: i64) void {
-        const h: *HookLog = @ptrCast(@alignCast(ctx));
-        std.debug.assert(now_ms > 0);
-        h.events[h.n] = std.fmt.allocPrint(h.arena, "{d}:{s}:{s}", .{ step, @tagName(r.outcome), if (r.started_ms > 0) "t" else "-" }) catch unreachable;
-        h.n += 1;
-    }
-
-    fn hook(h: *HookLog) StepHook {
-        return .{ .ctx = h, .call = call };
-    }
-};
-
-test "on_step announces each transition once, live and replayed" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    const arena = a.allocator();
-    var env: std.process.Environ.Map = .init(arena);
-    const steps = [_]job_mod.Step{ testStep("a"), testStep("b"), testStep("c") };
-    const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 1, .has_container = false, .secrets = &.{}, .steps = &steps };
-
-    // Step 1 live; steps 2 (failed) and 3 (skipped) only in the report, as for a cached chain.
-    const fake =
-        \\q=$(cat)
-        \\echo "::zig-step::begin 1" >&2; echo "live" >&2; echo "::zig-step::end 1 0" >&2
-        \\printf '%s' '{"x":{"contents":"::zig-step::begin 1\nlive\n::zig-step::end 1 0\n::zig-step::begin 2\nboom\n::zig-step::end 2 4\n::zig-step::skip 3\n"}}'
-    ;
-    var buf: [1024]u8 = undefined;
-    var w: std.Io.Writer = .fixed(&buf);
-    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    var h: HookLog = .{ .arena = arena };
-    _ = try run(arena, std.testing.io, &env, .{ .argv = &.{ "sh", "-c", fake }, .on_step = h.hook() }, job, &log);
-
-    const want = [_][]const u8{ "1:not_run:t", "1:success:t", "2:not_run:t", "2:failure:t", "3:skipped:-" };
-    try std.testing.expectEqual(want.len, h.n);
-    for (want, h.events[0..h.n]) |e, got| try std.testing.expectEqualStrings(e, got);
+    return .{ .id = "x", .name = "n", .condition = "success()", .action = .{ .script = .{ .script = .{ .lit = script }, .shell = null, .working_directory = null } } };
 }
 
 fn testJob(steps: []const job_mod.Step) job_mod.Job {
@@ -838,6 +1103,44 @@ fn testJob(steps: []const job_mod.Step) job_mod.Job {
         .github = .{ .repository = "o/r", .sha = "0123456789012345678901234567890123456789", .ref = "refs/heads/x" },
         .steps = steps,
     };
+}
+
+test "scan finds markers, with and without leading output" {
+    try std.testing.expect(scan("plain output") == null);
+    try std.testing.expectEqual(@as(u32, 3), scan(marker ++ "begin 3").?.marker.begin);
+    const e = scan("tail without newline" ++ marker ++ "end 2").?;
+    try std.testing.expectEqualStrings("tail without newline", e.before);
+    try std.testing.expectEqual(@as(u32, 2), e.marker.end);
+    try std.testing.expect(scan(marker ++ "bogus 1") == null);
+    // Script source shown in a span header must not parse as a marker.
+    try std.testing.expect(scan("echo '" ++ marker ++ "begin 2'\\''") == null);
+    try std.testing.expectEqual(@as(?u32, 2), headerStep("echo '" ++ marker ++ "begin 2'\\''"));
+}
+
+test "evalCondition" {
+    try std.testing.expectEqual(@as(?bool, true), evalCondition("success()", false));
+    try std.testing.expectEqual(@as(?bool, false), evalCondition("success()", true));
+    try std.testing.expectEqual(@as(?bool, true), evalCondition("failure()", true));
+    try std.testing.expectEqual(@as(?bool, true), evalCondition(" always() ", true));
+    try std.testing.expectEqual(@as(?bool, null), evalCondition("github.ref == 'x'", false));
+}
+
+test "script quotes, applies env, shell and working directory, and propagates the exit code" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const w = try stepScript(a.allocator(), 2, .{ .run = .{
+        .script = "echo 'hi' && echo $X",
+        .shell = "sh",
+        .working_directory = "sub dir",
+        .env = &.{.{ .name = "X", .value = "a b" }},
+    } }, "build");
+    try std.testing.expect(std.mem.indexOf(u8, w, "cd 'sub dir' && env 'X=a b' 'GITHUB_OUTPUT=/github/file_commands/output_2'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, "'GITHUB_ACTION=build' sh -e -c 'echo '\\''hi'\\'' && echo $X'") != null);
+    // The file commands exist before the step and are touched again after it.
+    try std.testing.expect(std.mem.indexOf(u8, w, ": > /github/file_commands/output_2 > /github/file_commands/env_2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, ">> /github/file_commands/path_2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, marker ++ "begin 2") != null);
+    try std.testing.expect(std.mem.endsWith(u8, w, "exit $rc\n"));
 }
 
 test "checkoutQuery picks commit, ref or head and honours fetch-depth" {
@@ -855,81 +1158,400 @@ test "checkoutQuery picks commit, ref or head and honours fetch-depth" {
     try std.testing.expect((try checkoutQuery(a.allocator(), empty, .{})) == .err);
 }
 
-test "checkout wrapper reports the checkout and a failed fetch fails the step" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    var s = testStep("x");
-    s.name = "Run actions/checkout@v4";
-    s.action = .{ .checkout = .{} };
-    const ok = Fetched{ .result = .{ .dir = "ID" }, .repo = "o/r", .ref_label = "0123456", .mount = "/github/workspace" };
-    const w = try stepWrapper(a.allocator(), 1, s, ok);
-    try std.testing.expect(std.mem.indexOf(u8, w, "Syncing repository: o/r") != null);
-    try std.testing.expect(std.mem.indexOf(u8, w, "Checked out 0123456 into /github/workspace") != null);
-    try std.testing.expect(std.mem.indexOf(u8, w, "rc=0") != null);
-
-    const bad = Fetched{ .result = .{ .failed = "could not fetch o/r@abc: denied" }, .repo = "o/r", .ref_label = "abc", .mount = "/github/workspace" };
-    const w2 = try stepWrapper(a.allocator(), 1, s, bad);
-    try std.testing.expect(std.mem.indexOf(u8, w2, "could not fetch o/r@abc: denied") != null);
-    try std.testing.expect(std.mem.indexOf(u8, w2, marker ++ "end 1 1") != null);
+fn braceBalanced(doc: []const u8) bool {
+    var depth: i32 = 0;
+    var in_str = false;
+    var i: usize = 0;
+    while (i < doc.len) : (i += 1) {
+        const c = doc[i];
+        if (in_str) {
+            if (c == '\\') i += 1 else if (c == '"') in_str = false;
+        } else switch (c) {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth < 0) return false;
+            },
+            else => {},
+        }
+    }
+    return depth == 0 and !in_str;
 }
 
-test "buildQuery mounts the fetched tree before the checkout step and stays balanced" {
-    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer a.deinit();
-    var co = testStep("x");
-    co.name = "Run actions/checkout@v4";
-    co.action = .{ .checkout = .{} };
-    const steps = [_]job_mod.Step{ co, testStep("ls") };
-    const fetched = [_]?Fetched{ .{ .result = .{ .dir = "TREEID" }, .repo = "o/r", .ref_label = "abc", .mount = "/github/workspace/sub" }, null };
-    const q = try buildQuery(a.allocator(), testJob(&steps), "ubuntu:24.04", &fetched);
-    try std.testing.expect(std.mem.indexOf(u8, q, "withDirectory(path:\"/github/workspace/sub\",source:\"TREEID\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, q, "withDirectory").? < std.mem.indexOf(u8, q, "withExec").?);
-    try std.testing.expectEqual(std.mem.count(u8, q, "{"), std.mem.count(u8, q, "}"));
+/// A scripted stand-in for the Dagger session: answers queries in order and records them.
+const FakeSession = struct {
+    answers: []const []const u8,
+    next: usize = 0,
+    seen: std.ArrayList([]const u8) = .empty,
+    arena: Allocator,
+
+    fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8) anyerror![]const u8 {
+        const self: *FakeSession = @ptrCast(@alignCast(ptr));
+        try self.seen.append(self.arena, try arena.dupe(u8, doc));
+        defer self.next += 1;
+        if (self.next >= self.answers.len) return error.NoMoreAnswers;
+        return self.answers[self.next];
+    }
+
+    fn transport(self: *FakeSession) Transport {
+        return .{ .ptr = self, .sendFn = send };
+    }
+};
+
+const fake_child = "printf '0 tok\\n'; cat >/dev/null";
+const base_answer = "{\"data\":{\"container\":{\"from\":{\"withWorkdir\":{\"id\":\"C0\"}}}}}";
+
+fn exec(arena: Allocator, id: []const u8, code: i32, out: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":{{\"id\":\"{s}\",\"exitCode\":{d},\"stdout\":\"{s}\",\"stderr\":\"\"}}}}}}}}", .{ id, code, out });
 }
 
-test "run fetches checkouts through dagger, mounts them, and fails the step when a fetch fails" {
+test "run threads the container through steps, applies conditions, and replays cached output" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+
+    var s3 = testStep("c");
+    s3.condition = "always()";
+    var s4 = testStep("d");
+    s4.condition = "success()";
+    const steps = [_]job_mod.Step{ testStep("a"), testStep("b"), s3, s4 };
+    const answers = [_][]const u8{
+        base_answer,
+        try exec(arena, "C1", 0, "from-a\\n"),
+        try exec(arena, "C2", 3, "from-b\\n"),
+        try exec(arena, "C3", 0, "from-c\\n"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+
+    try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
+    try std.testing.expectEqual(Outcome.failure, res.steps[1].outcome);
+    try std.testing.expectEqual(@as(i32, 3), res.steps[1].exit_code);
+    try std.testing.expectEqual(Outcome.success, res.steps[2].outcome); // always()
+    try std.testing.expectEqual(Outcome.skipped, res.steps[3].outcome); // success() after a failure
+    try std.testing.expect(!res.succeeded);
+    // Every document is well-formed GraphQL (balanced braces outside of strings).
+    for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
+    // Each step started from the previous step's container.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "id:\"C0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "id:\"C1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "id:\"C2\"") != null);
+    try std.testing.expectEqual(@as(usize, 4), fake.seen.items.len); // the skipped step sends nothing
+    // No live lines were streamed, so the recorded stdout was replayed.
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[job 0 step 1 stdout] from-a\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[job 0 step 2 stdout] from-b\n") != null);
+}
+
+test "run streams live lines from the session's log and does not replay them" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("a")};
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "live-line\\n") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+
+    // The fake child also prints Dagger-style log output: noise, a span header, then the step's lines.
+    const child =
+        \\printf '0 tok\n'
+        \\{ echo "connecting"; printf '\342\226\274 withExec sh -c '\''echo '\\\\'\''::zig-step::begin 1'\\\\'\''\\\\nexit $rc\\\\n'\'' (expect: ANY)\n'
+        \\  echo "::zig-step::begin 1"; echo "live-line"; echo "::zig-step::end 1"; } >&2
+        \\cat >/dev/null
+    ;
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "live-line\n"));
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "withExec") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "connecting") == null);
+}
+
+test "a live line that arrives after its step was replayed is dropped, not logged twice" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const live = [_]std.atomic.Value(u32){.init(0)};
+    const ended = [_]std.atomic.Value(bool){.init(false)};
+    var sh: Shared = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = @constCast(&live), .ended = @constCast(&ended) };
+    sh.replay(1, "hello"); // the step looked cached
+    sh.emitLive(1, "hello"); // ...but its live copy arrives late
+    sh.emitLive(1, "hello"); // a genuine second line with the same text is kept
+    sh.emitLive(1, "other");
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, w.buffered(), "hello\n"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, w.buffered(), "other\n"));
+}
+
+test "run mounts a fetched checkout, and a failed fetch fails only that step" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
     var env: std.process.Environ.Map = .init(arena);
     var co = testStep("x");
     co.name = "Run actions/checkout@v4";
-    co.action = .{ .checkout = .{} };
-    const steps = [_]job_mod.Step{co};
-    const job = testJob(&steps);
-    // Fake dagger: git queries return a tree id; chain queries print the checkout step's markers.
-    const fake =
-        \\q=$(cat)
-        \\case "$q" in
-        \\  *'git(url'*) [ "$GIT_TERMINAL_PROMPT" = 0 ] || { echo "prompting for credentials is not disabled" >&2; exit 1; }
-        \\               printf '%s' '{"git":{"commit":{"tree":{"id":"TREE1"}}}}' ;;
-        \\  *) case "$q" in *'source:"TREE1"'*) ;; *) echo "tree not mounted" >&2; exit 1;; esac
-        \\     printf '%s\n' '::zig-step::begin 1' 'Syncing repository: o/r' '::zig-step::end 1 0' >&2 ;;
-        \\esac
+    co.action = .{ .checkout = &.{} };
+    var after = testStep("echo after");
+    after.condition = "always()";
+    const steps = [_]job_mod.Step{ co, after };
+
+    const answers = [_][]const u8{
+        base_answer,
+        "{\"data\":{\"git\":{\"commit\":{\"tree\":{\"id\":\"TREE1\"}}}}}",
+        try exec(arena, "C1", 0, "Syncing repository: o/r\\n"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    _ = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withDirectory(path:\"/github/workspace\",source:\"TREE1\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "Checked out 0123456 into /github/workspace") != null);
+
+    // Fetch failure (GraphQL error): that step fails with the reason; the always() step still runs.
+    const answers2 = [_][]const u8{
+        base_answer,
+        "{\"errors\":[{\"message\":\"remote: Repository not found.\"}]}",
+        try exec(arena, "C1", 0, "after\\n"),
+    };
+    var fake2: FakeSession = .{ .answers = &answers2, .arena = arena };
+    var buf2: [2048]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var log2: sink.LogSink = .{ .stdout = .{ .writer = &w2 } };
+    const res2 = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake2.transport() }, testJob(&steps), &log2);
+    try std.testing.expectEqual(Outcome.failure, res2.steps[0].outcome);
+    try std.testing.expectEqual(Outcome.success, res2.steps[1].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "could not fetch o/r@0123456: remote: Repository not found. (private repositories are not supported in v0)") != null);
+}
+
+test "run reports an engine error when the session cannot start" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("a")};
+    var buf: [256]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", "echo 'cannot connect to docker' >&2; exit 1" } }, testJob(&steps), &log);
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expect(res.engine_error != null);
+    try std.testing.expectEqual(Outcome.not_run, res.steps[0].outcome);
+}
+
+test "run evaluates expressions in conditions, names, env, scripts and the steps context" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+
+    const json =
+        \\{"plan":{"planId":"p"},"jobId":"j","resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
+        \\ "variables":{"TOKEN":{"value":"s3cr3t-value","isSecret":true}},
+        \\ "environmentVariables":[{"type":2,"map":[{"Key":{"lit":"JOB_ENV"},"Value":{"type":3,"expr":"format('{0}-job', github.ref_name)"}},{"Key":{"lit":"JOB_SECRET"},"Value":{"type":3,"expr":"secrets.TOKEN"}}]}],
+        \\ "contextData":{"matrix":null,"github":{"t":2,"d":[{"k":"ref","v":"refs/heads/main"},{"k":"ref_name","v":"main"},{"k":"sha","v":"abc123"},{"k":"repository","v":"o/r"}]}},
+        \\ "steps":[
+        \\  {"type":"action","reference":{"type":"script"},"id":"s1","contextName":"first","name":"first","condition":"success()",
+        \\   "displayNameToken":{"type":3,"expr":"format('Build {0}', github.ref_name)"},
+        \\   "environment":{"type":2,"map":[{"Key":{"lit":"STEP_ENV"},"Value":{"type":3,"expr":"github.sha"}}]},
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo {0} $STEP_ENV {1}', github.sha, env.JOB_ENV)"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s2","contextName":"__run","name":"__run","condition":"success() && (github.ref == 'refs/heads/main')",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo on-main"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s3","contextName":"__run_2","name":"__run_2","condition":"success() && (github.ref == 'refs/heads/other')",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo never"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s4","contextName":"__run_3","name":"__run_3","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo outcome={0} skipped={1}', steps.first.outcome, steps.__run_2.outcome)"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s5","contextName":"__run_4","name":"__run_4","condition":"success()",
+        \\   "environment":{"type":2,"map":[{"Key":{"lit":"DB_PASSWORD"},"Value":{"type":3,"expr":"secrets.TOKEN"}},{"Key":{"lit":"WITH_SECRET"},"Value":{"type":3,"expr":"format('user:{0}@host', secrets.TOKEN)"}}]},
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo uses-secret-env"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s6","contextName":"__run_5","name":"__run_5","condition":"always()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo cleanup"}}]}}
+        \\ ]}
     ;
+    const job = try job_mod.parse(arena, json);
+    const answers = [_][]const u8{
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_JOB\"}}}", // JOB_SECRET (job-level env), before the base container
+        base_answer,
+        try exec(arena, "C1", 0, "ok\\n"),
+        try exec(arena, "C2", 0, "ok\\n"),
+        try exec(arena, "C3", 0, "ok\\n"),
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_A\"}}}", // DB_PASSWORD
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_B\"}}}", // WITH_SECRET
+        try exec(arena, "C4", 0, "ok\\n"),
+        try exec(arena, "C5", 0, "ok\\n"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+
+    // Names and outcomes.
+    try std.testing.expectEqualStrings("Build main", res.steps[0].name);
+    try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
+    try std.testing.expectEqual(Outcome.success, res.steps[1].outcome);
+    try std.testing.expectEqual(Outcome.skipped, res.steps[2].outcome); // condition false
+    try std.testing.expectEqual(Outcome.success, res.steps[3].outcome);
+    try std.testing.expectEqual(Outcome.success, res.steps[4].outcome);
+    try std.testing.expectEqual(Outcome.success, res.steps[5].outcome);
+    try std.testing.expect(res.succeeded);
+    for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
+    // seen: 0 setSecret(job), 1 base, 2 s1, 3 s2, 4 s4, 5 setSecret, 6 setSecret, 7 s5, 8 s6
+    try std.testing.expectEqual(@as(usize, 9), fake.seen.items.len);
+    // Evaluated scripts reached Dagger: sha, step env, job env (from an expression), steps.* outcomes.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo abc123 $STEP_ENV main-job") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "STEP_ENV=abc123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "echo outcome=success skipped=skipped") != null);
+    // Job-level env is part of the base container: the plain value inline, the secret as a Dagger secret.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withEnvVariable(name:\"JOB_ENV\",value:\"main-job\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withSecretVariable(name:\"JOB_SECRET\",secret:\"SEC_JOB\")") != null);
+    // Secret-bearing step env is passed as Dagger secrets and appears nowhere in a command.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "withSecretVariable(name:\"DB_PASSWORD\",secret:\"SEC_A\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "withSecretVariable(name:\"WITH_SECRET\",secret:\"SEC_B\")") != null);
+    for (fake.seen.items, 0..) |d, i| {
+        const is_set_secret = std.mem.indexOf(u8, d, "setSecret") != null;
+        try std.testing.expectEqual(is_set_secret, std.mem.indexOf(u8, d, "s3cr3t-value") != null);
+        _ = i;
+    }
+}
+
+fn execFc(arena: Allocator, id: []const u8, out: []const u8, fc_output: []const u8, fc_env: []const u8, fc_path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":{{\"id\":\"{s}\",\"exitCode\":0,\"stdout\":\"{s}\",\"stderr\":\"\",\"fc_output\":{{\"contents\":\"{s}\"}},\"fc_env\":{{\"contents\":\"{s}\"}},\"fc_path\":{{\"contents\":\"{s}\"}}}}}}}}}}", .{ id, out, fc_output, fc_env, fc_path });
+}
+
+test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH reach later steps" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const json =
+        \\{"plan":{"planId":"p"},"jobId":"j","resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
+        \\ "contextData":{"github":{"t":2,"d":[{"k":"sha","v":"abc"},{"k":"repository","v":"o/r"},{"k":"ref_name","v":"main"}]}},
+        \\ "steps":[
+        \\  {"type":"action","reference":{"type":"script"},"id":"s1","contextName":"build","name":"build","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo producing"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s2","contextName":"use","name":"use","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo version={0} multi={1} env=$FROM_ENV', steps.build.outputs.version, steps.build.outputs.notes)"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s3","contextName":"bad","name":"bad","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo writes garbage"}}]}},
+        \\  {"type":"action","reference":{"type":"script"},"id":"s4","contextName":"after","name":"after","condition":"always()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"echo done"}}]}}
+        \\ ]}
+    ;
+    const job = try job_mod.parse(arena, json);
+    const answers = [_][]const u8{
+        base_answer,
+        try execFc(arena, "C1", "producing\\n", "version=1.2.3\\nnotes<<EOF\\nline a\\nline b\\nEOF\\n", "FROM_ENV=hello\\nGITHUB_SHA=evil\\n", "/opt/tool/bin\\n"),
+        try execFc(arena, "C2", "x\\n", "", "", ""),
+        try execFc(arena, "C3", "y\\n", "this is not valid\\n", "", ""),
+        try execFc(arena, "C4", "z\\n", "", "", ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+
+    for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
+    // Default environment is set once on the base container.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "withEnvVariable(name:\"GITHUB_SHA\",value:\"abc\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "name:\"CI\",value:\"true\"") != null);
+    // Step 1's query reads the file commands.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_output: file(path:\"/github/file_commands/output_1\")") != null);
+    // Outputs (including a multi-line one) were evaluated into step 2's script.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo version=1.2.3 multi=line a\\nline b env=$FROM_ENV") != null);
+    // GITHUB_ENV and GITHUB_PATH apply to the next step's container; reserved names are refused.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withEnvVariable(name:\"FROM_ENV\",value:\"hello\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withEnvVariable(name:\"PATH\",value:\"/opt/tool/bin:$PATH\",expand:true)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "name:\"GITHUB_SHA\",value:\"evil\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "ignored GITHUB_ENV entry 'GITHUB_SHA'") != null);
+    // ...and only once: step 3 no longer re-applies them.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "withEnvVariable") == null);
+    // A malformed GITHUB_OUTPUT fails the step that wrote it; always() still runs.
+    try std.testing.expectEqual(Outcome.failure, res.steps[2].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Unable to process the GITHUB_OUTPUT file command: invalid format 'this is not valid' on line 1") != null);
+    try std.testing.expectEqual(Outcome.success, res.steps[3].outcome);
+}
+
+test "the default image is provisioned with git; a custom image is left alone" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("true")};
+    for ([_]struct { image: []const u8, expect_provision: bool }{
+        .{ .image = default_image, .expect_provision = true },
+        .{ .image = "custom/image:1", .expect_provision = false },
+    }) |case| {
+        const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "") };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var buf: [512]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        _ = try run(arena, std.testing.io, &env, .{ .image = case.image, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+        const base = fake.seen.items[0];
+        try std.testing.expect(braceBalanced(base));
+        try std.testing.expectEqual(case.expect_provision, std.mem.indexOf(u8, base, "apt-get install") != null);
+        try std.testing.expect(std.mem.indexOf(u8, base, case.image) != null);
+    }
+}
+
+const Recorder = struct {
+    events: std.ArrayList([]const u8) = .empty,
+    arena: Allocator,
+
+    fn started(ptr: *anyopaque, number: u32, name: []const u8, started_ms: i64) void {
+        const self: *Recorder = @ptrCast(@alignCast(ptr));
+        const msg = std.fmt.allocPrint(self.arena, "start {d} {s} {s}", .{ number, name, if (started_ms > 0) "t" else "-" }) catch return;
+        self.events.append(self.arena, msg) catch {};
+    }
+
+    fn finished(ptr: *anyopaque, number: u32, r: StepResult) void {
+        const self: *Recorder = @ptrCast(@alignCast(ptr));
+        const msg = std.fmt.allocPrint(self.arena, "finish {d} {s} {s}", .{ number, r.name, @tagName(r.outcome) }) catch return;
+        self.events.append(self.arena, msg) catch {};
+    }
+};
+
+test "the observer sees each step start and finish, including skipped and failed-to-evaluate steps" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var s2 = testStep("never");
+    s2.condition = "failure()";
+    var s3 = testStep("x");
+    s3.action = .{ .unsupported = "not supported here" };
+    const steps = [_]job_mod.Step{ testStep("ok"), s2, s3, testStep("bad") };
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "a\\n"), try exec(arena, "C2", 1, "b\\n") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var rec: Recorder = .{ .arena = arena };
     var buf: [1024]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    const res = try run(arena, std.testing.io, &env, .{ .argv = &.{ "sh", "-c", fake } }, job, &log);
-    try std.testing.expect(res.succeeded);
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Syncing repository: o/r") != null);
+    // step 3 is unsupported (fails without running); step 4 is skipped by success() afterwards.
+    _ = try run(arena, std.testing.io, &env, .{
+        .test_session_argv = &.{ "sh", "-c", fake_child },
+        .test_transport = fake.transport(),
+        .observer = .{ .ptr = &rec, .startedFn = Recorder.started, .finishedFn = Recorder.finished },
+    }, testJob(&steps), &log);
 
-    // A failing fetch becomes a failing step with the reason, not a crashed job.
-    var buf2: [1024]u8 = undefined;
-    var w2: std.Io.Writer = .fixed(&buf2);
-    var log2: sink.LogSink = .{ .stdout = .{ .writer = &w2 } };
-    const failing =
-        \\q=$(cat)
-        \\case "$q" in
-        \\  *'git(url'*) echo "remote: Repository not found." >&2; exit 1 ;;
-        \\  *) case "$q" in
-        \\       *'could not fetch o/r@0123456: remote: Repository not found. (private repositories are not supported in v0)'*) m=message-in-step ;;
-        \\       *) m=message-missing ;;
-        \\     esac
-        \\     printf '%s\n' '::zig-step::begin 1' "$m" '::zig-step::end 1 1' >&2 ;;
-        \\esac
-    ;
-    const res2 = try run(arena, std.testing.io, &env, .{ .argv = &.{ "sh", "-c", failing } }, job, &log2);
-    try std.testing.expect(!res2.succeeded);
-    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "message-in-step") != null);
+    const want = [_][]const u8{
+        "start 1 n t", // the step has begun, with a start time
+        "finish 1 n success",
+        "finish 2 n skipped", // failure() was false: reported once, never "started"
+        "finish 3 n failure", // unsupported: reported once, never "started"
+        "finish 4 n skipped", // success() after a failure
+    };
+    try std.testing.expectEqual(want.len, rec.events.items.len);
+    for (want, rec.events.items) |expected, got| try std.testing.expectEqualStrings(expected, got);
 }

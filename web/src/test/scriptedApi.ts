@@ -1,5 +1,5 @@
 import { throwIfAborted, type Api } from '../api/Api'
-import type { ListRunsOptions, LogsResponse, Run, RunDetail } from '../api/types'
+import type { ListRunsOptions, LogsResponse, Run, RunDetail, Runner } from '../api/types'
 
 // A controllable Api for tests (KTD9). Each method is a channel: a request waits until the
 // test pushes a response (or an Error to reject with), takes one already queued, or falls
@@ -78,16 +78,19 @@ export interface ScriptedApi {
   runs: Channel<ListRunsOptions | undefined, Run[]>
   run: Channel<number, RunDetail>
   logs: Channel<LogsCall, LogsResponse>
+  runners: Channel<void, Runner[]>
 }
 
 export function createScriptedApi(): ScriptedApi {
   const runs = new Channel<ListRunsOptions | undefined, Run[]>()
   const run = new Channel<number, RunDetail>()
   const logs = new Channel<LogsCall, LogsResponse>()
+  const runners = new Channel<void, Runner[]>()
   const api: Api = {
     listRuns: (options, signal) => runs.request(options, signal),
     getRun: (runId, signal) => run.request(runId, signal),
     getLogs: (jobId, after, limit, signal) => logs.request({ jobId, after, limit }, signal),
+    listRunners: (signal) => runners.request(undefined, signal),
   }
-  return { api, runs, run, logs }
+  return { api, runs, run, logs, runners }
 }

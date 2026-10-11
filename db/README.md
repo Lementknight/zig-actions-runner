@@ -51,7 +51,8 @@ psql "$DATABASE_URL" -f db/seed.sql
 ```
 
 The seed adds a completed run with a job, steps 0..3 and six gapless log lines, plus an
-in-progress run with one running job. It is safe to run twice.
+in-progress run with one running job, a failed run, and three runners (busy, idle and
+offline). It is safe to run twice.
 
 ## CI
 

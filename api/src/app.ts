@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import type { Queryable } from './db'
 import { BadRequest, parseAfter, parseId, parseLimit, parseText } from './params'
-import { getJobLogs, getRun, listRuns } from './queries'
+import { getJobLogs, getRun, listRunners, listRuns } from './queries'
 
 // The read API, SPEC §5.3. Every route only reads; the pool it is given is read-only as well.
 
@@ -44,6 +44,8 @@ export function createApp(db: Queryable): Hono {
     const page = await getJobLogs(db, id, after, limit)
     return page === null ? c.json({ error: 'not found' }, 404) : c.json(page)
   })
+
+  app.get('/runners', async (c) => c.json(await listRunners(db)))
 
   app.notFound((c) => c.json({ error: 'not found' }, 404))
 

@@ -52,8 +52,9 @@ a:hover {
   text-decoration: none;
 }
 
-.ar-app-header__section {
-  color: var(--ar-fg-muted);
+.ar-app-header__link {
+  color: var(--ar-fg-default);
+  font-size: var(--ar-text-sm);
 }
 
 .ar-app-header__spacer {
