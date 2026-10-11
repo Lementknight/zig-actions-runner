@@ -35,6 +35,14 @@ export interface FakeJob {
   steps: FakeStep[]
 }
 
+/** A runner the fake lists even when no fixture job names it (an idle or an offline one). */
+export interface FakeRunner {
+  name: string
+  labels?: string[]
+  /** Not running: status offline, last seen hours ago. */
+  offline?: boolean
+}
+
 export interface FakeRun {
   id: number
   repo: string

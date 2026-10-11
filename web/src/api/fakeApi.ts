@@ -1,7 +1,7 @@
 import { ApiError, throwIfAborted, type Api } from './Api'
-import { defaultFixtures } from './fixtures'
-import type { FakeRun } from './fixtures/spec'
-import type { JobWithSteps, ListRunsOptions, LogLine, LogsResponse, Run, RunDetail, Step } from './types'
+import { defaultExtraRunners, defaultFixtures } from './fixtures'
+import type { FakeRun, FakeRunner } from './fixtures/spec'
+import type { JobWithSteps, ListRunsOptions, LogLine, LogsResponse, Run, RunDetail, Runner, Step } from './types'
 
 // The fake read API (KTD3). Stateless: every answer is derived from the fixtures and the
 // clock, never from timers or request history, so React StrictMode's double mount and a
@@ -9,6 +9,8 @@ import type { JobWithSteps, ListRunsOptions, LogLine, LogsResponse, Run, RunDeta
 
 export interface FakeApiOptions {
   fixtures?: FakeRun[]
+  /** Runners listed besides the ones fixture jobs name. Defaults to an idle and an offline one. */
+  extraRunners?: FakeRunner[]
   /** The clock. Defaults to Date.now. */
   now?: () => number
   /** The instant fixture offsets count from. Defaults to the clock's value at creation. */
@@ -170,6 +172,32 @@ function summary({ jobs: _jobs, ...run }: RunDetail): Run {
   return run
 }
 
+const DEFAULT_LABELS = ['self-hosted', 'linux', 'zig']
+const HOUR_MS = 3_600_000
+
+/** One entry per runner name: those fixture jobs run on, then `extra`. Busy while a job runs on it. */
+function runnersAt(timelines: RunTimeline[], extra: FakeRunner[], origin: number, t: number): Runner[] {
+  const jobs = timelines.filter((tl) => tl.createdAt <= t).flatMap((tl) => tl.jobs.map((job) => jobAt(job, t)))
+  const names = new Set<string>()
+  for (const tl of timelines) for (const job of tl.jobs) if (job.runnerName) names.add(job.runnerName)
+  for (const runner of extra) names.add(runner.name)
+  return [...names].sort().map((name): Runner => {
+    const mine = jobs.filter((j) => j.runner_name === name)
+    const running = mine.filter((j) => j.status === 'in_progress')
+    const offline = extra.find((r) => r.name === name)?.offline === true
+    return {
+      name,
+      status: offline ? 'offline' : running.length > 0 ? 'busy' : 'idle',
+      labels: extra.find((r) => r.name === name)?.labels ?? DEFAULT_LABELS,
+      registered_at: iso(origin - HOUR_MS),
+      last_seen_at: iso(offline ? origin - 3 * HOUR_MS : t),
+      current_job: running[0] ? { id: running[0].id, run_id: running[0].run_id, name: running[0].name } : null,
+      running_jobs: running.length,
+      completed_jobs: mine.filter((j) => j.status === 'completed').length,
+    }
+  })
+}
+
 export function createFakeApi(options: FakeApiOptions = {}): Api {
   const now = options.now ?? Date.now
   const origin = options.origin ?? now()
@@ -199,6 +227,11 @@ export function createFakeApi(options: FakeApiOptions = {}): Api {
       const timeline = existing(t).find((tl) => tl.run.id === runId)
       if (!timeline) throw new ApiError(`Run ${runId} not found`, 404)
       return runAt(timeline, t)
+    },
+
+    async listRunners(signal?: AbortSignal): Promise<Runner[]> {
+      throwIfAborted(signal)
+      return runnersAt(timelines, options.extraRunners ?? defaultExtraRunners, origin, now())
     },
 
     async getLogs(jobId: number, after: number, limit: number, signal?: AbortSignal): Promise<LogsResponse> {

@@ -1,0 +1,135 @@
+/* Runner list: the same bordered box of rows as the run list, name and badge left,
+   the current job in the middle, counts and last-seen age on the right. */
+
+.ar-runner-list__loading {
+  display: flex;
+  justify-content: center;
+  padding: var(--ar-space-12) var(--ar-space-6);
+}
+
+.ar-runner-list__header {
+  padding: var(--ar-space-4);
+  background: var(--ar-bg-subtle);
+  border-bottom: var(--ar-border-width) solid var(--ar-border-default);
+  border-radius: var(--ar-radius-md) var(--ar-radius-md) 0 0;
+  font-size: var(--ar-text-sm);
+  font-weight: var(--ar-weight-semibold);
+}
+
+.ar-runner-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ar-runner-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--ar-space-2);
+  padding: var(--ar-space-3) var(--ar-space-4);
+  border-top: var(--ar-border-width) solid var(--ar-border-muted);
+}
+
+.ar-runner-row:first-child {
+  border-top: 0;
+}
+
+.ar-runner-row:last-child {
+  border-radius: 0 0 var(--ar-radius-md) var(--ar-radius-md);
+}
+
+@media (min-width: 48em) {
+  .ar-runner-row {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 14em) 11em;
+    align-items: start;
+  }
+}
+
+.ar-runner-row__name {
+  margin-right: var(--ar-space-2);
+  font-weight: var(--ar-weight-semibold);
+  overflow-wrap: anywhere;
+}
+
+.ar-runner-row__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--ar-space-1);
+  margin-top: var(--ar-space-1);
+}
+
+.ar-runner-row__label {
+  padding: 0 var(--ar-space-1);
+  color: var(--ar-fg-muted);
+  background: var(--ar-bg-subtle);
+  border-radius: var(--ar-radius-sm);
+  font-family: var(--ar-font-mono);
+  font-size: var(--ar-text-xs);
+}
+
+.ar-runner-row__job {
+  font-size: var(--ar-text-sm);
+  overflow-wrap: anywhere;
+}
+
+.ar-runner-row__job-link {
+  font-weight: var(--ar-weight-semibold);
+}
+
+.ar-runner-row__none {
+  color: var(--ar-fg-muted);
+}
+
+.ar-runner-row__counts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--ar-space-1);
+  color: var(--ar-fg-muted);
+  font-size: var(--ar-text-sm);
+}
+
+.ar-runner-list__toggle {
+  display: flex;
+  flex-basis: 100%;
+  align-items: center;
+  gap: var(--ar-space-2);
+  margin-top: var(--ar-space-3);
+  font-size: var(--ar-text-sm);
+}
+
+/* The jobs of one runner, under its row, when "Show all jobs" is on. */
+.ar-runner-row__jobs {
+  grid-column: 1 / -1;
+  padding: var(--ar-space-2) 0 0 var(--ar-space-4);
+  border-top: var(--ar-border-width) solid var(--ar-border-muted);
+}
+
+.ar-runner-jobs {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ar-runner-job {
+  display: flex;
+  align-items: center;
+  gap: var(--ar-space-2);
+  padding: var(--ar-space-1) 0;
+  font-size: var(--ar-text-sm);
+}
+
+.ar-runner-job__name {
+  font-weight: var(--ar-weight-semibold);
+}
+
+.ar-runner-job__run {
+  flex: 1;
+  min-width: 0;
+  color: var(--ar-fg-muted);
+  overflow-wrap: anywhere;
+}
+
+.ar-runner-job__time {
+  color: var(--ar-fg-muted);
+  white-space: nowrap;
+}

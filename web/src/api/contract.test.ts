@@ -121,6 +121,23 @@ function defineContract(name: string, makeSubject: () => Promise<Subject>) {
       expect((await api.getLogs(runningJobId, 0, 1000)).job_done).toBe(false)
     })
 
+    it('lists runners with every documented field, typed, ordered by name', async () => {
+      const { api } = await get()
+      const runners = await api.listRunners()
+      expect(runners.length).toBeGreaterThanOrEqual(1)
+      for (const r of runners) {
+        expect(typeof r.name).toBe('string')
+        expect(['idle', 'busy', 'offline']).toContain(r.status)
+        expect(Array.isArray(r.labels)).toBe(true)
+        expect(Number.isNaN(Date.parse(r.last_seen_at))).toBe(false)
+        expect(typeof r.running_jobs).toBe('number')
+        expect(typeof r.completed_jobs).toBe('number')
+        // A runner reports a current job exactly when it is busy.
+        expect(r.current_job !== null).toBe(r.status === 'busy')
+      }
+      expect(runners.map((r) => r.name)).toEqual([...runners.map((r) => r.name)].sort())
+    })
+
     it('answers an unknown run and job with 404 (proposed, SPEC question 4)', async () => {
       const { api } = await get()
       expect(isNotFound(await api.getRun(987_654_321).catch((e: unknown) => e))).toBe(true)

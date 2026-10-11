@@ -207,11 +207,25 @@ CREATE INDEX runs_repo_created_at_idx ON runs (repo, created_at DESC, id DESC);
 CREATE INDEX jobs_run_id_id_idx       ON jobs (run_id, id);
 ```
 
+Added by `002_runners.sql`:
+
+```sql
+CREATE TABLE runners (
+  name           TEXT PRIMARY KEY,           -- the runner name (`jobs.runner_name` refers to it, without a foreign key)
+  status         TEXT NOT NULL CHECK (status IN ('idle', 'busy', 'offline')),
+  labels         TEXT[] NOT NULL DEFAULT '{}',
+  registered_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT now() -- heartbeat
+);
+CREATE INDEX jobs_runner_name_idx ON jobs (runner_name, status);
+```
+
 `job_logs` uses 1 day chunks (the default is 7). The primary key keeps `ts` because TimescaleDB requires the partition column in unique constraints.
 
 Rules:
 - Only the runner writes. The API is read-only.
 - `seq` starts at 1 per job and has no gaps; the frontend relies on it for ordering and resume.
+- The runner upserts its `runners` row on registration, sets `busy` when it acquires a job and `idle` when the job ends, refreshes `last_seen_at` on every broker poll (about every 50 s) and sets `offline` on a clean exit. The read API also reports a runner as `offline` when `last_seen_at` is older than 2 minutes (two polls), so a crashed runner does not stay `idle`.
 - Log lines are stored with ANSI codes intact; the frontend renders them.
 - Migrations live in `db/migrations/NNN_name.sql`, forward-only.
 - Migrations are applied with dbmate (`db/README.md`); `db/seed.sql` holds demo data for the API and contract test.
@@ -249,6 +263,7 @@ Hono on Node with `pg` (`api/README.md`). It only reads: every connection starts
 | `GET /api/runs?repo=&limit=&before=` | Run list, newest first |
 | `GET /api/runs/:id` | Run + its jobs + steps |
 | `GET /api/jobs/:id/logs?after=<seq>&limit=` | Log lines with `seq > after`, ordered by `seq` |
+| `GET /api/runners` | Every runner with its state and job counts |
 | `GET /api/health` | `{ "ok": true }` |
 
 Response shapes mirror the table columns (snake_case JSON). BIGINT ids and `seq` are JSON numbers; timestamps are ISO 8601; nullable columns are `null`. An empty query parameter (`?repo=`) counts as absent.
@@ -270,9 +285,19 @@ The client polls with `next_after` until `job_done` is true and a page comes bac
 
 Errors: an unknown run, job or path answers `404 { "error": "not found" }`. A non-numeric or non-positive id, or a malformed `limit`, `before` or `after`, answers `400 { "error": "invalid ..." }`. A database failure answers `500 { "error": "internal error" }`.
 
+Runners response (a bare array, ordered by `name`):
+```json
+[{ "name": "zig-runner-1", "status": "busy", "labels": ["self-hosted", "linux", "zig"],
+   "registered_at": "...", "last_seen_at": "...",
+   "current_job": { "id": 9100000002, "run_id": 9000000002, "name": "build" },
+   "running_jobs": 1, "completed_jobs": 2 }]
+```
+`status` is `idle`, `busy` or `offline` (see §4 for how `offline` is derived). `current_job` is the runner's in-progress job, or null. The counts come from `jobs.runner_name`. Jobs queued on GitHub that no runner has acquired yet are not visible to the runner and are not listed.
+
 ### 5.4 Frontend pages
 
 - `/` run list: status icon, workflow, repo, branch, sha, age, duration.
+- `/runners` runner list: status badge, name, labels, last seen, current job (links to its run), running and completed job counts. A "Show all jobs" switch (off by default) lists every running and finished job under its runner; there is no jobs endpoint, so it walks `GET /api/runs` and `GET /api/runs/:id`.
 - `/runs/:id` job list/graph with per-job status; selecting a job shows its steps.
 - `/runs/:runId/jobs/:jobId` job view, linkable on its own: collapsible steps, ANSI-colored log viewer, live tail while `in_progress`, timestamps toggle.
 - Must work with fake data from the M0 seed script.

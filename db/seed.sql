@@ -100,3 +100,11 @@ SELECT * FROM (VALUES
   (now() - interval '290 seconds', 9100000003, 8, 11, 'stdout', 'cleanup runs because always()')
 ) AS v(ts, job_id, step_number, seq, stream, line)
 WHERE NOT EXISTS (SELECT 1 FROM job_logs WHERE job_id = 9100000003);
+
+-- Runners. zig-runner-1 owns the three jobs above and is busy with the in-progress one;
+-- zig-runner-2 is idle; zig-runner-3 stopped a while ago (offline).
+INSERT INTO runners (name, status, labels, registered_at, last_seen_at) VALUES
+  ('zig-runner-1', 'busy',    '{self-hosted,linux,zig}', now() - interval '1 hour',  now() - interval '10 seconds'),
+  ('zig-runner-2', 'idle',    '{self-hosted,linux,zig}', now() - interval '1 hour',  now() - interval '20 seconds'),
+  ('zig-runner-3', 'offline', '{self-hosted,linux,zig}', now() - interval '1 day',   now() - interval '3 hours')
+ON CONFLICT DO NOTHING;
