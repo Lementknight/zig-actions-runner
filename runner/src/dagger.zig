@@ -168,6 +168,12 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
                 try w.writeByte('\n');
             }
             if (sc.write_event) try w.writeAll("if [ -n \"${" ++ event_env ++ "+x}\" ]; then mkdir -p " ++ event_dir ++ " && printf '%s' \"$" ++ event_env ++ "\" > " ++ event_path ++ "; fi\n");
+            // The script is a file, as on GitHub: `$0`, BASH_SOURCE and error messages name it.
+            const path = try scriptPath(arena, fc);
+            try w.writeAll("printf '%s' ");
+            try shellQuote(w, sc.script);
+            try w.print(" > {s}\n", .{path});
+            if (sc.shell == null) try w.writeAll("if command -v bash >/dev/null 2>&1; then zig_shell=bash; else zig_shell=sh; fi\n");
             try w.writeAll("( ");
             if (sc.working_directory) |wd| {
                 try w.writeAll("cd ");
@@ -175,9 +181,8 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
                 try w.writeAll(" && ");
             }
             try writeEnvCommand(w, arena, "env ", sc.env, sc.secret_env, sc.write_event, fc, action_name);
-            try w.writeAll(shellCommand(sc.shell));
-            try shellQuote(w, sc.script);
-            try w.writeAll(" )\nrc=$?\n");
+            try writeShellCommand(w, arena, sc.shell, path);
+            try w.writeAll(")\nrc=$?\n");
         },
         .checkout => |f| {
             // The tree is mounted by the query (`withDirectory`); the step only reports it.
@@ -318,17 +323,47 @@ fn writeEnvCommand(w: *std.Io.Writer, arena: Allocator, env_cmd: []const u8, env
     try w.writeByte(' ');
 }
 
-/// How a script runs, as on GitHub: no `shell:` is `bash -e`; `bash` adds pipefail and skips the
-/// profile and rc files; `sh` is `sh -e`.
-fn shellCommand(shell: ?[]const u8) []const u8 {
-    const s = shell orelse return "bash -e -c ";
-    return if (std.mem.eql(u8, s, "sh")) "sh -e -c " else "bash --noprofile --norc -e -o pipefail -c ";
+/// The command template for a step's `shell:` as GitHub runs it, `{0}` being the script file: no
+/// `shell:` is `bash -e {0}` (`sh -e {0}` when the image has no bash, decided in the script), `bash`
+/// adds pipefail and skips the profile and rc files, `sh` is `sh -e {0}`, and a custom command is
+/// used as written.
+fn shellTemplate(shell: ?[]const u8) []const u8 {
+    const s = shell orelse return "bash -e {0}";
+    if (std.mem.eql(u8, s, "bash")) return "bash --noprofile --norc -e -o pipefail {0}";
+    if (std.mem.eql(u8, s, "sh")) return "sh -e {0}";
+    return s;
 }
 
-/// The `shell:` line of a run step's log header, as GitHub's runner prints it.
-fn shellLine(shell: ?[]const u8) []const u8 {
-    const s = shell orelse return "shell: /usr/bin/bash -e {0}";
-    return if (std.mem.eql(u8, s, "sh")) "shell: /usr/bin/sh -e {0}" else "shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}";
+/// The command that runs the script file `path`: the template's words, quoted, with `{0}` replaced.
+fn writeShellCommand(w: *std.Io.Writer, arena: Allocator, shell: ?[]const u8, path: []const u8) !void {
+    var it = std.mem.tokenizeAny(u8, shellTemplate(shell), " \t");
+    var first = true;
+    while (it.next()) |word| {
+        // No `shell:`: bash, or sh where the image has no bash (`$zig_shell`, set by the script).
+        if (first and shell == null) {
+            try w.writeAll("\"$zig_shell\" ");
+        } else {
+            try shellQuote(w, try std.mem.replaceOwned(u8, arena, word, "{0}", path));
+            try w.writeByte(' ');
+        }
+        first = false;
+    }
+}
+
+/// The `shell:` line of a run step's log header, as GitHub's runner prints it: the template, with a
+/// bare `bash` or `sh` as its full path.
+fn shellLine(arena: Allocator, shell: ?[]const u8) ![]const u8 {
+    const t = shellTemplate(shell);
+    var it = std.mem.tokenizeAny(u8, t, " \t");
+    const prog = it.next() orelse return std.fmt.allocPrint(arena, "shell: {s}", .{t});
+    const rest = std.mem.trimStart(u8, t[prog.len..], " \t");
+    const full = if (std.mem.eql(u8, prog, "bash") or std.mem.eql(u8, prog, "sh")) try std.fmt.allocPrint(arena, "/usr/bin/{s}", .{prog}) else prog;
+    return std.fmt.allocPrint(arena, "shell: {s} {s}", .{ full, rest });
+}
+
+/// Where a step's script is written for its shell, as GitHub writes it under RUNNER_TEMP.
+fn scriptPath(arena: Allocator, fc: u32) ![]const u8 {
+    return std.fmt.allocPrint(arena, "/tmp/zig-runner-step-{d}.sh", .{fc});
 }
 
 /// The name under which a step's `i`th secret variable is attached to the container. Dagger silently
@@ -1239,12 +1274,18 @@ fn logRunHeader(arena: Allocator, sh: *Shared, num: u32, script: []const u8, she
     sh.append(num, try std.fmt.allocPrint(arena, "##[group]Run {s}", .{firstLine(script)}));
     var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, script, "\n"), '\n');
     while (lines.next()) |l| sh.append(num, l);
-    sh.append(num, shellLine(shell));
+    sh.append(num, try shellLine(arena, shell));
     if (env.len > 0) {
         sh.append(num, "env:");
         for (env) |e| sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ e.name, firstLine(e.value) }));
     }
     sh.append(num, "##[endgroup]");
+}
+
+/// What GitHub's runner logs when a script exits non-zero.
+fn logExitCode(sh: *Shared, num: u32, code: i32) void {
+    var buf: [64]u8 = undefined;
+    sh.append(num, std.fmt.bufPrint(&buf, "##[error]Process completed with exit code {d}.", .{code}) catch return);
 }
 
 /// The `env` context a step sees: the job's (workflow, job, GITHUB_ENV), then the step's own.
@@ -1523,7 +1564,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
                 };
                 const shell: ?[]const u8 = if (sc.shell) |t| (ev.render(t, sc1) catch null) else null;
                 if (shell) |sh_name| if (!job_mod.validShell(sh_name)) {
-                    try failStep(&ev, sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "unsupported shell '{s}' (v0 supports bash and sh)", .{sh_name}), coe);
+                    try failStep(&ev, sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "unsupported shell '{s}' ({s})", .{ sh_name, job_mod.shell_help }), coe);
                     continue;
                 };
                 const wd: ?[]const u8 = if (sc.working_directory) |t| (ev.render(t, sc1) catch null) else null;
@@ -1596,6 +1637,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
             error.EngineFailed => return engineFailed(&x, opts.observer, res, num, coe, results),
             else => return e,
         };
+        if (resolved == .run and out.code != 0) logExitCode(sh, num, out.code);
         res.completed_ms = std.Io.Clock.real.now(io).toMilliseconds();
         res.exit_code = out.code;
         res.outcome = if (out.code == 0) .success else .failure;
@@ -2065,7 +2107,7 @@ const Exec = struct {
             if (st.name == null) display = firstLine(script);
             const shell = expr.interpolate(arena, st.shell.?, sc) catch st.shell.?;
             if (!job_mod.validShell(shell)) {
-                try x.nestedFailed(num, ctx_id, display, try std.fmt.allocPrint(arena, "unsupported shell '{s}' (v0 supports bash and sh)", .{shell}), &failed, &exit_code);
+                try x.nestedFailed(num, ctx_id, display, try std.fmt.allocPrint(arena, "unsupported shell '{s}' ({s})", .{ shell, job_mod.shell_help }), &failed, &exit_code);
                 continue;
             }
             const wd: ?[]const u8 = if (st.working_directory) |d| (expr.interpolate(arena, d, sc) catch d) else null;
@@ -2082,7 +2124,7 @@ const Exec = struct {
             x.sh.append(num, try std.fmt.allocPrint(arena, "##[group]Run {s}", .{display}));
             var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, script, "\n"), '\n');
             while (lines.next()) |l| x.sh.append(num, l);
-            x.sh.append(num, shellLine(shell));
+            x.sh.append(num, try shellLine(arena, shell));
             const shown_env = try envContext(arena, ev.job_env.items, all_env);
             if (shown_env.len > 0) {
                 x.sh.append(num, "env:");
@@ -2097,6 +2139,7 @@ const Exec = struct {
             x.next_fc += 1;
             const out = try x.execScript(num, fc, .{ .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = plain.items } }, ctx_id, secret.items, if (mounted) &.{} else &m);
             try x.mounted_actions.put(arena, act.mount, {});
+            if (out.code != 0) logExitCode(x.sh, num, out.code);
             const ok = out.code == 0;
             try ev.steps.append(arena, .{ .id = ctx_id, .outcome = if (ok) "success" else "failure", .conclusion = if (ok or coe) "success" else "failure", .outputs = out.outputs });
             if (!ok and !coe) {
@@ -3311,7 +3354,20 @@ test "script quotes, applies env, shell and working directory, and propagates th
         .env = &.{.{ .name = "X", .value = "a b" }},
     } }, "build");
     try std.testing.expect(std.mem.indexOf(u8, w, "cd 'sub dir' && env 'X=a b' 'GITHUB_OUTPUT=/github/file_commands/output_2'") != null);
-    try std.testing.expect(std.mem.indexOf(u8, w, "'GITHUB_ACTION=build' sh -e -c 'echo '\\''hi'\\'' && echo $X'") != null);
+    // The script is written to a file that the shell runs, as GitHub does.
+    try std.testing.expect(std.mem.indexOf(u8, w, "printf '%s' 'echo '\\''hi'\\'' && echo $X' > /tmp/zig-runner-step-2.sh\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, "'GITHUB_ACTION=build' 'sh' '-e' '/tmp/zig-runner-step-2.sh' )") != null);
+    // A custom bash command, with {0} replaced by the file.
+    const custom = try stepScript(a.allocator(), 3, .{ .run = .{ .script = "echo hi", .shell = "bash -l {0}", .working_directory = null, .env = &.{} } }, "x");
+    try std.testing.expect(std.mem.indexOf(u8, custom, "'bash' '-l' '/tmp/zig-runner-step-3.sh' )") != null);
+    try std.testing.expect(std.mem.indexOf(u8, custom, "zig_shell") == null);
+    // No shell: bash -e, or sh -e where the image has no bash.
+    const default = try stepScript(a.allocator(), 4, .{ .run = .{ .script = "echo hi", .shell = null, .working_directory = null, .env = &.{} } }, "x");
+    try std.testing.expect(std.mem.indexOf(u8, default, "if command -v bash >/dev/null 2>&1; then zig_shell=bash; else zig_shell=sh; fi\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, default, "\"$zig_shell\" '-e' '/tmp/zig-runner-step-4.sh' )") != null);
+    try std.testing.expectEqualStrings("shell: /usr/bin/bash -e {0}", try shellLine(a.allocator(), null));
+    try std.testing.expectEqualStrings("shell: /usr/bin/bash -l {0}", try shellLine(a.allocator(), "bash -l {0}"));
+    try std.testing.expectEqualStrings("shell: /bin/bash --login -eo pipefail {0}", try shellLine(a.allocator(), "/bin/bash --login -eo pipefail {0}"));
     // The file commands exist before the step and are touched again after it.
     try std.testing.expect(std.mem.indexOf(u8, w, ": > /github/file_commands/output_2 > /github/file_commands/env_2") != null);
     try std.testing.expect(std.mem.indexOf(u8, w, ">> /github/file_commands/path_2") != null);
@@ -3902,6 +3958,8 @@ test "action failures: an image that cannot be pulled, a missing action.yml, and
     try std.testing.expect(std.mem.indexOf(u8, seen[9], "echo cleanup") != null);
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "could not pull nope:1 for o/dock@v1: pull access denied for nope") != null);
+    // As GitHub's runner logs a script that exits non-zero.
+    try std.testing.expect(std.mem.indexOf(u8, out, "##[error]Process completed with exit code 3.") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "o/none@v1 has no action.yml or action.yaml") != null);
 }
 
@@ -3997,7 +4055,8 @@ test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the
     try std.testing.expect(std.mem.indexOf(u8, run1, "'ACTIONS_CACHE_SERVICE_V2=True'") != null);
     try std.testing.expect(std.mem.indexOf(u8, run1, "GITHUB_STATE=") != null);
     // bash, not sh, starts the runtime (dash would drop INPUT_GITHUB-TOKEN).
-    try std.testing.expect(std.mem.indexOf(u8, run1, "bash --noprofile --norc -e -o pipefail -c 'PATH=\\\"/github/_runtime/bin:$PATH\\\" exec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "printf '%s' 'PATH=\\\"/github/_runtime/bin:$PATH\\\" exec") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'bash' '--noprofile' '--norc' '-e' '-o' 'pipefail' '/tmp/zig-runner-step-") != null);
     // No token in any command; the runtime is fetched only once.
     for (seen) |d| if (std.mem.indexOf(u8, d, "setSecret") == null) try std.testing.expect(std.mem.indexOf(u8, d, "ghs_") == null);
     try std.testing.expect(std.mem.indexOf(u8, seen[11], "withFile(path:\"/github/_runtime/node/node\"") == null);
@@ -4420,8 +4479,9 @@ test "logs read like GitHub's: Set up job, then each step's header with its shel
         at = i + want.len;
     }
     // The default shell is GitHub's `bash -e` (no pipefail); an explicit `sh` stays `sh -e`.
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "bash -e -c 'echo one") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], "sh -e -c 'echo from-the-action") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "printf '%s' 'echo one\\necho two' > /tmp/zig-runner-step-3.sh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "\\\"$zig_shell\\\" '-e' '/tmp/zig-runner-step-3.sh'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], "'sh' '-e' '/tmp/zig-runner-step-") != null);
 }
 
 test "splitArgs splits like a command line, with double quotes" {
