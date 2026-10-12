@@ -838,6 +838,17 @@ const Shared = struct {
         sh.log.setSecrets(list.items);
     }
 
+    /// State a step saved with the deprecated `::save-state`, since the last call.
+    fn takeState(sh: *Shared, step: u32) []const job_mod.EnvVar {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        if (step == 0 or step > sh.commands.len) return &.{};
+        const st = &sh.commands[step - 1];
+        const out = st.state.items;
+        st.state = .empty;
+        return out;
+    }
+
     /// Outputs a step set with the deprecated `::set-output`, since the last call.
     fn takeOutputs(sh: *Shared, step: u32) []const job_mod.EnvVar {
         sh.mu.lockUncancelable(sh.io);
@@ -1122,6 +1133,17 @@ pub fn run(
         .event_from_env = step_cache and (try ev.eventJson()).len <= max_event_env,
         .job_secret_env = jobEnvHasSecret(job, ev.job_env.items),
         .run_nonce = try runNonce(arena, io, &ev),
+        .execs = try zeroed(arena, u32, job.steps.len),
+        .loaded = try nulls(arena, Exec.LoadResult, job.steps.len),
+        .pre_state = try emptySlices(arena, job_mod.EnvVar, job.steps.len),
+    };
+
+    // JavaScript actions' `pre` scripts run before any step, as on GitHub.
+    for (job.steps, 1..) |step, n| if (step.action == .uses) {
+        x.runPre(@intCast(n), step) catch |e| switch (e) {
+            error.EngineFailed => return finish(arena, &sh, results, x.err_msg),
+            else => return e,
+        };
     };
 
     for (job.steps, results, 1..) |step, *res, n| {
@@ -1232,7 +1254,32 @@ pub fn run(
         if (res.outcome == .failure and !coe) ev.job_failed = true;
         if (opts.observer) |o| o.finished(num, res.*);
     }
-    return finish(arena, &sh, results, "");
+    // Then their `post` scripts, last first.
+    x.runPosts() catch |e| switch (e) {
+        error.EngineFailed => return finish(arena, &sh, results, x.err_msg),
+        else => return e,
+    };
+    var result = try finish(arena, &sh, results, "");
+    if (x.hook_failed) result.succeeded = false;
+    return result;
+}
+
+fn zeroed(arena: Allocator, comptime T: type, n: usize) ![]T {
+    const s = try arena.alloc(T, n);
+    @memset(s, 0);
+    return s;
+}
+
+fn nulls(arena: Allocator, comptime T: type, n: usize) ![]?T {
+    const s = try arena.alloc(?T, n);
+    @memset(s, null);
+    return s;
+}
+
+fn emptySlices(arena: Allocator, comptime T: type, n: usize) ![][]const T {
+    const s = try arena.alloc([]const T, n);
+    @memset(s, &.{});
+    return s;
 }
 
 /// A directory mounted into the container for one exec.
@@ -1260,6 +1307,16 @@ const Exec = struct {
     js_runtime: config.JsRuntime,
     /// Whether the JavaScript runtime is in the container yet (it is added by the first JS action).
     js_mounted: bool = false,
+    /// Per step (index = step - 1): execs so far, the action loaded for it, the state its `pre` saved.
+    execs: []u32,
+    loaded: []?LoadResult,
+    pre_state: [][]const job_mod.EnvVar,
+    /// Action directories already mounted (by path), so a later phase sees what an earlier one left.
+    mounted_actions: std.StringHashMapUnmanaged(void) = .empty,
+    /// JavaScript actions' `post` scripts, run after the job's steps in reverse order.
+    posts: std.ArrayList(Post) = .empty,
+    /// A `pre` or `post` script failed: the job fails, whatever its steps' results.
+    hook_failed: bool = false,
     /// Steps may use the job's Dagger engine (see `Options.nesting`).
     nesting: bool,
     /// Unchanged steps may be reused across runs (see `Options.step_cache`).
@@ -1271,7 +1328,37 @@ const Exec = struct {
     /// Differs on every run (and attempt): makes steps that use secrets run every time.
     run_nonce: []const u8,
 
-    const ExecOut = struct { code: i32, outputs: []const job_mod.EnvVar };
+    const Post = struct {
+        num: u32,
+        act: Loaded,
+        u: job_mod.Uses,
+        script: []const u8,
+        condition: []const u8,
+        inputs: []const expr.Value.Entry,
+        step_env: []const job_mod.EnvVar,
+        step_secret: []const SecretRef,
+        state: []const job_mod.EnvVar,
+    };
+
+    const Phase = enum {
+        pre,
+        main,
+        post,
+        fn label(p: Phase) []const u8 {
+            return switch (p) {
+                .pre => "Pre",
+                .main => "Run",
+                .post => "Post",
+            };
+        }
+    };
+
+    const ExecOut = struct {
+        code: i32,
+        outputs: []const job_mod.EnvVar,
+        /// From GITHUB_STATE and `::save-state`; a JavaScript action's later phases get it as STATE_*.
+        state: []const job_mod.EnvVar = &.{},
+    };
 
     /// Runs one script in the job's container, logging as step `num`, and applies its file
     /// commands. `error.EngineFailed` (with `err_msg`) when Dagger itself failed.
@@ -1363,7 +1450,7 @@ const Exec = struct {
         // Nesting gives the step's `dagger` CLI a session on this engine, sharing its cache. The
         // container id is read after the step's secrets are removed (below).
         try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
-        for ([_][]const u8{ "output", "env", "path" }) |kind| {
+        for ([_][]const u8{ "output", "env", "path", "state" }) |kind| {
             try w.print(" fc_{s}: file(path:\"{s}\") {{ contents }}", .{ kind, try fcPath(arena, kind, fc) });
         }
         // The next step starts from this container without the step's secrets.
@@ -1377,6 +1464,13 @@ const Exec = struct {
         try w.writeAll(" }");
         for (0..braces) |_| try w.writeAll(" }");
 
+        // Several execs can log as one step (a composite action's steps, a JavaScript action's pre, main
+        // and post): after the first, count each one's live lines afresh, so a cached one is replayed.
+        if (x.execs[num - 1] > 0) {
+            x.sh.live_lines[num - 1].store(0, .monotonic);
+            x.sh.ended[num - 1].store(false, .release);
+        }
+        x.execs[num - 1] += 1;
         const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch return error.EngineFailed;
         var code: i32 = if (jsonFind(data, "exitCode")) |c| (if (c == .integer) @intCast(c.integer) else 1) else 1;
         if (jsonFindString(data, "id")) |id| x.container_id = id;
@@ -1410,7 +1504,12 @@ const Exec = struct {
         // Outputs set with the deprecated `::set-output` come after GITHUB_OUTPUT's, which win.
         const legacy = x.sh.takeOutputs(num);
         if (legacy.len > 0) outputs = try std.mem.concat(arena, job_mod.EnvVar, &.{ outputs, legacy });
-        return .{ .code = code, .outputs = outputs };
+        var state: []const job_mod.EnvVar = x.sh.takeState(num);
+        if (fileCommand(data, "fc_state")) |text| switch (try commands.parseKeyValues(arena, text)) {
+            .ok => |kv| state = try std.mem.concat(arena, job_mod.EnvVar, &.{ state, kv }),
+            .invalid => |why| x.sh.append(num, try std.fmt.allocPrint(arena, "Unable to process the GITHUB_STATE file command: {s}", .{why})),
+        };
+        return .{ .code = code, .outputs = outputs, .state = state };
     }
 
     const ActionOut = struct { failed: bool, exit_code: i32 = 0, outputs: []const job_mod.EnvVar = &.{} };
@@ -1426,43 +1525,20 @@ const Exec = struct {
     fn runAction(x: *Exec, num: u32, u: job_mod.Uses, caller: expr.Scope, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef) !ActionOut {
         const arena = x.arena;
         const ev = x.ev;
-        const act = switch (try x.loadAction(u)) {
+        const act = switch (try x.loadFor(num, u)) {
             .failed => |msg| return x.actionFailed(num, "{s}", .{msg}),
             .ok => |a| a,
         };
         if (act.meta.runs == .docker) return x.actionFailed(num, "{s} is a Docker action; Docker actions are not supported yet", .{act.ref_label});
 
-        // Inputs: the step's `with:` values, else the defaults, evaluated where the `uses:` step is.
-        var inputs: std.ArrayList(expr.Value.Entry) = .empty;
-        for (act.meta.inputs) |def| {
-            var val: []const u8 = "";
-            if (findInput(u.inputs, def.name)) |t| {
-                ev.diag = "";
-                val = ev.render(t, caller) catch return x.actionFailed(num, "could not evaluate input '{s}': {s}", .{ def.name, ev.diag });
-            } else if (def.default) |d| {
-                ev.diag = "";
-                val = expr.interpolate(arena, d, caller) catch return x.actionFailed(num, "could not evaluate the default of input '{s}': {s}", .{ def.name, ev.diag });
-            }
-            try inputs.append(arena, .{ .key = def.name, .value = .{ .string = val } });
-        }
-        // Like GitHub: warn about inputs the action does not declare, and pass them on anyway.
-        var unexpected: std.ArrayList([]const u8) = .empty;
-        for (u.inputs) |in| if (act.meta.input(in.name) == null) {
-            try unexpected.append(arena, in.name);
-            const val = ev.render(in.value, caller) catch "";
-            try inputs.append(arena, .{ .key = in.name, .value = .{ .string = val } });
+        const inputs = switch (try x.resolveInputs(num, act, u, caller, true)) {
+            .failed => |out| return out,
+            .ok => |in| in,
         };
-        if (unexpected.items.len > 0) {
-            var valid: std.ArrayList([]const u8) = .empty;
-            for (act.meta.inputs) |def| try valid.append(arena, def.name);
-            x.sh.append(num, try std.fmt.allocPrint(arena, "Warning: Unexpected input(s) '{s}', valid inputs are ['{s}']", .{
-                try std.mem.join(arena, "', '", unexpected.items), try std.mem.join(arena, "', '", valid.items),
-            }));
-        }
 
         const steps = switch (act.meta.runs) {
             .composite => |st| st,
-            .node => |nd| return x.runJs(num, act, u, nd, inputs.items, step_env, step_secret),
+            .node => |nd| return x.runJs(num, act, u, nd, inputs, step_env, step_secret),
             .docker => unreachable,
         };
 
@@ -1480,7 +1556,7 @@ const Exec = struct {
         }
         const repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name });
         ev.steps = .empty;
-        ev.inputs = .{ .object = inputs.items };
+        ev.inputs = .{ .object = inputs };
         ev.github = try withEntries(arena, ev.github, &.{
             .{ .key = "action_path", .value = .{ .string = act.path } },
             .{ .key = "action_repository", .value = .{ .string = repository } },
@@ -1563,12 +1639,6 @@ const Exec = struct {
             const m = [_]Mount{.{ .dir = .{ .path = act.mount, .id = act.dir } }};
             const fc = x.next_fc;
             x.next_fc += 1;
-            // All the action's scripts log as step `num`: after the first, count each one's lines afresh,
-            // so a cached one is still replayed.
-            if (mounted) {
-                x.sh.live_lines[num - 1].store(0, .monotonic);
-                x.sh.ended[num - 1].store(false, .release);
-            }
             const out = try x.execScript(num, fc, .{ .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = plain.items } }, ctx_id, secret.items, if (mounted) &.{} else &m);
             mounted = true;
             const ok = out.code == 0;
@@ -1589,10 +1659,139 @@ const Exec = struct {
 
     /// Runs a JavaScript action's `main` with the configured runtime (Bun by default, see SPEC §6).
     fn runJs(x: *Exec, num: u32, act: Loaded, u: job_mod.Uses, nd: @FieldType(action.Runs, "node"), inputs: []const expr.Value.Entry, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef) !ActionOut {
-        const arena = x.arena;
-        if (nd.pre != null) x.sh.append(num, try std.fmt.allocPrint(arena, "Warning: {s} has a pre script ({s}), which this runner does not run yet", .{ act.ref_label, nd.pre.? }));
-        if (nd.post != null) x.sh.append(num, try std.fmt.allocPrint(arena, "Warning: {s} has a post script ({s}), which this runner does not run yet", .{ act.ref_label, nd.post.? }));
+        const out = (try x.runJsScript(num, .main, act, u, nd.main, inputs, step_env, step_secret, x.pre_state[num - 1])) orelse
+            return .{ .failed = true, .exit_code = 1 };
+        // Its `post` runs after the job's steps, with the inputs and the state saved so far.
+        if (nd.post) |post| try x.posts.append(x.arena, .{
+            .num = num,
+            .act = act,
+            .u = u,
+            .script = post,
+            .condition = nd.post_if orelse "always()",
+            .inputs = inputs,
+            .step_env = step_env,
+            .step_secret = step_secret,
+            .state = try std.mem.concat(x.arena, job_mod.EnvVar, &.{ x.pre_state[num - 1], out.state }),
+        });
+        return .{ .failed = out.code != 0, .exit_code = out.code, .outputs = out.outputs };
+    }
 
+    const LoadResult = union(enum) { ok: Loaded, failed: []const u8 };
+
+    /// The action's repository, loaded once per step, whether it loads or not: the `pre` pass at the
+    /// start of the job (as GitHub downloads every action in "Set up job") and the step itself share it.
+    fn loadFor(x: *Exec, num: u32, u: job_mod.Uses) !LoadResult {
+        if (x.loaded[num - 1]) |l| return l;
+        const r = try x.loadAction(u);
+        const lr: LoadResult = switch (r) {
+            .ok => |l| .{ .ok = l },
+            .failed => |m| .{ .failed = m },
+        };
+        x.loaded[num - 1] = lr;
+        return lr;
+    }
+
+    /// Inputs: the step's `with:` values, else the defaults, evaluated where the `uses:` step is.
+    /// `warn`: log GitHub's warning about undeclared inputs (once, for the step itself).
+    fn resolveInputs(x: *Exec, num: u32, act: Loaded, u: job_mod.Uses, caller: expr.Scope, warn: bool) !union(enum) { ok: []const expr.Value.Entry, failed: ActionOut } {
+        const arena = x.arena;
+        const ev = x.ev;
+        var inputs: std.ArrayList(expr.Value.Entry) = .empty;
+        for (act.meta.inputs) |def| {
+            var val: []const u8 = "";
+            if (findInput(u.inputs, def.name)) |t| {
+                ev.diag = "";
+                val = ev.render(t, caller) catch return .{ .failed = try x.actionFailed(num, "could not evaluate input '{s}': {s}", .{ def.name, ev.diag }) };
+            } else if (def.default) |d| {
+                ev.diag = "";
+                val = expr.interpolate(arena, d, caller) catch return .{ .failed = try x.actionFailed(num, "could not evaluate the default of input '{s}': {s}", .{ def.name, ev.diag }) };
+            }
+            try inputs.append(arena, .{ .key = def.name, .value = .{ .string = val } });
+        }
+        // Like GitHub: warn about inputs the action does not declare, and pass them on anyway.
+        var unexpected: std.ArrayList([]const u8) = .empty;
+        for (u.inputs) |in| if (act.meta.input(in.name) == null) {
+            try unexpected.append(arena, in.name);
+            const val = ev.render(in.value, caller) catch "";
+            try inputs.append(arena, .{ .key = in.name, .value = .{ .string = val } });
+        };
+        if (warn and unexpected.items.len > 0) {
+            var valid: std.ArrayList([]const u8) = .empty;
+            for (act.meta.inputs) |def| try valid.append(arena, def.name);
+            x.sh.append(num, try std.fmt.allocPrint(arena, "Warning: Unexpected input(s) '{s}', valid inputs are ['{s}']", .{
+                try std.mem.join(arena, "', '", unexpected.items), try std.mem.join(arena, "', '", valid.items),
+            }));
+        }
+        return .{ .ok = inputs.items };
+    }
+
+    /// Runs a JavaScript action's `pre` script before the job's steps, when it has one and its
+    /// `pre-if` (default `always()`) holds. A failing `pre` fails the job, so later steps see failure().
+    /// An action that cannot be loaded or evaluated here is left to its step, which reports why.
+    fn runPre(x: *Exec, num: u32, step: job_mod.Step) !void {
+        const u = step.action.uses;
+        const act = switch (try x.loadFor(num, u)) {
+            .failed => return,
+            .ok => |a| a,
+        };
+        const nd = switch (act.meta.runs) {
+            .node => |nd| nd,
+            else => return,
+        };
+        const pre = nd.pre orelse return;
+        const ev = x.ev;
+        ev.diag = "";
+        const sc0 = try ev.scope(&.{});
+        const step_env = ev.renderEnv(step.env, sc0) catch return;
+        const sc1 = try ev.scope(step_env);
+        if (!(expr.evalCondition(x.arena, nd.pre_if orelse "always()", sc1) catch false)) return;
+        const inputs = switch (try x.resolveInputs(num, act, u, sc1, false)) {
+            .failed => return,
+            .ok => |in| in,
+        };
+        var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+        var secret: std.ArrayList(SecretRef) = .empty;
+        splitEnv(x.arena, x.transport, x.job.*, &x.secret_counter, step_env, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
+        const out = (try x.runJsScript(num, .pre, act, u, pre, inputs, plain.items, secret.items, &.{})) orelse {
+            ev.job_failed = true;
+            x.hook_failed = true;
+            return;
+        };
+        x.pre_state[num - 1] = out.state;
+        if (out.code != 0) {
+            x.sh.append(num, try std.fmt.allocPrint(x.arena, "##[error]Pre {s} failed (exit code {d})", .{ act.ref_label, out.code }));
+            ev.job_failed = true;
+            x.hook_failed = true;
+        }
+    }
+
+    /// Runs the registered `post` scripts, last first, each when its `post-if` (default `always()`)
+    /// holds. A failing one fails the job; the steps' own results stay as they were.
+    fn runPosts(x: *Exec) !void {
+        var i = x.posts.items.len;
+        while (i > 0) {
+            i -= 1;
+            const p = x.posts.items[i];
+            x.ev.diag = "";
+            const sc = try x.ev.scope(&.{});
+            if (!(expr.evalCondition(x.arena, p.condition, sc) catch true)) continue;
+            const out = (try x.runJsScript(p.num, .post, p.act, p.u, p.script, p.inputs, p.step_env, p.step_secret, p.state)) orelse {
+                x.hook_failed = true;
+                continue;
+            };
+            if (out.code != 0) {
+                x.sh.append(p.num, try std.fmt.allocPrint(x.arena, "##[error]Post {s} failed (exit code {d})", .{ p.act.ref_label, out.code }));
+                x.hook_failed = true;
+                x.ev.job_failed = true;
+            }
+        }
+    }
+
+    /// Runs one of a JavaScript action's scripts (`pre`, `main` or `post`, relative to the action's
+    /// directory) with the configured runtime (Bun by default, see SPEC §6). `state` reaches it as
+    /// STATE_<name>. Null when the runtime could not be set up (the reason is logged).
+    fn runJsScript(x: *Exec, num: u32, phase: Phase, act: Loaded, u: job_mod.Uses, script_rel: []const u8, inputs: []const expr.Value.Entry, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef, state: []const job_mod.EnvVar) !?ExecOut {
+        const arena = x.arena;
         var mounts: std.ArrayList(Mount) = .empty;
         if (!x.js_mounted) {
             const rt = js_runtimes.get(x.js_runtime);
@@ -1601,10 +1800,14 @@ const Exec = struct {
                 try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }} npm: directory(path:\"{s}\") {{ id }} }} }} }}", .{ rt.image, rt.binary, npm })
             else
                 try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }} }} }} }}", .{ rt.image, rt.binary });
-            const data = gql(arena, x.transport, doc, &msg) catch
-                return x.actionFailed(num, "could not get the JavaScript runtime from {s}: {s}", .{ rt.image, msg });
-            const bin = (if (jsonFind(data, "bin")) |b| jsonFindString(b, "id") else null) orelse
-                return x.actionFailed(num, "could not get the JavaScript runtime from {s}", .{rt.image});
+            const data = gql(arena, x.transport, doc, &msg) catch {
+                _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}: {s}", .{ rt.image, msg });
+                return null;
+            };
+            const bin = (if (jsonFind(data, "bin")) |b| jsonFindString(b, "id") else null) orelse {
+                _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}", .{rt.image});
+                return null;
+            };
             try mounts.append(arena, .{ .file = .{ .path = js_runtime_path, .id = bin, .permissions = 0o755 } });
             try mounts.append(arena, .{ .new_file = .{ .path = js_shim_path, .contents = node_shim, .permissions = 0o755 } });
             switch (x.js_runtime) {
@@ -1614,15 +1817,18 @@ const Exec = struct {
                     try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npx", .contents = npx_bun_shim, .permissions = 0o755 } });
                 },
                 .node => {
-                    const npm = (if (jsonFind(data, "npm")) |d| jsonFindString(d, "id") else null) orelse
-                        return x.actionFailed(num, "could not get npm from {s}", .{rt.image});
+                    const npm = (if (jsonFind(data, "npm")) |d| jsonFindString(d, "id") else null) orelse {
+                        _ = try x.actionFailed(num, "could not get npm from {s}", .{rt.image});
+                        return null;
+                    };
                     try mounts.append(arena, .{ .dir = .{ .path = js_npm_dir, .id = npm } });
                     try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npx", .contents = npx_node_shim, .permissions = 0o755 } });
                     try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npm", .contents = npm_node_shim, .permissions = 0o755 } });
                 },
             }
         }
-        try mounts.append(arena, .{ .dir = .{ .path = act.mount, .id = act.dir } });
+        // Mounted once: a later phase sees what an earlier one left in the action's directory.
+        if (!x.mounted_actions.contains(act.mount)) try mounts.append(arena, .{ .dir = .{ .path = act.mount, .id = act.dir } });
 
         // Inputs as INPUT_<NAME> (spaces become underscores, as in @actions/core), the action's
         // location, and the services actions/cache and artifact actions talk to.
@@ -1644,6 +1850,8 @@ const Exec = struct {
             .{ .name = "ACTIONS_CACHE_SERVICE_V2", .value = if (rt_env.cache_v2) "True" else "" },
         };
         for (runtime_vars) |v| if (v.value.len > 0) try env.append(arena, v);
+        // What earlier phases saved (`core.saveState`), read with `core.getState`.
+        for (state) |st| try env.append(arena, .{ .name = try std.fmt.allocPrint(arena, "STATE_{s}", .{st.name}), .value = st.value });
 
         var plain: std.ArrayList(job_mod.EnvVar) = .empty;
         var secret: std.ArrayList(SecretRef) = .empty;
@@ -1652,7 +1860,7 @@ const Exec = struct {
         splitEnv(arena, x.transport, x.job.*, &x.secret_counter, env.items, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
 
         // As GitHub shows it: the action and the inputs the workflow gave it.
-        x.sh.append(num, try std.fmt.allocPrint(arena, "##[group]Run {s}", .{act.ref_label}));
+        x.sh.append(num, try std.fmt.allocPrint(arena, "##[group]{s} {s}", .{ phase.label(), act.ref_label }));
         if (u.inputs.len > 0) {
             x.sh.append(num, "with:");
             for (u.inputs) |given| for (inputs) |in| if (std.ascii.eqlIgnoreCase(in.key, given.name)) {
@@ -1666,12 +1874,13 @@ const Exec = struct {
         // (INPUT_GITHUB-TOKEN) when it starts a program; bash passes them on.
         var script: std.Io.Writer.Allocating = .init(arena);
         try script.writer.writeAll("PATH=\"" ++ js_bin_dir ++ ":$PATH\" exec " ++ js_runtime_path ++ " ");
-        try shellQuote(&script.writer, try std.fmt.allocPrint(arena, "{s}/{s}", .{ act.path, nd.main }));
+        try shellQuote(&script.writer, try std.fmt.allocPrint(arena, "{s}/{s}", .{ act.path, script_rel }));
         const fc = x.next_fc;
         x.next_fc += 1;
         const out = try x.execScript(num, fc, .{ .run = .{ .script = script.written(), .shell = null, .working_directory = null, .env = plain.items } }, repository, secret.items, mounts.items);
         x.js_mounted = true;
-        return .{ .failed = out.code != 0, .exit_code = out.code, .outputs = out.outputs };
+        try x.mounted_actions.put(arena, act.mount, {});
+        return out;
     }
 
     /// Logs why one of a composite action's steps could not run, and fails the action.
@@ -2678,20 +2887,29 @@ test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the
     ;
     job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena, ctx_json, .{});
 
+    const main_with_state = "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\",\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\",\"fc_output\":{\"contents\":\"result=42\\n\"},\"fc_state\":{\"contents\":\"pid=7\\n\"}}}}}";
     const answers = [_][]const u8{
         base_answer,
+        // Every action is fetched at the start of the job (the `pre` pass), as GitHub does.
+        try treeAnswer(arena, "D1", &.{ "action.yml", "dist" }),
+        try fileAnswer(arena, action_yml),
         try treeAnswer(arena, "D1", &.{ "action.yml", "dist" }),
         try fileAnswer(arena, action_yml),
         "{\"data\":{\"container\":{\"from\":{\"bin\":{\"id\":\"BUN\"}}}}}",
         "{\"data\":{\"setSecret\":{\"id\":\"SEC_TOKEN\"}}}", // INPUT_GITHUB-TOKEN
         "{\"data\":{\"setSecret\":{\"id\":\"SEC_RUNTIME\"}}}", // ACTIONS_RUNTIME_TOKEN
-        try execFc(arena, "C1", "", "result=42\\n", "", ""),
-        try treeAnswer(arena, "D1", &.{ "action.yml", "dist" }),
-        try fileAnswer(arena, action_yml),
+        main_with_state,
         "{\"data\":{\"setSecret\":{\"id\":\"SEC_TOKEN2\"}}}",
         "{\"data\":{\"setSecret\":{\"id\":\"SEC_RUNTIME2\"}}}",
         try exec(arena, "C2", 0, ""),
         try exec(arena, "C3", 0, ""),
+        // posts, last step first
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_P1\"}}}",
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_P2\"}}}",
+        try exec(arena, "C4", 0, ""),
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_P3\"}}}",
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_P4\"}}}",
+        try exec(arena, "C5", 0, ""),
     };
     var fake: FakeSession = .{ .answers = &answers, .arena = arena };
     var buf: [8192]u8 = undefined;
@@ -2699,16 +2917,16 @@ test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
     const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
 
-    try std.testing.expect(res.succeeded);
     const seen = fake.seen.items;
-    try std.testing.expectEqual(@as(usize, 13), seen.len);
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqual(@as(usize, 19), seen.len);
     for (seen) |d| try std.testing.expect(braceBalanced(d));
     // The event payload is written for GITHUB_EVENT_PATH.
     try std.testing.expect(std.mem.indexOf(u8, seen[0], "withNewFile(path:\"/github/workflow/event.json\",contents:\"{\\n  \\\"ref\\\": \\\"refs/heads/x\\\"\\n}\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[0], "withEnvVariable(name:\"GITHUB_EVENT_PATH\",value:\"/github/workflow/event.json\")") != null);
     // Bun comes from its image, once per job.
-    try std.testing.expect(std.mem.indexOf(u8, seen[3], "from(address:\"oven/bun:1.4.3\") { bin: file(path:\"/usr/local/bin/bun\")") != null);
-    const run1 = seen[6];
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "from(address:\"oven/bun:1.4.3\") { bin: file(path:\"/usr/local/bin/bun\")") != null);
+    const run1 = seen[8];
     try std.testing.expect(std.mem.indexOf(u8, run1, "withFile(path:\"/github/_runtime/node/node\",source:\"BUN\",permissions:493)") != null);
     try std.testing.expect(std.mem.indexOf(u8, run1, "withNewFile(path:\"/github/_runtime/bin/node\"") != null);
     // npx is `bun x`, through the same binary named bun.
@@ -2732,7 +2950,14 @@ test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the
     // The action's output reaches the next step.
     try std.testing.expect(std.mem.indexOf(u8, seen[12], "echo 42") != null);
     const out = w.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "has a post script (dist/post.js), which this runner does not run yet") != null);
+    // Posts run after the steps, last step first, with the state the main script saved.
+    try std.testing.expect(std.mem.indexOf(u8, seen[15], "/github/_actions/actions/github-script/v9/dist/post.js") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[15], "STATE_pid") == null); // the second step saved nothing
+    try std.testing.expect(std.mem.indexOf(u8, seen[18], "dist/post.js") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[18], "'STATE_pid=7'") != null);
+    // The action directory and runtime are not mounted again for the post.
+    try std.testing.expect(std.mem.indexOf(u8, seen[18], "withDirectory") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Post actions/github-script@v9") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Run actions/github-script@v9") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "  script: return 42") != null);
 }
@@ -2951,4 +3176,68 @@ test "a checkout gets the refs actions/checkout leaves" {
     // Never fails the step, and only runs where git exists.
     try std.testing.expect(std.mem.startsWith(u8, branch, "if command -v git >/dev/null 2>&1; then ( cd '/github/workspace' && "));
     try std.testing.expect(std.mem.endsWith(u8, branch, ") >/dev/null 2>&1 || true; fi\n"));
+}
+
+test "JavaScript pre and post: pre runs first and hands its state on, post-if is honoured, a failing pre fails the job" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const action_yml =
+        \\runs:
+        \\  using: node24
+        \\  pre: dist/pre.js
+        \\  main: dist/main.js
+        \\  post: dist/post.js
+        \\  post-if: success()
+    ;
+    const pre_with_state = "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\",\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\",\"fc_state\":{\"contents\":\"fromPre=1\\n\"}}}}}";
+    for ([_]bool{ false, true }) |pre_fails| {
+        const steps = [_]job_mod.Step{ usesStep("act", "o", "act", "v1", &.{}), testStep("exit 1") };
+        var job = testJob(&steps);
+        job.secrets = &.{"ghs_jobtoken"};
+        job.job_token = "ghs_jobtoken";
+        var answers: std.ArrayList([]const u8) = .empty;
+        try answers.appendSlice(arena, &.{
+            base_answer,
+            try treeAnswer(arena, "D1", &.{ "action.yml", "dist" }),
+            try fileAnswer(arena, action_yml),
+            "{\"data\":{\"container\":{\"from\":{\"bin\":{\"id\":\"BUN\"}}}}}",
+            "{\"data\":{\"setSecret\":{\"id\":\"S1\"}}}",
+        });
+        if (pre_fails) {
+            try answers.append(arena, try exec(arena, "C1", 1, ""));
+        } else {
+            try answers.appendSlice(arena, &.{
+                pre_with_state,
+                "{\"data\":{\"setSecret\":{\"id\":\"S2\"}}}",
+                try exec(arena, "C2", 0, ""),
+                try exec(arena, "C3", 1, ""), // the failing step: success() is false for the post
+            });
+        }
+        var fake: FakeSession = .{ .answers = answers.items, .arena = arena };
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+        const seen = fake.seen.items;
+        for (seen) |d| try std.testing.expect(braceBalanced(d));
+        try std.testing.expect(!res.succeeded);
+        try std.testing.expect(std.mem.indexOf(u8, seen[5], "/github/_actions/o/act/v1/dist/pre.js") != null);
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[job 0 step 1 stdout] ##[group]Pre o/act@v1") != null);
+        if (pre_fails) {
+            try std.testing.expectEqual(@as(usize, 6), seen.len);
+            try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]Pre o/act@v1 failed (exit code 1)") != null);
+            try std.testing.expectEqual(Outcome.skipped, res.steps[0].outcome);
+            try std.testing.expectEqual(Outcome.skipped, res.steps[1].outcome);
+        } else {
+            // main gets pre's state; no post after the failing step (post-if: success()).
+            try std.testing.expectEqual(@as(usize, 9), seen.len);
+            try std.testing.expect(std.mem.indexOf(u8, seen[7], "dist/main.js") != null);
+            try std.testing.expect(std.mem.indexOf(u8, seen[7], "'STATE_fromPre=1'") != null);
+            try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
+            try std.testing.expectEqual(Outcome.failure, res.steps[1].outcome);
+            try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Post o/act") == null);
+        }
+    }
 }
