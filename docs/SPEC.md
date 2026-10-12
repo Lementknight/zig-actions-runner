@@ -411,6 +411,13 @@ Supported v0 subset: `run`, `env`, `working-directory`, `shell` (bash, sh, or a 
 - Binary: single static executable, no runtime dependencies.
 - Target 20+ idle runners on a 4 GB machine; to be validated in M7.
 
+Measured 2026-10-12 (Linux arm64 in Docker on macOS, `aarch64-linux-musl` static build, `--runners 20`, direct engine sessions over the engine's own TCP listener, a fresh engine):
+- Binary: 12.8 MB ReleaseSafe (most of it debug info), 1.0 MB ReleaseSmall; static, no runtime dependencies.
+- 20 idle runners in one process: 29 MB RSS in total (about 1.4 MB per runner), flat over minutes of long polls, 62 threads (each waiting runner: its task, its poll and a stop watcher).
+- 10 concurrent jobs on those 20 runners (checkout, 15 s of streamed output, `actions/github-script` on Bun; all succeeded): the runner peaked at 44 MB (about 1.5 MB per running job) and returned to 31 MB; no other process ran outside the engine. The engine container, with the jobs' own containers, peaked at 376 MB on a cold cache.
+- So 20+ runners on a 4 GB machine is met by a wide margin for the runner itself; what a machine can run at once is bounded by the jobs' containers in the engine.
+- Found by measuring: every HTTP request used to build its own `std.http.Client`, which loads the CA bundle (and a 64 KB decompression window) into the memory a waiting runner only frees after its next job, so each idle runner grew by about 700 KB per poll (20 runners: 74 MB growing by about 14 MB a minute). One client for the process (`src/github/http.zig`) and per-request scratch memory fixed it.
+
 ## 8. Definition of done (demo slice)
 
 1. `runner` starts with the env vars above and registers a JIT runner.

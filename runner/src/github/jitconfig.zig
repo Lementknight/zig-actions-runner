@@ -67,8 +67,9 @@ pub fn generate(
 
     const auth = try std.fmt.allocPrint(arena, "Bearer {s}", .{cfg.gh_token});
 
-    var client: std.http.Client = .{ .allocator = arena, .io = io };
-    defer client.deinit();
+    var local: std.http.Client = .{ .allocator = arena, .io = io };
+    defer local.deinit();
+    const client = @import("http.zig").client(&local);
 
     var resp: std.Io.Writer.Allocating = .init(arena);
     const result = try client.fetch(.{

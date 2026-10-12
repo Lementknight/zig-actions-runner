@@ -3,6 +3,7 @@
 const std = @import("std");
 const jitconfig = @import("jitconfig.zig");
 const auth = @import("auth.zig");
+const http = @import("http.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -58,13 +59,19 @@ pub fn request(
     payload: ?[]const u8,
     opts: RequestOptions,
 ) !Response {
-    const bearer: ?[]const u8 = if (opts.token) |t| try std.fmt.allocPrint(arena, "Bearer {s}", .{t}) else null;
-    const headers = try arena.alloc(std.http.Header, opts.extra_headers.len + 1);
+    // What the request needs only while it runs (headers, the decompression window) is freed with
+    // it; only the response body goes to `arena`, which a waiting runner keeps until its next job.
+    var scratch_state: std.heap.ArenaAllocator = .init(if (http.shared) |c| c.allocator else arena);
+    defer scratch_state.deinit();
+    const scratch = scratch_state.allocator();
+    const bearer: ?[]const u8 = if (opts.token) |t| try std.fmt.allocPrint(scratch, "Bearer {s}", .{t}) else null;
+    const headers = try scratch.alloc(std.http.Header, opts.extra_headers.len + 1);
     headers[0] = .{ .name = "Accept", .value = "application/json" };
     @memcpy(headers[1..], opts.extra_headers);
     // The default 1 KiB write buffer is smaller than the ~1.6 KiB bearer token; requests stall.
-    var client: std.http.Client = .{ .allocator = arena, .io = io, .write_buffer_size = 16 * 1024 };
-    defer client.deinit();
+    var local: std.http.Client = .{ .allocator = arena, .io = io, .write_buffer_size = 16 * 1024 };
+    defer local.deinit();
+    const client = http.client(&local);
 
     if (trace) std.debug.print("trace: connecting {s} {s}\n", .{ @tagName(method), url[0 .. std.mem.indexOfScalarPos(u8, url, 8, '/') orelse url.len] });
     var req = try client.request(method, try std.Uri.parse(url), .{
@@ -100,17 +107,17 @@ pub fn request(
         return .{ .status = response.head.status, .body = "" };
     }
 
-    var resp: std.Io.Writer.Allocating = .init(arena);
+    var resp: std.Io.Writer.Allocating = .init(scratch);
     var transfer_buffer: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
-    const decompress_buffer = try arena.alloc(u8, std.compress.flate.max_window_len);
+    const decompress_buffer = try scratch.alloc(u8, std.compress.flate.max_window_len);
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
     _ = reader.streamRemaining(&resp.writer) catch |err| switch (err) {
         error.ReadFailed => return response.bodyErr().?,
         else => |e| return e,
     };
     if (trace) std.debug.print("trace: body {d} bytes\n", .{resp.written().len});
-    return .{ .status = response.head.status, .body = resp.written() };
+    return .{ .status = response.head.status, .body = try arena.dupe(u8, resp.written()) };
 }
 
 /// Prints request stages to stderr (never headers or bodies). Set while probing.

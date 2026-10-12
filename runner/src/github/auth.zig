@@ -87,8 +87,9 @@ pub fn fetchAccessToken(arena: Allocator, io: std.Io, creds: Credentials, jwt: [
         .{jwt},
     );
 
-    var client: std.http.Client = .{ .allocator = arena, .io = io };
-    defer client.deinit();
+    var local: std.http.Client = .{ .allocator = arena, .io = io };
+    defer local.deinit();
+    const client = @import("http.zig").client(&local);
 
     var resp: std.Io.Writer.Allocating = .init(arena);
     const result = try client.fetch(.{

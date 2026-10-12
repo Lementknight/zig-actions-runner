@@ -8,6 +8,7 @@ const db = @import("db.zig");
 const pg = @import("pg.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
+const http = @import("github/http.zig");
 
 comptime {
     _ = @import("sink.zig");
@@ -115,6 +116,11 @@ pub fn main(init: std.process.Init) !u8 {
         const code = try inspect.run(arena, io, &cfg, name, &out_w.interface);
         return code;
     }
+
+    // One HTTP client for every runner (see `github/http.zig`).
+    var http_client: std.http.Client = .{ .allocator = init.gpa, .io = io, .write_buffer_size = 16 * 1024 };
+    defer http_client.deinit();
+    http.shared = &http_client;
 
     // SIGTERM / SIGINT stop the runners gracefully (see `loop.stop_signals`); a second one exits.
     const act: std.posix.Sigaction = .{ .handler = .{ .handler = onStopSignal }, .mask = std.posix.sigemptyset(), .flags = std.posix.SA.RESTART };
