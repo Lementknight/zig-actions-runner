@@ -1,0 +1,163 @@
+{
+ "plan": {
+  "planId": "p"
+ },
+ "jobId": "j",
+ "jobContainer": null,
+ "variables": {
+  "DEPLOY_TOKEN": {
+   "value": "s3cr3t-deploy-token",
+   "isSecret": true
+  }
+ },
+ "resources": {
+  "endpoints": [
+   {
+    "authorization": {
+     "parameters": {
+      "AccessToken": "local-job-token"
+     }
+    }
+   }
+  ]
+ },
+ "contextData": {
+  "github": {
+   "t": 2,
+   "d": [
+    {
+     "k": "repository",
+     "v": "zig-runner-test/step-cache"
+    },
+    {
+     "k": "sha",
+     "v": "aaaa"
+    },
+    {
+     "k": "run_id",
+     "v": "1"
+    },
+    {
+     "k": "run_attempt",
+     "v": "1"
+    },
+    {
+     "k": "event",
+     "v": {
+      "t": 2,
+      "d": [
+       {
+        "k": "run_marker",
+        "v": "event-of-run-1"
+       }
+      ]
+     }
+    }
+   ]
+  }
+ },
+ "steps": [
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "s1",
+   "name": "__run",
+   "condition": "success()",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "lit": "script"
+      },
+      "Value": {
+       "lit": "echo build ran at $(date +%H:%M:%S.%N); sleep 2"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "s2",
+   "name": "__run",
+   "condition": "success()",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "lit": "script"
+      },
+      "Value": {
+       "lit": "echo run id in env: $GITHUB_RUN_ID; echo event file: $(cat $GITHUB_EVENT_PATH | tr -d ' \\n')"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "s3",
+   "name": "__run",
+   "condition": "success()",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "lit": "script"
+      },
+      "Value": {
+       "lit": "echo deploy ran at $(date +%H:%M:%S.%N)"
+      }
+     }
+    ]
+   },
+   "environment": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "lit": "TOKEN"
+      },
+      "Value": {
+       "type": 3,
+       "expr": "secrets.DEPLOY_TOKEN"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "s4",
+   "name": "__run",
+   "condition": "success()",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "lit": "script"
+      },
+      "Value": {
+       "lit": "echo after-deploy ran at $(date +%H:%M:%S.%N)"
+      }
+     }
+    ]
+   }
+  }
+ ]
+}
