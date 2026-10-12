@@ -49,6 +49,9 @@ pub const Uses = struct {
     path: []const u8 = "",
     ref: []const u8,
     inputs: []const Input = &.{},
+    /// `uses: ./path`: an action in the workflow's own repository, read from the workspace; `path`
+    /// is relative to it ("" for its root) and `owner`, `name` and `ref` are empty.
+    local: bool = false,
 };
 
 /// Supported inputs of actions/checkout. Anything else makes the step unsupported.
@@ -200,7 +203,7 @@ fn parseStep(arena: Allocator, sv: Value) Error!Step {
         if (std.ascii.eqlIgnoreCase(repo_type, "self")) {
             const local = path(sv, &.{ "reference", "path" }) orelse uses_name;
             uses_label = local;
-            action = .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s}: actions in the workflow's own repository are not supported yet", .{local}) };
+            action = try parseLocalUses(arena, local, o.get("inputs"));
         } else if (std.ascii.eqlIgnoreCase(uses_name, "actions/checkout")) {
             action = try parseCheckoutInputs(arena, o.get("inputs"));
         } else {
@@ -284,6 +287,26 @@ fn parseUses(arena: Allocator, name: []const u8, ref_path: []const u8, ref: []co
         };
     };
     return .{ .uses = .{ .owner = owner, .name = repo, .path = dir, .ref = ref, .inputs = kv } };
+}
+
+/// `uses: ./dir`: the directory, relative to the workspace, must stay inside it.
+fn parseLocalUses(arena: Allocator, local: []const u8, inputs: ?Value) Error!Action {
+    var dir = std.mem.trim(u8, local, " ");
+    while (std.mem.startsWith(u8, dir, "./")) dir = dir[2..];
+    dir = std.mem.trim(u8, dir, "/");
+    if (std.mem.eql(u8, dir, ".")) dir = "";
+    var parts = std.mem.splitScalar(u8, dir, '/');
+    while (parts.next()) |seg| if (std.mem.eql(u8, seg, "..")) {
+        return .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s}: a local action must be inside the workspace", .{local}) };
+    };
+    var kv: []const Input = &.{};
+    if (inputs) |iv| if (iv != .null) {
+        kv = mappingInputs(arena, iv) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unsupported => return .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s}: inputs must be strings or expressions", .{local}) },
+        };
+    };
+    return .{ .uses = .{ .owner = "", .name = "", .path = dir, .ref = "", .inputs = kv, .local = true } };
 }
 
 pub fn validShell(sh: []const u8) bool {
@@ -701,7 +724,7 @@ test "malformed job" {
     try std.testing.expectError(error.MalformedJob, parse(a.allocator(), "not json"));
 }
 
-test "uses: references keep their directory and inputs; local actions are unsupported; docker:// images" {
+test "uses: references keep their directory and inputs; local actions; docker:// images" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const json =
@@ -726,7 +749,10 @@ test "uses: references keep their directory and inputs; local actions are unsupp
     try std.testing.expectEqualStrings("github.token", codeql.inputs[1].value.expr);
     try std.testing.expectEqualStrings("Run github/codeql-action@v3", job.steps[0].name);
     try std.testing.expectEqualStrings("sub/dir", job.steps[1].action.uses.path);
-    try std.testing.expect(std.mem.indexOf(u8, job.steps[2].action.unsupported, "workflow's own repository are not supported yet") != null);
+    const local = job.steps[2].action.uses;
+    try std.testing.expect(local.local);
+    try std.testing.expectEqualStrings(".github/actions/local", local.path);
+    try std.testing.expectEqualStrings("Run ./.github/actions/local", job.steps[2].name);
     try std.testing.expect(std.mem.indexOf(u8, job.steps[3].action.unsupported, "inputs must be strings or expressions") != null);
     const docker = job.steps[4].action.docker;
     try std.testing.expectEqualStrings("alpine:3.22", docker.image);

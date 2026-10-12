@@ -1724,24 +1724,23 @@ const Exec = struct {
             ev.github = saved_github;
             ev.job_failed = saved_failed;
         }
-        const repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name });
+        const repository = act.repository;
         ev.steps = .empty;
         ev.inputs = .{ .object = inputs };
         ev.github = try withEntries(arena, ev.github, &.{
             .{ .key = "action_path", .value = .{ .string = act.path } },
             .{ .key = "action_repository", .value = .{ .string = repository } },
-            .{ .key = "action_ref", .value = .{ .string = u.ref } },
+            .{ .key = "action_ref", .value = .{ .string = act.ref } },
         });
         ev.job_failed = false;
         const action_env = [_]job_mod.EnvVar{
             .{ .name = "GITHUB_ACTION_PATH", .value = act.path },
             .{ .name = "GITHUB_ACTION_REPOSITORY", .value = repository },
-            .{ .name = "GITHUB_ACTION_REF", .value = u.ref },
+            .{ .name = "GITHUB_ACTION_REF", .value = act.ref },
         };
 
         var failed = false;
         var exit_code: i32 = 0;
-        var mounted = false;
         for (steps, 1..) |st, i| {
             const ctx_id = st.id orelse try std.fmt.allocPrint(arena, "__{d}", .{i});
             ev.diag = "";
@@ -1805,12 +1804,13 @@ const Exec = struct {
             while (lines.next()) |l| x.sh.append(num, l);
             x.sh.append(num, "##[endgroup]");
 
-            // The action's files are mounted once; its steps may change them, as on GitHub.
+            // The action's files are mounted once per job; its steps may change them, as on GitHub.
+            const mounted = x.mounted_actions.contains(act.mount);
             const m = [_]Mount{.{ .dir = .{ .path = act.mount, .id = act.dir } }};
             const fc = x.next_fc;
             x.next_fc += 1;
             const out = try x.execScript(num, fc, .{ .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = plain.items } }, ctx_id, secret.items, if (mounted) &.{} else &m);
-            mounted = true;
+            try x.mounted_actions.put(arena, act.mount, {});
             const ok = out.code == 0;
             try ev.steps.append(arena, .{ .id = ctx_id, .outcome = if (ok) "success" else "failure", .conclusion = if (ok or coe) "success" else "failure", .outputs = out.outputs });
             if (!ok and !coe) {
@@ -1852,11 +1852,7 @@ const Exec = struct {
     /// start of the job (as GitHub downloads every action in "Set up job") and the step itself share it.
     fn loadFor(x: *Exec, num: u32, u: job_mod.Uses) !LoadResult {
         if (x.loaded[num - 1]) |l| return l;
-        const r = try x.loadAction(u);
-        const lr: LoadResult = switch (r) {
-            .ok => |l| .{ .ok = l },
-            .failed => |m| .{ .failed = m },
-        };
+        const lr = if (u.local) try x.loadLocal(u) else try x.loadAction(u);
         x.loaded[num - 1] = lr;
         return lr;
     }
@@ -1900,6 +1896,8 @@ const Exec = struct {
     /// An action that cannot be loaded or evaluated here is left to its step, which reports why.
     fn runPre(x: *Exec, num: u32, step: job_mod.Step) !void {
         const u = step.action.uses;
+        // A local action is read when its step runs, after the checkout; GitHub runs no `pre` for it.
+        if (u.local) return;
         const act = switch (try x.loadFor(num, u)) {
             .failed => return,
             .ok => |a| a,
@@ -2010,12 +2008,11 @@ const Exec = struct {
 
         // Inputs as INPUT_<NAME> (spaces become underscores, as in @actions/core), the action's
         // location, and the services actions/cache and artifact actions talk to.
-        const repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name });
         var env: std.ArrayList(job_mod.EnvVar) = .empty;
         try env.appendSlice(arena, try inputEnv(arena, inputs));
         try env.append(arena, .{ .name = "GITHUB_ACTION_PATH", .value = act.path });
-        try env.append(arena, .{ .name = "GITHUB_ACTION_REPOSITORY", .value = repository });
-        try env.append(arena, .{ .name = "GITHUB_ACTION_REF", .value = u.ref });
+        try env.append(arena, .{ .name = "GITHUB_ACTION_REPOSITORY", .value = act.repository });
+        try env.append(arena, .{ .name = "GITHUB_ACTION_REF", .value = act.ref });
         try x.runtimeEnv(&env, state);
 
         var plain: std.ArrayList(job_mod.EnvVar) = .empty;
@@ -2033,7 +2030,7 @@ const Exec = struct {
         try shellQuote(&script.writer, try std.fmt.allocPrint(arena, "{s}/{s}", .{ act.path, script_rel }));
         const fc = x.next_fc;
         x.next_fc += 1;
-        const out = try x.execScript(num, fc, .{ .run = .{ .script = script.written(), .shell = null, .working_directory = null, .env = plain.items } }, repository, secret.items, mounts.items);
+        const out = try x.execScript(num, fc, .{ .run = .{ .script = script.written(), .shell = null, .working_directory = null, .env = plain.items } }, if (act.repository.len > 0) act.repository else act.ref_label, secret.items, mounts.items);
         x.js_mounted = true;
         try x.mounted_actions.put(arena, act.mount, {});
         return out;
@@ -2248,7 +2245,7 @@ const Exec = struct {
         const image: DockerRun.Image = if (std.mem.startsWith(u8, dk.image, "docker://"))
             .{ .pull = dk.image["docker://".len..] }
         else img: {
-            const rel = try std.fs.path.resolveAllocPosix(arena, &.{ if (u.path.len > 0) u.path else ".", dk.image });
+            const rel = try std.fs.path.resolveAllocPosix(arena, &.{ if (act.sub.len > 0) act.sub else ".", dk.image });
             break :img .{ .build = .{
                 .dir = act.dir,
                 .context = std.fs.path.dirnamePosix(rel) orelse ".",
@@ -2262,8 +2259,8 @@ const Exec = struct {
             .env = env.items,
             .secret = step_secret,
             .label = act.ref_label,
-            .repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name }),
-            .ref = u.ref,
+            .repository = act.repository,
+            .ref = act.ref,
             .shown = try shownInputs(arena, u.inputs, inputs),
         };
     }
@@ -2510,18 +2507,24 @@ const Exec = struct {
 
     const Loaded = struct {
         meta: action.Metadata,
-        /// Dagger Directory id of the action's repository.
+        /// Dagger Directory id of the action's repository (of the action's own directory, for a local action).
         dir: []const u8,
         /// Where the repository is mounted, and the action's own directory inside it.
         mount: []const u8,
         path: []const u8,
-        /// `owner/repo[/path]@ref`, for messages.
+        /// The action's directory inside `dir` ("" for its root).
+        sub: []const u8 = "",
+        /// `owner/repo[/path]@ref` or `./path`, for messages.
         ref_label: []const u8,
+        /// `github.action_repository` / `action_ref` (GITHUB_ACTION_REPOSITORY / _REF): `owner/repo`
+        /// and the ref, or empty for a local action, as on GitHub.
+        repository: []const u8 = "",
+        ref: []const u8 = "",
     };
 
     /// Fetches the action's repository (Dagger's git support, cached by the engine) and reads its
     /// `action.yml` or `action.yaml`.
-    fn loadAction(x: *Exec, u: job_mod.Uses) !union(enum) { ok: Loaded, failed: []const u8 } {
+    fn loadAction(x: *Exec, u: job_mod.Uses) !LoadResult {
         const arena = x.arena;
         const sub = if (u.path.len > 0) try std.fmt.allocPrint(arena, "/{s}", .{u.path}) else "";
         const ref_label = try std.fmt.allocPrint(arena, "{s}/{s}{s}@{s}", .{ u.owner, u.name, sub, u.ref });
@@ -2571,8 +2574,41 @@ const Exec = struct {
             .dir = dir,
             .mount = mount,
             .path = if (u.path.len > 0) try std.fmt.allocPrint(arena, "{s}/{s}", .{ mount, u.path }) else mount,
+            .sub = u.path,
             .ref_label = ref_label,
+            .repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name }),
+            .ref = u.ref,
         } };
+    }
+
+    /// Reads a local action (`uses: ./path`) from the workspace as the job's container has it now, so
+    /// the repository must have been checked out first (GitHub says the same). Nothing is mounted: the
+    /// action's files are already there.
+    fn loadLocal(x: *Exec, u: job_mod.Uses) !LoadResult {
+        const arena = x.arena;
+        const abs = if (u.path.len > 0) try std.fmt.allocPrint(arena, workspace ++ "/{s}", .{u.path}) else workspace;
+        const label = try std.fmt.allocPrint(arena, "./{s}", .{u.path});
+        const missing = try std.fmt.allocPrint(arena, "Can't find 'action.yml' or 'action.yaml' under '{s}'. Did you forget to run actions/checkout before running your local action?", .{abs});
+        const doc = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ directory(path:{f}) {{ id entries }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(abs, .{}) });
+        var msg: []const u8 = "";
+        const data = gql(arena, x.transport, doc, &msg) catch return .{ .failed = missing };
+        const dir = jsonFindString(data, "id") orelse return .{ .failed = missing };
+        var file_name: ?[]const u8 = null;
+        if (jsonFind(data, "entries")) |entries| if (entries == .array) for (entries.array.items) |e| {
+            if (e != .string) continue;
+            if (std.mem.eql(u8, e.string, "action.yml") or (file_name == null and std.mem.eql(u8, e.string, "action.yaml"))) file_name = e.string;
+        };
+        const name = file_name orelse return .{ .failed = missing };
+        const fdoc = try std.fmt.allocPrint(arena, "{{ loadDirectoryFromID(id:{f}) {{ file(path:{f}) {{ contents }} }} }}", .{ std.json.fmt(dir, .{}), std.json.fmt(name, .{}) });
+        const fdata = gql(arena, x.transport, fdoc, &msg) catch
+            return .{ .failed = try std.fmt.allocPrint(arena, "could not read {s} of {s}: {s}", .{ name, label, msg }) };
+        const text = jsonFindString(fdata, "contents") orelse return .{ .failed = try std.fmt.allocPrint(arena, "could not read {s} of {s}", .{ name, label }) };
+        const meta = switch (try action.parse(arena, text)) {
+            .ok => |m| m,
+            .invalid => |why| return .{ .failed = try std.fmt.allocPrint(arena, "{s} of {s} {s}", .{ name, label, why }) },
+        };
+        try x.mounted_actions.put(arena, abs, {});
+        return .{ .ok = .{ .meta = meta, .dir = dir, .mount = abs, .path = abs, .ref_label = label } };
     }
 };
 
@@ -3737,6 +3773,59 @@ test "hashFiles globs the workspace, honours exclusions, and hashes the files' d
     try std.testing.expect(std.mem.indexOf(u8, seen[3], want) != null);
     // Nothing inside the workspace to include: "" without asking Dagger.
     try std.testing.expect(std.mem.indexOf(u8, seen[4], "echo none-.") != null);
+}
+
+test "a local action is read from the workspace when its step runs, and is not mounted" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const action_yml =
+        \\inputs:
+        \\  who:
+        \\    default: nobody
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - shell: bash
+        \\      run: echo "hi ${{ inputs.who }} from $GITHUB_ACTION_PATH (${{ github.action_repository }})"
+    ;
+    const inputs = [_]job_mod.Input{.{ .name = "who", .value = .{ .lit = "you" } }};
+    var greet = usesStep("greet", "", "", "", &inputs);
+    greet.action.uses.path = ".github/actions/greet";
+    greet.action.uses.local = true;
+    var missing = usesStep("missing", "", "", "", &.{});
+    missing.action.uses.path = "nope";
+    missing.action.uses.local = true;
+    missing.condition = "always()";
+    const steps = [_]job_mod.Step{ testStep("echo checkout"), greet, missing };
+    const answers = [_][]const u8{
+        base_answer,
+        try exec(arena, "C1", 0, ""),
+        "{\"data\":{\"loadContainerFromID\":{\"directory\":{\"id\":\"LD\",\"entries\":[\"action.yml\"]}}}}",
+        try fileAnswer(arena, action_yml),
+        try exec(arena, "C2", 0, ""),
+        "{\"errors\":[{\"message\":\"lstat /github/workspace/nope: no such file or directory\"}]}",
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 6), seen.len);
+    for (seen) |d| try std.testing.expect(braceBalanced(d));
+    // Read after the earlier step, from the container that step left; nothing is fetched up front.
+    try std.testing.expect(std.mem.indexOf(u8, seen[2], "loadContainerFromID(id:\"C1\") { directory(path:\"/github/workspace/.github/actions/greet\") { id entries } }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "loadDirectoryFromID(id:\"LD\") { file(path:\"action.yml\")") != null);
+    const run1 = seen[4];
+    try std.testing.expect(std.mem.indexOf(u8, run1, "withDirectory") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "hi you from $GITHUB_ACTION_PATH ()") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'GITHUB_ACTION_PATH=/github/workspace/.github/actions/greet'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'GITHUB_ACTION_REPOSITORY='") != null);
+    try std.testing.expectEqual(Outcome.success, res.steps[1].outcome);
+    try std.testing.expectEqual(Outcome.failure, res.steps[2].outcome);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Can't find 'action.yml' or 'action.yaml' under '/github/workspace/nope'. Did you forget to run actions/checkout") != null);
 }
 
 test "splitArgs splits like a command line, with double quotes" {
