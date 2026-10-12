@@ -11,9 +11,14 @@ pub const Error = std.Io.Writer.Error || std.mem.Allocator.Error;
 pub const StdoutSink = struct {
     writer: *std.Io.Writer,
     secrets: []const []const u8 = &.{},
+    /// Set when several runners in the process share the sink: each line is written whole.
+    io: ?std.Io = null,
+    mu: std.Io.Mutex = .init,
 
     /// Buffered; never blocks on anything but the underlying writer.
     pub fn append(s: *StdoutSink, job_id: u64, step_number: u32, stream: Stream, line: []const u8) Error!void {
+        if (s.io) |io| s.mu.lockUncancelable(io);
+        defer if (s.io) |io| s.mu.unlock(io);
         try s.writer.print("[job {d} step {d} {s}] ", .{ job_id, step_number, @tagName(stream) });
         try redact.write(s.writer, line, s.secrets);
         try s.writer.writeByte('\n');
@@ -22,6 +27,8 @@ pub const StdoutSink = struct {
     }
 
     pub fn flush(s: *StdoutSink) Error!void {
+        if (s.io) |io| s.mu.lockUncancelable(io);
+        defer if (s.io) |io| s.mu.unlock(io);
         try s.writer.flush();
     }
 

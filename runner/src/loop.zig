@@ -54,6 +54,50 @@ pub const Cycle = union(enum) {
     failed: struct { exit: Exit, retry: bool = true },
 };
 
+/// Runs `n` runners in this process as concurrent tasks (`std.Io.Group`), each serving jobs one after
+/// another (`serve`) with its own registrations, memory per job and Dagger session per job. They
+/// share the configuration, the log sinks and the database connection (all safe to share). Returns
+/// once every runner has stopped: the most severe exit code among them.
+pub fn pool(c: Context, n: u32) !Exit {
+    if (n <= 1) return serve(c);
+    const slots = try c.arena.alloc(Slot, n);
+    var group: std.Io.Group = .init;
+    for (slots) |*s| {
+        s.* = .{ .c = c };
+        group.concurrent(c.io, Slot.main, .{s}) catch |e| {
+            try c.err.print("could not start {d} runners: {s}\n", .{ n, @errorName(e) });
+            group.cancel(c.io);
+            return .config;
+        };
+    }
+    try say(c, "started {d} runners", .{n});
+    group.await(c.io) catch {};
+    var worst: Exit = .done;
+    for (slots) |s| if (@backingInt(s.exit) > @backingInt(worst)) {
+        worst = s.exit;
+    };
+    return worst;
+}
+
+/// One runner of a pool. Its error messages go through its own buffer, flushed a cycle at a time, so
+/// runners' messages do not interleave mid-line.
+const Slot = struct {
+    c: Context,
+    exit: Exit = .done,
+    err_buf: [4096]u8 = undefined,
+
+    fn main(s: *Slot) void {
+        var err_w: std.Io.File.Writer = .initStreaming(.stderr(), s.c.io, &s.err_buf);
+        var c = s.c;
+        c.err = &err_w.interface;
+        s.exit = serve(c) catch |e| blk: {
+            c.err.print("runner stopped: {s}\n", .{@errorName(e)}) catch {};
+            break :blk .github;
+        };
+        err_w.interface.flush() catch {};
+    }
+};
+
 /// Runs jobs one after another: each cycle registers a fresh JIT runner (GitHub gives a JIT runner a
 /// single job), waits for a job, runs it, and frees everything the cycle allocated before the next.
 /// A cycle that fails before running a job is retried with a growing delay (`backoffSecs`), unless
@@ -71,6 +115,7 @@ pub fn serve(c: Context) !Exit {
         cc.name = try std.fmt.allocPrint(cc.arena, "{s}-{x}", .{ c.cfg.name_prefix, suffix });
 
         const r = try cycle(cc);
+        c.err.flush() catch {};
         if (c.cfg.once) return switch (r) {
             .job => |ok| if (ok) .done else .github,
             .failed => |f| f.exit,
@@ -124,7 +169,7 @@ pub fn cycle(c: Context) !Cycle {
     if (created.status.class() != .success) return failBody(c, "create session", created);
     const sid = jsonString(c.arena, created.body, "sessionId") orelse return fail(c, "create session", error.BadResponse);
     defer _ = broker.call(c.arena, c.io, .DELETE, std.fmt.allocPrint(c.arena, "{s}session?sessionId={s}", .{ base, sid }) catch "", token, null) catch {};
-    try say(c, "listening for jobs (labels: {s})", .{c.cfg.labels});
+    try say(c, "'{s}' listening for jobs (labels: {s})", .{ c.name, c.cfg.labels });
 
     while (true) {
         const now = std.Io.Clock.real.now(c.io).toSeconds();
@@ -339,12 +384,12 @@ fn uploadLogs(c: Context, job: job_mod.Job, lines: []const sink.CollectedLine) !
         const blob = try results.formatBlob(c.arena, lines, @intCast(n));
         if (blob.line_count == 0) continue;
         const r = results.upload(c.arena, c.io, job, .{ .step = step.id }, blob);
-        try c.err.print("log upload step {d}: {s}{s}\n", .{ n, if (r.ok) "ok, " else "FAILED: ", r.detail });
+        try c.err.print("job {d}: log upload step {d}: {s}{s}\n", .{ job.check_run_id, n, if (r.ok) "ok, " else "FAILED: ", r.detail });
     }
     const all = try results.formatBlob(c.arena, lines, null);
     if (all.line_count > 0) {
         const r = results.upload(c.arena, c.io, job, .job, all);
-        try c.err.print("log upload job: {s}{s}\n", .{ if (r.ok) "ok, " else "FAILED: ", r.detail });
+        try c.err.print("job {d}: log upload job: {s}{s}\n", .{ job.check_run_id, if (r.ok) "ok, " else "FAILED: ", r.detail });
     }
 }
 

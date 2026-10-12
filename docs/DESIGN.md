@@ -102,6 +102,6 @@ M0, M5 and M6 do not need GitHub access and can start immediately, in parallel w
 The point of a lightweight runner is running many of them on one machine. The target model is Go's goroutines, with a workflow job as the unit: one process runs N runner slots as concurrent tasks (`std.Io`), each looping register → wait → run → report, with per-job memory freed after each job and one shared Dagger session instead of a `dagger run` child per job (measured at about 60 MB each, ten times the runner itself). Steps:
 
 1. One runner keeps going: re-registers after each job, per-job arena (`--once` keeps the old behaviour).
-2. `--runners N`: N concurrent slots in one process, sharing config, log sinks and the database.
+2. `--runners N`: N concurrent slots in one process, sharing config, log sinks and the database. Done: three concurrent jobs cost the runner process ~47 MB at peak (Debug), the three `dagger run` children ~195 MB, which is what step 3 removes.
 3. One shared Dagger session for the process: job-scoped step markers and secret names, session restart on failure.
 4. Graceful shutdown (SIGTERM: stop polling, finish running jobs, delete idle registrations) and measured cost per idle slot and per running job, in release builds.
