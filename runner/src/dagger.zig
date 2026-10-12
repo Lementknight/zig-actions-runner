@@ -268,6 +268,9 @@ pub const Options = struct {
     js_runtime: config.JsRuntime = .bun,
     /// Steps may use the job's Dagger engine (`dagger call` inside a step): `experimentalPrivilegedNesting`.
     nesting: bool = true,
+    /// Mount `package_cache_dirs` from persistent cache volumes, scoped to the repository. The runner
+    /// turns this on (`RUNNER_PACKAGE_CACHES`, on by default).
+    package_caches: bool = false,
     /// Tests only: replaces `dagger run ...` (it must print "<port> <token>" first) and the HTTP transport.
     test_session_argv: ?[]const []const u8 = null,
     test_transport: ?Transport = null,
@@ -948,6 +951,27 @@ pub fn run(
     var ev = try Evaluator.init(arena, &job);
     var secret_counter: u32 = 0;
     var err_msg: []const u8 = "";
+    // Package managers' caches persist across jobs in Dagger cache volumes (see `package_cache_dirs`).
+    const cache_ids: []const []const u8 = if (opts.package_caches and job.github.repository.len > 0) ids: {
+        const scope = try packageCacheScope(arena, &ev, job.github.repository);
+        var doc: std.Io.Writer.Allocating = .init(arena);
+        const w = &doc.writer;
+        try w.writeAll("{");
+        for (package_cache_dirs, 0..) |d, i| {
+            try w.print(" c{d}: cacheVolume(key:", .{i});
+            try std.json.Stringify.value(try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/{s}", .{ job.github.repository, scope, d.name }), .{}, w);
+            try w.writeAll(") { id }");
+        }
+        try w.writeAll(" }");
+        const data = gql(arena, transport, doc.written(), &err_msg) catch return fail(&sh, results, err_msg);
+        const ids = try arena.alloc([]const u8, package_cache_dirs.len);
+        for (ids, 0..) |*id, i| {
+            const v = jsonFind(data, try std.fmt.allocPrint(arena, "c{d}", .{i})) orelse return fail(&sh, results, "Dagger returned no cache volume");
+            id.* = jsonFindString(v, "id") orelse return fail(&sh, results, "Dagger returned no cache volume");
+        }
+        break :ids ids;
+    } else &.{};
+
     const container_id: []const u8 = blk: {
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
@@ -961,6 +985,13 @@ pub fn run(
             try w.writeAll(") { ");
         }
         try w.print("withWorkdir(path:\"{s}\") {{ ", .{workspace});
+        for (cache_ids, 0..) |id, i| {
+            try w.writeAll("withMountedCache(path:");
+            try std.json.Stringify.value(package_cache_dirs[i].path, .{}, w);
+            try w.writeAll(",cache:");
+            try std.json.Stringify.value(id, .{}, w);
+            try w.writeAll(") { ");
+        }
         // The event payload, as on GitHub (actions read it through GITHUB_EVENT_PATH).
         try w.writeAll("withNewFile(path:\"" ++ event_path ++ "\",contents:");
         try std.json.Stringify.value(try ev.eventJson(), .{}, w);
@@ -979,7 +1010,7 @@ pub fn run(
         splitEnv(arena, transport, job, &secret_counter, ev.job_env.items, &plain_job, &secret_job, &err_msg) catch return fail(&sh, results, err_msg);
         const job_env_nodes = try writeEnvNodes(w, plain_job.items, secret_job.items);
         try w.writeAll("id");
-        for (0..defaults.len + job_env_nodes + 5 + @as(usize, if (provision) 1 else 0)) |_| try w.writeAll(" }");
+        for (0..defaults.len + job_env_nodes + cache_ids.len + 5 + @as(usize, if (provision) 1 else 0)) |_| try w.writeAll(" }");
         const data = gql(arena, transport, doc.written(), &err_msg) catch return fail(&sh, results, err_msg);
         break :blk jsonFindString(data, "id") orelse return fail(&sh, results, "Dagger returned no container");
     };
@@ -1608,6 +1639,33 @@ const js_runtimes: std.EnumArray(config.JsRuntime, JsRuntimeSource) = .init(.{
     .bun = .{ .image = "oven/bun:1.4.3", .binary = "/usr/local/bin/bun" },
     .node = .{ .image = "node:24-bookworm-slim", .binary = "/usr/local/bin/node" },
 });
+
+/// Package managers' cache directories (for root, the default images' user), each mounted from its
+/// own cache volume. Their contents are caches the tools validate themselves, so sharing them between
+/// jobs is safe; they are keyed by repository (see `packageCacheScope`).
+const package_cache_dirs = [_]struct { name: []const u8, path: []const u8 }{
+    .{ .name = "npm", .path = "/root/.npm" },
+    .{ .name = "pnpm", .path = "/root/.local/share/pnpm/store" },
+    .{ .name = "yarn", .path = "/usr/local/share/.cache/yarn" },
+    .{ .name = "pip", .path = "/root/.cache/pip" },
+    .{ .name = "uv", .path = "/root/.cache/uv" },
+    .{ .name = "go-mod", .path = "/root/go/pkg/mod" },
+    .{ .name = "go-build", .path = "/root/.cache/go-build" },
+    .{ .name = "cargo-registry", .path = "/root/.cargo/registry" },
+    .{ .name = "cargo-git", .path = "/root/.cargo/git" },
+    .{ .name = "bun", .path = "/root/.bun/install/cache" },
+    .{ .name = "zig", .path = "/root/.cache/zig" },
+    .{ .name = "gradle", .path = "/root/.gradle/caches" },
+    .{ .name = "maven", .path = "/root/.m2/repository" },
+};
+
+/// Pull requests from forks get their own volumes, so untrusted code cannot plant content in the
+/// caches the repository's own branches use (GitHub scopes its cache by branch for the same reason).
+fn packageCacheScope(arena: Allocator, ev: *Evaluator, repository: []const u8) ![]const u8 {
+    const ctxs = [_]expr.Value.Entry{.{ .key = "github", .value = ev.github }};
+    const head = expr.evalString(arena, "github.event.pull_request.head.repo.full_name", .{ .contexts = &ctxs }) catch "";
+    return if (head.len > 0 and !std.ascii.eqlIgnoreCase(head, repository)) "fork-pr" else "repo";
+}
 
 /// `ACTIONS_STEP_DEBUG` set to true, as a secret or a repository variable, shows `::debug::` lines.
 fn stepDebug(arena: Allocator, job: job_mod.Job) bool {
@@ -2552,4 +2610,37 @@ test "ACTIONS_STEP_DEBUG shows ::debug:: lines" {
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
     _ = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[debug]shown\nnow") != null);
+}
+
+test "package caches: one volume per tool, keyed by repository, separate for fork pull requests" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("npm ci")};
+    const fork_ctx =
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"event","v":{"t":2,"d":[{"k":"pull_request","v":{"t":2,"d":[{"k":"head","v":{"t":2,"d":[{"k":"repo","v":{"t":2,"d":[{"k":"full_name","v":"someone/r"}]}}]}}]}}]}}]}}
+    ;
+    for ([_]bool{ false, true }) |fork| {
+        var job = testJob(&steps);
+        if (fork) job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena, fork_ctx, .{});
+        var vols: std.Io.Writer.Allocating = .init(arena);
+        try vols.writer.writeAll("{\"data\":{");
+        for (package_cache_dirs, 0..) |_, i| try vols.writer.print("{s}\"c{d}\":{{\"id\":\"V{d}\"}}", .{ if (i == 0) "" else ",", i, i });
+        try vols.writer.writeAll("}}");
+        const answers = [_][]const u8{ vols.written(), base_answer, try exec(arena, "C1", 0, "") };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        const res = try run(arena, std.testing.io, &env, .{ .package_caches = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+        try std.testing.expect(res.succeeded);
+        const scope = if (fork) "fork-pr" else "repo";
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "c0: cacheVolume(key:\"zig-runner/o/r/{s}/npm\")", .{scope})) != null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "cacheVolume(key:\"zig-runner/o/r/{s}/zig\")", .{scope})) != null);
+        // Mounted on the base container, so every step has them.
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.npm\",cache:\"V0\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.cache/zig\",cache:\"V10\")") != null);
+        try std.testing.expect(braceBalanced(fake.seen.items[1]));
+    }
 }
