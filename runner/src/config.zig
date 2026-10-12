@@ -45,6 +45,9 @@ pub const Config = struct {
     engine: EngineMode = .direct,
     /// The engine container `direct` sessions run `buildctl dial-stdio` in.
     engine_container: []const u8 = "dagger-engine-v0.21.10",
+    /// The engine's own listener (`tcp://host:port`, `unix:///path`) for `direct` sessions, reached
+    /// without the Docker API; empty to go through `engine_container`.
+    engine_host: []const u8 = "",
     /// The Docker API socket (from DOCKER_HOST when it is `unix://`).
     docker_socket: []const u8 = "/var/run/docker.sock",
     /// Give each step's commands access to the job's Dagger engine (`experimentalPrivilegedNesting`), so
@@ -88,6 +91,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_JS_RUNTIME")) |v| c.js_runtime = try jsRuntime(v);
         if (environ.get("RUNNER_ENGINE")) |v| c.engine = try engineMode(v);
         if (environ.get("RUNNER_ENGINE_CONTAINER")) |v| c.engine_container = v;
+        if (environ.get("RUNNER_ENGINE_HOST")) |v| c.engine_host = v;
         if (environ.get("DOCKER_HOST")) |v| if (std.mem.startsWith(u8, v, "unix://")) {
             c.docker_socket = v["unix://".len..];
         };
@@ -140,6 +144,7 @@ pub const Config = struct {
             else if (std.mem.eql(u8, key, "log-flush-ms")) c.log_flush_ms = try num(u32, val) //
             else if (std.mem.eql(u8, key, "js-runtime")) c.js_runtime = try jsRuntime(val) //
             else if (std.mem.eql(u8, key, "engine")) c.engine = try engineMode(val) //
+            else if (std.mem.eql(u8, key, "engine-host")) c.engine_host = val //
             else if (std.mem.eql(u8, key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
             else if (std.mem.eql(u8, key, "package-caches")) c.package_caches = try boolean(val) //
             else if (std.mem.eql(u8, key, "step-cache")) c.step_cache = try boolean(val) //
@@ -191,7 +196,7 @@ pub const Config = struct {
     /// How jobs reach the engine, for `dagger.Options.engine`: null means a `dagger run` child.
     pub fn engineEndpoint(c: *const Config) ?@import("engine.zig").Endpoint {
         return switch (c.engine) {
-            .direct => .{ .docker_socket = c.docker_socket, .container = c.engine_container },
+            .direct => .{ .host = c.engine_host, .docker_socket = c.docker_socket, .container = c.engine_container },
             .cli => null,
         };
     }
@@ -255,6 +260,8 @@ test "RUNNER_ENGINE, RUNNER_ENGINE_CONTAINER and DOCKER_HOST" {
     try std.testing.expectEqualStrings("/run/user/1000/docker.sock", c.docker_socket);
     try std.testing.expectEqualStrings("dagger-engine-custom", c.engine_container);
     try std.testing.expectError(error.InvalidEngine, Config.load(&env, &.{ "runner", "--engine=go" }));
+    try env.put("RUNNER_ENGINE_HOST", "tcp://dagger-engine:1234");
+    try std.testing.expectEqualStrings("tcp://dagger-engine:1234", (try Config.load(&env, &.{"runner"})).engineEndpoint().?.host);
 }
 
 test "--runners and RUNNER_COUNT" {
