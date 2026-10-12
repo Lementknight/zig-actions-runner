@@ -128,3 +128,126 @@ test "paths and protected names" {
     try std.testing.expect(isProtectedEnvName("NODE_OPTIONS"));
     try std.testing.expect(!isProtectedEnvName("MY_VAR"));
 }
+
+// --- workflow commands printed by a step: `::name key=value,...::data` ---
+
+pub const Workflow = union(enum) {
+    /// Not a command, an unknown one, or commands are stopped: log the line as it is.
+    none,
+    /// Mask this value in all later output; the line itself is not logged.
+    add_mask: []const u8,
+    group: []const u8,
+    endgroup,
+    /// `error`, `warning` or `notice`, logged as `##[<level>]<message>`.
+    annotation: struct { level: []const u8, message: []const u8 },
+    debug: []const u8,
+    /// `::stop-commands::<token>`: no commands until `::<token>::`.
+    stop: []const u8,
+    /// `::<token>::` while commands are stopped.
+    resume_commands,
+    /// Deprecated `set-output` and `save-state`, still honoured.
+    set_output: job_mod.EnvVar,
+    save_state: job_mod.EnvVar,
+    /// `set-env` and `add-path`, which GitHub disabled.
+    disabled: []const u8,
+    /// `::echo::on|off` only changes whether commands are echoed; this runner never echoes them.
+    echo,
+};
+
+/// Parses one line of a step's output. `stopped_token` is the token of an active `stop-commands`.
+/// Leading and trailing whitespace is ignored, as in GitHub's runner; command names are
+/// case-insensitive.
+pub fn parseWorkflow(arena: Allocator, line: []const u8, stopped_token: ?[]const u8) Allocator.Error!Workflow {
+    const t = std.mem.trim(u8, line, " \t\r");
+    if (!std.mem.startsWith(u8, t, "::")) return .none;
+    const rest = t[2..];
+    const end = std.mem.indexOf(u8, rest, "::") orelse return .none;
+    const section = rest[0..end];
+    const data = rest[end + 2 ..];
+
+    if (stopped_token) |token| {
+        return if (std.mem.eql(u8, section, token)) .resume_commands else .none;
+    }
+
+    const space = std.mem.indexOfScalar(u8, section, ' ');
+    const name = section[0 .. space orelse section.len];
+    const props = if (space) |s| section[s + 1 ..] else "";
+    const eql = std.ascii.eqlIgnoreCase;
+
+    if (eql(name, "add-mask")) return .{ .add_mask = try unescape(arena, data, false) };
+    if (eql(name, "group")) return .{ .group = try unescape(arena, data, false) };
+    if (eql(name, "endgroup")) return .endgroup;
+    if (eql(name, "debug")) return .{ .debug = try unescape(arena, data, false) };
+    if (eql(name, "echo")) return .echo;
+    if (eql(name, "stop-commands")) return if (data.len > 0) .{ .stop = data } else .none;
+    if (eql(name, "set-env") or eql(name, "add-path")) return .{ .disabled = name };
+    for ([_][]const u8{ "error", "warning", "notice" }) |level| if (eql(name, level))
+        return .{ .annotation = .{ .level = level, .message = try unescape(arena, data, false) } };
+    if (eql(name, "set-output") or eql(name, "save-state")) {
+        const key = (try property(arena, props, "name")) orelse return .none;
+        const kv: job_mod.EnvVar = .{ .name = key, .value = try unescape(arena, data, false) };
+        return if (eql(name, "set-output")) .{ .set_output = kv } else .{ .save_state = kv };
+    }
+    return .none;
+}
+
+/// The value of property `key` in `k=v,k2=v2`.
+fn property(arena: Allocator, props: []const u8, key: []const u8) Allocator.Error!?[]const u8 {
+    var it = std.mem.splitScalar(u8, props, ',');
+    while (it.next()) |p| {
+        const eq = std.mem.indexOfScalar(u8, p, '=') orelse continue;
+        if (std.mem.eql(u8, std.mem.trim(u8, p[0..eq], " "), key)) return try unescape(arena, p[eq + 1 ..], true);
+    }
+    return null;
+}
+
+/// GitHub's escapes: `%25` `%0D` `%0A` in data, plus `%3A` `%2C` in property values.
+fn unescape(arena: Allocator, s: []const u8, is_property: bool) Allocator.Error![]const u8 {
+    if (std.mem.indexOfScalar(u8, s, '%') == null) return s;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '%' and i + 3 <= s.len) {
+            const code = s[i + 1 .. i + 3];
+            const c: ?u8 = if (std.ascii.eqlIgnoreCase(code, "25")) '%' else if (std.ascii.eqlIgnoreCase(code, "0D")) '\r' else if (std.ascii.eqlIgnoreCase(code, "0A")) '\n' else if (is_property and std.ascii.eqlIgnoreCase(code, "3A")) ':' else if (is_property and std.ascii.eqlIgnoreCase(code, "2C")) ',' else null;
+            if (c) |ch| {
+                try out.append(arena, ch);
+                i += 3;
+                continue;
+            }
+        }
+        try out.append(arena, s[i]);
+        i += 1;
+    }
+    return out.items;
+}
+
+test "workflow commands" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    try std.testing.expect(try parseWorkflow(ar, "plain output", null) == .none);
+    try std.testing.expect(try parseWorkflow(ar, "a ::group::not at the start", null) == .none);
+    try std.testing.expect(try parseWorkflow(ar, "::unknown::x", null) == .none);
+    try std.testing.expectEqualStrings("s3cret", (try parseWorkflow(ar, "::add-mask::s3cret", null)).add_mask);
+    try std.testing.expectEqualStrings("Build", (try parseWorkflow(ar, "  ::group::Build  ", null)).group);
+    try std.testing.expect(try parseWorkflow(ar, "::endgroup::", null) == .endgroup);
+    try std.testing.expect(try parseWorkflow(ar, "::ENDGROUP::", null) == .endgroup);
+    const err = (try parseWorkflow(ar, "::error file=a.js,line=3,title=Oops::two%0Alines 100%25", null)).annotation;
+    try std.testing.expectEqualStrings("error", err.level);
+    try std.testing.expectEqualStrings("two\nlines 100%", err.message);
+    try std.testing.expectEqualStrings("warning", (try parseWorkflow(ar, "::warning::w", null)).annotation.level);
+    try std.testing.expectEqualStrings("d", (try parseWorkflow(ar, "::debug::d", null)).debug);
+    const out = (try parseWorkflow(ar, "::set-output name=a%3Ab::v%0A2", null)).set_output;
+    try std.testing.expectEqualStrings("a:b", out.name);
+    try std.testing.expectEqualStrings("v\n2", out.value);
+    try std.testing.expectEqualStrings("isPost", (try parseWorkflow(ar, "::save-state name=isPost::true", null)).save_state.name);
+    try std.testing.expect(try parseWorkflow(ar, "::set-output::no name", null) == .none);
+    try std.testing.expectEqualStrings("set-env", (try parseWorkflow(ar, "::set-env name=X::1", null)).disabled);
+    try std.testing.expect(try parseWorkflow(ar, "::echo::on", null) == .echo);
+    // stop-commands: everything is plain text until the token comes back
+    try std.testing.expectEqualStrings("tok123", (try parseWorkflow(ar, "::stop-commands::tok123", null)).stop);
+    try std.testing.expect(try parseWorkflow(ar, "::stop-commands::", null) == .none);
+    try std.testing.expect(try parseWorkflow(ar, "::add-mask::x", "tok123") == .none);
+    try std.testing.expect(try parseWorkflow(ar, "::tok123::", "tok123") == .resume_commands);
+}

@@ -1,0 +1,12 @@
+{
+ "plan": {"planId": "p"}, "jobId": "j", "jobContainer": null,
+ "variables": {"MY_SECRET": {"value": "s3cr3t-value", "isSecret": true}},
+ "resources": {"endpoints": [{"authorization": {"parameters": {"AccessToken": "local-job-token"}}}]},
+ "contextData": {"github": {"t": 2, "d": [{"k": "repository", "v": "o/r"}]}},
+ "steps": [
+  {"type": "action", "reference": {"type": "script"}, "id": "s1", "contextName": "cmds", "name": "__run", "condition": "success()",
+   "inputs": {"type": 2, "map": [{"Key": {"lit": "script"}, "Value": {"lit": "token=generated-$(date +%s)-xyz\necho \"::add-mask::$token\"\necho \"the token is $token\"\necho '::group::Details'\necho inside the group\necho '::endgroup::'\necho '::warning file=a.sh,line=2::two%0Alines'\necho '::debug::only with ACTIONS_STEP_DEBUG'\necho '::set-output name=legacy::from-set-output'\necho \"modern=from-file\" >> \"$GITHUB_OUTPUT\"\necho \"$token\" > /tmp/token"}}]}},
+  {"type": "action", "reference": {"type": "script"}, "id": "s2", "name": "__run", "condition": "success()",
+   "inputs": {"type": 2, "map": [{"Key": {"lit": "script"}, "Value": {"type": 3, "expr": "format('echo step two sees the token: $(cat /tmp/token); echo legacy={0} modern={1}', steps.cmds.outputs.legacy, steps.cmds.outputs.modern)"}}]}}
+ ]
+}

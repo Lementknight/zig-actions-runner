@@ -683,11 +683,91 @@ const Shared = struct {
     /// Lines replayed from a query result whose live copy may still arrive late (guarded by `mu`).
     /// Key is "<step>:<text>"; the value is how many live copies to swallow.
     replayed: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Workflow-command state per step (index = step - 1, guarded by `mu`).
+    commands: []StepCommands = &.{},
+    /// `ACTIONS_STEP_DEBUG`: show `::debug::` lines.
+    step_debug: bool = false,
 
+    const StepCommands = struct {
+        stop_token: ?[]const u8 = null,
+        /// From the deprecated `::set-output` and `::save-state`.
+        outputs: std.ArrayList(job_mod.EnvVar) = .empty,
+        state: std.ArrayList(job_mod.EnvVar) = .empty,
+    };
+
+    /// A line from the runner itself; never read as a workflow command.
     fn append(sh: *Shared, step: u32, text: []const u8) void {
         sh.mu.lockUncancelable(sh.io);
         defer sh.mu.unlock(sh.io);
+        sh.appendLocked(step, text);
+    }
+
+    fn appendLocked(sh: *Shared, step: u32, text: []const u8) void {
         sh.log.append(sh.sink_job_id, step, .stdout, text) catch {};
+    }
+
+    /// A line of a step's output: workflow commands (`::add-mask::`, `::group::`, ...) are carried out
+    /// and logged the way GitHub shows them; anything else is logged as it is.
+    fn stepOutput(sh: *Shared, step: u32, text: []const u8) void {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        if (step == 0 or step > sh.commands.len) return sh.appendLocked(step, text);
+        const st = &sh.commands[step - 1];
+        const cmd = commands.parseWorkflow(sh.arena, text, st.stop_token) catch return sh.appendLocked(step, text);
+        switch (cmd) {
+            .none => sh.appendLocked(step, text),
+            .add_mask => |value| sh.addMask(value),
+            .group => |title| sh.appendFmt(step, "##[group]{s}", .{title}),
+            .endgroup => sh.appendLocked(step, "##[endgroup]"),
+            .annotation => |an| {
+                var lines = std.mem.splitScalar(u8, an.message, '\n');
+                sh.appendFmt(step, "##[{s}]{s}", .{ an.level, std.mem.trimEnd(u8, lines.first(), "\r") });
+                while (lines.next()) |l| sh.appendLocked(step, std.mem.trimEnd(u8, l, "\r"));
+            },
+            .debug => |msg| if (sh.step_debug) sh.appendFmt(step, "##[debug]{s}", .{msg}),
+            .stop => |token| st.stop_token = token,
+            .resume_commands => st.stop_token = null,
+            .set_output => |kv| st.outputs.append(sh.arena, kv) catch {},
+            .save_state => |kv| st.state.append(sh.arena, kv) catch {},
+            .disabled => |name| sh.appendFmt(step, "##[error]The `{s}` command is disabled. Please upgrade to using Environment Files or opt into unsecure command execution by setting the `ACTIONS_ALLOW_UNSECURE_COMMANDS` environment variable to `true`. For more information see: https://github.blog/changelog/2020-10-01-github-actions-deprecating-set-env-and-add-path-commands/", .{name}),
+            .echo => {},
+        }
+    }
+
+    fn appendFmt(sh: *Shared, step: u32, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.allocPrint(sh.arena, fmt, args) catch return;
+        sh.appendLocked(step, text);
+    }
+
+    /// Masks `value` (and each of its lines) in everything logged from now on, in every sink.
+    fn addMask(sh: *Shared, value: []const u8) void {
+        var list: std.ArrayList([]const u8) = .empty;
+        list.appendSlice(sh.arena, sh.log.currentSecrets()) catch return;
+        var lines = std.mem.splitScalar(u8, value, '\n');
+        while (lines.next()) |l| {
+            const v = std.mem.trim(u8, l, " \t\r");
+            if (v.len > 0) list.append(sh.arena, sh.arena.dupe(u8, v) catch return) catch return;
+        }
+        const whole = std.mem.trim(u8, value, " \t\r\n");
+        if (whole.len > 0 and std.mem.indexOfScalar(u8, whole, '\n') != null) list.append(sh.arena, sh.arena.dupe(u8, whole) catch return) catch return;
+        // Longest first, so a secret that contains another one is masked whole.
+        std.mem.sort([]const u8, list.items, {}, struct {
+            fn longer(_: void, a: []const u8, b: []const u8) bool {
+                return a.len > b.len;
+            }
+        }.longer);
+        sh.log.setSecrets(list.items);
+    }
+
+    /// Outputs a step set with the deprecated `::set-output`, since the last call.
+    fn takeOutputs(sh: *Shared, step: u32) []const job_mod.EnvVar {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        if (step == 0 or step > sh.commands.len) return &.{};
+        const st = &sh.commands[step - 1];
+        const out = st.outputs.items;
+        st.outputs = .empty;
+        return out;
     }
 
     fn flush(sh: *Shared) void {
@@ -699,7 +779,7 @@ const Shared = struct {
     fn emitLive(sh: *Shared, step: u32, text: []const u8) void {
         if (step >= 1 and step <= sh.live_lines.len) _ = sh.live_lines[step - 1].fetchAdd(1, .monotonic);
         if (sh.swallowIfReplayed(step, text)) return;
-        sh.append(step, text);
+        sh.stepOutput(step, text);
     }
 
     /// True if this live line was already logged by a replay (the stream was just late).
@@ -727,7 +807,7 @@ const Shared = struct {
                 }
             } else |_| {}
         }
-        sh.append(step, text);
+        sh.stepOutput(step, text);
     }
 
     fn noise(sh: *Shared, line: []const u8) void {
@@ -820,7 +900,18 @@ pub fn run(
         l.* = .init(0);
         e.* = .init(false);
     }
-    var sh: Shared = .{ .io = io, .arena = arena, .log = log, .sink_job_id = opts.sink_job_id, .live_lines = live, .ended = ended };
+    const step_commands = try arena.alloc(Shared.StepCommands, job.steps.len);
+    @memset(step_commands, .{});
+    var sh: Shared = .{
+        .io = io,
+        .arena = arena,
+        .log = log,
+        .sink_job_id = opts.sink_job_id,
+        .live_lines = live,
+        .ended = ended,
+        .commands = step_commands,
+        .step_debug = stepDebug(arena, job),
+    };
 
     const argv: []const []const u8 = opts.test_session_argv orelse &.{ opts.dagger_cmd, "run", "--progress=logs", "sh", "-c", session_script };
     var child = try std.process.spawn(io, .{ .argv = argv, .environ_map = &env, .stdin = .pipe, .stdout = .pipe, .stderr = .pipe });
@@ -1169,6 +1260,9 @@ const Exec = struct {
             x.sh.append(num, msg);
             if (code == 0) code = 1;
         }
+        // Outputs set with the deprecated `::set-output` come after GITHUB_OUTPUT's, which win.
+        const legacy = x.sh.takeOutputs(num);
+        if (legacy.len > 0) outputs = try std.mem.concat(arena, job_mod.EnvVar, &.{ outputs, legacy });
         return .{ .code = code, .outputs = outputs };
     }
 
@@ -1514,6 +1608,18 @@ const js_runtimes: std.EnumArray(config.JsRuntime, JsRuntimeSource) = .init(.{
     .bun = .{ .image = "oven/bun:1.4.3", .binary = "/usr/local/bin/bun" },
     .node = .{ .image = "node:24-bookworm-slim", .binary = "/usr/local/bin/node" },
 });
+
+/// `ACTIONS_STEP_DEBUG` set to true, as a secret or a repository variable, shows `::debug::` lines.
+fn stepDebug(arena: Allocator, job: job_mod.Job) bool {
+    for (job.secret_vars) |sv| if (std.mem.eql(u8, sv.name, "ACTIONS_STEP_DEBUG")) return std.ascii.eqlIgnoreCase(sv.value, "true");
+    if (job.context_data == .object) if (job.context_data.object.get("vars")) |vars| {
+        const v = context.fromContextData(arena, vars) catch return false;
+        if (v == .object) for (v.object) |e| if (std.mem.eql(u8, e.key, "ACTIONS_STEP_DEBUG")) {
+            return e.value == .string and std.ascii.eqlIgnoreCase(e.value.string, "true");
+        };
+    };
+    return false;
+}
 
 fn hasKey(v: expr.Value, key: []const u8) bool {
     if (v != .object) return false;
@@ -2374,4 +2480,76 @@ test "steps get the engine (privileged nesting) unless it is turned off" {
         try std.testing.expectEqual(nesting, std.mem.indexOf(u8, fake.seen.items[1], ",expect:ANY,experimentalPrivilegedNesting:true)") != null);
         try std.testing.expect(braceBalanced(fake.seen.items[1]));
     }
+}
+
+test "workflow commands in a step's output: masks, groups, annotations, debug, set-output, stop-commands" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var after = testStep("");
+    after.action.script.script = .{ .expr = "format('echo got={0}', steps.cmds.outputs.legacy)" };
+    var first = testStep("x");
+    first.context_name = "cmds";
+    const steps = [_]job_mod.Step{ first, after };
+    const out1 =
+        "before s3cr3t-token\\n::add-mask::s3cr3t-token\\nafter s3cr3t-token\\n" ++
+        "::group::Install%25\\ninside\\n::endgroup::\\n" ++
+        "::error file=a.js,line=1::bad%0Asecond line\\n::warning::careful\\n::debug::hidden\\n" ++
+        "::set-output name=legacy::42\\n::set-env name=X::1\\n" ++
+        "::stop-commands::tok\\n::group::not a group\\n::add-mask::not-masked\\n::tok::\\n::notice::back\\n";
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, out1), try exec(arena, "C2", 0, "s3cr3t-token in step 2\\n") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    const want =
+        \\[job 0 step 1 stdout] before s3cr3t-token
+        \\[job 0 step 1 stdout] after ***
+        \\[job 0 step 1 stdout] ##[group]Install%
+        \\[job 0 step 1 stdout] inside
+        \\[job 0 step 1 stdout] ##[endgroup]
+        \\[job 0 step 1 stdout] ##[error]bad
+        \\[job 0 step 1 stdout] second line
+        \\[job 0 step 1 stdout] ##[warning]careful
+        \\[job 0 step 1 stdout] ##[error]The `set-env` command is disabled.
+    ;
+    const got = w.buffered();
+    var it = std.mem.splitScalar(u8, want, '\n');
+    var pos: usize = 0;
+    while (it.next()) |line| {
+        const i = std.mem.indexOfPos(u8, got, pos, line) orelse {
+            std.debug.print("missing, in order: {s}\n--- log:\n{s}\n", .{ line, got });
+            return error.TestUnexpectedResult;
+        };
+        pos = i + line.len;
+    }
+    // Lines that must not be logged: the mask command, debug (ACTIONS_STEP_DEBUG is off), stop/resume.
+    for ([_][]const u8{ "add-mask::s3cr3t", "hidden", "::stop-commands", "::tok::", "::set-output" }) |no| try std.testing.expect(std.mem.indexOf(u8, got, no) == null);
+    // While stopped, commands are plain text; afterwards they work again.
+    try std.testing.expect(std.mem.indexOf(u8, got, "] ::group::not a group") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "] ::add-mask::not-masked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "##[notice]back") != null);
+    // The mask holds for later steps, and set-output reached steps.<id>.outputs.
+    try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 2 stdout] *** in step 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo got=42") != null);
+}
+
+test "ACTIONS_STEP_DEBUG shows ::debug:: lines" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("x")};
+    var job = testJob(&steps);
+    job.secret_vars = &.{.{ .name = "ACTIONS_STEP_DEBUG", .value = "true" }};
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "::debug::shown%0Anow\\n") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    _ = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[debug]shown\nnow") != null);
 }
