@@ -27,6 +27,7 @@ const expr = @import("expr.zig");
 const context = @import("context.zig");
 const commands = @import("commands.zig");
 const action = @import("action.zig");
+const config = @import("config.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -126,7 +127,8 @@ pub const Resolved = union(enum) {
 };
 
 const fc_dir = "/github/file_commands";
-const fc_kinds = [_][]const u8{ "output", "env", "path", "step_summary" };
+/// GITHUB_STATE is written by JavaScript actions (`core.saveState`) for their post scripts.
+const fc_kinds = [_][]const u8{ "output", "env", "path", "step_summary", "state" };
 
 fn fcPath(arena: Allocator, kind: []const u8, n: u32) ![]const u8 {
     return std.fmt.allocPrint(arena, "{s}/{s}_{d}", .{ fc_dir, kind, n });
@@ -170,7 +172,7 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
                 try w.print("\"${s}\" ", .{try secretAlias(arena, i)});
             }
             // Set after the step's own env, so a step cannot point these somewhere else.
-            const names = [_][]const u8{ "GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY" };
+            const names = [_][]const u8{ "GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_STATE" };
             for (names, fc_kinds) |name, kind| {
                 try shellQuote(w, try std.fmt.allocPrint(arena, "{s}={s}", .{ name, try fcPath(arena, kind, fc) }));
                 try w.writeByte(' ');
@@ -262,6 +264,8 @@ pub const Options = struct {
     provision: bool = true,
     /// Key under which output lines are written to the sink.
     sink_job_id: u64 = 0,
+    /// What runs JavaScript actions.
+    js_runtime: config.JsRuntime = .bun,
     /// Steps may use the job's Dagger engine (`dagger call` inside a step): `experimentalPrivilegedNesting`.
     nesting: bool = true,
     /// Tests only: replaces `dagger run ...` (it must print "<port> <token>" first) and the HTTP transport.
@@ -437,6 +441,13 @@ const Evaluator = struct {
             .vars = try context.named(arena, job.context_data, "vars"),
             .job_context = try context.named(arena, job.context_data, "job"),
         };
+        // GitHub's runner adds `github.token` (the job's GITHUB_TOKEN); it is not in contextData. Actions
+        // default their `github-token` input to it.
+        if (ev.github == .object and !hasKey(ev.github, "token")) {
+            for (job.secret_vars) |sv| if (std.mem.eql(u8, sv.name, "GITHUB_TOKEN")) {
+                ev.github = try withEntries(arena, ev.github, &.{.{ .key = "token", .value = .{ .string = sv.value } }});
+            };
+        }
         for (job.env) |in| {
             const sc = try ev.scope(&.{});
             const val = ev.render(in.value, sc) catch continue; // an env value that cannot be evaluated stays unset
@@ -537,6 +548,13 @@ const Evaluator = struct {
         return "";
     }
 
+    /// `github.event` as JSON, for GITHUB_EVENT_PATH; `{}` when the job has none.
+    fn eventJson(ev: *Evaluator) ![]const u8 {
+        const ctxs = [_]expr.Value.Entry{.{ .key = "github", .value = ev.github }};
+        const text = expr.evalString(ev.arena, "toJSON(github.event)", .{ .contexts = &ctxs }) catch return "{}";
+        return if (std.mem.eql(u8, text, "null") or text.len == 0) "{}" else text;
+    }
+
     /// The variables every step sees, as on a GitHub-hosted runner.
     fn defaultEnv(ev: *const Evaluator) ![]const job_mod.EnvVar {
         var out: std.ArrayList(job_mod.EnvVar) = .empty;
@@ -549,6 +567,7 @@ const Evaluator = struct {
             .{ .name = "RUNNER_NAME", .value = "zig-runner" },
             .{ .name = "RUNNER_TEMP", .value = "/tmp" },
             .{ .name = "RUNNER_TOOL_CACHE", .value = "/opt/hostedtoolcache" },
+            .{ .name = "GITHUB_EVENT_PATH", .value = event_path },
         };
         try out.appendSlice(ev.arena, &fixed);
         const from_github = [_][2][]const u8{
@@ -851,6 +870,10 @@ pub fn run(
             try w.writeAll(") { ");
         }
         try w.print("withWorkdir(path:\"{s}\") {{ ", .{workspace});
+        // The event payload, as on GitHub (actions read it through GITHUB_EVENT_PATH).
+        try w.writeAll("withNewFile(path:\"" ++ event_path ++ "\",contents:");
+        try std.json.Stringify.value(try ev.eventJson(), .{}, w);
+        try w.writeAll(") { ");
         const defaults = try ev.defaultEnv();
         for (defaults) |e| {
             try w.writeAll("withEnvVariable(name:");
@@ -865,7 +888,7 @@ pub fn run(
         splitEnv(arena, transport, job, &secret_counter, ev.job_env.items, &plain_job, &secret_job, &err_msg) catch return fail(&sh, results, err_msg);
         const job_env_nodes = try writeEnvNodes(w, plain_job.items, secret_job.items);
         try w.writeAll("id");
-        for (0..defaults.len + job_env_nodes + 4 + @as(usize, if (provision) 1 else 0)) |_| try w.writeAll(" }");
+        for (0..defaults.len + job_env_nodes + 5 + @as(usize, if (provision) 1 else 0)) |_| try w.writeAll(" }");
         const data = gql(arena, transport, doc.written(), &err_msg) catch return fail(&sh, results, err_msg);
         break :blk jsonFindString(data, "id") orelse return fail(&sh, results, "Dagger returned no container");
     };
@@ -880,6 +903,7 @@ pub fn run(
         .container_id = container_id,
         .secret_counter = secret_counter,
         .next_fc = @intCast(job.steps.len + 1),
+        .js_runtime = opts.js_runtime,
         .nesting = opts.nesting,
     };
 
@@ -958,7 +982,7 @@ pub fn run(
                     continue;
                 }
                 resolved = .{ .checkout = f };
-                mount_buf[0] = .{ .path = f.mount, .dir = f.result.dir };
+                mount_buf[0] = .{ .dir = .{ .path = f.mount, .id = f.result.dir } };
                 mounts = &mount_buf;
             },
             .uses => |u| {
@@ -995,7 +1019,11 @@ pub fn run(
 }
 
 /// A directory mounted into the container for one exec.
-const Mount = struct { path: []const u8, dir: []const u8 };
+const Mount = union(enum) {
+    dir: struct { path: []const u8, id: []const u8 },
+    file: struct { path: []const u8, id: []const u8, permissions: u32 },
+    new_file: struct { path: []const u8, contents: []const u8, permissions: u32 },
+};
 
 /// What running steps needs, shared by the job's own steps and the steps of composite actions.
 const Exec = struct {
@@ -1012,6 +1040,9 @@ const Exec = struct {
     secret_counter: u32,
     /// File-command ids for the steps of composite actions, after the job's own step numbers.
     next_fc: u32,
+    js_runtime: config.JsRuntime,
+    /// Whether the JavaScript runtime is in the container yet (it is added by the first JS action).
+    js_mounted: bool = false,
     /// Steps may use the job's Dagger engine (see `Options.nesting`).
     nesting: bool,
 
@@ -1064,10 +1095,28 @@ const Exec = struct {
             braces += 1;
         }
         for (mounts) |m| {
-            try w.writeAll("withDirectory(path:");
-            try std.json.Stringify.value(m.path, .{}, w);
-            try w.writeAll(",source:");
-            try std.json.Stringify.value(m.dir, .{}, w);
+            switch (m) {
+                .dir => |d| {
+                    try w.writeAll("withDirectory(path:");
+                    try std.json.Stringify.value(d.path, .{}, w);
+                    try w.writeAll(",source:");
+                    try std.json.Stringify.value(d.id, .{}, w);
+                },
+                .file => |f| {
+                    try w.writeAll("withFile(path:");
+                    try std.json.Stringify.value(f.path, .{}, w);
+                    try w.writeAll(",source:");
+                    try std.json.Stringify.value(f.id, .{}, w);
+                    try w.print(",permissions:{d}", .{f.permissions});
+                },
+                .new_file => |f| {
+                    try w.writeAll("withNewFile(path:");
+                    try std.json.Stringify.value(f.path, .{}, w);
+                    try w.writeAll(",contents:");
+                    try std.json.Stringify.value(f.contents, .{}, w);
+                    try w.print(",permissions:{d}", .{f.permissions});
+                },
+            }
             try w.writeAll(") { ");
             braces += 1;
         }
@@ -1140,11 +1189,7 @@ const Exec = struct {
             .failed => |msg| return x.actionFailed(num, "{s}", .{msg}),
             .ok => |a| a,
         };
-        const steps = switch (act.meta.runs) {
-            .composite => |st| st,
-            .node => |nd| return x.actionFailed(num, "{s} is a JavaScript action ({s}); JavaScript actions are not supported yet", .{ act.ref_label, nd.using }),
-            .docker => return x.actionFailed(num, "{s} is a Docker action; Docker actions are not supported yet", .{act.ref_label}),
-        };
+        if (act.meta.runs == .docker) return x.actionFailed(num, "{s} is a Docker action; Docker actions are not supported yet", .{act.ref_label});
 
         // Inputs: the step's `with:` values, else the defaults, evaluated where the `uses:` step is.
         var inputs: std.ArrayList(expr.Value.Entry) = .empty;
@@ -1173,6 +1218,12 @@ const Exec = struct {
                 try std.mem.join(arena, "', '", unexpected.items), try std.mem.join(arena, "', '", valid.items),
             }));
         }
+
+        const steps = switch (act.meta.runs) {
+            .composite => |st| st,
+            .node => |nd| return x.runJs(num, act, u, nd, inputs.items, step_env, step_secret),
+            .docker => unreachable,
+        };
 
         // The action's steps see its own `inputs` and `steps`, and `github.action_path`; the job's come
         // back afterwards. GITHUB_ENV and GITHUB_PATH changes outlive the action, as on GitHub.
@@ -1268,7 +1319,7 @@ const Exec = struct {
             x.sh.append(num, "##[endgroup]");
 
             // The action's files are mounted once; its steps may change them, as on GitHub.
-            const m = [_]Mount{.{ .path = act.mount, .dir = act.dir }};
+            const m = [_]Mount{.{ .dir = .{ .path = act.mount, .id = act.dir } }};
             const fc = x.next_fc;
             x.next_fc += 1;
             // All the action's scripts log as step `num`: after the first, count each one's lines afresh,
@@ -1293,6 +1344,75 @@ const Exec = struct {
         const outputs = try arena.alloc(job_mod.EnvVar, act.meta.outputs.len);
         for (act.meta.outputs, outputs) |o, *dst| dst.* = .{ .name = o.name, .value = expr.interpolate(arena, o.value, sc_out) catch "" };
         return .{ .failed = failed, .exit_code = exit_code, .outputs = outputs };
+    }
+
+    /// Runs a JavaScript action's `main` with the configured runtime (Bun by default, see SPEC §6).
+    fn runJs(x: *Exec, num: u32, act: Loaded, u: job_mod.Uses, nd: @FieldType(action.Runs, "node"), inputs: []const expr.Value.Entry, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef) !ActionOut {
+        const arena = x.arena;
+        if (nd.pre != null) x.sh.append(num, try std.fmt.allocPrint(arena, "Warning: {s} has a pre script ({s}), which this runner does not run yet", .{ act.ref_label, nd.pre.? }));
+        if (nd.post != null) x.sh.append(num, try std.fmt.allocPrint(arena, "Warning: {s} has a post script ({s}), which this runner does not run yet", .{ act.ref_label, nd.post.? }));
+
+        var mounts: std.ArrayList(Mount) = .empty;
+        if (!x.js_mounted) {
+            const rt = js_runtimes.get(x.js_runtime);
+            var msg: []const u8 = "";
+            const doc = try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ file(path:\"{s}\") {{ id }} }} }} }}", .{ rt.image, rt.binary });
+            const data = gql(arena, x.transport, doc, &msg) catch
+                return x.actionFailed(num, "could not get the JavaScript runtime from {s}: {s}", .{ rt.image, msg });
+            const id = jsonFindString(data, "id") orelse return x.actionFailed(num, "could not get the JavaScript runtime from {s}", .{rt.image});
+            try mounts.append(arena, .{ .file = .{ .path = js_runtime_path, .id = id, .permissions = 0o755 } });
+            try mounts.append(arena, .{ .new_file = .{ .path = js_shim_path, .contents = node_shim, .permissions = 0o755 } });
+        }
+        try mounts.append(arena, .{ .dir = .{ .path = act.mount, .id = act.dir } });
+
+        // Inputs as INPUT_<NAME> (spaces become underscores, as in @actions/core), the action's
+        // location, and the services actions/cache and artifact actions talk to.
+        const repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name });
+        var env: std.ArrayList(job_mod.EnvVar) = .empty;
+        for (inputs) |in| {
+            const name = try std.ascii.allocUpperString(arena, try std.mem.replaceOwned(u8, arena, in.key, " ", "_"));
+            try env.append(arena, .{ .name = try std.fmt.allocPrint(arena, "INPUT_{s}", .{name}), .value = in.value.string });
+        }
+        try env.append(arena, .{ .name = "GITHUB_ACTION_PATH", .value = act.path });
+        try env.append(arena, .{ .name = "GITHUB_ACTION_REPOSITORY", .value = repository });
+        try env.append(arena, .{ .name = "GITHUB_ACTION_REF", .value = u.ref });
+        const rt_env = x.job.runtime;
+        const runtime_vars = [_]job_mod.EnvVar{
+            .{ .name = "ACTIONS_RUNTIME_URL", .value = rt_env.pipelines_url },
+            .{ .name = "ACTIONS_RUNTIME_TOKEN", .value = x.job.job_token },
+            .{ .name = "ACTIONS_CACHE_URL", .value = rt_env.cache_url },
+            .{ .name = "ACTIONS_RESULTS_URL", .value = rt_env.results_url },
+            .{ .name = "ACTIONS_CACHE_SERVICE_V2", .value = if (rt_env.cache_v2) "True" else "" },
+        };
+        for (runtime_vars) |v| if (v.value.len > 0) try env.append(arena, v);
+
+        var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+        var secret: std.ArrayList(SecretRef) = .empty;
+        try plain.appendSlice(arena, step_env);
+        try secret.appendSlice(arena, step_secret);
+        splitEnv(arena, x.transport, x.job.*, &x.secret_counter, env.items, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
+
+        // As GitHub shows it: the action and the inputs the workflow gave it.
+        x.sh.append(num, try std.fmt.allocPrint(arena, "##[group]Run {s}", .{act.ref_label}));
+        if (u.inputs.len > 0) {
+            x.sh.append(num, "with:");
+            for (u.inputs) |given| for (inputs) |in| if (std.ascii.eqlIgnoreCase(in.key, given.name)) {
+                x.sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ in.key, firstLine(in.value.string) }));
+                break;
+            };
+        }
+        x.sh.append(num, "##[endgroup]");
+
+        // Started through bash, not sh: dash drops variables whose names are not identifiers
+        // (INPUT_GITHUB-TOKEN) when it starts a program; bash passes them on.
+        var script: std.Io.Writer.Allocating = .init(arena);
+        try script.writer.writeAll("PATH=\"" ++ js_bin_dir ++ ":$PATH\" exec " ++ js_runtime_path ++ " ");
+        try shellQuote(&script.writer, try std.fmt.allocPrint(arena, "{s}/{s}", .{ act.path, nd.main }));
+        const fc = x.next_fc;
+        x.next_fc += 1;
+        const out = try x.execScript(num, fc, .{ .run = .{ .script = script.written(), .shell = null, .working_directory = null, .env = plain.items } }, repository, secret.items, mounts.items);
+        x.js_mounted = true;
+        return .{ .failed = out.code != 0, .exit_code = out.code, .outputs = out.outputs };
     }
 
     /// Logs why one of a composite action's steps could not run, and fails the action.
@@ -1371,6 +1491,35 @@ const Exec = struct {
         } };
     }
 };
+
+/// Where a job's event payload is written.
+const event_path = "/github/workflow/event.json";
+
+/// JavaScript actions run with this binary, named `node` so that Bun behaves as Node. The shim on
+/// PATH answers `node --version`, which Bun named `node` does not handle, and runs the binary
+/// otherwise, so actions that start `node` themselves get the same runtime.
+const js_runtime_path = "/github/_runtime/node/node";
+const js_bin_dir = "/github/_runtime/bin";
+const js_shim_path = js_bin_dir ++ "/node";
+const node_shim =
+    \\#!/bin/sh
+    \\case "$1" in -v|--version) exec /github/_runtime/node/node -p process.version ;; esac
+    \\exec /github/_runtime/node/node "$@"
+    \\
+;
+
+const JsRuntimeSource = struct { image: []const u8, binary: []const u8 };
+/// Bun is pinned to the version the repository's images use (see api/Dockerfile).
+const js_runtimes: std.EnumArray(config.JsRuntime, JsRuntimeSource) = .init(.{
+    .bun = .{ .image = "oven/bun:1.4.3", .binary = "/usr/local/bin/bun" },
+    .node = .{ .image = "node:24-bookworm-slim", .binary = "/usr/local/bin/node" },
+});
+
+fn hasKey(v: expr.Value, key: []const u8) bool {
+    if (v != .object) return false;
+    for (v.object) |e| if (std.ascii.eqlIgnoreCase(e.key, key)) return true;
+    return false;
+}
 
 fn findInput(inputs: []const job_mod.Input, name: []const u8) ?job_mod.Template {
     for (inputs) |in| if (std.ascii.eqlIgnoreCase(in.name, name)) return in.value;
@@ -2061,7 +2210,7 @@ test "a composite action runs its steps with its inputs, and its outputs reach l
     try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Run echo v=0.21.10") != null);
 }
 
-test "composite failures: JavaScript actions, a missing action.yml, and a failing step with failure() cleanup" {
+test "composite failures: Docker actions, a missing action.yml, and a failing step with failure() cleanup" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -2083,11 +2232,11 @@ test "composite failures: JavaScript actions, a missing action.yml, and a failin
     s2.condition = "always()";
     var s3 = usesStep("fails", "o", "act2", "0123456789012345678901234567890123456789", &.{});
     s3.condition = "always()";
-    const steps = [_]job_mod.Step{ usesStep("js", "o", "js", "v1", &.{}), s2, s3 };
+    const steps = [_]job_mod.Step{ usesStep("dock", "o", "dock", "v1", &.{}), s2, s3 };
     const answers = [_][]const u8{
         base_answer,
         try treeAnswer(arena, "D1", &.{"action.yml"}),
-        try fileAnswer(arena, "runs:\n  using: node24\n  main: dist/index.js\n"),
+        try fileAnswer(arena, "runs:\n  using: docker\n  image: Dockerfile\n"),
         try treeAnswer(arena, "D2", &.{"README.md"}),
         try treeAnswer(arena, "D3", &.{"action.yaml"}),
         try fileAnswer(arena, failing_yml),
@@ -2111,8 +2260,100 @@ test "composite failures: JavaScript actions, a missing action.yml, and a failin
     try std.testing.expect(std.mem.indexOf(u8, seen[5], "file(path:\"action.yaml\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[7], "echo cleanup") != null);
     const out = w.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "o/js@v1 is a JavaScript action (node24); JavaScript actions are not supported yet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "o/dock@v1 is a Docker action; Docker actions are not supported yet") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "o/none@v1 has no action.yml or action.yaml") != null);
+}
+
+test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the runtime services, and the event" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+
+    const action_yml =
+        \\inputs:
+        \\  github-token:
+        \\    default: ${{ github.token }}
+        \\  script:
+        \\    required: true
+        \\  result encoding:
+        \\    default: json
+        \\outputs:
+        \\  result:
+        \\    description: set by the action
+        \\runs:
+        \\  using: node24
+        \\  main: dist/index.js
+        \\  post: dist/post.js
+    ;
+    const inputs = [_]job_mod.Input{.{ .name = "script", .value = .{ .lit = "return 42" } }};
+    var after = testStep("");
+    after.action.script.script = .{ .expr = "format('echo {0}', steps.gs.outputs.result)" };
+    const steps = [_]job_mod.Step{ usesStep("gs", "actions", "github-script", "v9", &inputs), usesStep("again", "actions", "github-script", "v9", &inputs), after };
+    var job = testJob(&steps);
+    job.secrets = &.{ "ghs_jobtoken", "ghs_secret" };
+    job.job_token = "ghs_jobtoken";
+    job.secret_vars = &.{.{ .name = "GITHUB_TOKEN", .value = "ghs_secret" }};
+    job.runtime = .{ .pipelines_url = "https://pipelines.test/", .cache_url = "https://cache.test/", .results_url = "https://results.test/", .cache_v2 = true };
+    const ctx_json =
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"event","v":{"t":2,"d":[{"k":"ref","v":"refs/heads/x"}]}}]}}
+    ;
+    job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena, ctx_json, .{});
+
+    const answers = [_][]const u8{
+        base_answer,
+        try treeAnswer(arena, "D1", &.{ "action.yml", "dist" }),
+        try fileAnswer(arena, action_yml),
+        "{\"data\":{\"container\":{\"from\":{\"file\":{\"id\":\"BUN\"}}}}}",
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_TOKEN\"}}}", // INPUT_GITHUB-TOKEN
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_RUNTIME\"}}}", // ACTIONS_RUNTIME_TOKEN
+        try execFc(arena, "C1", "", "result=42\\n", "", ""),
+        try treeAnswer(arena, "D1", &.{ "action.yml", "dist" }),
+        try fileAnswer(arena, action_yml),
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_TOKEN2\"}}}",
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC_RUNTIME2\"}}}",
+        try exec(arena, "C2", 0, ""),
+        try exec(arena, "C3", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+
+    try std.testing.expect(res.succeeded);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 13), seen.len);
+    for (seen) |d| try std.testing.expect(braceBalanced(d));
+    // The event payload is written for GITHUB_EVENT_PATH.
+    try std.testing.expect(std.mem.indexOf(u8, seen[0], "withNewFile(path:\"/github/workflow/event.json\",contents:\"{\\n  \\\"ref\\\": \\\"refs/heads/x\\\"\\n}\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[0], "withEnvVariable(name:\"GITHUB_EVENT_PATH\",value:\"/github/workflow/event.json\")") != null);
+    // Bun comes from its image, once per job.
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "from(address:\"oven/bun:1.4.3\") { file(path:\"/usr/local/bin/bun\")") != null);
+    const run1 = seen[6];
+    try std.testing.expect(std.mem.indexOf(u8, run1, "withFile(path:\"/github/_runtime/node/node\",source:\"BUN\",permissions:493)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "withNewFile(path:\"/github/_runtime/bin/node\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "withDirectory(path:\"/github/_actions/actions/github-script/v9\",source:\"D1\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "exec /github/_runtime/node/node '\\\\''/github/_actions/actions/github-script/v9/dist/index.js'\\\\''") != null);
+    // Inputs: given, defaulted (github.token, a secret, under its hyphenated name), names upper-cased with spaces as underscores.
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'INPUT_SCRIPT=return 42'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'INPUT_RESULT_ENCODING=json'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'INPUT_GITHUB-TOKEN='\\\"$ZIG_SECRET_0\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'ACTIONS_RUNTIME_TOKEN='\\\"$ZIG_SECRET_1\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'ACTIONS_CACHE_URL=https://cache.test/'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'ACTIONS_CACHE_SERVICE_V2=True'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "GITHUB_STATE=") != null);
+    // bash, not sh, starts the runtime (dash would drop INPUT_GITHUB-TOKEN).
+    try std.testing.expect(std.mem.indexOf(u8, run1, "bash --noprofile --norc -e -o pipefail -c 'PATH=\\\"/github/_runtime/bin:$PATH\\\" exec") != null);
+    // No token in any command; the runtime is fetched only once.
+    for (seen) |d| if (std.mem.indexOf(u8, d, "setSecret") == null) try std.testing.expect(std.mem.indexOf(u8, d, "ghs_") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[11], "withFile(path:\"/github/_runtime/node/node\"") == null);
+    // The action's output reaches the next step.
+    try std.testing.expect(std.mem.indexOf(u8, seen[12], "echo 42") != null);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "has a post script (dist/post.js), which this runner does not run yet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Run actions/github-script@v9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "  script: return 42") != null);
 }
 
 test "steps get the engine (privileged nesting) unless it is turned off" {

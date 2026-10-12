@@ -1,0 +1,108 @@
+{
+ "plan": {
+  "planId": "p"
+ },
+ "jobId": "j",
+ "jobContainer": null,
+ "variables": {
+  "github_token": {
+   "value": "ghs_fake_token_value",
+   "isSecret": true
+  },
+  "system.github.token": {
+   "value": "ghs_fake_token_value",
+   "isSecret": true
+  }
+ },
+ "resources": {
+  "endpoints": [
+   {
+    "name": "SystemVssConnection",
+    "url": "https://pipelines.test/",
+    "authorization": {
+     "parameters": {
+      "AccessToken": "local-job-token"
+     }
+    }
+   }
+  ]
+ },
+ "contextData": {
+  "github": {
+   "t": 2,
+   "d": [
+    {
+     "k": "repository",
+     "v": "o/r"
+    },
+    {
+     "k": "event_name",
+     "v": "push"
+    },
+    {
+     "k": "event",
+     "v": {
+      "t": 2,
+      "d": [
+       {
+        "k": "ref",
+        "v": "refs/heads/x"
+       }
+      ]
+     }
+    }
+   ]
+  }
+ },
+ "steps": [
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "s0",
+   "name": "__run",
+   "condition": "success()",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "lit": "script"
+      },
+      "Value": {
+       "type": 3,
+       "expr": "format('echo token-len={0}', github.token)"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "repository",
+    "name": "actions/github-script",
+    "ref": "v9",
+    "repositoryType": "GitHub"
+   },
+   "id": "gs",
+   "contextName": "gs",
+   "name": "__gs",
+   "condition": "success()",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "lit": "script"
+      },
+      "Value": {
+       "lit": "core.info('token present: ' + (process.env['INPUT_GITHUB-TOKEN'] || '').length); core.info('runtime: ' + (process.versions.bun ? 'bun ' + process.versions.bun : 'node ' + process.version)); return 7"
+      }
+     }
+    ]
+   }
+  }
+ ]
+}
