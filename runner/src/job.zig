@@ -35,6 +35,9 @@ pub const Action = union(enum) {
     /// `uses: owner/repo[/path]@ref` of any other action. The runner reads the action's `action.yml`
     /// when the step runs; `inputs` are the step's `with:` values.
     uses: Uses,
+    /// `uses: docker://<image>`: runs the image as a Docker action. `args` and `entrypoint` among the
+    /// inputs say how; all inputs also arrive as INPUT_<NAME>.
+    docker: struct { image: []const u8, inputs: []const Input = &.{} },
     /// Why the step cannot run. The executor logs this and fails the step.
     unsupported: []const u8,
 };
@@ -203,6 +206,20 @@ fn parseStep(arena: Allocator, sv: Value) Error!Step {
         } else {
             action = try parseUses(arena, uses_name, path(sv, &.{ "reference", "path" }) orelse "", uses_ref, uses_label, o.get("inputs"));
         }
+    } else if (std.mem.eql(u8, reference_type, "containerRegistry")) {
+        const raw = path(sv, &.{ "reference", "image" }) orelse "";
+        const image = if (std.mem.startsWith(u8, raw, "docker://")) raw["docker://".len..] else raw;
+        uses_label = try std.fmt.allocPrint(arena, "docker://{s}", .{image});
+        action = if (image.len == 0) .{ .unsupported = "uses: docker:// names no image" } else blk: {
+            var kv: []const Input = &.{};
+            if (o.get("inputs")) |iv| if (iv != .null) {
+                kv = mappingInputs(arena, iv) catch |e| switch (e) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Unsupported => break :blk .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s}: inputs must be strings or expressions", .{uses_label}) },
+                };
+            };
+            break :blk .{ .docker = .{ .image = image, .inputs = kv } };
+        };
     } else {
         action = .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported step reference type '{s}' (v0 supports run: steps)", .{reference_type}) };
     }
@@ -684,7 +701,7 @@ test "malformed job" {
     try std.testing.expectError(error.MalformedJob, parse(a.allocator(), "not json"));
 }
 
-test "uses: references keep their directory and inputs; local actions are unsupported" {
+test "uses: references keep their directory and inputs; local actions are unsupported; docker:// images" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const json =
@@ -695,7 +712,9 @@ test "uses: references keep their directory and inputs; local actions are unsupp
         \\  {"type":"action","reference":{"type":"repository","name":"o/r/sub/dir","ref":"main","repositoryType":"GitHub"},"id":"b","name":"__b","condition":"success()"},
         \\  {"type":"action","reference":{"type":"repository","path":"./.github/actions/local","repositoryType":"self"},"id":"c","name":"__c","condition":"success()"},
         \\  {"type":"action","reference":{"type":"repository","name":"o/r","ref":"v1","repositoryType":"GitHub"},"id":"d","name":"__d","condition":"success()",
-        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"list"},"Value":{"type":1,"seq":[]}}]}}
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"list"},"Value":{"type":1,"seq":[]}}]}},
+        \\  {"type":"action","reference":{"type":"containerRegistry","image":"docker://alpine:3.22"},"id":"e","name":"__e","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"args"},"Value":{"lit":"-c 'echo hi'"}},{"Key":{"lit":"entrypoint"},"Value":{"lit":"sh"}}]}}
         \\ ]}
     ;
     const job = try parse(a.allocator(), json);
@@ -709,4 +728,8 @@ test "uses: references keep their directory and inputs; local actions are unsupp
     try std.testing.expectEqualStrings("sub/dir", job.steps[1].action.uses.path);
     try std.testing.expect(std.mem.indexOf(u8, job.steps[2].action.unsupported, "workflow's own repository are not supported yet") != null);
     try std.testing.expect(std.mem.indexOf(u8, job.steps[3].action.unsupported, "inputs must be strings or expressions") != null);
+    const docker = job.steps[4].action.docker;
+    try std.testing.expectEqualStrings("alpine:3.22", docker.image);
+    try std.testing.expectEqualStrings("args", docker.inputs[0].name);
+    try std.testing.expectEqualStrings("Run docker://alpine:3.22", job.steps[4].name);
 }

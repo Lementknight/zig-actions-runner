@@ -45,7 +45,19 @@ pub const Runs = union(enum) {
         pre_if: ?[]const u8 = null,
         post_if: ?[]const u8 = null,
     },
-    docker: struct { image: []const u8 },
+    /// `image` is `Dockerfile` (a path in the action's directory) or `docker://<image>`.
+    docker: struct {
+        image: []const u8,
+        /// Replaces the image's entrypoint; null keeps it.
+        entrypoint: ?[]const u8 = null,
+        /// Null: the image's own command. Items may contain expressions.
+        args: ?[]const []const u8 = null,
+        env: []const KeyValue = &.{},
+        pre_entrypoint: ?[]const u8 = null,
+        post_entrypoint: ?[]const u8 = null,
+        pre_if: ?[]const u8 = null,
+        post_if: ?[]const u8 = null,
+    },
 };
 
 pub const Metadata = struct {
@@ -124,7 +136,24 @@ pub fn parse(arena: Allocator, text: []const u8) Allocator.Error!Parsed {
         } };
     } else if (std.mem.eql(u8, using, "docker")) {
         const image = (runs.get("image") orelse return .{ .invalid = "is a Docker action without 'runs.image'" }).text() orelse return .{ .invalid = "has 'runs.image' that is not a string" };
-        m.runs = .{ .docker = .{ .image = image } };
+        var args: ?[]const []const u8 = null;
+        if (runs.get("args")) |an| {
+            if (an != .seq) return .{ .invalid = "has 'runs.args' that is not a list" };
+            const list = try arena.alloc([]const u8, an.seq.len);
+            for (an.seq, list) |item, *dst| dst.* = scalar(item) orelse return .{ .invalid = "has 'runs.args' with an item that is not a string" };
+            args = list;
+        }
+        const env = if (runs.get("env")) |en| (try keyValues(arena, en)) orelse return .{ .invalid = "has 'runs.env' that is not a mapping of strings" } else &.{};
+        m.runs = .{ .docker = .{
+            .image = image,
+            .entrypoint = if (runs.get("entrypoint")) |v| v.text() else null,
+            .args = args,
+            .env = env,
+            .pre_entrypoint = if (runs.get("pre-entrypoint")) |v| v.text() else null,
+            .post_entrypoint = if (runs.get("post-entrypoint")) |v| v.text() else null,
+            .pre_if = if (runs.get("pre-if")) |v| v.text() else null,
+            .post_if = if (runs.get("post-if")) |v| v.text() else null,
+        } };
     } else {
         return invalid(arena, "has an unknown 'runs.using' value '{s}'", .{using_raw});
     }
@@ -301,6 +330,28 @@ test "JavaScript and Docker actions" {
     try std.testing.expectEqual(@as(usize, 0), js.outputs.len); // no `value`: set by the action
     const docker = (try parse(a.allocator(), "runs:\n  using: docker\n  image: Dockerfile\n")).ok;
     try std.testing.expectEqualStrings("Dockerfile", docker.runs.docker.image);
+    try std.testing.expect(docker.runs.docker.args == null);
+    const full = (try parse(a.allocator(),
+        \\runs:
+        \\  using: 'docker'
+        \\  image: 'docker://alpine:3.22'
+        \\  entrypoint: /bin/echo
+        \\  args:
+        \\    - ${{ inputs.who }}
+        \\    - --flag
+        \\  env:
+        \\    GREETING: hi
+        \\  post-entrypoint: /cleanup.sh
+        \\  post-if: failure()
+    )).ok.runs.docker;
+    try std.testing.expectEqualStrings("docker://alpine:3.22", full.image);
+    try std.testing.expectEqualStrings("/bin/echo", full.entrypoint.?);
+    try std.testing.expectEqualStrings("${{ inputs.who }}", full.args.?[0]);
+    try std.testing.expectEqualStrings("--flag", full.args.?[1]);
+    try std.testing.expectEqualStrings("GREETING", full.env[0].name);
+    try std.testing.expectEqualStrings("/cleanup.sh", full.post_entrypoint.?);
+    try std.testing.expectEqualStrings("failure()", full.post_if.?);
+    try std.testing.expect(full.pre_entrypoint == null);
 }
 
 test "invalid metadata says why" {
@@ -315,6 +366,7 @@ test "invalid metadata says why" {
         .{ .src = "runs:\n  using: composite\n  steps:\n    - uses: a/b@v1\n      bogus: 1\n", .want = "unknown key 'bogus'" },
         .{ .src = "runs:\n  using: composite\n  steps:\n    - uses: a/b@v1\n      with: [1]\n", .want = "'with' is not a mapping" },
         .{ .src = "runs:\n  using: node20\n", .want = "without 'runs.main'" },
+        .{ .src = "runs:\n  using: docker\n  image: Dockerfile\n  args: x\n", .want = "'runs.args' that is not a list" },
         .{ .src = "a: &x 1\n", .want = "does not support (anchors, aliases and tags, line 1)" },
         .{ .src = "- a\n", .want = "is not a mapping" },
     };

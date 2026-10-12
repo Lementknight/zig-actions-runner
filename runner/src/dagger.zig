@@ -173,27 +173,7 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
                 try shellQuote(w, wd);
                 try w.writeAll(" && ");
             }
-            try w.writeAll("env ");
-            for (sc.secret_env, 0..) |_, i| try w.print("-u {s} ", .{try secretAlias(arena, i)});
-            if (sc.write_event) try w.writeAll("-u " ++ event_env ++ " ");
-            for (sc.env) |e| {
-                const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
-                try shellQuote(w, pair);
-                try w.writeByte(' ');
-            }
-            // The value is expanded by the shell from the alias; only the variable's name is in the command.
-            for (sc.secret_env, 0..) |name, i| {
-                try shellQuote(w, try std.fmt.allocPrint(arena, "{s}=", .{name}));
-                try w.print("\"${s}\" ", .{try secretAlias(arena, i)});
-            }
-            // Set after the step's own env, so a step cannot point these somewhere else.
-            const names = [_][]const u8{ "GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_STATE" };
-            for (names, fc_kinds) |name, kind| {
-                try shellQuote(w, try std.fmt.allocPrint(arena, "{s}={s}", .{ name, try fcPath(arena, kind, fc) }));
-                try w.writeByte(' ');
-            }
-            try shellQuote(w, try std.fmt.allocPrint(arena, "GITHUB_ACTION={s}", .{action_name}));
-            try w.writeByte(' ');
+            try writeEnvCommand(w, arena, "env ", sc.env, sc.secret_env, sc.write_event, fc, action_name);
             if (sc.shell != null and std.mem.eql(u8, sc.shell.?, "sh")) {
                 try w.writeAll("sh -e -c ");
             } else {
@@ -217,6 +197,122 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
     for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, fc)});
     try w.print("\necho '{s}end {d}'\nexit $rc\n", .{ marker, n });
     return aw.written();
+}
+
+/// Where a Docker action's container gets its static busybox, and HOME (shared by the job's Docker
+/// actions, as GitHub mounts one /github/home into each).
+const busybox_image = "busybox:1.37.0-musl";
+const busybox_path = "/github/_runtime/busybox";
+const docker_home = "/github/home";
+
+/// The busybox `sh -c` script that runs a Docker action's command `argv` as step `n`: as
+/// `stepScriptFc`, with the image's command in place of a shell script, and busybox's own `mkdir`,
+/// `printf` and `env` (the image may have none).
+fn containerScript(arena: Allocator, n: u32, fc: u32, argv: []const []const u8, env: []const job_mod.EnvVar, secret_env: []const []const u8, always_run: ?[]const u8, write_event: bool, action_name: []const u8) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("echo '{s}begin {d}'\nB=" ++ busybox_path ++ "\n\"$B\" mkdir -p " ++ fc_dir ++ " " ++ docker_home ++ " " ++ event_dir ++ " && : ", .{ marker, n });
+    for (fc_kinds) |k| try w.print("> {s} ", .{try fcPath(arena, k, fc)});
+    try w.writeByte('\n');
+    if (always_run) |why| {
+        try w.writeAll(": ");
+        try shellQuote(w, why);
+        try w.writeByte('\n');
+    }
+    if (write_event) try w.writeAll("if [ -n \"${" ++ event_env ++ "+x}\" ]; then \"$B\" printf '%s' \"$" ++ event_env ++ "\" > " ++ event_path ++ "; fi\n");
+    try writeEnvCommand(w, arena, "\"$B\" env ", env, secret_env, write_event, fc, action_name);
+    for (argv) |a| {
+        try shellQuote(w, a);
+        try w.writeByte(' ');
+    }
+    try w.writeAll("\nrc=$?\n: ");
+    for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, fc)});
+    try w.print("\necho '{s}end {d}'\nexit $rc\n", .{ marker, n });
+    return aw.written();
+}
+
+/// Splits `with: args` of a `docker://` step into arguments as GitHub's runner does (it hands the
+/// string to `docker run`): at whitespace, with double quotes grouping and `\"` a literal quote.
+fn splitArgs(arena: Allocator, s: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var cur: std.ArrayList(u8) = .empty;
+    var in_arg = false;
+    var quoted = false;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == '\\' and i + 1 < s.len and s[i + 1] == '"') {
+            try cur.append(arena, '"');
+            in_arg = true;
+            i += 1;
+        } else if (c == '"') {
+            quoted = !quoted;
+            in_arg = true;
+        } else if (!quoted and std.ascii.isWhitespace(c)) {
+            if (in_arg) try out.append(arena, try cur.toOwnedSlice(arena));
+            in_arg = false;
+        } else {
+            try cur.append(arena, c);
+            in_arg = true;
+        }
+    }
+    if (in_arg) try out.append(arena, try cur.toOwnedSlice(arena));
+    return out.items;
+}
+
+/// Inputs as INPUT_<NAME> (upper case, spaces as underscores, as `@actions/core` reads them).
+fn inputEnv(arena: Allocator, inputs: []const expr.Value.Entry) ![]const job_mod.EnvVar {
+    const out = try arena.alloc(job_mod.EnvVar, inputs.len);
+    for (inputs, out) |in, *dst| {
+        const name = try std.ascii.allocUpperString(arena, try std.mem.replaceOwned(u8, arena, in.key, " ", "_"));
+        dst.* = .{ .name = try std.fmt.allocPrint(arena, "INPUT_{s}", .{name}), .value = in.value.string };
+    }
+    return out;
+}
+
+/// The resolved inputs that the workflow gave (`with:`), for the log.
+fn shownInputs(arena: Allocator, given: []const job_mod.Input, inputs: []const expr.Value.Entry) ![]const job_mod.EnvVar {
+    var out: std.ArrayList(job_mod.EnvVar) = .empty;
+    for (given) |g| for (inputs) |in| if (std.ascii.eqlIgnoreCase(in.key, g.name)) {
+        try out.append(arena, .{ .name = in.key, .value = in.value.string });
+        break;
+    };
+    return out.items;
+}
+
+/// The strings of a JSON array (an image's entrypoint or command); empty for anything else.
+fn jsonStrings(arena: Allocator, v: ?std.json.Value) ![]const []const u8 {
+    const arr = v orelse return &.{};
+    if (arr != .array) return &.{};
+    var out: std.ArrayList([]const u8) = .empty;
+    for (arr.array.items) |item| if (item == .string) try out.append(arena, item.string);
+    return out.items;
+}
+
+/// `<env_cmd>-u <aliases> NAME=value ... GITHUB_OUTPUT=... GITHUB_ACTION=... `: what a step's command
+/// starts with, so it gets its env (secret values expanded from their aliases, see `Resolved.run`).
+fn writeEnvCommand(w: *std.Io.Writer, arena: Allocator, env_cmd: []const u8, env: []const job_mod.EnvVar, secret_env: []const []const u8, write_event: bool, fc: u32, action_name: []const u8) !void {
+    try w.writeAll(env_cmd);
+    for (secret_env, 0..) |_, i| try w.print("-u {s} ", .{try secretAlias(arena, i)});
+    if (write_event) try w.writeAll("-u " ++ event_env ++ " ");
+    for (env) |e| {
+        const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
+        try shellQuote(w, pair);
+        try w.writeByte(' ');
+    }
+    // The value is expanded by the shell from the alias; only the variable's name is in the command.
+    for (secret_env, 0..) |name, i| {
+        try shellQuote(w, try std.fmt.allocPrint(arena, "{s}=", .{name}));
+        try w.print("\"${s}\" ", .{try secretAlias(arena, i)});
+    }
+    // Set after the step's own env, so a step cannot point these somewhere else.
+    const names = [_][]const u8{ "GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_STATE" };
+    for (names, fc_kinds) |name, kind| {
+        try shellQuote(w, try std.fmt.allocPrint(arena, "{s}={s}", .{ name, try fcPath(arena, kind, fc) }));
+        try w.writeByte(' ');
+    }
+    try shellQuote(w, try std.fmt.allocPrint(arena, "GITHUB_ACTION={s}", .{action_name}));
+    try w.writeByte(' ');
 }
 
 /// The name under which a step's `i`th secret variable is attached to the container. Dagger silently
@@ -1224,10 +1320,15 @@ pub fn run(
                 mount_buf[0] = .{ .dir = .{ .path = f.mount, .id = f.result.dir } };
                 mounts = &mount_buf;
             },
-            .uses => |u| {
+            .uses, .docker => {
                 res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
                 if (opts.observer) |o| o.started(num, res.name, res.started_ms);
-                const out = x.runAction(num, u, sc1, plain_step_env.items, secret_step_env.items) catch |e| switch (e) {
+                const ran = switch (step.action) {
+                    .uses => |u| x.runAction(num, u, sc1, plain_step_env.items, secret_step_env.items),
+                    .docker => |d| x.runImageStep(num, d, sc1, plain_step_env.items, secret_step_env.items),
+                    else => unreachable,
+                };
+                const out = ran catch |e| switch (e) {
                     error.EngineFailed => return engineFailed(&x, opts.observer, res, num, coe, results),
                     else => return e,
                 };
@@ -1327,6 +1428,15 @@ const Exec = struct {
     job_secret_env: bool,
     /// Differs on every run (and attempt): makes steps that use secrets run every time.
     run_nonce: []const u8,
+    /// The job token as a Dagger secret, for ACTIONS_ID_TOKEN_REQUEST_TOKEN (registered on first use).
+    id_token_secret: ?[]const u8 = null,
+    /// Docker actions: the static busybox that starts their command, their images (pulled or built
+    /// once per job, by `DockerRun.Image` key), and /github/home, which they share, as on GitHub.
+    busybox_id: ?[]const u8 = null,
+    /// An empty Directory, for the directories a Docker action's container needs.
+    empty_dir: []const u8 = "",
+    images: std.StringHashMapUnmanaged(ImageInfo) = .empty,
+    docker_home: ?[]const u8 = null,
 
     const Post = struct {
         num: u32,
@@ -1338,7 +1448,37 @@ const Exec = struct {
         step_env: []const job_mod.EnvVar,
         step_secret: []const SecretRef,
         state: []const job_mod.EnvVar,
+        /// A Docker action's `post-entrypoint` (`script` is then the entrypoint).
+        docker: ?DockerRun = null,
     };
+
+    /// A Docker action to run: its image and how it is started (see `runContainer`).
+    const DockerRun = struct {
+        image: Image,
+        /// Replaces the image's entrypoint, and then its command too, as `docker run --entrypoint` does.
+        entrypoint: ?[]const u8 = null,
+        /// Null: the image's command.
+        args: ?[]const []const u8 = null,
+        /// The step's env, INPUT_<NAME>, the action's `env:`.
+        env: []const job_mod.EnvVar,
+        secret: []const SecretRef,
+        /// `owner/repo@ref` or `docker://<image>`, for the log and messages.
+        label: []const u8,
+        /// GITHUB_ACTION_REPOSITORY and GITHUB_ACTION_REF; empty for a `docker://` step.
+        repository: []const u8 = "",
+        ref: []const u8 = "",
+        /// The `with:` inputs the workflow gave, for the log.
+        shown: []const job_mod.EnvVar = &.{},
+
+        const Image = union(enum) {
+            pull: []const u8,
+            /// Built from `dockerfile` with `context` as the build context, both paths in the Directory `dir`.
+            build: struct { dir: []const u8, context: []const u8, dockerfile: []const u8 },
+        };
+    };
+
+    /// `user` is the image's USER ("" for root): the action runs as it, so it gets the directories it writes.
+    const ImageInfo = struct { id: []const u8, entrypoint: []const []const u8, cmd: []const []const u8, user: []const u8 };
 
     const Phase = enum {
         pre,
@@ -1367,18 +1507,29 @@ const Exec = struct {
         const ev = x.ev;
         // Secret variables are for scripts only; they reach them through aliases (`secretAlias`).
         var resolved = resolved_in;
-        const secret_env: []const SecretRef = if (resolved == .run) secret_env_in else &.{};
+        var secret_env: []const SecretRef = if (resolved == .run) secret_env_in else &.{};
         if (resolved == .run) {
+            const uses_secrets = secret_env.len > 0 or x.job_secret_env or containsSecret(x.job.*, resolved.run.script);
+            // With `id-token: write`, every step can request OIDC tokens, as on GitHub (`curl
+            // "$ACTIONS_ID_TOKEN_REQUEST_URL"` in a script, `core.getIDToken()` in an action).
+            const oidc = try x.idToken();
+            if (oidc) |t| {
+                resolved.run.env = try std.mem.concat(arena, job_mod.EnvVar, &.{ resolved.run.env, &.{t.url} });
+                secret_env = try std.mem.concat(arena, SecretRef, &.{ secret_env, &.{t.token} });
+            }
             const names = try arena.alloc([]const u8, secret_env.len);
             for (secret_env, names) |s, *n| n.* = s.name;
             resolved.run.secret_env = names;
             resolved.run.write_event = x.event_from_env;
             // A step that uses secrets (a deploy, a publish) must not be skipped because an earlier run
             // had the same inputs, and one that reads run-specific values must not replay an earlier
-            // run's; every step after it then runs too.
+            // run's; every step after it then runs too. One that can get OIDC tokens may publish or
+            // deploy without any secret (npm's trusted publishing, cloud logins), so it runs too.
             if (x.step_cache) {
-                const reason: ?[]const u8 = if (secret_env.len > 0 or x.job_secret_env or containsSecret(x.job.*, resolved.run.script))
+                const reason: ?[]const u8 = if (uses_secrets)
                     "it uses secrets"
+                else if (oidc != null)
+                    "it can request OIDC tokens (id-token: write)"
                 else if (readsRunSpecific(resolved.run.script))
                     "it reads run-specific values"
                 else
@@ -1464,16 +1615,28 @@ const Exec = struct {
         try w.writeAll(" }");
         for (0..braces) |_| try w.writeAll(" }");
 
-        // Several execs can log as one step (a composite action's steps, a JavaScript action's pre, main
-        // and post): after the first, count each one's live lines afresh, so a cached one is replayed.
+        x.beginExec(num);
+        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch return error.EngineFailed;
+        if (jsonFindString(data, "id")) |id| x.container_id = id;
+        return x.collect(num, data);
+    }
+
+    /// Several execs can log as one step (a composite action's steps, a JavaScript action's pre, main
+    /// and post): after the first, count each one's live lines afresh, so a cached one is replayed.
+    fn beginExec(x: *Exec, num: u32) void {
         if (x.execs[num - 1] > 0) {
             x.sh.live_lines[num - 1].store(0, .monotonic);
             x.sh.ended[num - 1].store(false, .release);
         }
         x.execs[num - 1] += 1;
-        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch return error.EngineFailed;
+    }
+
+    /// An exec's result (`exitCode stdout stderr fc_<kind> { contents }`): its output, replayed if it
+    /// was cached, and its file commands applied.
+    fn collect(x: *Exec, num: u32, data: std.json.Value) !ExecOut {
+        const arena = x.arena;
+        const ev = x.ev;
         var code: i32 = if (jsonFind(data, "exitCode")) |c| (if (c == .integer) @intCast(c.integer) else 1) else 1;
-        if (jsonFindString(data, "id")) |id| x.container_id = id;
 
         // A cached step prints no log lines. Wait briefly for a live stream, then replay the result.
         _ = awaitLiveOrReplay(x.io, x.sh, num, jsonFindString(data, "stdout") orelse "", jsonFindString(data, "stderr") orelse "");
@@ -1529,7 +1692,6 @@ const Exec = struct {
             .failed => |msg| return x.actionFailed(num, "{s}", .{msg}),
             .ok => |a| a,
         };
-        if (act.meta.runs == .docker) return x.actionFailed(num, "{s} is a Docker action; Docker actions are not supported yet", .{act.ref_label});
 
         const inputs = switch (try x.resolveInputs(num, act, u, caller, true)) {
             .failed => |out| return out,
@@ -1539,7 +1701,7 @@ const Exec = struct {
         const steps = switch (act.meta.runs) {
             .composite => |st| st,
             .node => |nd| return x.runJs(num, act, u, nd, inputs, step_env, step_secret),
-            .docker => unreachable,
+            .docker => |dk| return x.runDocker(num, act, u, dk, inputs, step_env, step_secret),
         };
 
         // The action's steps see its own `inputs` and `steps`, and `github.action_path`; the job's come
@@ -1734,17 +1896,17 @@ const Exec = struct {
             .failed => return,
             .ok => |a| a,
         };
-        const nd = switch (act.meta.runs) {
-            .node => |nd| nd,
-            else => return,
+        const pre: []const u8, const pre_if: ?[]const u8 = switch (act.meta.runs) {
+            .node => |nd| .{ nd.pre orelse return, nd.pre_if },
+            .docker => |dk| .{ dk.pre_entrypoint orelse return, dk.pre_if },
+            .composite => return,
         };
-        const pre = nd.pre orelse return;
         const ev = x.ev;
         ev.diag = "";
         const sc0 = try ev.scope(&.{});
         const step_env = ev.renderEnv(step.env, sc0) catch return;
         const sc1 = try ev.scope(step_env);
-        if (!(expr.evalCondition(x.arena, nd.pre_if orelse "always()", sc1) catch false)) return;
+        if (!(expr.evalCondition(x.arena, pre_if orelse "always()", sc1) catch false)) return;
         const inputs = switch (try x.resolveInputs(num, act, u, sc1, false)) {
             .failed => return,
             .ok => |in| in,
@@ -1752,7 +1914,11 @@ const Exec = struct {
         var plain: std.ArrayList(job_mod.EnvVar) = .empty;
         var secret: std.ArrayList(SecretRef) = .empty;
         splitEnv(x.arena, x.transport, x.job.*, &x.secret_counter, step_env, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
-        const out = (try x.runJsScript(num, .pre, act, u, pre, inputs, plain.items, secret.items, &.{})) orelse {
+        const pre_out = switch (act.meta.runs) {
+            .docker => |dk| if (try x.dockerRunFor(num, act, u, dk, inputs, plain.items, secret.items, pre)) |dr| try x.runContainer(num, .pre, dr, &.{}) else null,
+            else => try x.runJsScript(num, .pre, act, u, pre, inputs, plain.items, secret.items, &.{}),
+        };
+        const out = pre_out orelse {
             ev.job_failed = true;
             x.hook_failed = true;
             return;
@@ -1775,7 +1941,11 @@ const Exec = struct {
             x.ev.diag = "";
             const sc = try x.ev.scope(&.{});
             if (!(expr.evalCondition(x.arena, p.condition, sc) catch true)) continue;
-            const out = (try x.runJsScript(p.num, .post, p.act, p.u, p.script, p.inputs, p.step_env, p.step_secret, p.state)) orelse {
+            const post_out = if (p.docker) |dr|
+                try x.runContainer(p.num, .post, dr, p.state)
+            else
+                try x.runJsScript(p.num, .post, p.act, p.u, p.script, p.inputs, p.step_env, p.step_secret, p.state);
+            const out = post_out orelse {
                 x.hook_failed = true;
                 continue;
             };
@@ -1834,24 +2004,11 @@ const Exec = struct {
         // location, and the services actions/cache and artifact actions talk to.
         const repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name });
         var env: std.ArrayList(job_mod.EnvVar) = .empty;
-        for (inputs) |in| {
-            const name = try std.ascii.allocUpperString(arena, try std.mem.replaceOwned(u8, arena, in.key, " ", "_"));
-            try env.append(arena, .{ .name = try std.fmt.allocPrint(arena, "INPUT_{s}", .{name}), .value = in.value.string });
-        }
+        try env.appendSlice(arena, try inputEnv(arena, inputs));
         try env.append(arena, .{ .name = "GITHUB_ACTION_PATH", .value = act.path });
         try env.append(arena, .{ .name = "GITHUB_ACTION_REPOSITORY", .value = repository });
         try env.append(arena, .{ .name = "GITHUB_ACTION_REF", .value = u.ref });
-        const rt_env = x.job.runtime;
-        const runtime_vars = [_]job_mod.EnvVar{
-            .{ .name = "ACTIONS_RUNTIME_URL", .value = rt_env.pipelines_url },
-            .{ .name = "ACTIONS_RUNTIME_TOKEN", .value = x.job.job_token },
-            .{ .name = "ACTIONS_CACHE_URL", .value = rt_env.cache_url },
-            .{ .name = "ACTIONS_RESULTS_URL", .value = rt_env.results_url },
-            .{ .name = "ACTIONS_CACHE_SERVICE_V2", .value = if (rt_env.cache_v2) "True" else "" },
-        };
-        for (runtime_vars) |v| if (v.value.len > 0) try env.append(arena, v);
-        // What earlier phases saved (`core.saveState`), read with `core.getState`.
-        for (state) |st| try env.append(arena, .{ .name = try std.fmt.allocPrint(arena, "STATE_{s}", .{st.name}), .value = st.value });
+        try x.runtimeEnv(&env, state);
 
         var plain: std.ArrayList(job_mod.EnvVar) = .empty;
         var secret: std.ArrayList(SecretRef) = .empty;
@@ -1859,16 +2016,7 @@ const Exec = struct {
         try secret.appendSlice(arena, step_secret);
         splitEnv(arena, x.transport, x.job.*, &x.secret_counter, env.items, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
 
-        // As GitHub shows it: the action and the inputs the workflow gave it.
-        x.sh.append(num, try std.fmt.allocPrint(arena, "##[group]{s} {s}", .{ phase.label(), act.ref_label }));
-        if (u.inputs.len > 0) {
-            x.sh.append(num, "with:");
-            for (u.inputs) |given| for (inputs) |in| if (std.ascii.eqlIgnoreCase(in.key, given.name)) {
-                x.sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ in.key, firstLine(in.value.string) }));
-                break;
-            };
-        }
-        x.sh.append(num, "##[endgroup]");
+        try x.logGroup(num, phase, act.ref_label, try shownInputs(arena, u.inputs, inputs), &.{});
 
         // Started through bash, not sh: dash drops variables whose names are not identifiers
         // (INPUT_GITHUB-TOKEN) when it starts a program; bash passes them on.
@@ -1881,6 +2029,354 @@ const Exec = struct {
         x.js_mounted = true;
         try x.mounted_actions.put(arena, act.mount, {});
         return out;
+    }
+
+    /// With `id-token: write` (GitHub then sends GenerateIdTokenUrl), the variables every step requests
+    /// OIDC tokens with: the URL, and the job token as a Dagger secret (registered once per job).
+    fn idToken(x: *Exec) !?struct { url: job_mod.EnvVar, token: SecretRef } {
+        if (x.job.runtime.id_token_url.len == 0) return null;
+        const id = x.id_token_secret orelse id: {
+            const id = newSecret(x.arena, x.transport, &x.secret_counter, x.job.job_token, &x.err_msg) catch return error.EngineFailed;
+            x.id_token_secret = id;
+            break :id id;
+        };
+        return .{
+            .url = .{ .name = "ACTIONS_ID_TOKEN_REQUEST_URL", .value = x.job.runtime.id_token_url },
+            .token = .{ .name = "ACTIONS_ID_TOKEN_REQUEST_TOKEN", .id = id },
+        };
+    }
+
+    /// What GitHub's runner gives actions besides their inputs: the services actions/cache and artifact
+    /// actions talk to, and what earlier phases saved (`core.saveState`) as STATE_<name>.
+    fn runtimeEnv(x: *Exec, env: *std.ArrayList(job_mod.EnvVar), state: []const job_mod.EnvVar) !void {
+        const rt = x.job.runtime;
+        const vars = [_]job_mod.EnvVar{
+            .{ .name = "ACTIONS_RUNTIME_URL", .value = rt.pipelines_url },
+            .{ .name = "ACTIONS_RUNTIME_TOKEN", .value = x.job.job_token },
+            .{ .name = "ACTIONS_CACHE_URL", .value = rt.cache_url },
+            .{ .name = "ACTIONS_RESULTS_URL", .value = rt.results_url },
+            .{ .name = "ACTIONS_CACHE_SERVICE_V2", .value = if (rt.cache_v2) "True" else "" },
+        };
+        for (vars) |v| if (v.value.len > 0) try env.append(x.arena, v);
+        for (state) |st| try env.append(x.arena, .{ .name = try std.fmt.allocPrint(x.arena, "STATE_{s}", .{st.name}), .value = st.value });
+    }
+
+    /// As GitHub shows an action: `##[group]Run <action>`, the inputs the workflow gave it, `##[endgroup]`.
+    fn logGroup(x: *Exec, num: u32, phase: Phase, label: []const u8, shown: []const job_mod.EnvVar, extra: []const []const u8) !void {
+        x.sh.append(num, try std.fmt.allocPrint(x.arena, "##[group]{s} {s}", .{ phase.label(), label }));
+        if (shown.len > 0) {
+            x.sh.append(num, "with:");
+            for (shown) |in| x.sh.append(num, try std.fmt.allocPrint(x.arena, "  {s}: {s}", .{ in.name, firstLine(in.value) }));
+        }
+        for (extra) |l| x.sh.append(num, l);
+        x.sh.append(num, "##[endgroup]");
+    }
+
+    /// Runs a Docker action (`runs.using: docker`) and registers its `post-entrypoint`.
+    fn runDocker(x: *Exec, num: u32, act: Loaded, u: job_mod.Uses, dk: @FieldType(action.Runs, "docker"), inputs: []const expr.Value.Entry, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef) !ActionOut {
+        const failed: ActionOut = .{ .failed = true, .exit_code = 1 };
+        const dr = (try x.dockerRunFor(num, act, u, dk, inputs, step_env, step_secret, dk.entrypoint)) orelse return failed;
+        const out = (try x.runContainer(num, .main, dr, x.pre_state[num - 1])) orelse return failed;
+        if (dk.post_entrypoint) |post| {
+            var p = dr;
+            p.entrypoint = post;
+            try x.posts.append(x.arena, .{
+                .num = num,
+                .act = act,
+                .u = u,
+                .script = post,
+                .condition = dk.post_if orelse "always()",
+                .inputs = inputs,
+                .step_env = step_env,
+                .step_secret = step_secret,
+                .state = try std.mem.concat(x.arena, job_mod.EnvVar, &.{ x.pre_state[num - 1], out.state }),
+                .docker = p,
+            });
+        }
+        return .{ .failed = out.code != 0, .exit_code = out.code, .outputs = out.outputs };
+    }
+
+    /// How a Docker action runs: its image (`docker://<image>`, or built from the Dockerfile in its
+    /// directory, with the Dockerfile's directory as the context, as GitHub builds it), and its `args`
+    /// and `env:` evaluated with its `inputs` in scope. Null when they cannot be evaluated (logged).
+    fn dockerRunFor(x: *Exec, num: u32, act: Loaded, u: job_mod.Uses, dk: @FieldType(action.Runs, "docker"), inputs: []const expr.Value.Entry, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef, entrypoint: ?[]const u8) !?DockerRun {
+        const arena = x.arena;
+        const ev = x.ev;
+        const saved_inputs = ev.inputs;
+        defer ev.inputs = saved_inputs;
+        ev.inputs = .{ .object = inputs };
+        ev.diag = "";
+        const sc = try ev.scope(step_env);
+
+        var args: ?[]const []const u8 = null;
+        if (dk.args) |list| {
+            const out = try arena.alloc([]const u8, list.len);
+            for (list, out) |a, *dst| dst.* = expr.interpolate(arena, a, sc) catch {
+                _ = try x.actionFailed(num, "could not evaluate the args of {s}: {s}", .{ act.ref_label, ev.diag });
+                return null;
+            };
+            args = out;
+        }
+        var env: std.ArrayList(job_mod.EnvVar) = .empty;
+        try env.appendSlice(arena, step_env);
+        try env.appendSlice(arena, try inputEnv(arena, inputs));
+        for (dk.env) |e| try env.append(arena, .{ .name = e.name, .value = expr.interpolate(arena, e.value, sc) catch {
+            _ = try x.actionFailed(num, "could not evaluate env '{s}' of {s}: {s}", .{ e.name, act.ref_label, ev.diag });
+            return null;
+        } });
+
+        const image: DockerRun.Image = if (std.mem.startsWith(u8, dk.image, "docker://"))
+            .{ .pull = dk.image["docker://".len..] }
+        else img: {
+            const rel = try std.fs.path.resolveAllocPosix(arena, &.{ if (u.path.len > 0) u.path else ".", dk.image });
+            break :img .{ .build = .{
+                .dir = act.dir,
+                .context = std.fs.path.dirnamePosix(rel) orelse ".",
+                .dockerfile = std.fs.path.basenamePosix(rel),
+            } };
+        };
+        return .{
+            .image = image,
+            .entrypoint = entrypoint,
+            .args = args,
+            .env = env.items,
+            .secret = step_secret,
+            .label = act.ref_label,
+            .repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name }),
+            .ref = u.ref,
+            .shown = try shownInputs(arena, u.inputs, inputs),
+        };
+    }
+
+    /// `uses: docker://<image>`: the image runs as a Docker action, with `with: args` (split as a
+    /// command line) and `with: entrypoint`; every input also arrives as INPUT_<NAME>.
+    fn runImageStep(x: *Exec, num: u32, d: @FieldType(job_mod.Action, "docker"), sc: expr.Scope, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef) !ActionOut {
+        const arena = x.arena;
+        const ev = x.ev;
+        const inputs = try arena.alloc(expr.Value.Entry, d.inputs.len);
+        for (d.inputs, inputs) |in, *dst| {
+            ev.diag = "";
+            dst.* = .{ .key = in.name, .value = .{ .string = ev.render(in.value, sc) catch
+                return x.actionFailed(num, "could not evaluate input '{s}': {s}", .{ in.name, ev.diag }) } };
+        }
+        var args: ?[]const []const u8 = null;
+        var entrypoint: ?[]const u8 = null;
+        for (inputs) |in| {
+            if (std.ascii.eqlIgnoreCase(in.key, "args")) args = try splitArgs(arena, in.value.string);
+            if (std.ascii.eqlIgnoreCase(in.key, "entrypoint") and in.value.string.len > 0) entrypoint = in.value.string;
+        }
+        const label = try std.fmt.allocPrint(arena, "docker://{s}", .{d.image});
+        const shown = try arena.alloc(job_mod.EnvVar, inputs.len);
+        for (inputs, shown) |in, *dst| dst.* = .{ .name = in.key, .value = in.value.string };
+        const dr: DockerRun = .{
+            .image = .{ .pull = d.image },
+            .entrypoint = entrypoint,
+            .args = args,
+            .env = try std.mem.concat(arena, job_mod.EnvVar, &.{ step_env, try inputEnv(arena, inputs) }),
+            .secret = step_secret,
+            .label = label,
+            .shown = shown,
+        };
+        const out = (try x.runContainer(num, .main, dr, &.{})) orelse return .{ .failed = true, .exit_code = 1 };
+        return .{ .failed = out.code != 0, .exit_code = out.code, .outputs = out.outputs };
+    }
+
+    /// Runs a Docker action's container as (part of) step `num`, as GitHub does with `docker run`: the
+    /// job's workspace is copied in at /github/workspace (the working directory), with the event file,
+    /// the file commands and /github/home, and the workspace is copied back into the job's container
+    /// afterwards, deletions included. The command is started by a static busybox (`busybox_image`), so
+    /// images without a shell work too. Null when the image could not be pulled or built (logged).
+    fn runContainer(x: *Exec, num: u32, phase: Phase, dr: DockerRun, state: []const job_mod.EnvVar) !?ExecOut {
+        const arena = x.arena;
+        const ev = x.ev;
+        const image_line = switch (dr.image) {
+            .pull => |ref| try std.fmt.allocPrint(arena, "image: {s}", .{ref}),
+            .build => |b| try std.fmt.allocPrint(arena, "image: built from {s}", .{try std.fs.path.resolveAllocPosix(arena, &.{ b.context, b.dockerfile })}),
+        };
+        try x.logGroup(num, phase, dr.label, dr.shown, &.{image_line});
+        const busybox = (try x.busyboxFile(num)) orelse return null;
+        const img = (try x.imageInfo(num, dr.image, dr.label)) orelse return null;
+
+        // As `docker run [--entrypoint E] image [args]`.
+        var argv: std.ArrayList([]const u8) = .empty;
+        if (dr.entrypoint) |ep| {
+            try argv.append(arena, ep);
+            if (dr.args) |a| try argv.appendSlice(arena, a);
+        } else {
+            try argv.appendSlice(arena, img.entrypoint);
+            try argv.appendSlice(arena, dr.args orelse img.cmd);
+        }
+        if (argv.items.len == 0) {
+            _ = try x.actionFailed(num, "{s}: the image has no entrypoint or command, and the action gives none", .{dr.label});
+            return null;
+        }
+
+        const ws_in = blk: {
+            const doc = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ directory(path:\"" ++ workspace ++ "\") {{ id }} }} }}", .{std.json.fmt(x.container_id, .{})});
+            const data = gql(arena, x.transport, doc, &x.err_msg) catch return error.EngineFailed;
+            break :blk jsonFindString(data, "id") orelse {
+                x.err_msg = "Dagger returned no workspace directory";
+                return error.EngineFailed;
+            };
+        };
+
+        // The job's env (workflow, job, GITHUB_ENV), then the step's and the action's, as on GitHub.
+        var env: std.ArrayList(job_mod.EnvVar) = .empty;
+        try env.appendSlice(arena, ev.job_env.items);
+        try env.appendSlice(arena, dr.env);
+        try env.append(arena, .{ .name = "HOME", .value = docker_home });
+        if (dr.repository.len > 0) {
+            try env.append(arena, .{ .name = "GITHUB_ACTION_REPOSITORY", .value = dr.repository });
+            try env.append(arena, .{ .name = "GITHUB_ACTION_REF", .value = dr.ref });
+        }
+        try x.runtimeEnv(&env, state);
+        var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+        var secret: std.ArrayList(SecretRef) = .empty;
+        try secret.appendSlice(arena, dr.secret);
+        splitEnv(arena, x.transport, x.job.*, &x.secret_counter, env.items, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
+        if (try x.idToken()) |t| {
+            try plain.append(arena, t.url);
+            try secret.append(arena, t.token);
+        }
+        const names = try arena.alloc([]const u8, secret.items.len);
+        for (secret.items, names) |sr, *n| n.* = sr.name;
+        // It always has the job token (ACTIONS_RUNTIME_TOKEN), so with step caching it always runs.
+        const always_run: ?[]const u8 = if (x.step_cache) try std.fmt.allocPrint(arena, "zig-runner runs this step every time: it uses secrets (run {s})", .{x.run_nonce}) else null;
+        const fc = x.next_fc;
+        x.next_fc += 1;
+        const script = try containerScript(arena, num, fc, argv.items, plain.items, names, always_run, x.event_from_env, if (dr.repository.len > 0) dr.repository else dr.label);
+
+        var doc: std.Io.Writer.Allocating = .init(arena);
+        const w = &doc.writer;
+        try w.writeAll("{ loadContainerFromID(id:");
+        try std.json.Stringify.value(img.id, .{}, w);
+        try w.writeAll(") { withWorkdir(path:\"" ++ workspace ++ "\") { withFile(path:\"" ++ busybox_path ++ "\",permissions:493,source:");
+        try std.json.Stringify.value(busybox, .{}, w);
+        try w.writeAll(") { ");
+        var braces: usize = 4;
+        // The workspace, /github/home, and where file commands and the event go, owned by the image's
+        // user, which may not be root (GitHub's own example action runs as one).
+        const dirs = [_][2][]const u8{
+            .{ workspace, ws_in },
+            .{ docker_home, x.docker_home orelse x.empty_dir },
+            .{ fc_dir, x.empty_dir },
+            .{ event_dir, x.empty_dir },
+        };
+        for (dirs) |d| {
+            try w.writeAll("withDirectory(path:");
+            try std.json.Stringify.value(d[0], .{}, w);
+            try w.writeAll(",source:");
+            try std.json.Stringify.value(d[1], .{}, w);
+            if (img.user.len > 0) {
+                try w.writeAll(",owner:");
+                try std.json.Stringify.value(img.user, .{}, w);
+            }
+            try w.writeAll(") { ");
+            braces += 1;
+        }
+        for (try ev.defaultEnv()) |e| {
+            try w.writeAll(if (x.step_cache and isVolatile(e.name)) "withVolatileVariable(name:" else "withEnvVariable(name:");
+            try std.json.Stringify.value(e.name, .{}, w);
+            try w.writeAll(",value:");
+            try std.json.Stringify.value(e.value, .{}, w);
+            try w.writeAll(") { ");
+            braces += 1;
+        }
+        try w.writeAll(if (x.event_from_env) "withVolatileVariable(name:\"" ++ event_env ++ "\",value:" else "withNewFile(path:\"" ++ event_path ++ "\",contents:");
+        try std.json.Stringify.value(try ev.eventJson(), .{}, w);
+        try w.writeAll(") { ");
+        braces += 1;
+        for (secret.items, 0..) |sr, i| {
+            try w.writeAll("withSecretVariable(name:");
+            try std.json.Stringify.value(try secretAlias(arena, i), .{}, w);
+            try w.writeAll(",secret:");
+            try std.json.Stringify.value(sr.id, .{}, w);
+            try w.writeAll(") { ");
+            braces += 1;
+        }
+        try w.writeAll("withExec(args:");
+        try std.json.Stringify.value([_][]const u8{ busybox_path, "sh", "-c", script }, .{}, w);
+        try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
+        for ([_][]const u8{ "output", "env", "path", "state" }) |kind| {
+            try w.print(" fc_{s}: file(path:\"{s}\") {{ contents }}", .{ kind, try fcPath(arena, kind, fc) });
+        }
+        try w.writeAll(" ws: directory(path:\"" ++ workspace ++ "\") { id } home: directory(path:\"" ++ docker_home ++ "\") { id } }");
+        for (0..braces) |_| try w.writeAll(" }");
+
+        x.beginExec(num);
+        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch return error.EngineFailed;
+        const out = try x.collect(num, data);
+        if (jsonFind(data, "home")) |h| if (jsonFindString(h, "id")) |id| {
+            x.docker_home = id;
+        };
+        // The workspace as the action left it replaces the job's.
+        const ws_out = (if (jsonFind(data, "ws")) |d| jsonFindString(d, "id") else null) orelse {
+            x.err_msg = "Dagger returned no workspace directory";
+            return error.EngineFailed;
+        };
+        const back = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ withoutDirectory(path:\"" ++ workspace ++ "\") {{ withDirectory(path:\"" ++ workspace ++ "\",source:{f}) {{ id }} }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(ws_out, .{}) });
+        const bdata = gql(arena, x.transport, back, &x.err_msg) catch return error.EngineFailed;
+        x.container_id = jsonFindString(bdata, "id") orelse {
+            x.err_msg = "Dagger returned no container";
+            return error.EngineFailed;
+        };
+        return out;
+    }
+
+    /// The static busybox that starts Docker actions' commands (taken from its image once per job).
+    fn busyboxFile(x: *Exec, num: u32) !?[]const u8 {
+        if (x.busybox_id) |id| return id;
+        var msg: []const u8 = "";
+        const data = gql(x.arena, x.transport, "{ bb: container { from(address:\"" ++ busybox_image ++ "\") { file(path:\"/bin/busybox\") { id } } } empty: directory { id } }", &msg) catch {
+            _ = try x.actionFailed(num, "could not get busybox from {s}: {s}", .{ busybox_image, msg });
+            return null;
+        };
+        const id = (if (jsonFind(data, "bb")) |b| jsonFindString(b, "id") else null) orelse {
+            _ = try x.actionFailed(num, "could not get busybox from {s}", .{busybox_image});
+            return null;
+        };
+        x.empty_dir = (if (jsonFind(data, "empty")) |e| jsonFindString(e, "id") else null) orelse {
+            _ = try x.actionFailed(num, "Dagger returned no directory", .{});
+            return null;
+        };
+        x.busybox_id = id;
+        return id;
+    }
+
+    /// A Docker action's image, pulled or built once per job, with its entrypoint and command.
+    fn imageInfo(x: *Exec, num: u32, image: DockerRun.Image, label: []const u8) !?ImageInfo {
+        const arena = x.arena;
+        const key = switch (image) {
+            .pull => |ref| try std.fmt.allocPrint(arena, "pull {s}", .{ref}),
+            .build => |b| try std.fmt.allocPrint(arena, "build {s} {s} {s}", .{ b.dir, b.context, b.dockerfile }),
+        };
+        if (x.images.get(key)) |info| return info;
+        const fields = "{{ id entrypoint defaultArgs user }}";
+        const doc = switch (image) {
+            .pull => |ref| try std.fmt.allocPrint(arena, "{{ container {{ from(address:{f}) " ++ fields ++ " }} }}", .{std.json.fmt(ref, .{})}),
+            .build => |b| try std.fmt.allocPrint(arena, "{{ loadDirectoryFromID(id:{f}) {{ directory(path:{f}) {{ dockerBuild(dockerfile:{f}) " ++ fields ++ " }} }} }}", .{
+                std.json.fmt(b.dir, .{}), std.json.fmt(b.context, .{}), std.json.fmt(b.dockerfile, .{}),
+            }),
+        };
+        var msg: []const u8 = "";
+        const data = gql(arena, x.transport, doc, &msg) catch {
+            switch (image) {
+                .pull => |ref| _ = try x.actionFailed(num, "could not pull {s} for {s}: {s}", .{ ref, label, msg }),
+                .build => |b| _ = try x.actionFailed(num, "could not build {s} of {s}: {s}", .{ b.dockerfile, label, msg }),
+            }
+            return null;
+        };
+        const info: ImageInfo = .{
+            .id = jsonFindString(data, "id") orelse {
+                _ = try x.actionFailed(num, "could not get the image of {s}", .{label});
+                return null;
+            },
+            .entrypoint = try jsonStrings(arena, jsonFind(data, "entrypoint")),
+            .cmd = try jsonStrings(arena, jsonFind(data, "defaultArgs")),
+            .user = jsonFindString(data, "user") orelse "",
+        };
+        try x.images.put(arena, key, info);
+        return info;
     }
 
     /// Logs why one of a composite action's steps could not run, and fails the action.
@@ -2797,7 +3293,7 @@ test "a composite action runs its steps with its inputs, and its outputs reach l
     try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Run echo v=0.21.10") != null);
 }
 
-test "composite failures: Docker actions, a missing action.yml, and a failing step with failure() cleanup" {
+test "action failures: an image that cannot be pulled, a missing action.yml, and a failing step with failure() cleanup" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -2823,10 +3319,12 @@ test "composite failures: Docker actions, a missing action.yml, and a failing st
     const answers = [_][]const u8{
         base_answer,
         try treeAnswer(arena, "D1", &.{"action.yml"}),
-        try fileAnswer(arena, "runs:\n  using: docker\n  image: Dockerfile\n"),
+        try fileAnswer(arena, "runs:\n  using: docker\n  image: docker://nope:1\n"),
         try treeAnswer(arena, "D2", &.{"README.md"}),
         try treeAnswer(arena, "D3", &.{"action.yaml"}),
         try fileAnswer(arena, failing_yml),
+        "{\"data\":{\"bb\":{\"from\":{\"file\":{\"id\":\"BB\"}}},\"empty\":{\"id\":\"EMPTY\"}}}",
+        "{\"errors\":[{\"message\":\"pull access denied for nope\"}]}",
         try exec(arena, "C1", 3, ""),
         try exec(arena, "C2", 0, ""),
     };
@@ -2842,12 +3340,12 @@ test "composite failures: Docker actions, a missing action.yml, and a failing st
     try std.testing.expectEqual(Outcome.failure, res.steps[2].outcome);
     try std.testing.expectEqual(@as(i32, 3), res.steps[2].exit_code);
     const seen = fake.seen.items;
-    try std.testing.expectEqual(@as(usize, 8), seen.len); // the step after the failure is skipped
+    try std.testing.expectEqual(@as(usize, 10), seen.len); // the step after the failure is skipped
     try std.testing.expect(std.mem.indexOf(u8, seen[4], "commit(id:\"0123456789012345678901234567890123456789\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[5], "file(path:\"action.yaml\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[7], "echo cleanup") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[9], "echo cleanup") != null);
     const out = w.buffered();
-    try std.testing.expect(std.mem.indexOf(u8, out, "o/dock@v1 is a Docker action; Docker actions are not supported yet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "could not pull nope:1 for o/dock@v1: pull access denied for nope") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "o/none@v1 has no action.yml or action.yaml") != null);
 }
 
@@ -2960,6 +3458,132 @@ test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the
     try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Post actions/github-script@v9") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Run actions/github-script@v9") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "  script: return 42") != null);
+}
+
+test "Docker actions: built or pulled, the workspace copied in and back, args, env, entrypoints and post" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+
+    const action_yml =
+        \\inputs:
+        \\  who:
+        \\    default: nobody
+        \\runs:
+        \\  using: docker
+        \\  image: ./docker/Dockerfile
+        \\  args:
+        \\    - hello ${{ inputs.who }}
+        \\  env:
+        \\    GREETING: hi ${{ inputs.who }}
+        \\  post-entrypoint: /cleanup.sh
+    ;
+    const inputs = [_]job_mod.Input{.{ .name = "who", .value = .{ .lit = "world" } }};
+    var built = usesStep("dock", "o", "dock", "v1", &inputs);
+    built.action.uses.path = "sub";
+    var pulled = testStep("");
+    pulled.action = .{ .docker = .{ .image = "alpine:3.22", .inputs = &.{
+        .{ .name = "entrypoint", .value = .{ .lit = "sh" } },
+        .{ .name = "args", .value = .{ .lit = "-c \"echo $GREETING\" x" } },
+    } } };
+    pulled.env = &.{.{ .name = "GREETING", .value = .{ .lit = "from the step" } }};
+    const steps = [_]job_mod.Step{ built, pulled };
+    var job = testJob(&steps);
+    job.secrets = &.{"ghs_jobtoken"};
+    job.job_token = "ghs_jobtoken";
+
+    const ws = "{\"data\":{\"loadContainerFromID\":{\"directory\":{\"id\":\"WS0\"}}}}";
+    const back = "{\"data\":{\"loadContainerFromID\":{\"withoutDirectory\":{\"withDirectory\":{\"id\":\"CB\"}}}}}";
+    const secret = "{\"data\":{\"setSecret\":{\"id\":\"SEC\"}}}";
+    const ran = "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\",\"fc_output\":{\"contents\":\"said=hi\\n\"},\"ws\":{\"id\":\"WS1\"},\"home\":{\"id\":\"H1\"}}}}}";
+    const answers = [_][]const u8{
+        base_answer,
+        try treeAnswer(arena, "D1", &.{"action.yml"}),
+        try fileAnswer(arena, action_yml),
+        // step 1: busybox, the image built from its Dockerfile, the workspace, the token, the exec, the copy back
+        "{\"data\":{\"bb\":{\"from\":{\"file\":{\"id\":\"BB\"}}},\"empty\":{\"id\":\"EMPTY\"}}}",
+        "{\"data\":{\"loadDirectoryFromID\":{\"directory\":{\"dockerBuild\":{\"id\":\"IMG\",\"entrypoint\":[\"/entry.sh\"],\"defaultArgs\":[\"unused\"],\"user\":\"actionuser\"}}}}}",
+        ws,
+        secret,
+        ran,
+        back,
+        // step 2: a pulled image; busybox is not fetched again
+        "{\"data\":{\"container\":{\"from\":{\"id\":\"ALP\",\"entrypoint\":[],\"defaultArgs\":[\"/bin/sh\"]}}}}",
+        ws,
+        secret,
+        ran,
+        back,
+        // post of step 1: the same image (not built again), with its post-entrypoint
+        ws,
+        secret,
+        ran,
+        back,
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+
+    const seen = fake.seen.items;
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqual(@as(usize, 18), seen.len);
+    for (seen) |d| try std.testing.expect(braceBalanced(d));
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "from(address:\"busybox:1.37.0-musl\") { file(path:\"/bin/busybox\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "empty: directory { id }") != null);
+    // Built with the Dockerfile's directory as the context.
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "loadDirectoryFromID(id:\"D1\") { directory(path:\"sub/docker\") { dockerBuild(dockerfile:\"Dockerfile\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "loadContainerFromID(id:\"C0\") { directory(path:\"/github/workspace\")") != null);
+    const run1 = seen[7];
+    try std.testing.expect(std.mem.indexOf(u8, run1, "loadContainerFromID(id:\"IMG\") { withWorkdir(path:\"/github/workspace\")") != null);
+    // The image's user owns what it writes: the workspace, /github/home, file commands, the event.
+    try std.testing.expect(std.mem.indexOf(u8, run1, "withDirectory(path:\"/github/workspace\",source:\"WS0\",owner:\"actionuser\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "withDirectory(path:\"/github/home\",source:\"EMPTY\",owner:\"actionuser\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "withDirectory(path:\"/github/file_commands\",source:\"EMPTY\",owner:\"actionuser\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "withDirectory(path:\"/github/workflow\",source:\"EMPTY\",owner:\"actionuser\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "withFile(path:\"/github/_runtime/busybox\",permissions:493,source:\"BB\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "withExec(args:[\"/github/_runtime/busybox\",\"sh\",\"-c\",") != null);
+    // The image's entrypoint with the action's args, evaluated with its inputs; its env and INPUT_*.
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'/entry.sh' 'hello world'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "unused") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'GREETING=hi world'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'INPUT_WHO=world'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'HOME=/github/home'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'ACTIONS_RUNTIME_TOKEN='\\\"$ZIG_SECRET_0\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "withEnvVariable(name:\"GITHUB_WORKSPACE\",value:\"/github/workspace\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "ws: directory(path:\"/github/workspace\") { id } home: directory(path:\"/github/home\") { id }") != null);
+    // The workspace it left replaces the job's.
+    try std.testing.expect(std.mem.indexOf(u8, seen[8], "withoutDirectory(path:\"/github/workspace\") { withDirectory(path:\"/github/workspace\",source:\"WS1\")") != null);
+    // docker://: the entrypoint input, args split like a command line, the step's env; /github/home is shared.
+    try std.testing.expect(std.mem.indexOf(u8, seen[9], "from(address:\"alpine:3.22\") { id entrypoint defaultArgs user }") != null);
+    const run2 = seen[12];
+    try std.testing.expect(std.mem.indexOf(u8, run2, "loadContainerFromID(id:\"ALP\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run2, "'sh' '-c' 'echo $GREETING' 'x'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run2, "/bin/sh") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run2, "'GREETING=from the step'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run2, "withDirectory(path:\"/github/home\",source:\"H1\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run2, "owner:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run2, "loadContainerFromID(id:\"CB\")") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[10], "loadContainerFromID(id:\"CB\")") != null);
+    // The post: same image, its post-entrypoint with the args.
+    try std.testing.expect(std.mem.indexOf(u8, seen[16], "loadContainerFromID(id:\"IMG\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[16], "'/cleanup.sh' 'hello world'") != null);
+    for (seen) |d| if (std.mem.indexOf(u8, d, "setSecret") == null) try std.testing.expect(std.mem.indexOf(u8, d, "ghs_") == null);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Run o/dock/sub@v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "image: built from sub/docker/Dockerfile") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Post o/dock/sub@v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "image: alpine:3.22") != null);
+}
+
+test "splitArgs splits like a command line, with double quotes" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const got = try splitArgs(a.allocator(), "  -c \"echo hi there\"  a\\\"b 'x y' \"\"");
+    const want = [_][]const u8{ "-c", "echo hi there", "a\"b", "'x", "y'", "" };
+    try std.testing.expectEqual(want.len, got.len);
+    for (want, got) |wnt, g| try std.testing.expectEqualStrings(wnt, g);
 }
 
 test "steps get the engine (privileged nesting) unless it is turned off" {
@@ -3142,6 +3766,48 @@ test "step caching: run-specific values are volatile, steps with secrets always 
         const got = w.buffered();
         const note = std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused from Dagger's cache") orelse return error.TestUnexpectedResult;
         try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] built").? < note);
+    }
+}
+
+test "with id-token: write, every step can request OIDC tokens, and so always runs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{ testStep("one"), testStep("two") };
+    for ([_]bool{ true, false }) |granted| {
+        var job = testJob(&steps);
+        job.secrets = &.{"ghs_jobtoken"};
+        job.job_token = "ghs_jobtoken";
+        if (granted) job.runtime.id_token_url = "https://token.test/idtoken?api-version=2.0";
+        const answers = [_][]const u8{
+            base_answer,
+            "{\"data\":{\"setSecret\":{\"id\":\"SEC_ID\"}}}", // registered once for the job
+            try exec(arena, "C1", 0, ""),
+            try exec(arena, "C2", 0, ""),
+        };
+        var fake: FakeSession = .{ .answers = if (granted) &answers else &.{ answers[0], answers[2], answers[3] }, .arena = arena };
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+        try std.testing.expect(res.succeeded);
+        const seen = fake.seen.items;
+        for (seen) |d| try std.testing.expect(braceBalanced(d));
+        if (!granted) {
+            try std.testing.expectEqual(@as(usize, 3), seen.len);
+            for (seen) |d| try std.testing.expect(std.mem.indexOf(u8, d, "ACTIONS_ID_TOKEN") == null);
+            continue;
+        }
+        try std.testing.expectEqual(@as(usize, 4), seen.len);
+        try std.testing.expect(std.mem.indexOf(u8, seen[1], "setSecret") != null);
+        for ([_][]const u8{ seen[2], seen[3] }) |d| {
+            try std.testing.expect(std.mem.indexOf(u8, d, "'ACTIONS_ID_TOKEN_REQUEST_URL=https://token.test/idtoken?api-version=2.0'") != null);
+            try std.testing.expect(std.mem.indexOf(u8, d, "withSecretVariable(name:\"ZIG_SECRET_0\",secret:\"SEC_ID\")") != null);
+            try std.testing.expect(std.mem.indexOf(u8, d, "'ACTIONS_ID_TOKEN_REQUEST_TOKEN='\\\"$ZIG_SECRET_0\\\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, d, "runs this step every time: it can request OIDC tokens (id-token: write)") != null);
+            try std.testing.expect(std.mem.indexOf(u8, d, "ghs_") == null);
+        }
     }
 }
 
