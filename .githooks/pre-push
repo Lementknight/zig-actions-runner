@@ -33,7 +33,9 @@ worktree_matches() {
 }
 
 tmp=""
-cleanup() { [ -n "$tmp" ] && git worktree remove --force "$tmp" >/dev/null 2>&1 || true; }
+cleanup() {
+	if [ -n "$tmp" ]; then git worktree remove --force "$tmp" >/dev/null 2>&1 || true; fi
+}
 trap cleanup EXIT
 
 run_checks() { # <runner dir> <cache dir>
