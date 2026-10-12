@@ -20,6 +20,14 @@ const Allocator = std.mem.Allocator;
 /// SPEC §2 exit codes.
 pub const Exit = enum(u8) { done = 0, config = 1, github = 2, db = 3 };
 
+/// SIGTERM / SIGINT received so far (`main` installs the handlers). The first asks the runners to
+/// stop: waiting ones stop at once, running jobs finish first. The second exits immediately.
+pub var stop_signals: std.atomic.Value(u32) = .init(0);
+
+pub fn stopRequested() bool {
+    return stop_signals.load(.acquire) > 0;
+}
+
 pub const Context = struct {
     /// Lives for one cycle (`serve` frees it after each job).
     arena: Allocator,
@@ -52,6 +60,8 @@ pub const Cycle = union(enum) {
     job: bool,
     /// No job ran (or it could not be completed): the exit code, and whether trying again could help.
     failed: struct { exit: Exit, retry: bool = true },
+    /// A stop was requested while the runner waited for a job.
+    stopped,
 };
 
 /// Runs `n` runners in this process as concurrent tasks (`std.Io.Group`), each serving jobs one after
@@ -59,7 +69,6 @@ pub const Cycle = union(enum) {
 /// share the configuration, the log sinks and the database connection (all safe to share). Returns
 /// once every runner has stopped: the most severe exit code among them.
 pub fn pool(c: Context, n: u32) !Exit {
-    if (n <= 1) return serve(c);
     const slots = try c.arena.alloc(Slot, n);
     var group: std.Io.Group = .init;
     for (slots) |*s| {
@@ -70,7 +79,7 @@ pub fn pool(c: Context, n: u32) !Exit {
             return .config;
         };
     }
-    try say(c, "started {d} runners", .{n});
+    if (n > 1) try say(c, "started {d} runners", .{n});
     group.await(c.io) catch {};
     var worst: Exit = .done;
     for (slots) |s| if (@backingInt(s.exit) > @backingInt(worst)) {
@@ -119,16 +128,22 @@ pub fn serve(c: Context) !Exit {
         if (c.cfg.once) return switch (r) {
             .job => |ok| if (ok) .done else .github,
             .failed => |f| f.exit,
+            .stopped => .done,
         };
+        if (r == .stopped or stopRequested()) return .done;
         switch (r) {
             .job => failures = 0,
+            .stopped => unreachable,
             .failed => |f| {
                 if (!f.retry) return f.exit;
                 failures += 1;
                 const wait = backoffSecs(failures);
                 try c.err.print("trying again in {d}s ({d} failed attempt(s) in a row)\n", .{ wait, failures });
                 try c.err.flush();
-                c.io.sleep(.fromMilliseconds(@as(i64, wait) * 1000), .awake) catch {};
+                // In steps, so a stop is not kept waiting.
+                var waited: u32 = 0;
+                while (waited < wait * 5 and !stopRequested()) : (waited += 1) c.io.sleep(.fromMilliseconds(200), .awake) catch {};
+                if (stopRequested()) return .done;
             },
         }
     }
@@ -139,6 +154,33 @@ pub fn backoffSecs(failures: u32) u32 {
     if (failures == 0) return 0;
     const shift: u5 = @intCast(@min(failures - 1, 6));
     return @min(@as(u32, 5) << shift, 300);
+}
+
+const Polled = union(enum) { poll: anyerror!broker.Response, stop: void };
+
+/// One long poll for a message (it can take about 50 s), given up as soon as a stop is requested:
+/// the poll runs next to a watcher, and whichever ends first cancels the other (a blocked read is
+/// interrupted). The cycle's cleanup then deletes the session and the registration.
+fn poll(c: Context, url: []const u8, token: []const u8) !Polled {
+    var buf: [2]Polled = undefined;
+    var sel: std.Io.Select(Polled) = .init(c.io, &buf);
+    try sel.concurrent(.poll, pollOnce, .{ c.arena, c.io, url, token });
+    try sel.concurrent(.stop, waitForStop, .{c});
+    const first = sel.await() catch Polled{ .stop = {} };
+    while (sel.cancel()) |_| {}
+    return first;
+}
+
+fn pollOnce(arena: Allocator, io: std.Io, url: []const u8, token: []const u8) anyerror!broker.Response {
+    return broker.call(arena, io, .GET, url, token, null);
+}
+
+var stop_announced: std.atomic.Value(bool) = .init(false);
+
+fn waitForStop(c: Context) void {
+    while (!stopRequested()) c.io.sleep(.fromMilliseconds(200), .awake) catch return;
+    // No allocation: the poll may be using the cycle's arena at the same time.
+    if (!stop_announced.swap(true, .acq_rel)) c.log.append(0, 0, .stderr, "stopping: waiting runners stop now, running jobs finish first (a second signal exits at once)") catch {};
 }
 
 /// One registration and at most one job.
@@ -172,12 +214,16 @@ pub fn cycle(c: Context) !Cycle {
     try say(c, "'{s}' listening for jobs (labels: {s})", .{ c.name, c.cfg.labels });
 
     while (true) {
+        if (stopRequested()) return .stopped;
         const now = std.Io.Clock.real.now(c.io).toSeconds();
         if (now - token_at > token_refresh_secs) {
             token = mintToken(c, creds, &status) catch |e| return failHttp(c, "oauth token refresh", e, status);
             token_at = now;
         }
-        const m = broker.call(c.arena, c.io, .GET, try broker.messageUrl(c.arena, base, sid, "Online"), token, null) catch |e| return fail(c, "poll", e);
+        const m = switch (try poll(c, try broker.messageUrl(c.arena, base, sid, "Online"), token)) {
+            .stop => return .stopped,
+            .poll => |r| r catch |e| return fail(c, "poll", e),
+        };
         if (m.status == .accepted or (m.status.class() == .success and m.body.len == 0)) continue;
         if (m.status.class() != .success) return failBody(c, "poll", m);
 
