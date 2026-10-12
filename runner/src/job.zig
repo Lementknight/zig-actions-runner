@@ -95,6 +95,8 @@ pub const Job = struct {
     display_name: []const u8 = "",
     /// `container:` jobs are not supported in v0.
     has_container: bool,
+    /// `services:` (the message's `jobServiceContainers`), which the runner cannot run yet.
+    has_services: bool = false,
     /// Literal values that must never reach a log: the job token and every variable marked `isSecret`.
     secrets: []const []const u8,
     /// The `secrets` context: user secrets by name (they arrive as variables flagged `isSecret`),
@@ -164,6 +166,7 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .context_data = root.object.get("contextData") orelse .null,
         .display_name = path(root, &.{"jobDisplayName"}) orelse "",
         .has_container = if (root.object.get("jobContainer")) |c| c != .null else false,
+        .has_services = if (root.object.get("jobServiceContainers")) |c| c != .null else false,
         .steps = steps,
     };
 }
@@ -641,6 +644,7 @@ test "parse job fixture" {
     }
     try std.testing.expect(seen_host and seen_token);
     try std.testing.expect(!job.has_container);
+    try std.testing.expect(!job.has_services);
     try std.testing.expectEqual(@as(usize, 8), job.steps.len);
 
     const s1 = job.steps[0];
@@ -720,6 +724,19 @@ test "expressions are kept as templates: step name, env, inputs, condition, job 
     try std.testing.expectEqualStrings("w", job.env[0].value.lit);
     try std.testing.expectEqualStrings("format('{0}-job', github.ref_name)", job.env[1].value.expr);
     try std.testing.expect(job.context_data == .object);
+}
+
+test "services: arrive as jobServiceContainers" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const json =
+        \\{"plan":{"planId":"p"},"jobId":"j","resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
+        \\ "jobServiceContainers":{"type":2,"map":[{"Key":"redis","Value":{"type":2,"map":[{"Key":"image","Value":"redis:7"}]}}]},
+        \\ "steps":[]}
+    ;
+    const job = try parse(a.allocator(), json);
+    try std.testing.expect(job.has_services);
+    try std.testing.expect(!job.has_container);
 }
 
 test "malformed job" {
