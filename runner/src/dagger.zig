@@ -113,6 +113,11 @@ pub const Fetched = struct {
     /// The ref the checkout stands for (`refs/heads/main`, `refs/pull/7/merge`, a bare name from
     /// `with: ref:`), or null for a sha or a repository's default branch. See `checkoutRefCommands`.
     git_ref: ?[]const u8 = null,
+    /// What was asked for, for the step's log: the URL, the ref or commit, the depth and tags.
+    url: []const u8 = "",
+    want: []const u8 = "",
+    depth: u32 = 1,
+    tags: bool = false,
 };
 
 /// A step with its expressions evaluated, ready to become a script.
@@ -185,14 +190,19 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
             try w.writeAll(")\nrc=$?\n");
         },
         .checkout => |f| {
-            // The tree is mounted by the query (`withDirectory`); the step only reports it.
-            try w.writeAll("printf '%s\\n' ");
-            try shellQuote(w, try std.fmt.allocPrint(arena, "Syncing repository: {s}", .{f.repo}));
-            try w.writeAll("\nprintf '%s\\n' ");
-            try shellQuote(w, try std.fmt.allocPrint(arena, "Checked out {s} into {s} (the runner's built-in checkout replaces actions/checkout)", .{ f.ref_label, f.mount }));
-            try w.writeByte('\n');
+            // The tree is mounted by the query (`withDirectory`); the step reports it in the shape
+            // actions/checkout's log has (the same folds, and the commit last), with what happened.
+            for (try checkoutLog(arena, f)) |line| {
+                try w.writeAll("printf '%s\\n' ");
+                try shellQuote(w, line);
+                try w.writeByte('\n');
+            }
             if (f.git_ref) |ref| try w.writeAll(try checkoutRefCommands(arena, f.mount, ref));
-            try w.writeAll("rc=0\n");
+            try w.writeAll("printf '%s\\n' '##[endgroup]'\n");
+            // The commit, as actions/checkout ends (it runs the same git command).
+            try w.writeAll("git -C ");
+            try shellQuote(w, f.mount);
+            try w.writeAll(" log -1 --format=%H 2>/dev/null\nrc=0\n");
         },
     }
     try w.writeAll("mkdir -p " ++ fc_dir ++ " && : ");
@@ -567,6 +577,42 @@ pub fn checkoutQuery(arena: Allocator, job: job_mod.Job, co: job_mod.Checkout, a
     return .{ .doc = aw.written() };
 }
 
+/// The checkout step's log up to the commit: actions/checkout's folds ("Fetching the repository",
+/// "Checking out the ref"), filled with what the built-in checkout did instead of git commands it
+/// did not run. The script closes the last fold after setting up the refs.
+fn checkoutLog(arena: Allocator, f: Fetched) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    try out.append(arena, try std.fmt.allocPrint(arena, "Syncing repository: {s}", .{f.repo}));
+    try out.append(arena, "##[group]Fetching the repository");
+    try out.append(arena, try std.fmt.allocPrint(arena, "Fetched {s} with Dagger's git support (the runner's built-in checkout replaces actions/checkout)", .{f.url}));
+    try out.append(arena, try std.fmt.allocPrint(arena, "{s}: {s}", .{ if (isSha(f.want)) "Commit" else "Ref", f.want }));
+    if (f.depth == 0) {
+        try out.append(arena, "Depth: full history");
+    } else {
+        try out.append(arena, try std.fmt.allocPrint(arena, "Depth: {d}", .{f.depth}));
+    }
+    try out.append(arena, try std.fmt.allocPrint(arena, "Tags: {s}", .{if (f.tags) "fetched" else "not fetched"}));
+    try out.append(arena, "##[endgroup]");
+    try out.append(arena, "##[group]Checking out the ref");
+    try out.append(arena, try std.fmt.allocPrint(arena, "Into {s}", .{f.mount}));
+    const ref = f.git_ref orelse {
+        try out.append(arena, try std.fmt.allocPrint(arena, "HEAD is detached at {s}", .{f.ref_label}));
+        return out.items;
+    };
+    if (std.mem.startsWith(u8, ref, "refs/heads/")) {
+        const b = ref["refs/heads/".len..];
+        try out.append(arena, try std.fmt.allocPrint(arena, "Switched to a new branch '{s}'", .{b}));
+        try out.append(arena, try std.fmt.allocPrint(arena, "branch '{s}' set up to track 'origin/{s}'.", .{ b, b }));
+    } else if (std.mem.startsWith(u8, ref, "refs/pull/")) {
+        try out.append(arena, try std.fmt.allocPrint(arena, "HEAD is detached at refs/remotes/pull/{s}", .{ref["refs/pull/".len..]}));
+    } else if (std.mem.startsWith(u8, ref, "refs/")) {
+        try out.append(arena, try std.fmt.allocPrint(arena, "HEAD is detached at {s}", .{ref}));
+    } else {
+        try out.append(arena, try std.fmt.allocPrint(arena, "HEAD is detached at origin/{s}", .{ref}));
+    }
+    return out.items;
+}
+
 /// Shell lines that give a fetched tree the refs actions/checkout leaves: Dagger's tree has a
 /// detached HEAD and no refs at all. Without a ref at HEAD, a later `git fetch` in the job cannot tell
 /// the server what it already has and downloads the whole tree again; that is also why the dagger
@@ -641,7 +687,17 @@ fn fetchCheckout(arena: Allocator, t: Transport, job: job_mod.Job, co: job_mod.C
     const label = if (isSha(want)) want[0..7] else want;
     // The workflow's own commit is named by the ref that triggered the run, as actions/checkout does.
     const git_ref: ?[]const u8 = if (co.ref) |r| (if (isSha(r)) null else r) else if (co.repository == null and job.github.ref.len > 0) job.github.ref else null;
-    var f: Fetched = .{ .result = .{ .failed = "" }, .repo = repo, .ref_label = label, .mount = mount, .git_ref = git_ref };
+    var f: Fetched = .{
+        .result = .{ .failed = "" },
+        .repo = repo,
+        .ref_label = label,
+        .mount = mount,
+        .git_ref = git_ref,
+        .url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ std.mem.trimEnd(u8, job.github.server_url, "/"), repo }),
+        .want = want,
+        .depth = co.fetch_depth,
+        .tags = co.fetch_tags,
+    };
 
     const doc = switch (try checkoutQuery(arena, job, co, auth)) {
         .err => |msg| {
@@ -659,7 +715,7 @@ fn fetchCheckout(arena: Allocator, t: Transport, job: job_mod.Job, co: job_mod.C
         msg = "Dagger returned no tree";
     } else |_| {}
     f.result = .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}@{s}: {s}{s}", .{
-        repo, label, msg, if (looksLikeAuthFailure(msg)) " (private repositories are not supported in v0)" else "",
+        repo, label, msg, if (looksLikeAuthFailure(msg)) " (the job's GITHUB_TOKEN reads only the job's own repository; another private one cannot be checked out)" else "",
     }) };
     return f;
 }
@@ -3039,7 +3095,7 @@ const Exec = struct {
         var msg: []const u8 = "";
         const data = gql(arena, x.transport, doc.written(), &msg) catch
             return .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}: {s}{s}", .{
-                ref_label, msg, if (looksLikeAuthFailure(msg)) " (private repositories are not supported in v0)" else "",
+                ref_label, msg, if (looksLikeAuthFailure(msg)) " (the job's GITHUB_TOKEN reads only the job's own repository; a private action elsewhere cannot be fetched)" else "",
             }) };
         const dir = jsonFindString(data, "id") orelse return .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}: Dagger returned no tree", .{ref_label}) };
         var file_name: ?[]const u8 = null;
@@ -3445,6 +3501,28 @@ test "secret variables reach the script through aliases, whatever their names" {
     try std.testing.expect(std.mem.indexOf(u8, w, "env -u ZIG_SECRET_0 -u ZIG_SECRET_1 'PLAIN=p' 'INPUT_GITHUB-TOKEN='\"$ZIG_SECRET_0\" 'TOKEN='\"$ZIG_SECRET_1\" ") != null);
 }
 
+test "the checkout log names the ref as the checkout leaves it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const base: Fetched = .{ .result = .{ .dir = "D" }, .repo = "o/r", .ref_label = "abc1234", .mount = "/github/workspace", .url = "https://github.com/o/r", .want = "refs/pull/7/merge", .depth = 0 };
+    const cases = [_]struct { ref: ?[]const u8, want: []const u8 }{
+        .{ .ref = "refs/heads/main", .want = "branch 'main' set up to track 'origin/main'." },
+        .{ .ref = "refs/pull/7/merge", .want = "HEAD is detached at refs/remotes/pull/7/merge" },
+        .{ .ref = "v1", .want = "HEAD is detached at origin/v1" },
+        .{ .ref = "refs/tags/v1", .want = "HEAD is detached at refs/tags/v1" },
+        .{ .ref = null, .want = "HEAD is detached at abc1234" },
+    };
+    for (cases) |c| {
+        var f = base;
+        f.git_ref = c.ref;
+        const lines = try checkoutLog(arena, f);
+        try std.testing.expectEqualStrings(c.want, lines[lines.len - 1]);
+        try std.testing.expectEqualStrings("Depth: full history", lines[4]);
+        try std.testing.expectEqualStrings("Ref: refs/pull/7/merge", lines[3]);
+    }
+}
+
 test "checkoutQuery picks commit, ref or head and honours fetch-depth" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -3621,7 +3699,24 @@ test "run mounts a fetched checkout, and a failed fetch fails only that step" {
     _ = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
     for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withDirectory(path:\"/github/workspace\",source:\"TREE1\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "Checked out 0123456 into /github/workspace") != null);
+    // actions/checkout's folds, with what the built-in checkout did, and the commit last (from git).
+    const co_script = fake.seen.items[2];
+    for ([_][]const u8{
+        "Syncing repository: o/r",
+        "##[group]Fetching the repository",
+        "Fetched https://github.com/o/r with Dagger",
+        "Commit: 0123456789012345678901234567890123456789",
+        "Depth: 1",
+        "Tags: not fetched",
+        "##[group]Checking out the ref",
+        "Into /github/workspace",
+        "Switched to a new branch ",
+        "/github/workspace",
+        " log -1 --format=%H",
+    }) |want| if (std.mem.indexOf(u8, co_script, want) == null) {
+        std.debug.print("missing: {s}\n", .{want});
+        return error.TestUnexpectedResult;
+    };
 
     // Fetch failure (GraphQL error): that step fails with the reason; the always() step still runs.
     const answers2 = [_][]const u8{
@@ -3636,7 +3731,7 @@ test "run mounts a fetched checkout, and a failed fetch fails only that step" {
     const res2 = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake2.transport() }, testJob(&steps), &log2);
     try std.testing.expectEqual(Outcome.failure, res2.steps[0].outcome);
     try std.testing.expectEqual(Outcome.success, res2.steps[1].outcome);
-    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "could not fetch o/r@0123456: remote: Repository not found. (private repositories are not supported in v0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "could not fetch o/r@0123456: remote: Repository not found. (the job's GITHUB_TOKEN reads only the job's own repository; another private one cannot be checked out)") != null);
 }
 
 test "run reports an engine error when the session cannot start" {
