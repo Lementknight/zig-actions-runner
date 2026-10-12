@@ -1,6 +1,7 @@
 //! JIT runner registration: `generate-jitconfig` call and `encoded_jit_config` decoding (SPEC §3).
 const std = @import("std");
 const Config = @import("../config.zig").Config;
+const broker = @import("broker.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -30,21 +31,16 @@ fn runnersUrl(arena: Allocator, cfg: *const Config) Allocator.Error![]const u8 {
 }
 
 /// Removes a registered runner (cleanup for runners that never ran a job).
-pub fn deleteRunner(arena: Allocator, io: std.Io, cfg: *const Config, runner_id: u64) Error!std.http.Status {
+/// Goes through `broker.request`: GitHub answers 204 with no Content-Length, and `std.http.Client.fetch`
+/// then waits on the idle connection until GitHub closes it, which kept the runner from exiting for
+/// minutes after its job.
+pub fn deleteRunner(arena: Allocator, io: std.Io, cfg: *const Config, runner_id: u64) !std.http.Status {
     const url = try std.fmt.allocPrint(arena, "{s}/{d}", .{ try runnersUrl(arena, cfg), runner_id });
-    const auth = try std.fmt.allocPrint(arena, "Bearer {s}", .{cfg.gh_token});
-    var client: std.http.Client = .{ .allocator = arena, .io = io };
-    defer client.deinit();
-    const result = try client.fetch(.{
-        .location = .{ .url = url },
-        .method = .DELETE,
-        .headers = .{ .authorization = .{ .override = auth } },
-        .extra_headers = &.{
-            .{ .name = "Accept", .value = "application/vnd.github+json" },
-            .{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" },
-        },
+    const r = try broker.request(arena, io, .DELETE, url, null, .{
+        .token = cfg.gh_token,
+        .extra_headers = &.{.{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" }},
     });
-    return result.status;
+    return r.status;
 }
 
 /// Request a JIT config for `name`. All returned memory is allocated from `arena`.
