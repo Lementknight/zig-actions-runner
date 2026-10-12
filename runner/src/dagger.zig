@@ -122,6 +122,11 @@ pub const Resolved = union(enum) {
         /// Names of env variables whose values are Dagger secrets. The `i`th arrives in the container as
         /// `ZIG_SECRET_<i>` and the script gives it its real name (any name works, see `secretAlias`).
         secret_env: []const []const u8 = &.{},
+        /// Set for steps that must run every time (they use secrets or read run-specific values): a
+        /// line with a per-run value, so the step never matches an earlier run's cache entry.
+        always_run: ?[]const u8 = null,
+        /// Write the event payload from the volatile ZIG_RUNNER_EVENT variable to GITHUB_EVENT_PATH.
+        write_event: bool = false,
     },
     checkout: Fetched,
 };
@@ -153,6 +158,12 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
     try w.writeByte('\n');
     switch (r) {
         .run => |sc| {
+            if (sc.always_run) |why| {
+                try w.writeAll(": ");
+                try shellQuote(w, why);
+                try w.writeByte('\n');
+            }
+            if (sc.write_event) try w.writeAll("if [ -n \"${" ++ event_env ++ "+x}\" ]; then mkdir -p " ++ event_dir ++ " && printf '%s' \"$" ++ event_env ++ "\" > " ++ event_path ++ "; fi\n");
             try w.writeAll("( ");
             if (sc.working_directory) |wd| {
                 try w.writeAll("cd ");
@@ -161,6 +172,7 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
             }
             try w.writeAll("env ");
             for (sc.secret_env, 0..) |_, i| try w.print("-u {s} ", .{try secretAlias(arena, i)});
+            if (sc.write_event) try w.writeAll("-u " ++ event_env ++ " ");
             for (sc.env) |e| {
                 const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
                 try shellQuote(w, pair);
@@ -271,6 +283,9 @@ pub const Options = struct {
     /// Mount `package_cache_dirs` from persistent cache volumes, scoped to the repository. The runner
     /// turns this on (`RUNNER_PACKAGE_CACHES`, on by default).
     package_caches: bool = false,
+    /// Reuse unchanged steps' results across runs (see `volatile_env`). The runner turns this on
+    /// (`RUNNER_STEP_CACHE`, on by default).
+    step_cache: bool = false,
     /// Tests only: replaces `dagger run ...` (it must print "<port> <token>" first) and the HTTP transport.
     test_session_argv: ?[]const []const u8 = null,
     test_transport: ?Transport = null,
@@ -688,6 +703,9 @@ const Shared = struct {
     replayed: std.StringHashMapUnmanaged(u32) = .empty,
     /// Workflow-command state per step (index = step - 1, guarded by `mu`).
     commands: []StepCommands = &.{},
+    /// Steps whose recorded output was replayed (index = step - 1, guarded by `mu`). If no live line
+    /// ever arrives for one, Dagger served it from cache (see `noteReusedSteps`).
+    replayed_steps: []bool = &.{},
     /// `ACTIONS_STEP_DEBUG`: show `::debug::` lines.
     step_debug: bool = false,
 
@@ -903,6 +921,8 @@ pub fn run(
         l.* = .init(0);
         e.* = .init(false);
     }
+    const replayed_steps = try arena.alloc(bool, job.steps.len);
+    @memset(replayed_steps, false);
     const step_commands = try arena.alloc(Shared.StepCommands, job.steps.len);
     @memset(step_commands, .{});
     var sh: Shared = .{
@@ -913,6 +933,7 @@ pub fn run(
         .live_lines = live,
         .ended = ended,
         .commands = step_commands,
+        .replayed_steps = replayed_steps,
         .step_debug = stepDebug(arena, job),
     };
 
@@ -924,11 +945,14 @@ pub fn run(
         return e;
     };
     // Order matters: closing stdin ends the session child and `dagger run`, which gives the reader EOF.
+    // Only then has every live line arrived, so only then can reused steps be told apart.
     defer {
         if (child.stdin) |f| f.close(io);
         child.stdin = null;
         _ = child.wait(io) catch {};
         reader.await(io);
+        noteReusedSteps(&sh);
+        sh.flush();
     }
 
     // First line of the child's stdout: "<port> <token>".
@@ -951,6 +975,7 @@ pub fn run(
     var ev = try Evaluator.init(arena, &job);
     var secret_counter: u32 = 0;
     var err_msg: []const u8 = "";
+    const step_cache = opts.step_cache and !optsOutOfStepCache(ev.job_env.items);
     // Package managers' caches persist across jobs in Dagger cache volumes (see `package_cache_dirs`).
     const cache_ids: []const []const u8 = if (opts.package_caches and job.github.repository.len > 0) ids: {
         const scope = try packageCacheScope(arena, &ev, job.github.repository);
@@ -992,13 +1017,21 @@ pub fn run(
             try std.json.Stringify.value(id, .{}, w);
             try w.writeAll(") { ");
         }
-        // The event payload, as on GitHub (actions read it through GITHUB_EVENT_PATH).
-        try w.writeAll("withNewFile(path:\"" ++ event_path ++ "\",contents:");
-        try std.json.Stringify.value(try ev.eventJson(), .{}, w);
+        // The event payload, as on GitHub (actions read it through GITHUB_EVENT_PATH). It differs on
+        // every run, so with step caching it travels in a volatile variable that each step writes to
+        // the file; a payload too large for one variable is written into the container instead.
+        const event = try ev.eventJson();
+        if (step_cache and event.len <= max_event_env) {
+            try w.writeAll("withVolatileVariable(name:\"" ++ event_env ++ "\",value:");
+        } else {
+            try w.writeAll("withNewFile(path:\"" ++ event_path ++ "\",contents:");
+        }
+        try std.json.Stringify.value(event, .{}, w);
         try w.writeAll(") { ");
         const defaults = try ev.defaultEnv();
         for (defaults) |e| {
-            try w.writeAll("withEnvVariable(name:");
+            // Run-specific values do not take part in exec cache keys, so unchanged steps are reused.
+            try w.writeAll(if (step_cache and isVolatile(e.name)) "withVolatileVariable(name:" else "withEnvVariable(name:");
             try std.json.Stringify.value(e.name, .{}, w);
             try w.writeAll(",value:");
             try std.json.Stringify.value(e.value, .{}, w);
@@ -1027,6 +1060,10 @@ pub fn run(
         .next_fc = @intCast(job.steps.len + 1),
         .js_runtime = opts.js_runtime,
         .nesting = opts.nesting,
+        .step_cache = step_cache,
+        .event_from_env = step_cache and (try ev.eventJson()).len <= max_event_env,
+        .job_secret_env = jobEnvHasSecret(job, ev.job_env.items),
+        .run_nonce = try runNonce(arena, io, &ev),
     };
 
     for (job.steps, results, 1..) |step, *res, n| {
@@ -1167,6 +1204,14 @@ const Exec = struct {
     js_mounted: bool = false,
     /// Steps may use the job's Dagger engine (see `Options.nesting`).
     nesting: bool,
+    /// Unchanged steps may be reused across runs (see `Options.step_cache`).
+    step_cache: bool,
+    /// The event payload is in ZIG_RUNNER_EVENT; each step writes it to GITHUB_EVENT_PATH.
+    event_from_env: bool,
+    /// Workflow- or job-level env carries a secret, so every step uses secrets.
+    job_secret_env: bool,
+    /// Differs on every run (and attempt): makes steps that use secrets run every time.
+    run_nonce: []const u8,
 
     const ExecOut = struct { code: i32, outputs: []const job_mod.EnvVar };
 
@@ -1182,6 +1227,19 @@ const Exec = struct {
             const names = try arena.alloc([]const u8, secret_env.len);
             for (secret_env, names) |s, *n| n.* = s.name;
             resolved.run.secret_env = names;
+            resolved.run.write_event = x.event_from_env;
+            // A step that uses secrets (a deploy, a publish) must not be skipped because an earlier run
+            // had the same inputs, and one that reads run-specific values must not replay an earlier
+            // run's; every step after it then runs too.
+            if (x.step_cache) {
+                const reason: ?[]const u8 = if (secret_env.len > 0 or x.job_secret_env or containsSecret(x.job.*, resolved.run.script))
+                    "it uses secrets"
+                else if (readsRunSpecific(resolved.run.script))
+                    "it reads run-specific values"
+                else
+                    null;
+                if (reason) |r| resolved.run.always_run = try std.fmt.allocPrint(arena, "zig-runner runs this step every time: {s} (run {s})", .{ r, x.run_nonce });
+            }
         }
         const script = try stepScriptFc(arena, num, fc, resolved, action_name);
         var doc: std.Io.Writer.Allocating = .init(arena);
@@ -1266,7 +1324,7 @@ const Exec = struct {
         if (jsonFindString(data, "id")) |id| x.container_id = id;
 
         // A cached step prints no log lines. Wait briefly for a live stream, then replay the result.
-        awaitLiveOrReplay(x.io, x.sh, num, jsonFindString(data, "stdout") orelse "", jsonFindString(data, "stderr") orelse "");
+        _ = awaitLiveOrReplay(x.io, x.sh, num, jsonFindString(data, "stdout") orelse "", jsonFindString(data, "stderr") orelse "");
 
         // File commands: outputs for `steps.<id>.outputs`, env and PATH for the steps that follow.
         var outputs: []const job_mod.EnvVar = &.{};
@@ -1618,7 +1676,47 @@ const Exec = struct {
 };
 
 /// Where a job's event payload is written.
-const event_path = "/github/workflow/event.json";
+const event_dir = "/github/workflow";
+const event_path = event_dir ++ "/event.json";
+/// The volatile variable that carries the event payload when step caching is on.
+const event_env = "ZIG_RUNNER_EVENT";
+/// Linux limits one environment string to 128 KiB; larger payloads are written as a file instead.
+const max_event_env = 100 * 1024;
+
+/// Default variables that identify the run rather than its inputs. With step caching they are
+/// volatile: they reach every step but do not take part in exec cache keys.
+const volatile_env = [_][]const u8{ "GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "GITHUB_RUN_ATTEMPT", "GITHUB_ACTOR", "GITHUB_TRIGGERING_ACTOR" };
+
+/// Whether a script names a variable whose value differs between runs while the cache key does not
+/// (the volatile ones and the event payload). Scripts the step runs from files are not looked into.
+fn readsRunSpecific(script: []const u8) bool {
+    for (volatile_env) |v| if (std.mem.indexOf(u8, script, v) != null) return true;
+    return std.mem.indexOf(u8, script, "GITHUB_EVENT_PATH") != null;
+}
+
+fn isVolatile(name: []const u8) bool {
+    for (volatile_env) |v| if (std.mem.eql(u8, v, name)) return true;
+    return false;
+}
+
+/// `ZIG_RUNNER_STEP_CACHE: false` in the workflow's or job's env turns step caching off for the job.
+fn optsOutOfStepCache(job_env: []const job_mod.EnvVar) bool {
+    for (job_env) |e| if (std.mem.eql(u8, e.name, "ZIG_RUNNER_STEP_CACHE"))
+        return std.ascii.eqlIgnoreCase(e.value, "false") or std.mem.eql(u8, e.value, "0");
+    return false;
+}
+
+fn jobEnvHasSecret(job: job_mod.Job, job_env: []const job_mod.EnvVar) bool {
+    for (job_env) |e| if (containsSecret(job, e.value)) return true;
+    return false;
+}
+
+/// `<run_id>.<run_attempt>`, or the time when the job has no run id (`--exec-job`).
+fn runNonce(arena: Allocator, io: std.Io, ev: *const Evaluator) ![]const u8 {
+    const id = ev.githubString("run_id");
+    if (id.len > 0) return std.fmt.allocPrint(arena, "{s}.{s}", .{ id, ev.githubString("run_attempt") });
+    return std.fmt.allocPrint(arena, "t{d}", .{std.Io.Clock.real.now(io).toMilliseconds()});
+}
 
 /// JavaScript actions run with this binary, named `node` so that Bun behaves as Node. The shim on
 /// PATH answers `node --version`, which Bun named `node` does not handle, and runs the binary
@@ -1732,13 +1830,18 @@ fn fileCommand(data: std.json.Value, alias: []const u8) ?[]const u8 {
 
 /// Gives the reader a moment to deliver this step's lines; if none show up the step was served from
 /// cache, so its recorded stdout and stderr are logged instead.
-fn awaitLiveOrReplay(io: std.Io, sh: *Shared, step: u32, stdout: []const u8, stderr: []const u8) void {
+fn awaitLiveOrReplay(io: std.Io, sh: *Shared, step: u32, stdout: []const u8, stderr: []const u8) bool {
     const idx = step - 1;
     var waited: u32 = 0;
     while (waited < live_grace_ms and !sh.ended[idx].load(.acquire)) : (waited += 10) {
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    if (sh.live_lines[idx].load(.monotonic) > 0 or sh.ended[idx].load(.acquire)) return;
+    if (sh.live_lines[idx].load(.monotonic) > 0 or sh.ended[idx].load(.acquire)) return false;
+    {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        if (idx < sh.replayed_steps.len) sh.replayed_steps[idx] = true;
+    }
     for ([_][]const u8{ stdout, stderr }) |text| {
         var lines = std.mem.splitScalar(u8, text, '\n');
         while (lines.next()) |l| {
@@ -1751,6 +1854,7 @@ fn awaitLiveOrReplay(io: std.Io, sh: *Shared, step: u32, stdout: []const u8, std
         }
     }
     sh.flush();
+    return true;
 }
 
 /// Logs why a step could not run and marks it failed (the job too, unless continue-on-error).
@@ -1766,6 +1870,17 @@ fn failStep(ev: *Evaluator, sh: *Shared, observer: ?Observer, step: job_mod.Step
 fn fail(sh: *Shared, results: []StepResult, msg: []const u8) !Result {
     sh.flush();
     return .{ .steps = results, .engine_error = msg, .succeeded = false };
+}
+
+/// Says which steps Dagger served from cache. Decided once the session has ended and the log stream is
+/// fully read, not when a step's output is replayed: the live stream can lag behind a step that did
+/// run, and its lines then arrive (and are dropped as duplicates) after the replay. Only a step none
+/// of whose live lines ever arrived was reused. The note goes to that step's own log, after its output.
+fn noteReusedSteps(sh: *Shared) void {
+    for (sh.replayed_steps, 0..) |replayed, idx| {
+        if (!replayed or sh.live_lines[idx].load(.monotonic) > 0 or sh.ended[idx].load(.acquire)) continue;
+        sh.append(@intCast(idx + 1), "Reused from Dagger's cache: this step's inputs were unchanged since an earlier run, so the output above was recorded then.");
+    }
 }
 
 fn finish(arena: Allocator, sh: *Shared, results: []StepResult, engine_msg: []const u8) !Result {
@@ -2643,4 +2758,81 @@ test "package caches: one volume per tool, keyed by repository, separate for for
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.cache/zig\",cache:\"V10\")") != null);
         try std.testing.expect(braceBalanced(fake.seen.items[1]));
     }
+}
+
+test "step caching: run-specific values are volatile, steps with secrets always run, workflows can opt out" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const ctx_json =
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"sha","v":"abc"},{"k":"run_id","v":"123"},{"k":"run_attempt","v":"2"},
+        \\  {"k":"event","v":{"t":2,"d":[{"k":"ref","v":"refs/heads/x"}]}}]}}
+    ;
+    var with_secret = testStep("deploy");
+    with_secret.env = &.{.{ .name = "TOKEN", .value = .{ .lit = "s3cr3t-value" } }};
+    const steps = [_]job_mod.Step{ testStep("build"), with_secret };
+    for ([_]bool{ false, true }) |opt_out| {
+        var job = testJob(&steps);
+        job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena, ctx_json, .{});
+        job.secrets = &.{"s3cr3t-value"};
+        if (opt_out) job.env = &.{.{ .name = "ZIG_RUNNER_STEP_CACHE", .value = .{ .lit = "false" } }};
+        const answers = [_][]const u8{
+            base_answer,
+            try exec(arena, "C1", 0, "built\\n"), // no live lines in this fake session: replayed, so "reused"
+            "{\"data\":{\"setSecret\":{\"id\":\"SEC\"}}}",
+            try exec(arena, "C2", 0, ""),
+        };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+        try std.testing.expect(res.succeeded);
+        const base = fake.seen.items[0];
+        const build = fake.seen.items[1];
+        const deploy = fake.seen.items[3];
+        for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
+        // Content stays in the cache key either way.
+        try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"GITHUB_SHA\",value:\"abc\")") != null);
+        if (!opt_out) {
+            try std.testing.expect(std.mem.indexOf(u8, base, "withVolatileVariable(name:\"GITHUB_RUN_ID\",value:\"123\")") != null);
+            try std.testing.expect(std.mem.indexOf(u8, base, "withVolatileVariable(name:\"ZIG_RUNNER_EVENT\",value:") != null);
+            try std.testing.expect(std.mem.indexOf(u8, base, "withNewFile") == null);
+            // Each step writes the event file from the volatile variable and hides the variable.
+            try std.testing.expect(std.mem.indexOf(u8, build, "printf '%s' \\\"$ZIG_RUNNER_EVENT\\\" > /github/workflow/event.json") != null);
+            try std.testing.expect(std.mem.indexOf(u8, build, "-u ZIG_RUNNER_EVENT ") != null);
+            // Only the step with a secret is forced to run, with a per-run value.
+            try std.testing.expect(std.mem.indexOf(u8, build, "runs this step every time") == null);
+            try std.testing.expect(std.mem.indexOf(u8, deploy, ": 'zig-runner runs this step every time: it uses secrets (run 123.2)'") != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"GITHUB_RUN_ID\",value:\"123\")") != null);
+            try std.testing.expect(std.mem.indexOf(u8, base, "withNewFile(path:\"/github/workflow/event.json\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, base, "withVolatileVariable") == null);
+            try std.testing.expect(std.mem.indexOf(u8, deploy, "runs this step every time") == null);
+        }
+        // The note follows the replayed output, at the end of the job.
+        const got = w.buffered();
+        const note = std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused from Dagger's cache") orelse return error.TestUnexpectedResult;
+        try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] built").? < note);
+    }
+}
+
+test "a step is noted as reused only if none of its live lines ever arrived" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var live = [_]std.atomic.Value(u32){ .init(0), .init(1), .init(0) };
+    var ended = [_]std.atomic.Value(bool){ .init(false), .init(false), .init(false) };
+    var replayed = [_]bool{ true, true, false };
+    var sh: Shared = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed };
+    // Step 1 was replayed and no live line came: cached. Step 2 was replayed but its (late) live
+    // lines arrived: it ran. Step 3 streamed live.
+    noteReusedSteps(&sh);
+    const got = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused from Dagger's cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "step 2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "step 3") == null);
 }

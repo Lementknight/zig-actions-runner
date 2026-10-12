@@ -46,6 +46,9 @@ pub const Config = struct {
     dagger_nesting: bool = true,
     /// Mount persistent Dagger cache volumes at package managers' cache directories in every job.
     package_caches: bool = true,
+    /// Reuse a step's result from an earlier run when its inputs are unchanged (steps that use secrets
+    /// always run). A workflow can opt out with `ZIG_RUNNER_STEP_CACHE: false` in its env.
+    step_cache: bool = true,
     dry_run: bool = false,
     /// Connect to the configured database, report what is there, and exit (no GitHub credentials needed).
     db_check: bool = false,
@@ -73,6 +76,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_JS_RUNTIME")) |v| c.js_runtime = try jsRuntime(v);
         if (environ.get("RUNNER_DAGGER_NESTING")) |v| c.dagger_nesting = try boolean(v);
         if (environ.get("RUNNER_PACKAGE_CACHES")) |v| c.package_caches = try boolean(v);
+        if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
 
         var i: usize = 1; // args[0] is the program name
         while (i < args.len) : (i += 1) {
@@ -114,6 +118,7 @@ pub const Config = struct {
             else if (std.mem.eql(u8, key, "js-runtime")) c.js_runtime = try jsRuntime(val) //
             else if (std.mem.eql(u8, key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
             else if (std.mem.eql(u8, key, "package-caches")) c.package_caches = try boolean(val) //
+            else if (std.mem.eql(u8, key, "step-cache")) c.step_cache = try boolean(val) //
             else return error.UnknownFlag;
         }
 
@@ -233,4 +238,15 @@ test "package caches are on by default and can be turned off" {
     try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--package-caches=false" })).package_caches);
     try env.put("RUNNER_PACKAGE_CACHES", "0");
     try std.testing.expect(!(try Config.load(&env, &.{"runner"})).package_caches);
+}
+
+test "step caching is on by default and can be turned off" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).step_cache);
+    try std.testing.expect(!(try Config.load(&env, &.{ "runner", "--step-cache=false" })).step_cache);
+    try env.put("RUNNER_STEP_CACHE", "false");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).step_cache);
 }

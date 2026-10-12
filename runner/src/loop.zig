@@ -234,6 +234,7 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit
             .js_runtime = c.cfg.js_runtime,
             .nesting = c.cfg.dagger_nesting,
             .package_caches = c.cfg.package_caches,
+            .step_cache = c.cfg.step_cache,
             .observer = if (reporter) |*r| r.observer() else null,
             .sink_job_id = job.check_run_id,
         }, job, log);
