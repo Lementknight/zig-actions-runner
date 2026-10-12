@@ -289,16 +289,21 @@ fn parseUses(arena: Allocator, name: []const u8, ref_path: []const u8, ref: []co
     return .{ .uses = .{ .owner = owner, .name = repo, .path = dir, .ref = ref, .inputs = kv } };
 }
 
-/// `uses: ./dir`: the directory, relative to the workspace, must stay inside it.
-fn parseLocalUses(arena: Allocator, local: []const u8, inputs: ?Value) Error!Action {
+/// The directory of `uses: ./dir`, relative to the workspace ("" for its root); null when it would
+/// leave the workspace.
+pub fn localActionPath(local: []const u8) ?[]const u8 {
     var dir = std.mem.trim(u8, local, " ");
     while (std.mem.startsWith(u8, dir, "./")) dir = dir[2..];
     dir = std.mem.trim(u8, dir, "/");
     if (std.mem.eql(u8, dir, ".")) dir = "";
     var parts = std.mem.splitScalar(u8, dir, '/');
-    while (parts.next()) |seg| if (std.mem.eql(u8, seg, "..")) {
+    while (parts.next()) |seg| if (std.mem.eql(u8, seg, "..")) return null;
+    return dir;
+}
+
+fn parseLocalUses(arena: Allocator, local: []const u8, inputs: ?Value) Error!Action {
+    const dir = localActionPath(local) orelse
         return .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s}: a local action must be inside the workspace", .{local}) };
-    };
     var kv: []const Input = &.{};
     if (inputs) |iv| if (iv != .null) {
         kv = mappingInputs(arena, iv) catch |e| switch (e) {

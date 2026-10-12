@@ -199,6 +199,9 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
     return aw.written();
 }
 
+/// GitHub's limit on composite actions inside composite actions.
+const max_composite_depth = 9;
+
 /// The list of files `hashFiles()` hashes, written next to the exec that hashes them.
 const hash_list_path = "/tmp/zig-runner-hashfiles";
 
@@ -1332,7 +1335,7 @@ pub fn run(
                 res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
                 if (opts.observer) |o| o.started(num, res.name, res.started_ms);
                 const ran = switch (step.action) {
-                    .uses => |u| x.runAction(num, u, sc1, plain_step_env.items, secret_step_env.items),
+                    .uses => |u| x.runAction(num, u, sc1, plain_step_env.items, secret_step_env.items, false),
                     .docker => |d| x.runImageStep(num, d, sc1, plain_step_env.items, secret_step_env.items),
                     else => unreachable,
                 };
@@ -1441,6 +1444,8 @@ const Exec = struct {
     /// Docker actions: the static busybox that starts their command, their images (pulled or built
     /// once per job, by `DockerRun.Image` key), and /github/home, which they share, as on GitHub.
     busybox_id: ?[]const u8 = null,
+    /// How deep composite actions are nested right now (see `max_composite_depth`).
+    depth: u32 = 0,
     /// An empty Directory, for the directories a Docker action's container needs.
     empty_dir: []const u8 = "",
     images: std.StringHashMapUnmanaged(ImageInfo) = .empty,
@@ -1693,10 +1698,13 @@ const Exec = struct {
     /// Runs a `uses:` step: reads the action's metadata and, for a composite action, runs its steps
     /// as part of step `num`. `caller` is the scope of the `uses:` step (for `with:` and defaults);
     /// `step_env` and `step_secret` are its evaluated `env:`, which its steps inherit.
-    fn runAction(x: *Exec, num: u32, u: job_mod.Uses, caller: expr.Scope, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef) !ActionOut {
+    /// `nested`: a step of a composite action (loaded here, not with the job's own steps). Recursive
+    /// through composite actions' `uses:` steps, hence `anyerror`.
+    fn runAction(x: *Exec, num: u32, u: job_mod.Uses, caller: expr.Scope, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef, nested: bool) anyerror!ActionOut {
         const arena = x.arena;
         const ev = x.ev;
-        const act = switch (try x.loadFor(num, u)) {
+        const loaded = if (!nested) try x.loadFor(num, u) else if (u.local) try x.loadLocal(u) else try x.loadAction(u);
+        const act = switch (loaded) {
             .failed => |msg| return x.actionFailed(num, "{s}", .{msg}),
             .ok => |a| a,
         };
@@ -1711,6 +1719,11 @@ const Exec = struct {
             .node => |nd| return x.runJs(num, act, u, nd, inputs, step_env, step_secret),
             .docker => |dk| return x.runDocker(num, act, u, dk, inputs, step_env, step_secret),
         };
+
+        // GitHub allows composite actions nested 9 deep.
+        if (x.depth >= max_composite_depth) return x.actionFailed(num, "{s}: composite actions can be nested at most {d} levels deep", .{ act.ref_label, max_composite_depth });
+        x.depth += 1;
+        defer x.depth -= 1;
 
         // The action's steps see its own `inputs` and `steps`, and `github.action_path`; the job's come
         // back afterwards. GITHUB_ENV and GITHUB_PATH changes outlive the action, as on GitHub.
@@ -1774,7 +1787,32 @@ const Exec = struct {
             }
             const coe = if (st.continue_on_error) |c| std.mem.eql(u8, expr.interpolate(arena, c, sc) catch "false", "true") else false;
             const run_text = st.run orelse {
-                try x.nestedFailed(num, ctx_id, display, try std.fmt.allocPrint(arena, "uses: {s} inside a composite action is not supported yet", .{st.uses.?}), &failed, &exit_code);
+                // `uses:`: its `with:` is evaluated here, in the action's scope; it inherits the env.
+                var with: std.ArrayList(job_mod.Input) = .empty;
+                for (st.with) |kv| {
+                    const v = expr.interpolate(arena, kv.value, sc) catch {
+                        env_error = try std.fmt.allocPrint(arena, "could not evaluate input '{s}': {s}", .{ kv.name, ev.diag });
+                        break;
+                    };
+                    try with.append(arena, .{ .name = kv.name, .value = .{ .lit = v } });
+                }
+                if (env_error) |msg| {
+                    try x.nestedFailed(num, ctx_id, display, msg, &failed, &exit_code);
+                    continue;
+                }
+                var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+                var secret: std.ArrayList(SecretRef) = .empty;
+                try plain.appendSlice(arena, step_env);
+                try secret.appendSlice(arena, step_secret);
+                splitEnv(arena, x.transport, x.job.*, &x.secret_counter, nested_env.items, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
+                const out = try x.runNested(num, ctx_id, st.uses.?, with.items, sc, plain.items, secret.items);
+                const ok = !out.failed;
+                try ev.steps.append(arena, .{ .id = ctx_id, .outcome = if (ok) "success" else "failure", .conclusion = if (ok or coe) "success" else "failure", .outputs = out.outputs });
+                if (!ok and !coe) {
+                    failed = true;
+                    ev.job_failed = true;
+                    if (exit_code == 0) exit_code = if (out.exit_code != 0) out.exit_code else 1;
+                }
                 continue;
             };
             const script = expr.interpolate(arena, run_text, sc) catch {
@@ -1825,6 +1863,42 @@ const Exec = struct {
         const outputs = try arena.alloc(job_mod.EnvVar, act.meta.outputs.len);
         for (act.meta.outputs, outputs) |o, *dst| dst.* = .{ .name = o.name, .value = expr.interpolate(arena, o.value, sc_out) catch "" };
         return .{ .failed = failed, .exit_code = exit_code, .outputs = outputs };
+    }
+
+    /// A composite action's `uses:` step, run as part of step `num` like a step of the job: the built-in
+    /// checkout for actions/checkout, a `docker://` image, or a local or remote action (which may be
+    /// composite again). Nested actions' `pre` scripts do not run; their `post` scripts do, at the end.
+    fn runNested(x: *Exec, num: u32, ctx_id: []const u8, uses_text: []const u8, with: []const job_mod.Input, caller: expr.Scope, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef) anyerror!ActionOut {
+        const parsed = action.parseUses(uses_text) orelse return x.actionFailed(num, "uses: {s} is not a valid action reference", .{uses_text});
+        switch (parsed) {
+            .docker => |image| return x.runImageStep(num, .{ .image = image, .inputs = with }, caller, step_env, step_secret),
+            .local => |raw| {
+                const dir = job_mod.localActionPath(raw) orelse return x.actionFailed(num, "uses: {s}: a local action must be inside the workspace", .{raw});
+                return x.runAction(num, .{ .owner = "", .name = "", .path = dir, .ref = "", .inputs = with, .local = true }, caller, step_env, step_secret, true);
+            },
+            .repo => |r| {
+                if (std.ascii.eqlIgnoreCase(r.owner, "actions") and std.ascii.eqlIgnoreCase(r.name, "checkout") and r.path.len == 0) return x.runNestedCheckout(num, ctx_id, with);
+                return x.runAction(num, .{ .owner = r.owner, .name = r.name, .path = r.path, .ref = r.ref, .inputs = with }, caller, step_env, step_secret, true);
+            },
+        }
+    }
+
+    /// actions/checkout inside a composite action: the runner's built-in checkout, as for the job's steps.
+    fn runNestedCheckout(x: *Exec, num: u32, ctx_id: []const u8, with: []const job_mod.Input) !ActionOut {
+        const arena = x.arena;
+        const kv = try arena.alloc(job_mod.EnvVar, with.len);
+        for (with, kv) |in, *dst| dst.* = .{ .name = in.name, .value = in.value.lit };
+        const co = switch (try job_mod.checkoutFromInputs(arena, kv)) {
+            .ok => |c| c,
+            .unsupported => |why| return x.actionFailed(num, "{s}", .{why}),
+        };
+        const f = try fetchCheckout(arena, x.transport, x.job.*, co);
+        if (f.result == .failed) return x.actionFailed(num, "{s}", .{f.result.failed});
+        const m = [_]Mount{.{ .dir = .{ .path = f.mount, .id = f.result.dir } }};
+        const fc = x.next_fc;
+        x.next_fc += 1;
+        const out = try x.execScript(num, fc, .{ .checkout = f }, ctx_id, &.{}, &m);
+        return .{ .failed = out.code != 0, .exit_code = out.code, .outputs = out.outputs };
     }
 
     /// Runs a JavaScript action's `main` with the configured runtime (Bun by default, see SPEC §6).
@@ -3826,6 +3900,101 @@ test "a local action is read from the workspace when its step runs, and is not m
     try std.testing.expectEqual(Outcome.success, res.steps[1].outcome);
     try std.testing.expectEqual(Outcome.failure, res.steps[2].outcome);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Can't find 'action.yml' or 'action.yaml' under '/github/workspace/nope'. Did you forget to run actions/checkout") != null);
+}
+
+test "a composite action's uses: steps: nested actions, the built-in checkout, outputs, and the nesting limit" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const outer_yml =
+        \\inputs:
+        \\  who:
+        \\    default: nobody
+        \\outputs:
+        \\  greeting:
+        \\    value: ${{ steps.inner.outputs.greeting }}
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - id: inner
+        \\      uses: o/inner@v1
+        \\      with:
+        \\        name: ${{ inputs.who }}
+        \\    - uses: actions/checkout@v4
+        \\      with:
+        \\        path: sub
+        \\    - shell: bash
+        \\      run: echo "inner said ${{ steps.inner.outputs.greeting }}"
+    ;
+    const inner_yml =
+        \\inputs:
+        \\  name:
+        \\    required: true
+        \\outputs:
+        \\  greeting:
+        \\    value: ${{ steps.g.outputs.text }}
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - id: g
+        \\      shell: bash
+        \\      run: echo "text=hello ${{ inputs.name }}" >> "$GITHUB_OUTPUT"
+    ;
+    const inputs = [_]job_mod.Input{.{ .name = "who", .value = .{ .lit = "zig" } }};
+    var after = testStep("");
+    after.action.script.script = .{ .expr = "format('echo {0}', steps.outer.outputs.greeting)" };
+    const steps = [_]job_mod.Step{ usesStep("outer", "o", "outer", "v1", &inputs), after };
+    const answers = [_][]const u8{
+        base_answer,
+        try treeAnswer(arena, "D1", &.{"action.yml"}),
+        try fileAnswer(arena, outer_yml),
+        // the nested action, loaded when its step runs
+        try treeAnswer(arena, "D2", &.{"action.yml"}),
+        try fileAnswer(arena, inner_yml),
+        "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\",\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\",\"fc_output\":{\"contents\":\"text=hello zig\\n\"}}}}}",
+        // the checkout
+        "{\"data\":{\"git\":{\"commit\":{\"tree\":{\"id\":\"TREE1\"}}}}}",
+        try exec(arena, "C2", 0, ""),
+        try exec(arena, "C3", 0, ""),
+        try exec(arena, "C4", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 10), seen.len);
+    for (seen) |d| try std.testing.expect(braceBalanced(d));
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "git(url:\"https://github.com/o/inner.git\")") != null);
+    // The nested action gets the outer action's input, and its own directory.
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "withDirectory(path:\"/github/_actions/o/inner/v1\",source:\"D2\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "echo \\\"text=hello zig\\\"") != null);
+    // actions/checkout is the built-in checkout, at its path.
+    try std.testing.expect(std.mem.indexOf(u8, seen[7], "withDirectory(path:\"/github/workspace/sub\",source:\"TREE1\")") != null);
+    // Its outputs reach the outer action's steps and outputs, and the job's next step.
+    try std.testing.expect(std.mem.indexOf(u8, seen[8], "inner said hello zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[9], "echo hello zig") != null);
+
+    // An action that uses itself stops at GitHub's limit of 9 levels.
+    const loop_yml = "runs:\n  using: composite\n  steps:\n    - uses: o/loop@v1\n";
+    var loop_answers: std.ArrayList([]const u8) = .empty;
+    try loop_answers.append(arena, base_answer);
+    for (0..10) |_| {
+        try loop_answers.append(arena, try treeAnswer(arena, "DL", &.{"action.yml"}));
+        try loop_answers.append(arena, try fileAnswer(arena, loop_yml));
+    }
+    const loop_steps = [_]job_mod.Step{usesStep("loop", "o", "loop", "v1", &.{})};
+    var fake2: FakeSession = .{ .answers = loop_answers.items, .arena = arena };
+    var buf2: [8192]u8 = undefined;
+    var w2: std.Io.Writer = .fixed(&buf2);
+    var log2: sink.LogSink = .{ .stdout = .{ .writer = &w2 } };
+    const res2 = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake2.transport() }, testJob(&loop_steps), &log2);
+    try std.testing.expect(!res2.succeeded);
+    try std.testing.expectEqual(@as(usize, 21), fake2.seen.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "o/loop@v1: composite actions can be nested at most 9 levels deep") != null);
 }
 
 test "splitArgs splits like a command line, with double quotes" {
