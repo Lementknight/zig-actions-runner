@@ -345,6 +345,8 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Cycl
             .dagger_cmd = c.cfg.dagger_cmd,
             .image = c.cfg.image,
             .js_runtime = c.cfg.js_runtime,
+            .engine = c.cfg.engineEndpoint(),
+            .gpa = c.gpa,
             .nesting = c.cfg.dagger_nesting,
             .package_caches = c.cfg.package_caches,
             .step_cache = c.cfg.step_cache,

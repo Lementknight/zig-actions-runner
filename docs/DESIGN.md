@@ -103,5 +103,5 @@ The point of a lightweight runner is running many of them on one machine. The ta
 
 1. One runner keeps going: re-registers after each job, per-job arena (`--once` keeps the old behaviour).
 2. `--runners N`: N concurrent slots in one process, sharing config, log sinks and the database. Done: three concurrent jobs cost the runner process ~47 MB at peak (Debug), the three `dagger run` children ~195 MB, which is what step 3 removes.
-3. One shared Dagger session for the process: job-scoped step markers and secret names, session restart on failure.
+3. ~~One shared Dagger session for the process.~~ Found unsafe: within one session, concurrent queries whose containers differ only in volatile variables are merged and one value wins, which would leak run-specific values (run id, event payload) between jobs. Instead, the runner speaks Dagger's client protocol itself (`src/engine.zig`, SPEC §6 "Engine client"): one session per job as before, but no `dagger run` child (about 65 MB of Go per job). Its connections still run `buildctl dial-stdio` in the engine container (about 11 MB each, three per job); a direct engine socket would remove those.
 4. Graceful shutdown (SIGTERM: stop polling, finish running jobs, delete idle registrations) and measured cost per idle slot and per running job, in release builds.

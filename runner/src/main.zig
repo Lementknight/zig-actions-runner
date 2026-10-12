@@ -24,6 +24,8 @@ comptime {
     _ = @import("github/results.zig");
     _ = @import("job.zig");
     _ = @import("dagger.zig");
+    _ = @import("engine.zig");
+    _ = @import("hpack.zig");
     _ = @import("loop.zig");
     _ = @import("timefmt.zig");
     _ = @import("expr.zig");
@@ -145,6 +147,8 @@ fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log
         .dagger_cmd = cfg.dagger_cmd,
         .image = cfg.image,
         .js_runtime = cfg.js_runtime,
+        .engine = cfg.engineEndpoint(),
+        .gpa = init.gpa,
         .nesting = cfg.dagger_nesting,
         .package_caches = cfg.package_caches,
         .step_cache = cfg.step_cache,
