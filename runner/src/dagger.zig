@@ -383,6 +383,8 @@ pub const Options = struct {
     provision: bool = true,
     /// Key under which output lines are written to the sink.
     sink_job_id: u64 = 0,
+    /// The name the runner registered under (`runner.name`, RUNNER_NAME).
+    runner_name: []const u8 = "zig-runner",
     /// What runs JavaScript actions.
     js_runtime: config.JsRuntime = .bun,
     /// Steps may use the job's Dagger engine (`dagger call` inside a step): `experimentalPrivilegedNesting`.
@@ -608,6 +610,8 @@ const Evaluator = struct {
     diag: []const u8 = "",
     /// Reads the job's files for `hashFiles()`, once the job's container exists.
     hash_files: ?expr.HashFiles = null,
+    /// `runner.name` and RUNNER_NAME: the name the runner registered under.
+    runner_name: []const u8 = "zig-runner",
 
     fn init(arena: Allocator, job: *const job_mod.Job) !Evaluator {
         var ev: Evaluator = .{
@@ -669,7 +673,7 @@ const Evaluator = struct {
         const runner_fields = try arena.alloc(expr.Value.Entry, 5);
         runner_fields[0] = .{ .key = "os", .value = .{ .string = "Linux" } };
         runner_fields[1] = .{ .key = "arch", .value = .{ .string = "X64" } };
-        runner_fields[2] = .{ .key = "name", .value = .{ .string = "zig-runner" } };
+        runner_fields[2] = .{ .key = "name", .value = .{ .string = ev.runner_name } };
         runner_fields[3] = .{ .key = "temp", .value = .{ .string = "/tmp" } };
         runner_fields[4] = .{ .key = "tool_cache", .value = .{ .string = "/opt/hostedtoolcache" } };
 
@@ -745,7 +749,7 @@ const Evaluator = struct {
             .{ .name = "GITHUB_WORKSPACE", .value = workspace },
             .{ .name = "RUNNER_OS", .value = "Linux" },
             .{ .name = "RUNNER_ARCH", .value = "X64" },
-            .{ .name = "RUNNER_NAME", .value = "zig-runner" },
+            .{ .name = "RUNNER_NAME", .value = ev.runner_name },
             .{ .name = "RUNNER_TEMP", .value = "/tmp" },
             .{ .name = "RUNNER_TOOL_CACHE", .value = "/opt/hostedtoolcache" },
             .{ .name = "GITHUB_EVENT_PATH", .value = event_path },
@@ -1147,6 +1151,7 @@ pub fn run(
     const transport: Transport = opts.test_transport orelse .{ .ptr = &http, .sendFn = HttpTransport.send };
 
     var ev = try Evaluator.init(arena, &job);
+    ev.runner_name = opts.runner_name;
     var secret_counter: u32 = 0;
     var err_msg: []const u8 = "";
     const step_cache = opts.step_cache and !optsOutOfStepCache(ev.job_env.items);
@@ -3995,6 +4000,24 @@ test "a composite action's uses: steps: nested actions, the built-in checkout, o
     try std.testing.expect(!res2.succeeded);
     try std.testing.expectEqual(@as(usize, 21), fake2.seen.items.len);
     try std.testing.expect(std.mem.indexOf(u8, w2.buffered(), "o/loop@v1: composite actions can be nested at most 9 levels deep") != null);
+}
+
+test "steps see the name the runner registered under" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var st = testStep("");
+    st.action.script.script = .{ .expr = "format('echo {0}', runner.name)" };
+    const steps = [_]job_mod.Step{st};
+    const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    _ = try run(arena, std.testing.io, &env, .{ .runner_name = "zig-1a2b3c4d", .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "withEnvVariable(name:\"RUNNER_NAME\",value:\"zig-1a2b3c4d\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "echo zig-1a2b3c4d") != null);
 }
 
 test "splitArgs splits like a command line, with double quotes" {

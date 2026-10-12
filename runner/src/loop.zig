@@ -1,5 +1,6 @@
 //! The runner's main flow (DESIGN §6): register a JIT runner, open a broker session, wait for one
-//! job, acquire it, execute it through Dagger, report the result, and exit (ephemeral).
+//! job, acquire it, execute it through Dagger, report the result, and start over with a new
+//! registration (`serve`), or exit after one job with `--once`.
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const jitconfig = @import("github/jitconfig.zig");
@@ -20,7 +21,10 @@ const Allocator = std.mem.Allocator;
 pub const Exit = enum(u8) { done = 0, config = 1, github = 2, db = 3 };
 
 pub const Context = struct {
+    /// Lives for one cycle (`serve` frees it after each job).
     arena: Allocator,
+    /// Backs each cycle's arena.
+    gpa: Allocator,
     io: std.Io,
     environ: *const std.process.Environ.Map,
     cfg: *const Config,
@@ -28,6 +32,7 @@ pub const Context = struct {
     err: *std.Io.Writer,
     /// Config secrets; the job's own secrets are appended once it is acquired.
     secrets: []const []const u8,
+    /// The runner's registration name; `serve` gives each cycle a new one.
     name: []const u8,
     /// Where run state is written (SPEC §5.2); null when the runner has no database.
     store: ?*db.Store = null,
@@ -41,13 +46,69 @@ fn say(c: Context, comptime fmt: []const u8, args: anytype) !void {
 /// Poll responses are 202 when idle. A fresh token is minted before the old one can expire.
 const token_refresh_secs = 10 * 60;
 
-pub fn run(c: Context) !Exit {
+/// What one cycle did.
+pub const Cycle = union(enum) {
+    /// A job ran and GitHub was told; whether it succeeded.
+    job: bool,
+    /// No job ran (or it could not be completed): the exit code, and whether trying again could help.
+    failed: struct { exit: Exit, retry: bool = true },
+};
+
+/// Runs jobs one after another: each cycle registers a fresh JIT runner (GitHub gives a JIT runner a
+/// single job), waits for a job, runs it, and frees everything the cycle allocated before the next.
+/// A cycle that fails before running a job is retried with a growing delay (`backoffSecs`), unless
+/// GitHub rejected the registration itself (bad token or scope), which retrying cannot fix.
+/// With `--once`, returns after the first cycle: 0 if its job succeeded.
+pub fn serve(c: Context) !Exit {
+    var failures: u32 = 0;
+    while (true) {
+        var cycle_arena: std.heap.ArenaAllocator = .init(c.gpa);
+        defer cycle_arena.deinit();
+        var cc = c;
+        cc.arena = cycle_arena.allocator();
+        var suffix: [4]u8 = undefined;
+        c.io.random(&suffix);
+        cc.name = try std.fmt.allocPrint(cc.arena, "{s}-{x}", .{ c.cfg.name_prefix, suffix });
+
+        const r = try cycle(cc);
+        if (c.cfg.once) return switch (r) {
+            .job => |ok| if (ok) .done else .github,
+            .failed => |f| f.exit,
+        };
+        switch (r) {
+            .job => failures = 0,
+            .failed => |f| {
+                if (!f.retry) return f.exit;
+                failures += 1;
+                const wait = backoffSecs(failures);
+                try c.err.print("trying again in {d}s ({d} failed attempt(s) in a row)\n", .{ wait, failures });
+                try c.err.flush();
+                c.io.sleep(.fromMilliseconds(@as(i64, wait) * 1000), .awake) catch {};
+            },
+        }
+    }
+}
+
+/// Seconds to wait after `failures` failed cycles in a row: 5, 10, 20, ... up to 5 minutes.
+pub fn backoffSecs(failures: u32) u32 {
+    if (failures == 0) return 0;
+    const shift: u5 = @intCast(@min(failures - 1, 6));
+    return @min(@as(u32, 5) << shift, 300);
+}
+
+/// One registration and at most one job.
+pub fn cycle(c: Context) !Cycle {
     var status: std.http.Status = .ok;
     const jit = jitconfig.generate(c.arena, c.io, c.cfg, c.name, &status) catch |e| {
         try c.err.writeAll("github error: ");
         try redact.write(c.err, @errorName(e), c.secrets);
         try c.err.print(" (HTTP {d})\n", .{@backingInt(status)});
-        return .github;
+        // Rejected credentials or scope will be rejected again; anything else may be transient.
+        const fatal = switch (@backingInt(status)) {
+            401, 403, 404, 422 => true,
+            else => false,
+        };
+        return .{ .failed = .{ .exit = .github, .retry = !fatal } };
     };
     // Best effort: GitHub removes ephemeral runners itself once their job completes.
     defer _ = jitconfig.deleteRunner(c.arena, c.io, c.cfg, jit.runner_id) catch {};
@@ -198,7 +259,7 @@ fn stepConclusion(res: dagger.StepResult) []const u8 {
     };
 }
 
-fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit {
+fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Cycle {
     const jr = runservice.parseJobRequest(c.arena, inner_body) catch |e| return fail(c, "job request", e);
     const acq = runservice.acquire(c.arena, c.io, jr, runner_token) catch |e| return fail(c, "acquirejob", e);
     if (acq.status.class() != .success) return failBody(c, "acquirejob", acq);
@@ -244,6 +305,7 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit
             .step_cache = c.cfg.step_cache,
             .observer = if (reporter) |*r| r.observer() else null,
             .sink_job_id = job.check_run_id,
+            .runner_name = c.name,
         }, job, log);
         if (result.engine_error) |msg| {
             try log.append(job.check_run_id, 0, .stderr, "dagger failed before running the steps:");
@@ -267,7 +329,7 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit
         if (done.status.class() != .success) return failBody(c, "completejob", done);
     }
     try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job {s}", .{@tagName(conclusion)}));
-    return if (result.succeeded) .done else .github;
+    return .{ .job = result.succeeded };
 }
 
 /// Uploads each step's log, then the whole job's, so GitHub's UI can show them. Failures are reported
@@ -335,22 +397,32 @@ fn jsonString(arena: Allocator, body: []const u8, key: []const u8) ?[]const u8 {
     return if (s == .string) s.string else null;
 }
 
-fn fail(c: Context, what: []const u8, e: anyerror) !Exit {
+const github_failure: Cycle = .{ .failed = .{ .exit = .github } };
+
+fn fail(c: Context, what: []const u8, e: anyerror) !Cycle {
     try c.err.print("error during {s}: ", .{what});
     try redact.write(c.err, @errorName(e), c.secrets);
     try c.err.writeByte('\n');
-    return .github;
+    return github_failure;
 }
 
-fn failHttp(c: Context, what: []const u8, e: anyerror, status: std.http.Status) !Exit {
+fn failHttp(c: Context, what: []const u8, e: anyerror, status: std.http.Status) !Cycle {
     try c.err.print("error during {s}: {s} (HTTP {d})\n", .{ what, @errorName(e), @backingInt(status) });
-    return .github;
+    return github_failure;
 }
 
-fn failBody(c: Context, what: []const u8, r: broker.Response) !Exit {
+fn failBody(c: Context, what: []const u8, r: broker.Response) !Cycle {
     // Error bodies are short JSON documents without credentials.
     try c.err.print("error during {s}: HTTP {d}: {s}\n", .{ what, @backingInt(r.status), r.body[0..@min(r.body.len, 400)] });
-    return .github;
+    return github_failure;
+}
+
+test "backoffSecs doubles from 5s up to 5 minutes" {
+    try std.testing.expectEqual(@as(u32, 5), backoffSecs(1));
+    try std.testing.expectEqual(@as(u32, 10), backoffSecs(2));
+    try std.testing.expectEqual(@as(u32, 160), backoffSecs(6));
+    try std.testing.expectEqual(@as(u32, 300), backoffSecs(7));
+    try std.testing.expectEqual(@as(u32, 300), backoffSecs(1000));
 }
 
 test "stepResultsJson maps outcomes and continue-on-error" {

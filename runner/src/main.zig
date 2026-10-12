@@ -114,8 +114,9 @@ pub fn main(init: std.process.Init) !u8 {
         return code;
     }
 
-    return @backingInt(try loop.run(.{
+    return @backingInt(try loop.serve(.{
         .arena = arena,
+        .gpa = init.gpa,
         .io = io,
         .environ = init.environ_map,
         .cfg = &cfg,

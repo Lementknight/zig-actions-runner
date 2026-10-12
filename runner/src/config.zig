@@ -50,6 +50,9 @@ pub const Config = struct {
     /// always run). A workflow can opt out with `ZIG_RUNNER_STEP_CACHE: false` in its env.
     step_cache: bool = true,
     dry_run: bool = false,
+    /// Stop after one job (or one failed attempt), as an ephemeral runner process. Off by default:
+    /// the runner registers again after each job.
+    once: bool = false,
     /// Connect to the configured database, report what is there, and exit (no GitHub credentials needed).
     db_check: bool = false,
     /// Dev: run a saved acquirejob response through the executor without contacting GitHub.
@@ -77,6 +80,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_DAGGER_NESTING")) |v| c.dagger_nesting = try boolean(v);
         if (environ.get("RUNNER_PACKAGE_CACHES")) |v| c.package_caches = try boolean(v);
         if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
+        if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
 
         var i: usize = 1; // args[0] is the program name
         while (i < args.len) : (i += 1) {
@@ -91,6 +95,10 @@ pub const Config = struct {
             }
             if (std.mem.eql(u8, arg, "--inspect")) {
                 c.inspect = true;
+                continue;
+            }
+            if (std.mem.eql(u8, arg, "--once")) {
+                c.once = true;
                 continue;
             }
             if (!std.mem.startsWith(u8, arg, "--")) return error.UnknownFlag;

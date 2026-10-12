@@ -32,8 +32,10 @@ pub const StdoutSink = struct {
 
 pub const CollectedLine = struct { step: u32, ts_ms: i64, text: []const u8 };
 
-/// Forwards every line to `inner` and keeps a redacted, timestamped copy so the job's logs can be
-/// uploaded to GitHub once it finishes. Memory is capped; lines past the cap are counted, not kept.
+/// Redacts every line with the job's secrets, forwards it to `inner` and keeps a timestamped copy so
+/// the job's logs can be uploaded to GitHub once it finishes. Memory is capped; lines past the cap are
+/// forwarded and counted, not kept. Redacting here, not in `inner`, keeps the job's secrets (which live
+/// as long as the job) out of the runner's shared sinks.
 pub const CollectSink = struct {
     arena: std.mem.Allocator,
     io: std.Io,
@@ -46,14 +48,14 @@ pub const CollectSink = struct {
     pub const max_bytes: usize = 64 * 1024 * 1024;
 
     pub fn append(s: *CollectSink, job_id: u64, step_number: u32, stream: Stream, line: []const u8) Error!void {
-        try s.inner.append(job_id, step_number, stream, line);
-        if (s.bytes + line.len > max_bytes) {
-            s.dropped += 1;
-            return;
-        }
         var aw: std.Io.Writer.Allocating = .init(s.arena);
         try redact.write(&aw.writer, line, s.secrets);
         const text = aw.written();
+        try s.inner.append(job_id, step_number, stream, text);
+        if (s.bytes + text.len > max_bytes) {
+            s.dropped += 1;
+            return;
+        }
         s.bytes += text.len;
         try s.lines.append(s.arena, .{ .step = step_number, .ts_ms = std.Io.Clock.real.now(s.io).toMilliseconds(), .text = text });
     }
@@ -90,10 +92,7 @@ pub const LogSink = union(enum) {
     /// Replaces the redaction list (e.g. with a job's secrets once it is known).
     pub fn setSecrets(s: *LogSink, secrets: []const []const u8) void {
         switch (s.*) {
-            .collect => |*c| {
-                c.secrets = secrets;
-                c.inner.setSecrets(secrets);
-            },
+            .collect => |*c| c.secrets = secrets,
             .postgres => |*p| {
                 p.secrets = secrets;
                 p.inner.setSecrets(secrets);
@@ -133,6 +132,8 @@ test "collect sink forwards, redacts and timestamps" {
     var sink: LogSink = .{ .collect = .{ .arena = a.allocator(), .io = std.testing.io, .inner = &inner } };
     sink.setSecrets(&.{"s3cret"});
     try sink.append(1, 2, .stdout, "token=s3cret ok");
+    // The job's secrets stay with the job's sink; the shared sink gets redacted text.
+    try std.testing.expectEqual(@as(usize, 0), inner.currentSecrets().len);
     try std.testing.expectEqualStrings("[job 1 step 2 stdout] token=*** ok\n", w.buffered());
     const c = sink.collect;
     try std.testing.expectEqual(@as(usize, 1), c.lines.items.len);

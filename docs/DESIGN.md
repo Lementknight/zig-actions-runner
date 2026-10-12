@@ -49,7 +49,7 @@ GitHub ⇄ runner (Zig) ──► Dagger engine (executes steps in containers)
 4. **Tiger Data is the primary log store.** Logs are append-only and time-ordered, which suits hypertables, compression and retention policies.
 5. **Runners write directly to the DB in batches.** No intermediate queue. Each runner buffers lines and flushes by size or interval.
 6. **Live logs via polling first.** `GET /jobs/:id/logs?after=<seq>` every ~1s. Upgrade to SSE or LISTEN/NOTIFY only if needed.
-7. **Ephemeral (JIT) runners.** One job per registration; the process re-registers for the next job. This simplifies state and cleanup.
+7. **Ephemeral (JIT) runners, long-lived process.** One job per registration; the process re-registers for the next job. This simplifies state and cleanup. The goal is many runners per machine as cheap concurrent tasks in one process, like goroutines, each one a job (see §10).
 
 ## 6. Job lifecycle
 
@@ -58,7 +58,7 @@ GitHub ⇄ runner (Zig) ──► Dagger engine (executes steps in containers)
 3. Runner exchanges an RSA-signed JWT for an OAuth token, creates a broker session, and long-polls for a message.
 4. On a job message: insert `runs`/`jobs`/`steps` rows (status `queued` → `in_progress`).
 5. Build the Dagger pipeline; execute step by step; batch log lines into `job_logs`.
-6. On finish: update step/job conclusion, report completion to GitHub, delete the session, exit (ephemeral).
+6. On finish: update step/job conclusion, report completion to GitHub, delete the session, and start again at step 2 with a new JIT registration and fresh per-job memory (or exit, with `--once`).
 
 ## 7. Risks
 
@@ -96,3 +96,12 @@ M0, M5 and M6 do not need GitHub access and can start immediately, in parallel w
   `runner/src/vendor/tls_client.zig` is std's client with one change that answers it (SPEC §6).
 - Dagger integration: `dagger` CLI vs. GraphQL API from Zig.
 - Where do operator secrets (GitHub token, DB URL) live?
+
+## 10. Many runners per process
+
+The point of a lightweight runner is running many of them on one machine. The target model is Go's goroutines, with a workflow job as the unit: one process runs N runner slots as concurrent tasks (`std.Io`), each looping register → wait → run → report, with per-job memory freed after each job and one shared Dagger session instead of a `dagger run` child per job (measured at about 60 MB each, ten times the runner itself). Steps:
+
+1. One runner keeps going: re-registers after each job, per-job arena (`--once` keeps the old behaviour).
+2. `--runners N`: N concurrent slots in one process, sharing config, log sinks and the database.
+3. One shared Dagger session for the process: job-scoped step markers and secret names, session restart on failure.
+4. Graceful shutdown (SIGTERM: stop polling, finish running jobs, delete idle registrations) and measured cost per idle slot and per running job, in release builds.
