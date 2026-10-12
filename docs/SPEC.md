@@ -35,7 +35,7 @@ Environment variables (flags override):
 | `RUNNER_NAME_PREFIX` | no | Name becomes `<prefix>-<hostname>-<n>` |
 | `DATABASE_URL` | no | `postgres://user:password@host:port/database?sslmode=require` (Tiger Data; user and password percent-encoded). `sslmode` is `require` (TLS verified against the system CAs and the host name, the default), `no-verify` (TLS without verification) or `disable` (plain TCP, local containers). Instead of a URL the standard `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` and `PGSSLMODE` variables work. If neither is set, logs go to stdout only (`StdoutSink`, §5.1) |
 | `DAGGER_CMD` | no | Path to the `dagger` CLI, default `dagger` |
-| `RUNNER_IMAGE` | no | Base image for jobs, default `ubuntu:24.04` (flag `--image`). The default gets `git`, `curl`, `xz-utils` and CA certificates installed; a custom image is used as is |
+| `RUNNER_IMAGE` | no | Base image for jobs, default `ubuntu:24.04` (flag `--image`). The default gets `git`, `curl`, `xz-utils`, `jq` and CA certificates installed; a custom image is used as is |
 | `LOG_FLUSH_LINES` | no | Default `200` |
 | `LOG_FLUSH_MS` | no | Default `500` |
 
@@ -261,7 +261,7 @@ Runners response (a bare array, ordered by `name`):
 
 ## 6. Dagger execution
 
-- One Dagger pipeline per job; base image defaults to `ubuntu:24.04` unless the job specifies `container:` (not supported yet) or `RUNNER_IMAGE` is set. The default image has `git`, `curl`, `xz-utils` and `ca-certificates` installed by one `apt-get` exec at the start of the job's container (cached by Dagger: about 13 s the first time, nothing after); a custom `RUNNER_IMAGE` is used as is, so it must bring its own tools.
+- One Dagger pipeline per job; base image defaults to `ubuntu:24.04` unless the job specifies `container:` (not supported yet) or `RUNNER_IMAGE` is set. The default image has `git`, `curl`, `xz-utils`, `jq` (composite actions often assume it, as GitHub's hosted images have it) and `ca-certificates` installed by one `apt-get` exec at the start of the job's container (cached by Dagger: about 13 s the first time, nothing after); a custom `RUNNER_IMAGE` is used as is, so it must bring its own tools.
 - Workspace: the checked-out repo mounted at `/github/workspace`.
 - `run:` steps become `withExec(["sh","-e","-c", script])`, honoring `working-directory`, `env` and `shell: bash|sh`.
 - Step stdout/stderr lines go to `LogSink` as they arrive, in order.
@@ -300,18 +300,27 @@ Executor design (verified live against Dagger v0.21.10, offline with `runner --e
 - Cached steps print no log lines. After each query the runner waits up to 60 ms for the step's `end` marker; if none arrived and no live line was seen, the step's `stdout` then `stderr` are replayed. Replayed lines are remembered so a late live copy is dropped instead of logged twice.
 - `run:` uses `bash --noprofile --norc -e -o pipefail -c` by default and `sh -e -c` for `shell: sh`. Step `env` is applied with `env K=V`, and `working-directory` with `cd`. Filesystem state carries across steps because each step starts from the previous step's container.
 - Measured: a 8-step job takes about 2.8 s the first time and 1.5 s when every step is cached (the single-query design was 2.2 s and 0.7 s; the difference is the per-step round trip and the 60 ms cache wait).
-- Limitations: live stdout and stderr are merged (a replayed step has them separate); `seq` across steps reflects arrival order; `container:` jobs and `uses:` actions other than checkout are unsupported.
+- Limitations: live stdout and stderr are merged (a replayed step has them separate); `seq` across steps reflects arrival order; `container:` jobs, and JavaScript, Docker and local `uses:` actions, are unsupported.
 
 `uses: actions/checkout` is replaced by a built-in checkout (verified live):
 - The step arrives as `reference: {type:"repository", name:"actions/checkout", ref:"v4", repositoryType:"GitHub"}`; `inputs` is absent when the workflow has no `with:`. The pinned version is ignored.
 - The runner resolves each checkout in the same session just before its step: `git(url:"<server_url>/<repo>.git", keepGitDir:true) { commit(id:<sha>) | ref(name:<ref>) | head { tree(depth:<n>) { id } } }`, which returns a Directory id. The step's query then mounts it with `withDirectory(path, source: id)` before the step's exec. The tree is content-addressed, so the same commit gives the same workspace and later steps keep hitting Dagger's cache. The workspace contains a real `.git`.
 - Defaults: `repository` = the workflow's repo, `ref` = the triggering sha (`github.sha`; another repository defaults to its HEAD), `fetch-depth` = 1 (0 = full history). `ref` may be a sha, a branch, a tag or `refs/...` (for example `refs/pull/N/merge`); `path` must be relative and stay inside the workspace.
-- Accepted and ignored: `persist-credentials`, `token`, `clean`, `show-progress`, `set-safe-directory`, `fetch-tags`, `filter`, `sparse-checkout-cone-mode`, `ssh-strict`, `ssh-user`. Accepted only when off: `submodules`, `lfs`, `sparse-checkout`, `ssh-key`, `ssh-known-hosts`. Any other input, or `submodules: recursive` and the like, fails the step with "unsupported ...". Other `uses:` actions fail with "uses: <name>@<ref> is not supported".
+- Accepted and ignored: `persist-credentials`, `token`, `clean`, `show-progress`, `set-safe-directory`, `fetch-tags`, `filter`, `sparse-checkout-cone-mode`, `ssh-strict`, `ssh-user`. Accepted only when off: `submodules`, `lfs`, `sparse-checkout`, `ssh-key`, `ssh-known-hosts`. Any other input, or `submodules: recursive` and the like, fails the step with "unsupported ...".
 - Scope: public repositories only. Private-repository access is not part of the MVP: a fetch that needs credentials fails that step with git's own message plus "(private repositories are not supported in v0)", and the rest of the job continues. Dagger prints URLs in its progress output and its Secret ids do not survive across `dagger query` sessions, so a future implementation must not put a token in a URL or rely on a secret created by an earlier query. `GIT_TERMINAL_PROMPT=0` is set so a fetch can never block on a prompt.
 - Differences from the real action: no credentials are left in `.git/config`; a failed fetch fails only that step, with the reason in its log; the default base image gets `git` (see §6 Dagger execution), so `git log` and friends work in the checked-out workspace.
 - A skipped checkout (`if:` false) still mounts the tree; only `success()`/`always()`/`failure()`/`cancelled()` are evaluated, as for other steps.
 
-Supported v0 subset: `run`, `env`, `working-directory`, `shell` (bash/sh), `name`, `continue-on-error`, `if:`, `${{ }}` expressions (see above) and `uses: actions/checkout`. Anything else fails the step with a clear "unsupported" message in the log. Expressions are described below.
+Other `uses:` actions are read from their `action.yml` (verified live with `dagger/dagger-for-github@v8.4.1` on Lementknight/blog):
+- The step arrives as `reference: {type:"repository", name:"owner/repo", ref, repositoryType:"GitHub"}`, plus `path` for an action in a subdirectory (`owner/repo/dir@ref`); `inputs` holds the `with:` values as template tokens. A local action (`uses: ./dir`, `repositoryType: "self"`) is unsupported for now.
+- When the step runs, the runner fetches the action's repository with Dagger's git support (`git(url) { ref(name) | commit(id) { tree(depth:1) { id entries(path) } } }`, cached by the engine), reads `action.yml` (or `action.yaml`) with a second query, and parses it with `src/yaml.zig`, a YAML subset parser (see its header; it was checked against 31 real `action.yml` files and Ruby's Psych). Invalid metadata, or a missing file, fails the step with the reason.
+- Composite actions (`runs.using: composite`) run as part of their `uses:` step: one GitHub step, one log, each of the action's steps a separate exec in the job's container. The repository is mounted at `/github/_actions/<owner>/<repo>/<ref>` before the first of them; `github.action_path` and `GITHUB_ACTION_PATH` point at the action's directory, with `GITHUB_ACTION_REPOSITORY` and `GITHUB_ACTION_REF`.
+- `${{ }}` in `action.yml` values is evaluated by the runner (the job message only pre-processes the workflow's own expressions). Inputs are the step's `with:` values, else the declared defaults (which may be expressions such as `${{ github.token }}`), both evaluated in the `uses:` step's scope. Undeclared inputs are passed on with GitHub's warning, "Unexpected input(s) ..., valid inputs are [...]".
+- The action's steps see its own `inputs` and `steps` contexts and a fresh `success()`/`failure()` state; the `uses:` step's `env` is inherited and each step's `env` added to it. `GITHUB_ENV` and `GITHUB_PATH` changes outlive the action, as on GitHub. A run step must name its `shell` (bash or sh). After the steps, the action's `outputs` are evaluated against its `steps` and become `steps.<id>.outputs` of the `uses:` step.
+- The log shows each step as GitHub does: `##[group]Run <first line of the evaluated script>`, the script, `##[endgroup]`, then its output.
+- Not yet: JavaScript actions (`node*`, planned on Bun) and Docker actions fail with "<action> is a JavaScript action (node24); JavaScript actions are not supported yet" or the Docker equivalent, and so does a `uses:` step inside a composite action.
+
+Supported v0 subset: `run`, `env`, `working-directory`, `shell` (bash/sh), `name`, `continue-on-error`, `if:`, `${{ }}` expressions (see above), `uses: actions/checkout` and composite `uses:` actions. Anything else fails the step with a clear "unsupported" message in the log. Expressions are described below.
 
 ## 7. Resource targets (to measure, not assumed)
 

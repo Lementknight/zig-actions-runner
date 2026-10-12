@@ -26,6 +26,7 @@ const broker = @import("github/broker.zig");
 const expr = @import("expr.zig");
 const context = @import("context.zig");
 const commands = @import("commands.zig");
+const action = @import("action.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -34,8 +35,9 @@ pub const workspace = "/github/workspace";
 pub const marker = "::zig-step::";
 
 /// Makes `ubuntu:24.04` usable for typical steps: git (checked-out workspaces are real repositories), xz (to unpack toolchains),
-/// curl and CA certificates. Dagger caches this exec, so only the first run pays for it.
-pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends git ca-certificates curl xz-utils >/dev/null && rm -rf /var/lib/apt/lists/*";
+/// curl, CA certificates and jq (which composite actions often assume, as on GitHub's hosted images). Dagger caches this
+/// exec, so only the first run pays for it.
+pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends git ca-certificates curl xz-utils jq >/dev/null && rm -rf /var/lib/apt/lists/*";
 
 pub const Marker = union(enum) {
     begin: u32,
@@ -133,10 +135,16 @@ fn fcPath(arena: Allocator, kind: []const u8, n: u32) ![]const u8 {
 /// query can always read them even if the step deleted them. A `run:` step sees them as
 /// `$GITHUB_OUTPUT`, `$GITHUB_ENV`, `$GITHUB_PATH` and `$GITHUB_STEP_SUMMARY`.
 pub fn stepScript(arena: Allocator, n: u32, r: Resolved, action_name: []const u8) ![]const u8 {
+    return stepScriptFc(arena, n, n, r, action_name);
+}
+
+/// As `stepScript`, with file commands numbered `fc` instead of `n`. The steps of a composite action
+/// all log as their `uses:` step (`n`), but each needs its own file commands.
+fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []const u8) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.print("echo '{s}begin {d}'\nmkdir -p " ++ fc_dir ++ " && : ", .{ marker, n });
-    for (fc_kinds) |k| try w.print("> {s} ", .{try fcPath(arena, k, n)});
+    for (fc_kinds) |k| try w.print("> {s} ", .{try fcPath(arena, k, fc)});
     try w.writeByte('\n');
     switch (r) {
         .run => |sc| {
@@ -155,7 +163,7 @@ pub fn stepScript(arena: Allocator, n: u32, r: Resolved, action_name: []const u8
             // Set after the step's own env, so a step cannot point these somewhere else.
             const names = [_][]const u8{ "GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY" };
             for (names, fc_kinds) |name, kind| {
-                try shellQuote(w, try std.fmt.allocPrint(arena, "{s}={s}", .{ name, try fcPath(arena, kind, n) }));
+                try shellQuote(w, try std.fmt.allocPrint(arena, "{s}={s}", .{ name, try fcPath(arena, kind, fc) }));
                 try w.writeByte(' ');
             }
             try shellQuote(w, try std.fmt.allocPrint(arena, "GITHUB_ACTION={s}", .{action_name}));
@@ -178,7 +186,7 @@ pub fn stepScript(arena: Allocator, n: u32, r: Resolved, action_name: []const u8
         },
     }
     try w.writeAll("mkdir -p " ++ fc_dir ++ " && : ");
-    for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, n)});
+    for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, fc)});
     try w.print("\necho '{s}end {d}'\nexit $rc\n", .{ marker, n });
     return aw.written();
 }
@@ -811,7 +819,7 @@ pub fn run(
     var ev = try Evaluator.init(arena, &job);
     var secret_counter: u32 = 0;
     var err_msg: []const u8 = "";
-    var container_id: []const u8 = blk: {
+    const container_id: []const u8 = blk: {
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
         try w.writeAll("{ container { from(address:");
@@ -841,6 +849,18 @@ pub fn run(
         for (0..defaults.len + job_env_nodes + 4 + @as(usize, if (provision) 1 else 0)) |_| try w.writeAll(" }");
         const data = gql(arena, transport, doc.written(), &err_msg) catch return fail(&sh, results, err_msg);
         break :blk jsonFindString(data, "id") orelse return fail(&sh, results, "Dagger returned no container");
+    };
+
+    var x: Exec = .{
+        .arena = arena,
+        .io = io,
+        .transport = transport,
+        .sh = &sh,
+        .ev = &ev,
+        .job = &job,
+        .container_id = container_id,
+        .secret_counter = secret_counter,
+        .next_fc = @intCast(job.steps.len + 1),
     };
 
     for (job.steps, results, 1..) |step, *res, n| {
@@ -874,13 +894,14 @@ pub fn run(
         // Env that carries a secret goes in as a Dagger secret, the rest in the script.
         var plain_step_env: std.ArrayList(job_mod.EnvVar) = .empty;
         var secret_step_env: std.ArrayList(SecretRef) = .empty;
-        splitEnv(arena, transport, job, &secret_counter, step_env, &plain_step_env, &secret_step_env, &err_msg) catch {
-            try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "Dagger could not register a secret: {s}", .{err_msg}), coe);
+        splitEnv(arena, transport, job, &x.secret_counter, step_env, &plain_step_env, &secret_step_env, &x.err_msg) catch {
+            try failStep(&ev, &sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "Dagger could not register a secret: {s}", .{x.err_msg}), coe);
             continue;
         };
 
         var resolved: Resolved = undefined;
-        var fetched: ?Fetched = null;
+        var mount_buf: [1]Mount = undefined;
+        var mounts: []const Mount = &.{};
         switch (step.action) {
             .unsupported => |why| {
                 try failStep(&ev, &sh, opts.observer, step, res, num, why, coe);
@@ -916,16 +937,74 @@ pub fn run(
                     try failStep(&ev, &sh, opts.observer, step, res, num, f.result.failed, coe);
                     continue;
                 }
-                fetched = f;
                 resolved = .{ .checkout = f };
+                mount_buf[0] = .{ .path = f.mount, .dir = f.result.dir };
+                mounts = &mount_buf;
+            },
+            .uses => |u| {
+                res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
+                if (opts.observer) |o| o.started(num, res.name, res.started_ms);
+                const out = x.runAction(num, u, sc1, plain_step_env.items, secret_step_env.items) catch |e| switch (e) {
+                    error.EngineFailed => return engineFailed(&x, opts.observer, res, num, coe, results),
+                    else => return e,
+                };
+                res.completed_ms = std.Io.Clock.real.now(io).toMilliseconds();
+                res.outcome = if (out.failed) .failure else .success;
+                res.exit_code = out.exit_code;
+                try ev.record(step, res.outcome, coe, out.outputs);
+                if (res.outcome == .failure and !coe) ev.job_failed = true;
+                if (opts.observer) |o| o.finished(num, res.*);
+                continue;
             },
         }
 
-        const script = try stepScript(arena, num, resolved, if (step.context_name.len > 0) step.context_name else step.id);
+        res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
+        if (opts.observer) |o| o.started(num, res.name, res.started_ms);
+        const out = x.execScript(num, num, resolved, if (step.context_name.len > 0) step.context_name else step.id, secret_step_env.items, mounts) catch |e| switch (e) {
+            error.EngineFailed => return engineFailed(&x, opts.observer, res, num, coe, results),
+            else => return e,
+        };
+        res.completed_ms = std.Io.Clock.real.now(io).toMilliseconds();
+        res.exit_code = out.code;
+        res.outcome = if (out.code == 0) .success else .failure;
+        try ev.record(step, res.outcome, coe, out.outputs);
+        if (res.outcome == .failure and !coe) ev.job_failed = true;
+        if (opts.observer) |o| o.finished(num, res.*);
+    }
+    return finish(arena, &sh, results, "");
+}
+
+/// A directory mounted into the container for one exec.
+const Mount = struct { path: []const u8, dir: []const u8 };
+
+/// What running steps needs, shared by the job's own steps and the steps of composite actions.
+const Exec = struct {
+    arena: Allocator,
+    io: std.Io,
+    transport: Transport,
+    sh: *Shared,
+    ev: *Evaluator,
+    job: *const job_mod.Job,
+    /// The container after the last exec; each exec starts from it.
+    container_id: []const u8,
+    /// What Dagger said when a query failed.
+    err_msg: []const u8 = "",
+    secret_counter: u32,
+    /// File-command ids for the steps of composite actions, after the job's own step numbers.
+    next_fc: u32,
+
+    const ExecOut = struct { code: i32, outputs: []const job_mod.EnvVar };
+
+    /// Runs one script in the job's container, logging as step `num`, and applies its file
+    /// commands. `error.EngineFailed` (with `err_msg`) when Dagger itself failed.
+    fn execScript(x: *Exec, num: u32, fc: u32, resolved: Resolved, action_name: []const u8, secret_env: []const SecretRef, mounts: []const Mount) !ExecOut {
+        const arena = x.arena;
+        const ev = x.ev;
+        const script = try stepScriptFc(arena, num, fc, resolved, action_name);
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
         try w.writeAll("{ loadContainerFromID(id:");
-        try std.json.Stringify.value(container_id, .{}, w);
+        try std.json.Stringify.value(x.container_id, .{}, w);
         try w.writeAll(") { ");
         var braces: usize = 2; // query + loadContainerFromID
         // Variables and PATH entries the previous steps asked for through $GITHUB_ENV / $GITHUB_PATH.
@@ -946,12 +1025,12 @@ pub fn run(
         }
         ev.pending_env.clearRetainingCapacity();
         ev.pending_path.clearRetainingCapacity();
-        braces += try writeEnvNodes(w, &.{}, secret_step_env.items);
-        if (fetched) |f| {
+        braces += try writeEnvNodes(w, &.{}, secret_env);
+        for (mounts) |m| {
             try w.writeAll("withDirectory(path:");
-            try std.json.Stringify.value(f.mount, .{}, w);
+            try std.json.Stringify.value(m.path, .{}, w);
             try w.writeAll(",source:");
-            try std.json.Stringify.value(f.result.dir, .{}, w);
+            try std.json.Stringify.value(m.dir, .{}, w);
             try w.writeAll(") { ");
             braces += 1;
         }
@@ -959,27 +1038,17 @@ pub fn run(
         try std.json.Stringify.value([_][]const u8{ "sh", "-c", script }, .{}, w);
         try w.writeAll(",expect:ANY) { id exitCode stdout stderr");
         for ([_][]const u8{ "output", "env", "path" }) |kind| {
-            try w.print(" fc_{s}: file(path:\"{s}\") {{ contents }}", .{ kind, try fcPath(arena, kind, num) });
+            try w.print(" fc_{s}: file(path:\"{s}\") {{ contents }}", .{ kind, try fcPath(arena, kind, fc) });
         }
         try w.writeAll(" }");
         for (0..braces) |_| try w.writeAll(" }");
 
-        res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
-        if (opts.observer) |o| o.started(num, res.name, res.started_ms);
-        const data = gql(arena, transport, doc.written(), &err_msg) catch {
-            res.* = .{ .name = res.name, .continued = coe, .outcome = .failure, .exit_code = 1, .started_ms = res.started_ms, .completed_ms = std.Io.Clock.real.now(io).toMilliseconds() };
-            sh.append(num, try std.fmt.allocPrint(arena, "Dagger error: {s}", .{err_msg}));
-            if (opts.observer) |o| o.finished(num, res.*);
-            return finish(arena, &sh, results, err_msg);
-        };
-        res.completed_ms = std.Io.Clock.real.now(io).toMilliseconds();
-        const code: i32 = if (jsonFind(data, "exitCode")) |c| (if (c == .integer) @intCast(c.integer) else 1) else 1;
-        res.exit_code = code;
-        res.outcome = if (code == 0) .success else .failure;
-        if (jsonFindString(data, "id")) |id| container_id = id;
+        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch return error.EngineFailed;
+        var code: i32 = if (jsonFind(data, "exitCode")) |c| (if (c == .integer) @intCast(c.integer) else 1) else 1;
+        if (jsonFindString(data, "id")) |id| x.container_id = id;
 
         // A cached step prints no log lines. Wait briefly for a live stream, then replay the result.
-        awaitLiveOrReplay(io, &sh, num, jsonFindString(data, "stdout") orelse "", jsonFindString(data, "stderr") orelse "");
+        awaitLiveOrReplay(x.io, x.sh, num, jsonFindString(data, "stdout") orelse "", jsonFindString(data, "stderr") orelse "");
 
         // File commands: outputs for `steps.<id>.outputs`, env and PATH for the steps that follow.
         var outputs: []const job_mod.EnvVar = &.{};
@@ -991,7 +1060,7 @@ pub fn run(
         if (fileCommand(data, "fc_env")) |text| switch (try commands.parseKeyValues(arena, text)) {
             .ok => |kv| for (kv) |e| {
                 if (commands.isProtectedEnvName(e.name)) {
-                    sh.append(num, try std.fmt.allocPrint(arena, "Warning: ignored GITHUB_ENV entry '{s}' (reserved name)", .{e.name}));
+                    x.sh.append(num, try std.fmt.allocPrint(arena, "Warning: ignored GITHUB_ENV entry '{s}' (reserved name)", .{e.name}));
                     continue;
                 }
                 try Evaluator.putEnv(arena, &ev.job_env, e.name, e.value);
@@ -1001,17 +1070,291 @@ pub fn run(
         };
         if (fileCommand(data, "fc_path")) |text| for (try commands.parsePaths(arena, text)) |dir| try ev.pending_path.append(arena, dir);
         if (cmd_error) |msg| {
-            sh.append(num, msg);
-            if (res.outcome == .success) {
-                res.outcome = .failure;
-                res.exit_code = 1;
+            x.sh.append(num, msg);
+            if (code == 0) code = 1;
+        }
+        return .{ .code = code, .outputs = outputs };
+    }
+
+    const ActionOut = struct { failed: bool, exit_code: i32 = 0, outputs: []const job_mod.EnvVar = &.{} };
+
+    fn actionFailed(x: *Exec, num: u32, comptime fmt: []const u8, args: anytype) !ActionOut {
+        x.sh.append(num, try std.fmt.allocPrint(x.arena, fmt, args));
+        return .{ .failed = true, .exit_code = 1 };
+    }
+
+    /// Runs a `uses:` step: reads the action's metadata and, for a composite action, runs its steps
+    /// as part of step `num`. `caller` is the scope of the `uses:` step (for `with:` and defaults);
+    /// `step_env` and `step_secret` are its evaluated `env:`, which its steps inherit.
+    fn runAction(x: *Exec, num: u32, u: job_mod.Uses, caller: expr.Scope, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef) !ActionOut {
+        const arena = x.arena;
+        const ev = x.ev;
+        const act = switch (try x.loadAction(u)) {
+            .failed => |msg| return x.actionFailed(num, "{s}", .{msg}),
+            .ok => |a| a,
+        };
+        const steps = switch (act.meta.runs) {
+            .composite => |st| st,
+            .node => |nd| return x.actionFailed(num, "{s} is a JavaScript action ({s}); JavaScript actions are not supported yet", .{ act.ref_label, nd.using }),
+            .docker => return x.actionFailed(num, "{s} is a Docker action; Docker actions are not supported yet", .{act.ref_label}),
+        };
+
+        // Inputs: the step's `with:` values, else the defaults, evaluated where the `uses:` step is.
+        var inputs: std.ArrayList(expr.Value.Entry) = .empty;
+        for (act.meta.inputs) |def| {
+            var val: []const u8 = "";
+            if (findInput(u.inputs, def.name)) |t| {
+                ev.diag = "";
+                val = ev.render(t, caller) catch return x.actionFailed(num, "could not evaluate input '{s}': {s}", .{ def.name, ev.diag });
+            } else if (def.default) |d| {
+                ev.diag = "";
+                val = expr.interpolate(arena, d, caller) catch return x.actionFailed(num, "could not evaluate the default of input '{s}': {s}", .{ def.name, ev.diag });
+            }
+            try inputs.append(arena, .{ .key = def.name, .value = .{ .string = val } });
+        }
+        // Like GitHub: warn about inputs the action does not declare, and pass them on anyway.
+        var unexpected: std.ArrayList([]const u8) = .empty;
+        for (u.inputs) |in| if (act.meta.input(in.name) == null) {
+            try unexpected.append(arena, in.name);
+            const val = ev.render(in.value, caller) catch "";
+            try inputs.append(arena, .{ .key = in.name, .value = .{ .string = val } });
+        };
+        if (unexpected.items.len > 0) {
+            var valid: std.ArrayList([]const u8) = .empty;
+            for (act.meta.inputs) |def| try valid.append(arena, def.name);
+            x.sh.append(num, try std.fmt.allocPrint(arena, "Warning: Unexpected input(s) '{s}', valid inputs are ['{s}']", .{
+                try std.mem.join(arena, "', '", unexpected.items), try std.mem.join(arena, "', '", valid.items),
+            }));
+        }
+
+        // The action's steps see its own `inputs` and `steps`, and `github.action_path`; the job's come
+        // back afterwards. GITHUB_ENV and GITHUB_PATH changes outlive the action, as on GitHub.
+        const saved_steps = ev.steps;
+        const saved_inputs = ev.inputs;
+        const saved_github = ev.github;
+        const saved_failed = ev.job_failed;
+        defer {
+            ev.steps = saved_steps;
+            ev.inputs = saved_inputs;
+            ev.github = saved_github;
+            ev.job_failed = saved_failed;
+        }
+        const repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name });
+        ev.steps = .empty;
+        ev.inputs = .{ .object = inputs.items };
+        ev.github = try withEntries(arena, ev.github, &.{
+            .{ .key = "action_path", .value = .{ .string = act.path } },
+            .{ .key = "action_repository", .value = .{ .string = repository } },
+            .{ .key = "action_ref", .value = .{ .string = u.ref } },
+        });
+        ev.job_failed = false;
+        const action_env = [_]job_mod.EnvVar{
+            .{ .name = "GITHUB_ACTION_PATH", .value = act.path },
+            .{ .name = "GITHUB_ACTION_REPOSITORY", .value = repository },
+            .{ .name = "GITHUB_ACTION_REF", .value = u.ref },
+        };
+
+        var failed = false;
+        var exit_code: i32 = 0;
+        var mounted = false;
+        for (steps, 1..) |st, i| {
+            const ctx_id = st.id orelse try std.fmt.allocPrint(arena, "__{d}", .{i});
+            ev.diag = "";
+            // The step's env is evaluated with the `uses:` step's env visible, then added to it.
+            const sc_env = try ev.scope(step_env);
+            var nested_env: std.ArrayList(job_mod.EnvVar) = .empty;
+            var env_error: ?[]const u8 = null;
+            for (st.env) |e| {
+                const v = expr.interpolate(arena, e.value, sc_env) catch {
+                    env_error = try std.fmt.allocPrint(arena, "could not evaluate env '{s}': {s}", .{ e.name, ev.diag });
+                    break;
+                };
+                try nested_env.append(arena, .{ .name = e.name, .value = v });
+            }
+            const all_env = try std.mem.concat(arena, job_mod.EnvVar, &.{ step_env, nested_env.items });
+            const sc = try ev.scope(all_env);
+            var display = if (st.name) |nm| (expr.interpolate(arena, nm, sc) catch nm) else if (st.run) |r| firstLine(r) else st.uses orelse "";
+            if (env_error) |msg| {
+                try x.nestedFailed(num, ctx_id, display, msg, &failed, &exit_code);
+                continue;
+            }
+
+            const cond = st.condition orelse "success()";
+            const go = expr.evalCondition(arena, cond, sc) catch {
+                try x.nestedFailed(num, ctx_id, display, try std.fmt.allocPrint(arena, "could not evaluate the condition '{s}': {s}", .{ cond, ev.diag }), &failed, &exit_code);
+                continue;
+            };
+            if (!go) {
+                try ev.steps.append(arena, .{ .id = ctx_id, .outcome = "skipped", .conclusion = "skipped", .outputs = &.{} });
+                continue;
+            }
+            const coe = if (st.continue_on_error) |c| std.mem.eql(u8, expr.interpolate(arena, c, sc) catch "false", "true") else false;
+            const run_text = st.run orelse {
+                try x.nestedFailed(num, ctx_id, display, try std.fmt.allocPrint(arena, "uses: {s} inside a composite action is not supported yet", .{st.uses.?}), &failed, &exit_code);
+                continue;
+            };
+            const script = expr.interpolate(arena, run_text, sc) catch {
+                try x.nestedFailed(num, ctx_id, display, try std.fmt.allocPrint(arena, "could not evaluate the script: {s}", .{ev.diag}), &failed, &exit_code);
+                continue;
+            };
+            // Without a name, the step is shown by its command as it will run.
+            if (st.name == null) display = firstLine(script);
+            const shell = expr.interpolate(arena, st.shell.?, sc) catch st.shell.?;
+            if (!job_mod.validShell(shell)) {
+                try x.nestedFailed(num, ctx_id, display, try std.fmt.allocPrint(arena, "unsupported shell '{s}' (v0 supports bash and sh)", .{shell}), &failed, &exit_code);
+                continue;
+            }
+            const wd: ?[]const u8 = if (st.working_directory) |d| (expr.interpolate(arena, d, sc) catch d) else null;
+
+            // Env that carries a secret goes in as a Dagger secret, the rest in the script.
+            var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+            var secret: std.ArrayList(SecretRef) = .empty;
+            try plain.appendSlice(arena, step_env);
+            try secret.appendSlice(arena, step_secret);
+            splitEnv(arena, x.transport, x.job.*, &x.secret_counter, nested_env.items, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
+            try plain.appendSlice(arena, &action_env);
+
+            // As the official runner does: the command, folded away, then its output.
+            x.sh.append(num, try std.fmt.allocPrint(arena, "##[group]Run {s}", .{display}));
+            var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, script, "\n"), '\n');
+            while (lines.next()) |l| x.sh.append(num, l);
+            x.sh.append(num, "##[endgroup]");
+
+            // The action's files are mounted once; its steps may change them, as on GitHub.
+            const m = [_]Mount{.{ .path = act.mount, .dir = act.dir }};
+            const fc = x.next_fc;
+            x.next_fc += 1;
+            // All the action's scripts log as step `num`: after the first, count each one's lines afresh,
+            // so a cached one is still replayed.
+            if (mounted) {
+                x.sh.live_lines[num - 1].store(0, .monotonic);
+                x.sh.ended[num - 1].store(false, .release);
+            }
+            const out = try x.execScript(num, fc, .{ .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = plain.items } }, ctx_id, secret.items, if (mounted) &.{} else &m);
+            mounted = true;
+            const ok = out.code == 0;
+            try ev.steps.append(arena, .{ .id = ctx_id, .outcome = if (ok) "success" else "failure", .conclusion = if (ok or coe) "success" else "failure", .outputs = out.outputs });
+            if (!ok and !coe) {
+                failed = true;
+                ev.job_failed = true;
+                if (exit_code == 0) exit_code = out.code;
             }
         }
-        try ev.record(step, res.outcome, coe, outputs);
-        if (res.outcome == .failure and !coe) ev.job_failed = true;
-        if (opts.observer) |o| o.finished(num, res.*);
+
+        // The action's outputs, evaluated against its own steps.
+        const sc_out = try ev.scope(step_env);
+        const outputs = try arena.alloc(job_mod.EnvVar, act.meta.outputs.len);
+        for (act.meta.outputs, outputs) |o, *dst| dst.* = .{ .name = o.name, .value = expr.interpolate(arena, o.value, sc_out) catch "" };
+        return .{ .failed = failed, .exit_code = exit_code, .outputs = outputs };
     }
-    return finish(arena, &sh, results, "");
+
+    /// Logs why one of a composite action's steps could not run, and fails the action.
+    fn nestedFailed(x: *Exec, num: u32, ctx_id: []const u8, display: []const u8, msg: []const u8, failed: *bool, exit_code: *i32) !void {
+        x.sh.append(num, try std.fmt.allocPrint(x.arena, "##[error]{s}: {s}", .{ display, msg }));
+        try x.ev.steps.append(x.arena, .{ .id = ctx_id, .outcome = "failure", .conclusion = "failure", .outputs = &.{} });
+        failed.* = true;
+        x.ev.job_failed = true;
+        if (exit_code.* == 0) exit_code.* = 1;
+    }
+
+    const Loaded = struct {
+        meta: action.Metadata,
+        /// Dagger Directory id of the action's repository.
+        dir: []const u8,
+        /// Where the repository is mounted, and the action's own directory inside it.
+        mount: []const u8,
+        path: []const u8,
+        /// `owner/repo[/path]@ref`, for messages.
+        ref_label: []const u8,
+    };
+
+    /// Fetches the action's repository (Dagger's git support, cached by the engine) and reads its
+    /// `action.yml` or `action.yaml`.
+    fn loadAction(x: *Exec, u: job_mod.Uses) !union(enum) { ok: Loaded, failed: []const u8 } {
+        const arena = x.arena;
+        const sub = if (u.path.len > 0) try std.fmt.allocPrint(arena, "/{s}", .{u.path}) else "";
+        const ref_label = try std.fmt.allocPrint(arena, "{s}/{s}{s}@{s}", .{ u.owner, u.name, sub, u.ref });
+        const url = try std.fmt.allocPrint(arena, "{s}/{s}/{s}.git", .{ std.mem.trimEnd(u8, x.job.github.server_url, "/"), u.owner, u.name });
+
+        var doc: std.Io.Writer.Allocating = .init(arena);
+        const w = &doc.writer;
+        try w.writeAll("{ git(url:");
+        try std.json.Stringify.value(url, .{}, w);
+        try w.writeAll(") { ");
+        try w.writeAll(if (isSha(u.ref)) "commit(id:" else "ref(name:");
+        try std.json.Stringify.value(u.ref, .{}, w);
+        try w.writeAll(") { tree(depth:1) { id entries(path:");
+        try std.json.Stringify.value(if (u.path.len > 0) u.path else ".", .{}, w);
+        try w.writeAll(") } } } }");
+        var msg: []const u8 = "";
+        const data = gql(arena, x.transport, doc.written(), &msg) catch
+            return .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}: {s}{s}", .{
+                ref_label, msg, if (looksLikeAuthFailure(msg)) " (private repositories are not supported in v0)" else "",
+            }) };
+        const dir = jsonFindString(data, "id") orelse return .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}: Dagger returned no tree", .{ref_label}) };
+        var file_name: ?[]const u8 = null;
+        if (jsonFind(data, "entries")) |entries| if (entries == .array) for (entries.array.items) |e| {
+            if (e != .string) continue;
+            if (std.mem.eql(u8, e.string, "action.yml") or (file_name == null and std.mem.eql(u8, e.string, "action.yaml"))) file_name = e.string;
+        };
+        const name = file_name orelse return .{ .failed = try std.fmt.allocPrint(arena, "{s} has no action.yml or action.yaml", .{ref_label}) };
+
+        doc = .init(arena);
+        const w2 = &doc.writer;
+        try w2.writeAll("{ loadDirectoryFromID(id:");
+        try std.json.Stringify.value(dir, .{}, w2);
+        try w2.writeAll(") { file(path:");
+        try std.json.Stringify.value(if (u.path.len > 0) try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.path, name }) else name, .{}, w2);
+        try w2.writeAll(") { contents } } }");
+        const fdata = gql(arena, x.transport, doc.written(), &msg) catch
+            return .{ .failed = try std.fmt.allocPrint(arena, "could not read {s} of {s}: {s}", .{ name, ref_label, msg }) };
+        const text = jsonFindString(fdata, "contents") orelse return .{ .failed = try std.fmt.allocPrint(arena, "could not read {s} of {s}", .{ name, ref_label }) };
+
+        const meta = switch (try action.parse(arena, text)) {
+            .ok => |m| m,
+            .invalid => |why| return .{ .failed = try std.fmt.allocPrint(arena, "{s} of {s} {s}", .{ name, ref_label, why }) },
+        };
+        const mount = try std.fmt.allocPrint(arena, "/github/_actions/{s}/{s}/{s}", .{ u.owner, u.name, u.ref });
+        return .{ .ok = .{
+            .meta = meta,
+            .dir = dir,
+            .mount = mount,
+            .path = if (u.path.len > 0) try std.fmt.allocPrint(arena, "{s}/{s}", .{ mount, u.path }) else mount,
+            .ref_label = ref_label,
+        } };
+    }
+};
+
+fn findInput(inputs: []const job_mod.Input, name: []const u8) ?job_mod.Template {
+    for (inputs) |in| if (std.ascii.eqlIgnoreCase(in.name, name)) return in.value;
+    return null;
+}
+
+/// `base` (an object, or null) with `extra` entries added or replaced.
+fn withEntries(arena: Allocator, base: expr.Value, extra: []const expr.Value.Entry) !expr.Value {
+    var list: std.ArrayList(expr.Value.Entry) = .empty;
+    if (base == .object) for (base.object) |e| {
+        var replaced = false;
+        for (extra) |x| if (std.ascii.eqlIgnoreCase(x.key, e.key)) {
+            replaced = true;
+        };
+        if (!replaced) try list.append(arena, e);
+    };
+    try list.appendSlice(arena, extra);
+    return .{ .object = list.items };
+}
+
+fn firstLine(s: []const u8) []const u8 {
+    const t = std.mem.trim(u8, s, " \n\r\t");
+    return t[0 .. std.mem.indexOfScalar(u8, t, '\n') orelse t.len];
+}
+
+/// Dagger itself failed during a step: the step and the job fail with what Dagger said.
+fn engineFailed(x: *Exec, observer: ?Observer, res: *StepResult, num: u32, coe: bool, results: []StepResult) !Result {
+    res.* = .{ .name = res.name, .continued = coe, .outcome = .failure, .exit_code = 1, .started_ms = res.started_ms, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() };
+    x.sh.append(num, try std.fmt.allocPrint(x.arena, "Dagger error: {s}", .{x.err_msg}));
+    if (observer) |o| o.finished(num, res.*);
+    return finish(x.arena, x.sh, results, x.err_msg);
 }
 
 /// How long to wait for a step's live lines before assuming it was served from cache. The log stream
@@ -1554,4 +1897,150 @@ test "the observer sees each step start and finish, including skipped and failed
     };
     try std.testing.expectEqual(want.len, rec.events.items.len);
     for (want, rec.events.items) |expected, got| try std.testing.expectEqualStrings(expected, got);
+}
+
+// --- composite actions ---
+
+fn treeAnswer(arena: Allocator, dir: []const u8, entries: []const []const u8) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try aw.writer.print("{{\"data\":{{\"git\":{{\"ref\":{{\"tree\":{{\"id\":\"{s}\",\"entries\":", .{dir});
+    try std.json.Stringify.value(entries, .{}, &aw.writer);
+    try aw.writer.writeAll("}}}}}");
+    return aw.written();
+}
+
+fn fileAnswer(arena: Allocator, contents: []const u8) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try aw.writer.writeAll("{\"data\":{\"loadDirectoryFromID\":{\"file\":{\"contents\":");
+    try std.json.Stringify.value(contents, .{}, &aw.writer);
+    try aw.writer.writeAll("}}}}");
+    return aw.written();
+}
+
+fn usesStep(id: []const u8, owner: []const u8, name: []const u8, ref: []const u8, inputs: []const job_mod.Input) job_mod.Step {
+    return .{ .id = id, .context_name = id, .name = "uses", .condition = "success()", .action = .{ .uses = .{ .owner = owner, .name = name, .ref = ref, .inputs = inputs } } };
+}
+
+test "a composite action runs its steps with its inputs, and its outputs reach later steps" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+
+    const action_yml =
+        \\inputs:
+        \\  version:
+        \\    default: latest
+        \\  verb:
+        \\    default: call
+        \\outputs:
+        \\  out:
+        \\    value: ${{ steps.second.outputs.result }}-${{ inputs.version }}
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - shell: bash
+        \\      run: echo v=${{ inputs.version }} verb=${{ inputs.verb }} path=${{ github.action_path }}
+        \\    - id: skipped
+        \\      if: inputs.verb == 'nope'
+        \\      shell: bash
+        \\      run: echo never
+        \\    - id: second
+        \\      shell: sh
+        \\      env:
+        \\        X: ${{ inputs.version }}
+        \\      run: echo "result=ok" >> "$GITHUB_OUTPUT"
+    ;
+    const inputs = [_]job_mod.Input{ .{ .name = "version", .value = .{ .lit = "0.21.10" } }, .{ .name = "bogus", .value = .{ .lit = "1" } } };
+    var after = testStep("");
+    after.action.script.script = .{ .expr = "format('echo {0}', steps.dag.outputs.out)" };
+    const steps = [_]job_mod.Step{ usesStep("dag", "o", "act", "v1", &inputs), after };
+    const answers = [_][]const u8{
+        base_answer,
+        try treeAnswer(arena, "D1", &.{ "README.md", "action.yml" }),
+        try fileAnswer(arena, action_yml),
+        try exec(arena, "C1", 0, ""),
+        try execFc(arena, "C2", "", "result=ok\\n", "", ""),
+        try exec(arena, "C3", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 6), seen.len); // the skipped step never runs
+    for (seen) |d| try std.testing.expect(braceBalanced(d));
+    try std.testing.expect(std.mem.indexOf(u8, seen[1], "git(url:\"https://github.com/o/act.git\") { ref(name:\"v1\") { tree(depth:1) { id entries(path:\".\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[2], "loadDirectoryFromID(id:\"D1\") { file(path:\"action.yml\")") != null);
+    // First step: interpolated inputs (given and default) and action path; the action is mounted once.
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "echo v=0.21.10 verb=call path=/github/_actions/o/act/v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "withDirectory(path:\"/github/_actions/o/act/v1\",source:\"D1\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "/github/file_commands/output_3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "withDirectory") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "'X=0.21.10'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "'GITHUB_ACTION_PATH=/github/_actions/o/act/v1'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "/github/file_commands/output_4") != null);
+    // The action's output, built from its own step's output and input, reaches the next job step.
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "echo ok-0.21.10") != null);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "Warning: Unexpected input(s) 'bogus', valid inputs are ['version', 'verb']") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Run echo v=0.21.10") != null);
+}
+
+test "composite failures: JavaScript actions, a missing action.yml, and a failing step with failure() cleanup" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+
+    const failing_yml =
+        \\runs:
+        \\  using: composite
+        \\  steps:
+        \\    - shell: bash
+        \\      run: exit 3
+        \\    - if: failure()
+        \\      shell: bash
+        \\      run: echo cleanup
+        \\    - shell: bash
+        \\      run: echo not after a failure
+    ;
+    var s2 = usesStep("missing", "o", "none", "v1", &.{});
+    s2.condition = "always()";
+    var s3 = usesStep("fails", "o", "act2", "0123456789012345678901234567890123456789", &.{});
+    s3.condition = "always()";
+    const steps = [_]job_mod.Step{ usesStep("js", "o", "js", "v1", &.{}), s2, s3 };
+    const answers = [_][]const u8{
+        base_answer,
+        try treeAnswer(arena, "D1", &.{"action.yml"}),
+        try fileAnswer(arena, "runs:\n  using: node24\n  main: dist/index.js\n"),
+        try treeAnswer(arena, "D2", &.{"README.md"}),
+        try treeAnswer(arena, "D3", &.{"action.yaml"}),
+        try fileAnswer(arena, failing_yml),
+        try exec(arena, "C1", 3, ""),
+        try exec(arena, "C2", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expectEqual(Outcome.failure, res.steps[0].outcome);
+    try std.testing.expectEqual(Outcome.failure, res.steps[1].outcome);
+    try std.testing.expectEqual(Outcome.failure, res.steps[2].outcome);
+    try std.testing.expectEqual(@as(i32, 3), res.steps[2].exit_code);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 8), seen.len); // the step after the failure is skipped
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "commit(id:\"0123456789012345678901234567890123456789\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "file(path:\"action.yaml\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[7], "echo cleanup") != null);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "o/js@v1 is a JavaScript action (node24); JavaScript actions are not supported yet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "o/none@v1 has no action.yml or action.yaml") != null);
 }

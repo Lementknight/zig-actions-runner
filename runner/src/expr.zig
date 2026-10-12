@@ -655,6 +655,46 @@ pub fn evalString(arena: Allocator, text: []const u8, scope: Scope) Error![]cons
     return toStr(arena, try evaluate(arena, text, scope));
 }
 
+/// Replaces every `${{ <expression> }}` in `text` with its value as a string. The job message
+/// arrives with this already done (as `format()` expressions), but `action.yml` files are read as
+/// they are written. A `}}` inside a quoted string does not end the expression.
+pub fn interpolate(arena: Allocator, text: []const u8, scope: Scope) Error![]const u8 {
+    if (std.mem.indexOf(u8, text, "${{") == null) return text;
+    var out: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, text, i, "${{")) |open| {
+        try out.appendSlice(arena, text[i..open]);
+        const body_start = open + 3;
+        const close = expressionEnd(text, body_start) orelse {
+            if (scope.diag) |d| d.* = "'${{' is never closed with '}}'";
+            return error.ParseError;
+        };
+        try out.appendSlice(arena, try evalString(arena, text[body_start..close], scope));
+        i = close + 2;
+    }
+    try out.appendSlice(arena, text[i..]);
+    return out.items;
+}
+
+/// Index of the `}}` that ends the expression starting at `from`, skipping 'quoted' strings.
+fn expressionEnd(text: []const u8, from: usize) ?usize {
+    var i = from;
+    var in_str = false;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (in_str) {
+            if (c == '\'') {
+                if (i + 1 < text.len and text[i + 1] == '\'') i += 1 else in_str = false;
+            }
+        } else if (c == '\'') {
+            in_str = true;
+        } else if (c == '}' and i + 1 < text.len and text[i + 1] == '}') {
+            return i;
+        }
+    }
+    return null;
+}
+
 /// Whether an `if:` expression calls success(), always(), failure() or cancelled().
 pub fn hasStatusFunction(arena: Allocator, text: []const u8) bool {
     const n = parse(arena, text, null) catch return false;
@@ -851,4 +891,23 @@ test "numbers print like GitHub" {
     try std.testing.expectEqualStrings("1.5", try evalStr(ar, "1.5", s));
     try std.testing.expectEqualStrings("100", try evalStr(ar, "1e2", s));
     try std.testing.expectEqualStrings("NaN", try evalStr(ar, "NaN", s));
+}
+
+test "interpolate replaces each ${{ }} and leaves the rest alone" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const inputs = [_]Value.Entry{ .{ .key = "version", .value = .{ .string = "0.21.10" } }, .{ .key = "args", .value = .{ .string = "ci --skip-links\nx" } } };
+    const ctxs = [_]Value.Entry{.{ .key = "inputs", .value = .{ .object = &inputs } }};
+    var diag: []const u8 = "";
+    const s: Scope = .{ .contexts = &ctxs, .diag = &diag };
+    try std.testing.expectEqualStrings("plain $HOME {{ x }}", try interpolate(ar, "plain $HOME {{ x }}", s));
+    try std.testing.expectEqualStrings("VERSION=0.21.10 and 0.21.10!", try interpolate(ar, "VERSION=${{ inputs.version }} and ${{inputs.VERSION}}!", s));
+    // toJSON as dagger-for-github uses it, and a '}}' inside a string literal
+    try std.testing.expectEqualStrings("echo '\"ci --skip-links\\nx\"'", try interpolate(ar, "echo '${{ toJSON(inputs.args) }}'", s));
+    // The '}}' inside the string does not end the expression (format() then reads it as an escaped '}').
+    try std.testing.expectEqualStrings("a}b", try interpolate(ar, "${{ format('{0}}}{1}', 'a', 'b') }}", s));
+    try std.testing.expectEqualStrings("it's", try interpolate(ar, "${{ 'it''s' }}", s));
+    try std.testing.expectError(error.ParseError, interpolate(ar, "x ${{ inputs.version", s));
+    try std.testing.expectEqualStrings("'${{' is never closed with '}}'", diag);
 }

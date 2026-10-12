@@ -32,8 +32,20 @@ pub const Action = union(enum) {
     /// `uses: actions/checkout`, replaced by a built-in checkout (Dagger's git support). The raw
     /// inputs are validated and turned into a `Checkout` when the step runs (`checkoutFromInputs`).
     checkout: []const Input,
+    /// `uses: owner/repo[/path]@ref` of any other action. The runner reads the action's `action.yml`
+    /// when the step runs; `inputs` are the step's `with:` values.
+    uses: Uses,
     /// Why the step cannot run. The executor logs this and fails the step.
     unsupported: []const u8,
+};
+
+pub const Uses = struct {
+    owner: []const u8,
+    name: []const u8,
+    /// Directory of the action inside its repository; "" for the root.
+    path: []const u8 = "",
+    ref: []const u8,
+    inputs: []const Input = &.{},
 };
 
 /// Supported inputs of actions/checkout. Anything else makes the step unsupported.
@@ -167,10 +179,15 @@ fn parseStep(arena: Allocator, sv: Value) Error!Step {
         const uses_name = path(sv, &.{ "reference", "name" }) orelse "";
         const uses_ref = path(sv, &.{ "reference", "ref" }) orelse "";
         uses_label = try std.fmt.allocPrint(arena, "{s}@{s}", .{ uses_name, uses_ref });
-        if (std.ascii.eqlIgnoreCase(uses_name, "actions/checkout")) {
+        const repo_type = path(sv, &.{ "reference", "repositoryType" }) orelse "GitHub";
+        if (std.ascii.eqlIgnoreCase(repo_type, "self")) {
+            const local = path(sv, &.{ "reference", "path" }) orelse uses_name;
+            uses_label = local;
+            action = .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s}: actions in the workflow's own repository are not supported yet", .{local}) };
+        } else if (std.ascii.eqlIgnoreCase(uses_name, "actions/checkout")) {
             action = try parseCheckoutInputs(arena, o.get("inputs"));
         } else {
-            action = .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s} is not supported (v0 supports run: steps and actions/checkout)", .{uses_label}) };
+            action = try parseUses(arena, uses_name, path(sv, &.{ "reference", "path" }) orelse "", uses_ref, uses_label, o.get("inputs"));
         }
     } else {
         action = .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported step reference type '{s}' (v0 supports run: steps)", .{reference_type}) };
@@ -217,6 +234,25 @@ fn parseScript(arena: Allocator, inputs: ?Value) Error!Action {
     if (shell) |sh| if (sh == .lit and !validShell(sh.lit))
         return .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported shell '{s}' (v0 supports bash and sh)", .{sh.lit}) };
     return .{ .script = .{ .script = s, .shell = shell, .working_directory = wd } };
+}
+
+fn parseUses(arena: Allocator, name: []const u8, ref_path: []const u8, ref: []const u8, label: []const u8, inputs: ?Value) Error!Action {
+    // `name` is `owner/repo`, and may carry the action's directory too (`owner/repo/sub/dir`).
+    var parts = std.mem.splitScalar(u8, name, '/');
+    const owner = parts.next() orelse "";
+    const repo = parts.next() orelse "";
+    const rest = parts.rest();
+    const dir = std.mem.trim(u8, if (ref_path.len > 0) ref_path else rest, "/");
+    if (owner.len == 0 or repo.len == 0 or ref.len == 0 or std.mem.indexOf(u8, dir, "..") != null)
+        return .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s} is not a valid action reference", .{label}) };
+    var kv: []const Input = &.{};
+    if (inputs) |iv| if (iv != .null) {
+        kv = mappingInputs(arena, iv) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unsupported => return .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s}: inputs must be strings or expressions", .{label}) },
+        };
+    };
+    return .{ .uses = .{ .owner = owner, .name = repo, .path = dir, .ref = ref, .inputs = kv } };
 }
 
 pub fn validShell(sh: []const u8) bool {
@@ -537,8 +573,12 @@ test "parse job fixture" {
     const bare = (try checkoutFromInputs(a.allocator(), try litEnv(a.allocator(), job.steps[3].action.checkout))).ok;
     try std.testing.expectEqual(@as(u32, 1), bare.fetch_depth);
     try std.testing.expectEqualStrings("Run actions/checkout@v4", job.steps[3].name);
-    // other actions fail loudly at parse time; unsupported checkout inputs once evaluated
-    try std.testing.expect(std.mem.indexOf(u8, job.steps[4].action.unsupported, "actions/cache@v4 is not supported") != null);
+    // other actions are read from their action.yml when they run; unsupported checkout inputs fail once evaluated
+    const cache = job.steps[4].action.uses;
+    try std.testing.expectEqualStrings("actions", cache.owner);
+    try std.testing.expectEqualStrings("cache", cache.name);
+    try std.testing.expectEqualStrings("v4", cache.ref);
+    try std.testing.expectEqualStrings("", cache.path);
     const sub = try checkoutFromInputs(a.allocator(), try litEnv(a.allocator(), job.steps[5].action.checkout));
     try std.testing.expect(std.mem.indexOf(u8, sub.unsupported, "submodules: recursive") != null);
     const escape = try checkoutFromInputs(a.allocator(), try litEnv(a.allocator(), job.steps[6].action.checkout));
@@ -583,4 +623,31 @@ test "malformed job" {
     defer a.deinit();
     try std.testing.expectError(error.MalformedJob, parse(a.allocator(), "{}"));
     try std.testing.expectError(error.MalformedJob, parse(a.allocator(), "not json"));
+}
+
+test "uses: references keep their directory and inputs; local actions are unsupported" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const json =
+        \\{"plan":{"planId":"p"},"jobId":"j","resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
+        \\ "steps":[
+        \\  {"type":"action","reference":{"type":"repository","name":"github/codeql-action","ref":"v3","path":"init","repositoryType":"GitHub"},"id":"a","name":"__a","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"languages"},"Value":{"lit":"go"}},{"Key":{"lit":"token"},"Value":{"type":3,"expr":"github.token"}}]}},
+        \\  {"type":"action","reference":{"type":"repository","name":"o/r/sub/dir","ref":"main","repositoryType":"GitHub"},"id":"b","name":"__b","condition":"success()"},
+        \\  {"type":"action","reference":{"type":"repository","path":"./.github/actions/local","repositoryType":"self"},"id":"c","name":"__c","condition":"success()"},
+        \\  {"type":"action","reference":{"type":"repository","name":"o/r","ref":"v1","repositoryType":"GitHub"},"id":"d","name":"__d","condition":"success()",
+        \\   "inputs":{"type":2,"map":[{"Key":{"lit":"list"},"Value":{"type":1,"seq":[]}}]}}
+        \\ ]}
+    ;
+    const job = try parse(a.allocator(), json);
+    const codeql = job.steps[0].action.uses;
+    try std.testing.expectEqualStrings("github", codeql.owner);
+    try std.testing.expectEqualStrings("codeql-action", codeql.name);
+    try std.testing.expectEqualStrings("init", codeql.path);
+    try std.testing.expectEqualStrings("go", codeql.inputs[0].value.lit);
+    try std.testing.expectEqualStrings("github.token", codeql.inputs[1].value.expr);
+    try std.testing.expectEqualStrings("Run github/codeql-action@v3", job.steps[0].name);
+    try std.testing.expectEqualStrings("sub/dir", job.steps[1].action.uses.path);
+    try std.testing.expect(std.mem.indexOf(u8, job.steps[2].action.unsupported, "workflow's own repository are not supported yet") != null);
+    try std.testing.expect(std.mem.indexOf(u8, job.steps[3].action.unsupported, "inputs must be strings or expressions") != null);
 }
