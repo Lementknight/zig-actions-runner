@@ -222,10 +222,17 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Exit
     }
 
     var result: dagger.Result = undefined;
-    if (job.has_container) {
+    // Fail the job up front rather than run steps that would fail in confusing ways without them.
+    const unsupported: ?[]const u8 = if (job.has_container)
+        "container: jobs are not supported yet"
+    else if (job.has_services)
+        "services: containers are not supported yet (the job's steps could not reach them)"
+    else
+        null;
+    if (unsupported) |why| {
         const step_results = try c.arena.alloc(dagger.StepResult, job.steps.len);
         @memset(step_results, .{});
-        try log.append(job.check_run_id, 0, .stderr, "container: jobs are not supported yet");
+        try log.append(job.check_run_id, 0, .stderr, why);
         result = .{ .steps = step_results, .engine_error = null, .succeeded = false };
     } else {
         result = try dagger.run(c.arena, c.io, c.environ, .{
