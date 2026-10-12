@@ -183,6 +183,23 @@ fn waitForStop(c: Context) void {
     if (!stop_announced.swap(true, .acq_rel)) c.log.append(0, 0, .stderr, "stopping: waiting runners stop now, running jobs finish first (a second signal exits at once)") catch {};
 }
 
+/// Deletes the cycle's runner registration, trying again (after 1 s, then 2 s) when GitHub refuses
+/// for now (422 right after a job, 5xx) or the request fails; a registration still left is reported
+/// instead of being dropped silently. 404: already gone.
+fn removeRegistration(c: Context, id: u64, name: []const u8) void {
+    var last: []const u8 = "";
+    for (0..3) |attempt| {
+        if (attempt > 0) c.io.sleep(.fromMilliseconds(@as(i64, @intCast(attempt)) * 1000), .awake) catch {};
+        if (jitconfig.deleteRunner(c.arena, c.io, c.cfg, id)) |status| {
+            const code = @backingInt(status);
+            if (status.class() == .success or code == 404) return;
+            last = std.fmt.allocPrint(c.arena, "HTTP {d}", .{code}) catch "HTTP error";
+            if (code != 422 and status.class() != .server_error) break;
+        } else |e| last = @errorName(e);
+    }
+    c.err.print("could not remove runner registration '{s}' (id {d}): {s}; delete it in the repository's runner settings\n", .{ name, id, last }) catch {};
+}
+
 /// One registration and at most one job.
 pub fn cycle(c: Context) !Cycle {
     var status: std.http.Status = .ok;
@@ -197,8 +214,8 @@ pub fn cycle(c: Context) !Cycle {
         };
         return .{ .failed = .{ .exit = .github, .retry = !fatal } };
     };
-    // Best effort: GitHub removes ephemeral runners itself once their job completes.
-    defer _ = jitconfig.deleteRunner(c.arena, c.io, c.cfg, jit.runner_id) catch {};
+    // GitHub removes ephemeral runners itself once their job completes; an idle one must be removed.
+    defer removeRegistration(c, jit.runner_id, jit.runner_name);
     try say(c, "registered runner '{s}' (id {d})", .{ jit.runner_name, jit.runner_id });
 
     const creds = auth.parseCredentials(c.arena, jit.files) catch |e| return fail(c, "credentials", e);
