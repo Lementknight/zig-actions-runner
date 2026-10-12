@@ -1206,6 +1206,7 @@ fn openSession(sess: *engine.Session, opts: Options, io: std.Io, ep: engine.Endp
 }
 
 fn engineOpenError(arena: Allocator, e: anyerror, ep: engine.Endpoint) ![]const u8 {
+    if (ep.host.len > 0) return std.fmt.allocPrint(arena, "could not start a Dagger session on the engine at {s}: {s}", .{ ep.host, @errorName(e) });
     return switch (e) {
         error.EngineContainerNotFound => std.fmt.allocPrint(arena, "the Dagger engine container '{s}' does not exist and `dagger core version` did not create it (set RUNNER_ENGINE=cli to use the dagger CLI instead)", .{ep.container}),
         error.FileNotFound, error.ConnectionRefused => std.fmt.allocPrint(arena, "could not reach the Docker API at {s} (is Docker running? DOCKER_HOST sets another socket)", .{ep.docker_socket}),

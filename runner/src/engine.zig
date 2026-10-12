@@ -27,6 +27,9 @@ pub const client_version = "v0.21.10";
 
 /// Where the engine's API is reached.
 pub const Endpoint = struct {
+    /// The engine's own listener, `tcp://host:port` or `unix:///path`, reached directly. Empty: go
+    /// through the engine container (`buildctl dial-stdio`, one process in the engine per connection).
+    host: []const u8 = "",
     /// Docker API socket.
     docker_socket: []const u8 = default_docker_socket,
     /// The engine container `buildctl dial-stdio` runs in.
@@ -594,7 +597,23 @@ pub const Conn = struct {
     /// Connects to a Unix socket. The Conn must not move afterwards.
     fn initUnix(c: *Conn, io: Io, path: []const u8) !void {
         const addr = try Io.net.UnixAddress.init(path);
-        c.* = .{ .io = io, .stream = try addr.connect(io), .in = undefined };
+        c.initStream(io, try addr.connect(io));
+    }
+
+    /// Connects to `host:port` (a name is resolved). The Conn must not move afterwards.
+    fn initTcp(c: *Conn, io: Io, host_port: []const u8) !void {
+        const colon = std.mem.lastIndexOfScalar(u8, host_port, ':') orelse return error.InvalidEngineHost;
+        const port = std.fmt.parseInt(u16, host_port[colon + 1 ..], 10) catch return error.InvalidEngineHost;
+        const host = std.mem.trim(u8, host_port[0..colon], "[]");
+        const stream = if (Io.net.IpAddress.parse(host, port)) |addr|
+            try addr.connect(io, .{ .mode = .stream })
+        else |_|
+            try (Io.net.HostName.init(host) catch return error.InvalidEngineHost).connect(io, port, .{ .mode = .stream });
+        c.initStream(io, stream);
+    }
+
+    fn initStream(c: *Conn, io: Io, stream: Io.net.Stream) void {
+        c.* = .{ .io = io, .stream = stream, .in = undefined };
         c.in = .{ .src = .{ .ptr = c, .readFn = readFn } };
         c.w = .init(c.stream, io, &c.wbuf);
         c.r = .init(c.stream, io, &c.rbuf);
@@ -614,9 +633,20 @@ pub const Conn = struct {
     }
 };
 
-/// A new connection to the engine's API: `buildctl dial-stdio` in the engine container, through
-/// the Docker API (create an exec, then start it with the connection upgraded to a raw stream).
+/// A new connection to the engine's API: its own listener when `ep.host` names one, else
+/// `buildctl dial-stdio` in the engine container, through the Docker API (create an exec, then start
+/// it with the connection upgraded to a raw stream).
 pub fn dial(gpa: Allocator, io: Io, ep: Endpoint) !*Conn {
+    if (ep.host.len > 0) {
+        const c = try gpa.create(Conn);
+        errdefer gpa.destroy(c);
+        if (std.mem.startsWith(u8, ep.host, "unix://")) {
+            try c.initUnix(io, ep.host["unix://".len..]);
+        } else if (std.mem.startsWith(u8, ep.host, "tcp://")) {
+            try c.initTcp(io, ep.host["tcp://".len..]);
+        } else return error.InvalidEngineHost;
+        return c;
+    }
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1046,6 +1076,7 @@ test "live: a session runs a query and streams its exec's output" {
     defer got.text.deinit(gpa);
     var ep: Endpoint = .{};
     if (env.get("ZIG_RUNNER_DOCKER_SOCKET")) |p| ep.docker_socket = p;
+    if (env.get("ZIG_RUNNER_ENGINE_HOST")) |h| ep.host = h;
     var s: Session = undefined;
     try s.open(gpa, io, ep, .{ .ptr = &got, .onRecord = Got.on });
     defer s.close();
