@@ -895,7 +895,7 @@ pub const Session = struct {
     }
 };
 
-fn uuid(io: Io, out: *[36]u8) void {
+pub fn uuid(io: Io, out: *[36]u8) void {
     var b: [16]u8 = undefined;
     io.random(&b);
     b[6] = (b[6] & 0x0f) | 0x40;

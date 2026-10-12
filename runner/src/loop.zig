@@ -9,6 +9,7 @@ const broker = @import("github/broker.zig");
 const runservice = @import("github/runservice.zig");
 const job_mod = @import("job.zig");
 const dagger = @import("dagger.zig");
+const engine = @import("engine.zig");
 const results = @import("github/results.zig");
 const db = @import("db.zig");
 const sink = @import("sink.zig");
@@ -423,15 +424,20 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Cycl
             try log.append(job.check_run_id, 0, .stderr, msg);
         }
     }
+    // "Complete job", as GitHub's runner ends a job (the job's containers went with its session).
+    const complete_started = std.Io.Clock.real.now(c.io).toMilliseconds();
+    const complete_step: u32 = if (result.next_log_step > 0) result.next_log_step else @intCast(job.steps.len + 1);
+    try log.append(job.check_run_id, complete_step, .stdout, "Cleaning up orphan processes");
     try log.flush();
     if (reporter) |*r| {
         r.jobFinished(job, c.name, result.succeeded, job_started_ms, std.Io.Clock.real.now(c.io).toMilliseconds());
         if (r.failures > 0) try c.err.print("run state: {d} database write(s) failed (last: {s})\n", .{ r.failures, r.last_error });
     }
-    try uploadLogs(c, job, log.collect.lines.items);
+    const shown = try shownSteps(c.arena, c.io, job, result, job_started_ms, .{ .log_step = complete_step, .started_ms = complete_started, .completed_ms = std.Io.Clock.real.now(c.io).toMilliseconds() });
+    try uploadLogs(c, job, shown, log.collect.lines.items);
 
     const conclusion: runservice.Conclusion = if (result.succeeded) .succeeded else .failed;
-    const step_json = try stepResultsJson(c.arena, job, result);
+    const step_json = try stepResultsJson(c.arena, shown);
     var done = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, step_json) catch |e| return fail(c, "completejob", e);
     if (done.status.class() != .success) {
         // A held job blocks the run for minutes, so always finish it: retry without step details.
@@ -443,14 +449,81 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Cycl
     return .{ .job = result.succeeded };
 }
 
-/// Uploads each step's log, then the whole job's, so GitHub's UI can show them. Failures are reported
-/// but never stop the job from completing.
-fn uploadLogs(c: Context, job: job_mod.Job, lines: []const sink.CollectedLine) !void {
-    for (job.steps, 1..) |step, n| {
-        const blob = try results.formatBlob(c.arena, lines, @intCast(n));
+/// A step as GitHub shows it for the job.
+pub const Shown = struct {
+    /// GitHub's step id, or one made here for the steps the runner adds.
+    id: []const u8,
+    number: u32,
+    name: []const u8,
+    /// Which lines are its log (`sink.CollectedLine.step`): 0 is "Set up job", 1..n the job's steps,
+    /// then `pre`/`post` scripts and "Complete job" (see `dagger.ExtraStep`).
+    log_step: u32,
+    /// succeeded / failed / skipped, as completejob takes them.
+    conclusion: []const u8,
+    started_ms: i64 = 0,
+    completed_ms: i64 = 0,
+};
+
+/// The steps GitHub shows for a job, in its runner's order and numbering: "Set up job", the actions'
+/// `pre` scripts, the job's steps, their `post` scripts, "Complete job". GitHub lists only the job's
+/// own steps; its runner adds the others with ids of their own, and so does this one.
+pub fn shownSteps(arena: Allocator, io: std.Io, job: job_mod.Job, result: dagger.Result, job_started_ms: i64, complete: struct { log_step: u32, started_ms: i64, completed_ms: i64 }) ![]Shown {
+    var out: std.ArrayList(Shown) = .empty;
+    var first_started: i64 = complete.started_ms;
+    for (result.steps) |r| if (r.started_ms > 0 and r.started_ms < first_started) {
+        first_started = r.started_ms;
+    };
+    for (result.extra) |e| if (e.started_ms > 0 and e.started_ms < first_started) {
+        first_started = e.started_ms;
+    };
+    try out.append(arena, .{ .id = try newId(arena, io), .number = 0, .name = "Set up job", .log_step = 0, .conclusion = "succeeded", .started_ms = job_started_ms, .completed_ms = first_started });
+    for (result.extra) |e| if (e.kind == .pre) try out.append(arena, try extraShown(arena, io, e));
+    for (job.steps, result.steps, 1..) |step, r, n| try out.append(arena, .{
+        .id = step.id,
+        .number = 0,
+        .name = if (r.name.len > 0) r.name else step.name,
+        .log_step = @intCast(n),
+        // Same vocabulary as the job conclusion (verified live): succeeded / failed / skipped.
+        .conclusion = switch (r.outcome) {
+            .success => "succeeded",
+            .failure => if (r.continued) "succeeded" else "failed",
+            .skipped, .not_run => "skipped",
+        },
+        .started_ms = r.started_ms,
+        .completed_ms = r.completed_ms,
+    });
+    for (result.extra) |e| if (e.kind == .post) try out.append(arena, try extraShown(arena, io, e));
+    try out.append(arena, .{ .id = try newId(arena, io), .number = 0, .name = "Complete job", .log_step = complete.log_step, .conclusion = "succeeded", .started_ms = complete.started_ms, .completed_ms = complete.completed_ms });
+    for (out.items, 1..) |*s, n| s.number = @intCast(n);
+    return out.items;
+}
+
+fn extraShown(arena: Allocator, io: std.Io, e: dagger.ExtraStep) !Shown {
+    return .{
+        .id = try newId(arena, io),
+        .number = 0,
+        .name = e.name,
+        .log_step = e.log_step,
+        .conclusion = if (e.outcome == .success) "succeeded" else "failed",
+        .started_ms = e.started_ms,
+        .completed_ms = e.completed_ms,
+    };
+}
+
+fn newId(arena: Allocator, io: std.Io) ![]const u8 {
+    const id = try arena.alloc(u8, 36);
+    engine.uuid(io, id[0..36]);
+    return id;
+}
+
+/// Uploads each shown step's log, then the whole job's, so GitHub's UI can show them. Failures are
+/// reported but never stop the job from completing.
+fn uploadLogs(c: Context, job: job_mod.Job, shown: []const Shown, lines: []const sink.CollectedLine) !void {
+    for (shown) |s| {
+        const blob = try results.formatBlob(c.arena, lines, s.log_step);
         if (blob.line_count == 0) continue;
-        const r = results.upload(c.arena, c.io, job, .{ .step = step.id }, blob);
-        try c.err.print("job {d}: log upload step {d}: {s}{s}\n", .{ job.check_run_id, n, if (r.ok) "ok, " else "FAILED: ", r.detail });
+        const r = results.upload(c.arena, c.io, job, .{ .step = s.id }, blob);
+        try c.err.print("job {d}: log upload '{s}': {s}{s}\n", .{ job.check_run_id, s.name, if (r.ok) "ok, " else "FAILED: ", r.detail });
     }
     const all = try results.formatBlob(c.arena, lines, null);
     if (all.line_count > 0) {
@@ -461,7 +534,7 @@ fn uploadLogs(c: Context, job: job_mod.Job, lines: []const sink.CollectedLine) !
 
 /// `stepResults` for completejob. Field names follow `actions/runner`'s StepResult; verified live
 /// by checking the steps GitHub reports for the job.
-pub fn stepResultsJson(arena: Allocator, job: job_mod.Job, result: dagger.Result) ![]const u8 {
+pub fn stepResultsJson(arena: Allocator, shown: []const Shown) ![]const u8 {
     const Item = struct {
         external_id: []const u8,
         number: u32,
@@ -471,23 +544,16 @@ pub fn stepResultsJson(arena: Allocator, job: job_mod.Job, result: dagger.Result
         started_at: ?[]const u8,
         completed_at: ?[]const u8,
     };
-    const items = try arena.alloc(Item, job.steps.len);
-    for (items, job.steps, result.steps, 1..) |*it, step, r, n| {
-        it.* = .{
-            .external_id = step.id,
-            .number = @intCast(n),
-            .name = if (r.name.len > 0) r.name else step.name,
-            .status = "completed",
-            // Same vocabulary as the job conclusion (verified live): succeeded / failed / skipped.
-            .conclusion = switch (r.outcome) {
-                .success => "succeeded",
-                .failure => if (r.continued) "succeeded" else "failed",
-                .skipped, .not_run => "skipped",
-            },
-            .started_at = if (r.started_ms > 0) try timefmt.isoTime(arena, r.started_ms) else null,
-            .completed_at = if (r.completed_ms > 0) try timefmt.isoTime(arena, r.completed_ms) else null,
-        };
-    }
+    const items = try arena.alloc(Item, shown.len);
+    for (items, shown) |*it, s| it.* = .{
+        .external_id = s.id,
+        .number = s.number,
+        .name = s.name,
+        .status = "completed",
+        .conclusion = s.conclusion,
+        .started_at = if (s.started_ms > 0) try timefmt.isoTime(arena, s.started_ms) else null,
+        .completed_at = if (s.completed_ms > 0) try timefmt.isoTime(arena, s.completed_ms) else null,
+    };
     var aw: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(items, .{ .emit_null_optional_fields = false }, &aw.writer);
     return aw.written();
@@ -536,17 +602,16 @@ test "backoffSecs doubles from 5s up to 5 minutes" {
     try std.testing.expectEqual(@as(u32, 300), backoffSecs(1000));
 }
 
-test "stepResultsJson maps outcomes and continue-on-error" {
+test "the steps GitHub shows: Set up job, pre, the job's steps, post, Complete job, numbered in order" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
     const mk = struct {
-        fn step(id: []const u8, coe: bool) job_mod.Step {
-            _ = coe;
+        fn step(id: []const u8) job_mod.Step {
             return .{ .id = id, .name = id, .condition = "success()", .action = .{ .unsupported = "x" } };
         }
     };
-    const steps = [_]job_mod.Step{ mk.step("a", false), mk.step("b", true), mk.step("c", false), mk.step("d", false) };
+    const steps = [_]job_mod.Step{ mk.step("a"), mk.step("b"), mk.step("c"), mk.step("d") };
     const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 1, .has_container = false, .secrets = &.{}, .steps = &steps };
     var rs = [_]dagger.StepResult{
         .{ .outcome = .success, .started_ms = 1000, .completed_ms = 2000 },
@@ -554,9 +619,31 @@ test "stepResultsJson maps outcomes and continue-on-error" {
         .{ .outcome = .failure, .exit_code = 2 },
         .{ .outcome = .skipped },
     };
-    const json = try stepResultsJson(arena, job, .{ .steps = &rs, .engine_error = null, .succeeded = false });
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"external_id\":\"a\",\"number\":1,\"name\":\"a\",\"status\":\"completed\",\"conclusion\":\"succeeded\",\"started_at\":\"1970-01-01T00:00:01.000Z\"") != null);
+    const extra = [_]dagger.ExtraStep{
+        .{ .kind = .pre, .name = "Pre a", .log_step = 5, .outcome = .success, .started_ms = 900, .completed_ms = 950 },
+        .{ .kind = .post, .name = "Post a", .log_step = 6, .outcome = .failure, .started_ms = 3000, .completed_ms = 3100 },
+    };
+    const result: dagger.Result = .{ .steps = &rs, .engine_error = null, .succeeded = false, .extra = &extra, .next_log_step = 7 };
+    const shown = try shownSteps(arena, std.testing.io, job, result, 500, .{ .log_step = 7, .started_ms = 3200, .completed_ms = 3300 });
+    const names = [_][]const u8{ "Set up job", "Pre a", "a", "b", "c", "d", "Post a", "Complete job" };
+    const logs = [_]u32{ 0, 5, 1, 2, 3, 4, 6, 7 };
+    try std.testing.expectEqual(names.len, shown.len);
+    for (shown, names, logs, 1..) |sh, name, ls, n| {
+        try std.testing.expectEqualStrings(name, sh.name);
+        try std.testing.expectEqual(ls, sh.log_step);
+        try std.testing.expectEqual(@as(u32, @intCast(n)), sh.number);
+    }
+    // The added steps get ids of their own; the job's keep GitHub's.
+    try std.testing.expectEqual(@as(usize, 36), shown[0].id.len);
+    try std.testing.expectEqualStrings("a", shown[2].id);
+    // "Set up job" runs from the job's start until the first step (here the pre).
+    try std.testing.expectEqual(@as(i64, 500), shown[0].started_ms);
+    try std.testing.expectEqual(@as(i64, 900), shown[0].completed_ms);
+    const json = try stepResultsJson(arena, shown);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"external_id\":\"a\",\"number\":3,\"name\":\"a\",\"status\":\"completed\",\"conclusion\":\"succeeded\",\"started_at\":\"1970-01-01T00:00:01.000Z\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"b\",\"status\":\"completed\",\"conclusion\":\"succeeded\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"c\",\"status\":\"completed\",\"conclusion\":\"failed\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"d\",\"status\":\"completed\",\"conclusion\":\"skipped\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"number\":7,\"name\":\"Post a\",\"status\":\"completed\",\"conclusion\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"number\":8,\"name\":\"Complete job\"") != null);
 }
