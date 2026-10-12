@@ -4,8 +4,9 @@
 //! context lookups (`github.sha`, `env.X`, `steps.id.outputs.y`, `matrix['os']`), the operators
 //! `! < <= > >= == != && ||` with GitHub's loose type coercion (string comparison is case
 //! insensitive, `&&`/`||` return an operand), and the functions contains, startsWith, endsWith,
-//! format, join, toJSON, fromJSON and success/always/cancelled/failure. `hashFiles` and the `*`
-//! object filter are not supported and report so, instead of evaluating wrongly.
+//! format, join, toJSON, fromJSON, success/always/cancelled/failure, and hashFiles when the scope
+//! can read files (`Scope.hash_files`). The `*` object filter is not supported and reports so,
+//! instead of evaluating wrongly.
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -28,6 +29,15 @@ pub const Value = union(enum) {
 
 pub const Error = error{ ParseError, EvalError, Unsupported, OutOfMemory };
 
+/// Computes `hashFiles(patterns)` where the job's files are (the caller supplies it).
+pub const HashFiles = struct {
+    ptr: *anyopaque,
+    hashFn: *const fn (ptr: *anyopaque, arena: Allocator, patterns: []const []const u8) Allocator.Error!Result,
+
+    /// The hex hash ("" when no file matched), or why it could not be computed.
+    pub const Result = union(enum) { ok: []const u8, failed: []const u8 };
+};
+
 /// What an expression can see.
 pub const Scope = struct {
     /// Top-level contexts: `github`, `env`, `steps`, `job`, `runner`, `secrets`, `vars`, ...
@@ -40,6 +50,8 @@ pub const Scope = struct {
     unsupported_contexts: []const []const u8 = &.{},
     /// Receives a human-readable reason when an error is returned. Optional.
     diag: ?*[]const u8 = null,
+    /// What `hashFiles()` reads files with; without it, `hashFiles()` is unsupported.
+    hash_files: ?HashFiles = null,
 
     fn fail(s: Scope, comptime fmt: []const u8, args: anytype, arena: Allocator) Error {
         if (s.diag) |d| d.* = std.fmt.allocPrint(arena, fmt, args) catch "expression error";
@@ -485,13 +497,24 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
     if (eql(name, "always")) return .{ .boolean = true };
     if (eql(name, "cancelled")) return .{ .boolean = scope.cancelled };
     if (eql(name, "failure")) return .{ .boolean = scope.job_failed and !scope.cancelled };
-    if (eql(name, "hashFiles")) {
-        if (scope.diag) |d| d.* = "hashFiles() is not supported yet";
+    if (eql(name, "hashFiles") and scope.hash_files == null) {
+        if (scope.diag) |d| d.* = "hashFiles() is not supported here";
         return error.Unsupported;
     }
 
     const args = try arena.alloc(Value, arg_nodes.len);
     for (arg_nodes, args) |an, *out| out.* = try eval(arena, an, scope);
+
+    if (eql(name, "hashFiles")) {
+        if (args.len < 1) return scope.fail("hashFiles() takes at least 1 argument", .{}, arena);
+        const patterns = try arena.alloc([]const u8, args.len);
+        for (args, patterns) |a, *dst| dst.* = try toStr(arena, a);
+        const hf = scope.hash_files.?;
+        return switch (try hf.hashFn(hf.ptr, arena, patterns)) {
+            .ok => |hex| .{ .string = hex },
+            .failed => |why| scope.fail("hashFiles({s}) failed: {s}", .{ try std.mem.join(arena, ", ", patterns), why }, arena),
+        };
+    }
 
     if (eql(name, "contains")) {
         if (args.len != 2) return scope.fail("contains() takes 2 arguments", .{}, arena);
@@ -866,10 +889,30 @@ test "errors say what is wrong" {
     try std.testing.expectEqualStrings("unknown function 'nosuch'", diag);
     try std.testing.expectError(error.EvalError, evaluate(ar, "format('{3}', 'a')", s));
     try std.testing.expectError(error.Unsupported, evaluate(ar, "hashFiles('**/*.zig')", s));
-    try std.testing.expectEqualStrings("hashFiles() is not supported yet", diag);
+    try std.testing.expectEqualStrings("hashFiles() is not supported here", diag);
     diag = "";
     try std.testing.expectError(error.Unsupported, evaluate(ar, "github.*.x", s));
     try std.testing.expect(std.mem.indexOf(u8, diag, "'*' object filter") != null);
+}
+
+test "hashFiles calls the scope's hook with its patterns" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const Fake = struct {
+        fn hash(ptr: *anyopaque, arena: Allocator, patterns: []const []const u8) Allocator.Error!HashFiles.Result {
+            _ = ptr;
+            if (std.mem.eql(u8, patterns[0], "bad")) return .{ .failed = "no" };
+            return .{ .ok = try std.mem.join(arena, "|", patterns) };
+        }
+    };
+    var dummy: u8 = 0;
+    var diag: []const u8 = "";
+    const s: Scope = .{ .diag = &diag, .hash_files = .{ .ptr = &dummy, .hashFn = Fake.hash } };
+    try std.testing.expectEqualStrings("**/go.sum|!x/**", (try evaluate(ar, "hashFiles('**/go.sum', '!x/**')", s)).string);
+    try std.testing.expectError(error.EvalError, evaluate(ar, "hashFiles('bad')", s));
+    try std.testing.expectEqualStrings("hashFiles(bad) failed: no", diag);
+    try std.testing.expectError(error.EvalError, evaluate(ar, "hashFiles()", s));
 }
 
 test "unsupported contexts fail loudly" {
