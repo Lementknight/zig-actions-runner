@@ -280,7 +280,7 @@ fn parseScript(arena: Allocator, inputs: ?Value) Error!Action {
     const s = script orelse return .{ .unsupported = "run step has no script" };
     // A literal shell is validated now; an expression is validated when the step runs.
     if (shell) |sh| if (sh == .lit and !validShell(sh.lit))
-        return .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported shell '{s}' (v0 supports bash and sh)", .{sh.lit}) };
+        return .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported shell '{s}' ({s})", .{ sh.lit, shell_help }) };
     return .{ .script = .{ .script = s, .shell = shell, .working_directory = wd } };
 }
 
@@ -328,9 +328,18 @@ fn parseLocalUses(arena: Allocator, local: []const u8, inputs: ?Value) Error!Act
     return .{ .uses = .{ .owner = "", .name = "", .path = dir, .ref = "", .inputs = kv, .local = true } };
 }
 
+/// `bash`, `sh`, or a custom command for either with `{0}` standing for the script file
+/// (`bash -l {0}`, `/bin/bash --login -eo pipefail {0}`), as GitHub accepts them.
 pub fn validShell(sh: []const u8) bool {
-    return std.mem.eql(u8, sh, "bash") or std.mem.eql(u8, sh, "sh");
+    if (std.mem.eql(u8, sh, "bash") or std.mem.eql(u8, sh, "sh")) return true;
+    if (std.mem.indexOf(u8, sh, "{0}") == null) return false;
+    var it = std.mem.tokenizeAny(u8, sh, " \t");
+    const prog = std.fs.path.basenamePosix(it.next() orelse return false);
+    return std.mem.eql(u8, prog, "bash") or std.mem.eql(u8, prog, "sh");
 }
+
+/// Why a shell is refused, for the step's log.
+pub const shell_help = "supported: bash, sh, or a bash or sh command with {0} for the script file, such as `bash -l {0}`";
 
 fn parseCheckoutInputs(arena: Allocator, inputs: ?Value) Error!Action {
     const iv = inputs orelse return .{ .checkout = &.{} };
@@ -759,6 +768,11 @@ test "malformed job" {
     defer a.deinit();
     try std.testing.expectError(error.MalformedJob, parse(a.allocator(), "{}"));
     try std.testing.expectError(error.MalformedJob, parse(a.allocator(), "not json"));
+}
+
+test "validShell: bash, sh, and custom bash or sh commands with {0}" {
+    for ([_][]const u8{ "bash", "sh", "bash -l {0}", "/bin/bash --login -eo pipefail {0}", "sh -x {0}" }) |ok| try std.testing.expect(validShell(ok));
+    for ([_][]const u8{ "pwsh", "python", "bash -l", "python {0}", "" }) |bad| try std.testing.expect(!validShell(bad));
 }
 
 test "uses: references keep their directory and inputs; local actions; docker:// images" {
