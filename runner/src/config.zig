@@ -22,6 +22,8 @@ pub const Scope = union(enum) {
 
 const pg = @import("pg.zig");
 
+pub const JsRuntime = enum { bun, node };
+
 pub const Config = struct {
     gh_token: []const u8,
     scope: Scope,
@@ -36,6 +38,8 @@ pub const Config = struct {
     image: []const u8 = "ubuntu:24.04",
     log_flush_lines: u32 = 200,
     log_flush_ms: u32 = 500,
+    /// What runs JavaScript actions (`runs.using: node*`). Bun by default; Node for exact Node behaviour.
+    js_runtime: JsRuntime = .bun,
     /// Give each step's commands access to the job's Dagger engine (`experimentalPrivilegedNesting`), so
     /// `dagger call` inside a job works, as dagger/dagger-for-github expects. That access is enough to run
     /// privileged containers, so a job can control the runner's host: turn it off for untrusted workflows.
@@ -48,7 +52,7 @@ pub const Config = struct {
     /// Register one runner, print the shape of its config, delete it, exit.
     inspect: bool = false,
 
-    pub const Error = error{ MissingGhToken, MissingGhScope, InvalidScope, InvalidNumber, InvalidBool, UnknownFlag, MissingFlagValue };
+    pub const Error = error{ MissingGhToken, MissingGhScope, InvalidScope, InvalidNumber, InvalidJsRuntime, InvalidBool, UnknownFlag, MissingFlagValue };
 
     /// Values are borrowed from `environ` / `args`, which must outlive the Config.
     pub fn load(environ: *const std.process.Environ.Map, args: []const [:0]const u8) Error!Config {
@@ -64,6 +68,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_IMAGE")) |v| c.image = v;
         if (environ.get("LOG_FLUSH_LINES")) |v| c.log_flush_lines = try num(u32, v);
         if (environ.get("LOG_FLUSH_MS")) |v| c.log_flush_ms = try num(u32, v);
+        if (environ.get("RUNNER_JS_RUNTIME")) |v| c.js_runtime = try jsRuntime(v);
         if (environ.get("RUNNER_DAGGER_NESTING")) |v| c.dagger_nesting = try boolean(v);
 
         var i: usize = 1; // args[0] is the program name
@@ -103,6 +108,7 @@ pub const Config = struct {
             else if (std.mem.eql(u8, key, "image")) c.image = val //
             else if (std.mem.eql(u8, key, "log-flush-lines")) c.log_flush_lines = try num(u32, val) //
             else if (std.mem.eql(u8, key, "log-flush-ms")) c.log_flush_ms = try num(u32, val) //
+            else if (std.mem.eql(u8, key, "js-runtime")) c.js_runtime = try jsRuntime(val) //
             else if (std.mem.eql(u8, key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
             else return error.UnknownFlag;
         }
@@ -134,6 +140,10 @@ pub const Config = struct {
             n = 2;
         }
         return buf[0..n];
+    }
+
+    fn jsRuntime(s: []const u8) error{InvalidJsRuntime}!JsRuntime {
+        return std.meta.stringToEnum(JsRuntime, s) orelse error.InvalidJsRuntime;
     }
 
     fn num(comptime T: type, s: []const u8) error{InvalidNumber}!T {
@@ -182,6 +192,19 @@ test "--db-check needs no GitHub credentials" {
     defer env.deinit();
     const c = try Config.load(&env, &.{ "runner", "--db-check" });
     try std.testing.expect(c.db_check);
+}
+
+test "JavaScript actions run on Bun unless Node is asked for" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expectEqual(JsRuntime.bun, (try Config.load(&env, &.{"runner"})).js_runtime);
+    try env.put("RUNNER_JS_RUNTIME", "node");
+    try std.testing.expectEqual(JsRuntime.node, (try Config.load(&env, &.{"runner"})).js_runtime);
+    try std.testing.expectEqual(JsRuntime.bun, (try Config.load(&env, &.{ "runner", "--js-runtime=bun" })).js_runtime);
+    try env.put("RUNNER_JS_RUNTIME", "deno");
+    try std.testing.expectError(error.InvalidJsRuntime, Config.load(&env, &.{"runner"}));
 }
 
 test "dagger nesting is on by default and can be turned off" {

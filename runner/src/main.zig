@@ -143,6 +143,7 @@ fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log
     const res = try dagger.run(arena, io, init.environ_map, .{
         .dagger_cmd = cfg.dagger_cmd,
         .image = cfg.image,
+        .js_runtime = cfg.js_runtime,
         .nesting = cfg.dagger_nesting,
         .sink_job_id = job.check_run_id,
     }, job, log);

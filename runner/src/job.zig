@@ -102,7 +102,18 @@ pub const Job = struct {
     context_data: Value = .null,
     /// Base URL of the results service (`system.github.results_endpoint`), where logs are uploaded.
     results_endpoint: []const u8 = "",
+    /// Service URLs JavaScript actions reach through the `ACTIONS_*` variables (cache, artifacts).
+    runtime: Runtime = .{},
     steps: []const Step,
+};
+
+/// From the `SystemVssConnection` endpoint's `data`, and the `actions_uses_cache_service_v2` variable.
+pub const Runtime = struct {
+    pipelines_url: []const u8 = "",
+    cache_url: []const u8 = "",
+    results_url: []const u8 = "",
+    id_token_url: []const u8 = "",
+    cache_v2: bool = false,
 };
 
 pub const Github = struct {
@@ -141,6 +152,7 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .secrets = try collectSecrets(arena, root),
         .secret_vars = try collectSecretVars(arena, root),
         .results_endpoint = variable(root, "system.github.results_endpoint") orelse "",
+        .runtime = runtime(root),
         .github = githubContext(arena, root),
         .env = try jobEnv(arena, root),
         .context_data = root.object.get("contextData") orelse .null,
@@ -505,6 +517,23 @@ fn checkRunId(root: Value) u64 {
     return 0;
 }
 
+fn runtime(root: Value) Runtime {
+    var r: Runtime = .{};
+    if (variable(root, "actions_uses_cache_service_v2")) |v| r.cache_v2 = std.ascii.eqlIgnoreCase(v, "true");
+    const res = root.object.get("resources") orelse return r;
+    if (res != .object) return r;
+    const eps = res.object.get("endpoints") orelse return r;
+    if (eps != .array) return r;
+    for (eps.array.items) |ep| {
+        if (!std.mem.eql(u8, path(ep, &.{"name"}) orelse "", "SystemVssConnection")) continue;
+        r.pipelines_url = path(ep, &.{ "data", "PipelinesServiceUrl" }) orelse path(ep, &.{"url"}) orelse "";
+        r.cache_url = path(ep, &.{ "data", "CacheServerUrl" }) orelse "";
+        r.results_url = path(ep, &.{ "data", "ResultsServiceUrl" }) orelse "";
+        r.id_token_url = path(ep, &.{ "data", "GenerateIdTokenUrl" }) orelse "";
+    }
+    return r;
+}
+
 fn jobToken(root: Value) ?[]const u8 {
     const eps = (root.object.get("resources") orelse return null);
     if (eps != .object) return null;
@@ -518,9 +547,10 @@ fn jobToken(root: Value) ?[]const u8 {
 
 const fixture =
     \\{"plan":{"planId":"plan-1"},"jobId":"job-1","jobContainer":null,
-    \\ "variables":{"github_token":{"value":"ghs_secret","isSecret":true},"TIGER_HOST":{"value":"db.example","isSecret":true},"system.github.token":{"value":"ghs_secret","isSecret":true},"plain":{"value":"x"},"system.github.results_endpoint":{"value":"https://results.test/"}},
+    \\ "variables":{"github_token":{"value":"ghs_secret","isSecret":true},"TIGER_HOST":{"value":"db.example","isSecret":true},"system.github.token":{"value":"ghs_secret","isSecret":true},"plain":{"value":"x"},"system.github.results_endpoint":{"value":"https://results.test/"},"actions_uses_cache_service_v2":{"value":"True"}},
     \\ "contextData":{"job":{"t":2,"d":[{"k":"status","v":"success"},{"k":"check_run_id","v":777}]},"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"sha","v":"0123456789012345678901234567890123456789"},{"k":"ref","v":"refs/heads/x"},{"k":"event_name","v":"push"}]}},
-    \\ "resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"jobtok"},"scheme":"OAuth"}}]},
+    \\ "resources":{"endpoints":[{"name":"SystemVssConnection","url":"https://pipelines.test/","authorization":{"parameters":{"AccessToken":"jobtok"},"scheme":"OAuth"},
+    \\   "data":{"CacheServerUrl":"https://cache.test/","ResultsServiceUrl":"https://results.test/","PipelinesServiceUrl":"https://pipelines.test/x/","GenerateIdTokenUrl":"https://token.test/"}}]},
     \\ "steps":[
     \\  {"type":"action","reference":{"type":"script"},"id":"s1","contextName":"__run","name":"__run","condition":"success()","continueOnError":null,
     \\   "inputs":{"type":2,"map":[{"Key":{"type":0,"lit":"script"},"Value":{"type":0,"file":1,"line":7,"col":14,"lit":"echo hello && sleep 2 && echo done"}}]}},
@@ -548,6 +578,11 @@ test "parse job fixture" {
     try std.testing.expectEqualStrings("jobtok", job.job_token);
     try std.testing.expectEqual(@as(u64, 777), job.check_run_id);
     try std.testing.expectEqualStrings("https://results.test/", job.results_endpoint);
+    try std.testing.expectEqualStrings("https://pipelines.test/x/", job.runtime.pipelines_url);
+    try std.testing.expectEqualStrings("https://cache.test/", job.runtime.cache_url);
+    try std.testing.expectEqualStrings("https://results.test/", job.runtime.results_url);
+    try std.testing.expectEqualStrings("https://token.test/", job.runtime.id_token_url);
+    try std.testing.expect(job.runtime.cache_v2);
     try std.testing.expectEqualStrings("o/r", job.github.repository);
     try std.testing.expectEqualStrings("https://github.com", job.github.server_url);
     try std.testing.expectEqualStrings("jobtok", job.secrets[0]);
