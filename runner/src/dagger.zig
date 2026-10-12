@@ -199,6 +199,9 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
     return aw.written();
 }
 
+/// The list of files `hashFiles()` hashes, written next to the exec that hashes them.
+const hash_list_path = "/tmp/zig-runner-hashfiles";
+
 /// Where a Docker action's container gets its static busybox, and HOME (shared by the job's Docker
 /// actions, as GitHub mounts one /github/home into each).
 const busybox_image = "busybox:1.37.0-musl";
@@ -600,6 +603,8 @@ const Evaluator = struct {
     pending_path: std.ArrayList([]const u8) = .empty,
     job_failed: bool = false,
     diag: []const u8 = "",
+    /// Reads the job's files for `hashFiles()`, once the job's container exists.
+    hash_files: ?expr.HashFiles = null,
 
     fn init(arena: Allocator, job: *const job_mod.Job) !Evaluator {
         var ev: Evaluator = .{
@@ -684,6 +689,7 @@ const Evaluator = struct {
             .contexts = ctxs,
             .job_failed = ev.job_failed,
             .diag = &ev.diag,
+            .hash_files = ev.hash_files,
         };
     }
 
@@ -1233,6 +1239,8 @@ pub fn run(
         .loaded = try nulls(arena, Exec.LoadResult, job.steps.len),
         .pre_state = try emptySlices(arena, job_mod.EnvVar, job.steps.len),
     };
+
+    ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
     // JavaScript actions' `pre` scripts run before any step, as on GitHub.
     for (job.steps, 1..) |step, n| if (step.action == .uses) {
@@ -2029,6 +2037,118 @@ const Exec = struct {
         x.js_mounted = true;
         try x.mounted_actions.put(arena, act.mount, {});
         return out;
+    }
+
+    /// `hashFiles(patterns)`, as GitHub computes it: the SHA-256 of the SHA-256 digests of the matching
+    /// files under the workspace, "" when none match. Patterns are globs relative to the workspace (or
+    /// absolute inside it), one per argument or line; `!` excludes, and the last matching pattern
+    /// decides; a pattern that matches a directory matches everything in it. Files are taken in path
+    /// order; GitHub takes them in directory-walk order, which can differ when several files match.
+    /// The files are listed with Dagger's `glob` and hashed by `sha256sum` in the job's container,
+    /// which the exec does not change.
+    fn hashFiles(ptr: *anyopaque, arena: Allocator, args: []const []const u8) Allocator.Error!expr.HashFiles.Result {
+        const x: *Exec = @ptrCast(@alignCast(ptr));
+        const Pattern = struct { glob: []const u8, exclude: bool };
+        var patterns: std.ArrayList(Pattern) = .empty;
+        var any_include = false;
+        for (args) |arg| {
+            var lines = std.mem.splitScalar(u8, arg, '\n');
+            while (lines.next()) |raw| {
+                var p = std.mem.trim(u8, raw, " \t\r");
+                if (p.len == 0 or p[0] == '#') continue;
+                const exclude = p[0] == '!';
+                if (exclude) p = std.mem.trimStart(u8, p[1..], " ");
+                if (std.mem.startsWith(u8, p, workspace ++ "/")) p = p[workspace.len + 1 ..] //
+                else if (std.mem.eql(u8, p, workspace)) p = "**" //
+                else if (p.len > 0 and p[0] == '/') continue; // outside the workspace: GitHub ignores those files
+                while (std.mem.startsWith(u8, p, "./")) p = p[2..];
+                p = std.mem.trimEnd(u8, p, "/");
+                if (p.len == 0) continue;
+                if (!exclude) any_include = true;
+                try patterns.append(arena, .{ .glob = p, .exclude = exclude });
+            }
+        }
+        if (!any_include) return .{ .ok = "" };
+
+        // Each pattern as given, and with `/**` for the contents of a directory it matches.
+        var doc: std.Io.Writer.Allocating = .init(arena);
+        const w = &doc.writer;
+        w.writeAll("{ loadContainerFromID(id:") catch return error.OutOfMemory;
+        std.json.Stringify.value(x.container_id, .{}, w) catch return error.OutOfMemory;
+        w.writeAll(") { directory(path:\"" ++ workspace ++ "\") {") catch return error.OutOfMemory;
+        for (patterns.items, 0..) |p, i| {
+            w.print(" p{d}: glob(pattern:", .{i}) catch return error.OutOfMemory;
+            std.json.Stringify.value(p.glob, .{}, w) catch return error.OutOfMemory;
+            w.print(") d{d}: glob(pattern:", .{i}) catch return error.OutOfMemory;
+            std.json.Stringify.value(try std.fmt.allocPrint(arena, "{s}/**", .{p.glob}), .{}, w) catch return error.OutOfMemory;
+            w.writeAll(")") catch return error.OutOfMemory;
+        }
+        w.writeAll(" } } }") catch return error.OutOfMemory;
+        var msg: []const u8 = "";
+        const data = gql(arena, x.transport, doc.written(), &msg) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .failed = msg },
+        };
+        const matches = try arena.alloc(std.StringHashMapUnmanaged(void), patterns.items.len);
+        var candidates: std.StringArrayHashMapUnmanaged(void) = .empty;
+        for (patterns.items, matches, 0..) |p, *set, i| {
+            set.* = .empty;
+            for ([_][]const u8{ "p", "d" }) |kind| {
+                const found = jsonStrings(arena, jsonFind(data, try std.fmt.allocPrint(arena, "{s}{d}", .{ kind, i }))) catch return error.OutOfMemory;
+                for (found) |path| {
+                    if (std.mem.endsWith(u8, path, "/")) continue; // a directory
+                    try set.put(arena, path, {});
+                    if (!p.exclude) try candidates.put(arena, path, {});
+                }
+            }
+        }
+        var files: std.ArrayList([]const u8) = .empty;
+        for (candidates.keys()) |path| {
+            var included = false;
+            for (patterns.items, matches) |p, set| if (set.contains(path)) {
+                included = !p.exclude;
+            };
+            if (included) try files.append(arena, path);
+        }
+        if (files.items.len == 0) return .{ .ok = "" };
+        std.mem.sort([]const u8, files.items, {}, struct {
+            fn lt(_: void, l: []const u8, r: []const u8) bool {
+                return std.mem.lessThan(u8, l, r);
+            }
+        }.lt);
+
+        // One sha256sum line per file, in order (names are listed in a file, so any number fits).
+        const list = try std.mem.join(arena, "\n", files.items);
+        doc = .init(arena);
+        const w2 = &doc.writer;
+        w2.writeAll("{ loadContainerFromID(id:") catch return error.OutOfMemory;
+        std.json.Stringify.value(x.container_id, .{}, w2) catch return error.OutOfMemory;
+        w2.writeAll(") { withNewFile(path:\"" ++ hash_list_path ++ "\",contents:") catch return error.OutOfMemory;
+        std.json.Stringify.value(list, .{}, w2) catch return error.OutOfMemory;
+        w2.writeAll(") { withExec(args:") catch return error.OutOfMemory;
+        std.json.Stringify.value([_][]const u8{ "sh", "-c", "cd " ++ workspace ++ " && tr '\\n' '\\0' < " ++ hash_list_path ++ " | xargs -0 sha256sum --" }, .{}, w2) catch return error.OutOfMemory;
+        w2.writeAll(",expect:ANY) { exitCode stdout stderr } } } }") catch return error.OutOfMemory;
+        const hdata = gql(arena, x.transport, doc.written(), &msg) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return .{ .failed = msg },
+        };
+        const code = if (jsonFind(hdata, "exitCode")) |c| (if (c == .integer) c.integer else 1) else 1;
+        if (code != 0) return .{ .failed = std.mem.trim(u8, jsonFindString(hdata, "stderr") orelse "sha256sum failed", " \n") };
+        var result = std.crypto.hash.sha2.Sha256.init(.{});
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, jsonFindString(hdata, "stdout") orelse "", "\n"), '\n');
+        var n: usize = 0;
+        while (lines.next()) |line_in| {
+            // sha256sum marks names it had to escape with a leading backslash.
+            const line = if (std.mem.startsWith(u8, line_in, "\\")) line_in[1..] else line_in;
+            if (line.len < 64) return .{ .failed = "unexpected sha256sum output" };
+            var digest: [32]u8 = undefined;
+            _ = std.fmt.hexToBytes(&digest, line[0..64]) catch return .{ .failed = "unexpected sha256sum output" };
+            result.update(&digest);
+            n += 1;
+        }
+        if (n != files.items.len) return .{ .failed = "sha256sum did not hash every file" };
+        const hex = std.fmt.bytesToHex(result.finalResult(), .lower);
+        return .{ .ok = try arena.dupe(u8, &hex) };
     }
 
     /// With `id-token: write` (GitHub then sends GenerateIdTokenUrl), the variables every step requests
@@ -3575,6 +3695,48 @@ test "Docker actions: built or pulled, the workspace copied in and back, args, e
     try std.testing.expect(std.mem.indexOf(u8, out, "image: built from sub/docker/Dockerfile") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Post o/dock/sub@v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "image: alpine:3.22") != null);
+}
+
+test "hashFiles globs the workspace, honours exclusions, and hashes the files' digests in path order" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var st = testStep("");
+    st.action.script.script = .{ .expr = "format('echo key-{0}', hashFiles('**/package-lock.json', '!node_modules/**'))" };
+    var none = testStep("");
+    none.action.script.script = .{ .expr = "format('echo none-{0}.', hashFiles('/elsewhere/x', '!a'))" };
+    const steps = [_]job_mod.Step{ st, none };
+    const d1 = "1111111111111111111111111111111111111111111111111111111111111111";
+    const d2 = "2222222222222222222222222222222222222222222222222222222222222222";
+    const answers = [_][]const u8{
+        base_answer,
+        "{\"data\":{\"loadContainerFromID\":{\"directory\":{\"p0\":[\"package-lock.json\",\"node_modules/x/package-lock.json\",\"a/package-lock.json\"],\"d0\":[]," ++
+            "\"p1\":[\"node_modules/\",\"node_modules/x/\",\"node_modules/x/package-lock.json\"],\"d1\":[\"node_modules/x/\",\"node_modules/x/package-lock.json\"]}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"withNewFile\":{\"withExec\":{\"exitCode\":0,\"stdout\":\"" ++ d1 ++ "  a/package-lock.json\\n" ++ d2 ++ "  package-lock.json\\n\",\"stderr\":\"\"}}}}}",
+        try exec(arena, "C1", 0, ""),
+        try exec(arena, "C2", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(@as(usize, 5), seen.len);
+    for (seen) |d| try std.testing.expect(braceBalanced(d));
+    try std.testing.expect(std.mem.indexOf(u8, seen[1], "loadContainerFromID(id:\"C0\") { directory(path:\"/github/workspace\") { p0: glob(pattern:\"**/package-lock.json\") d0: glob(pattern:\"**/package-lock.json/**\") p1: glob(pattern:\"node_modules/**\")") != null);
+    // node_modules is excluded; the rest is hashed in path order, in the job's container.
+    try std.testing.expect(std.mem.indexOf(u8, seen[2], "loadContainerFromID(id:\"C0\") { withNewFile(path:\"/tmp/zig-runner-hashfiles\",contents:\"a/package-lock.json\\npackage-lock.json\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[2], "xargs -0 sha256sum --") != null);
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(&(@as([32]u8, @splat(0x11))));
+    h.update(&(@as([32]u8, @splat(0x22))));
+    const want = try std.fmt.allocPrint(arena, "echo key-{s}", .{&std.fmt.bytesToHex(h.finalResult(), .lower)});
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], want) != null);
+    // Nothing inside the workspace to include: "" without asking Dagger.
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "echo none-.") != null);
 }
 
 test "splitArgs splits like a command line, with double quotes" {
