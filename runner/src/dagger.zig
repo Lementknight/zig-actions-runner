@@ -392,7 +392,28 @@ pub const Result = struct {
     engine_error: ?[]const u8,
     /// False if any step failed without continue-on-error, or the engine failed before running them.
     succeeded: bool,
+    /// Actions' `pre` and `post` scripts that ran, as GitHub shows them: steps of their own.
+    extra: []const ExtraStep = &.{},
+    /// The first log step number not used (see `ExtraStep.log_step`); 0 means `steps.len + 1`.
+    next_log_step: u32 = 0,
 };
+
+/// A `pre` or `post` script that ran: a step of its own in GitHub's list ("Pre Run x@v1",
+/// "Post Run x@v1"). Its lines are logged under `log_step`, a number after the job's own steps
+/// (0 is "Set up job", 1..n the job's steps).
+pub const ExtraStep = struct {
+    kind: enum { pre, post },
+    name: []const u8,
+    log_step: u32,
+    outcome: Outcome,
+    started_ms: i64,
+    completed_ms: i64,
+};
+
+/// Log step numbers a job can use: its steps, and at most one `pre` and one `post` each.
+fn logSteps(n: usize) usize {
+    return n * 3 + 1;
+}
 
 /// Sends one GraphQL document to the Dagger session and returns the response body.
 pub const Transport = struct {
@@ -1152,15 +1173,16 @@ pub fn run(
 
     const results = try arena.alloc(StepResult, job.steps.len);
     @memset(results, .{});
-    const live = try arena.alloc(std.atomic.Value(u32), job.steps.len);
-    const ended = try arena.alloc(std.atomic.Value(bool), job.steps.len);
+    // Per log step: the job's steps, then their `pre` and `post` scripts (see `ExtraStep`).
+    const live = try arena.alloc(std.atomic.Value(u32), logSteps(job.steps.len));
+    const ended = try arena.alloc(std.atomic.Value(bool), logSteps(job.steps.len));
     for (live, ended) |*l, *e| {
         l.* = .init(0);
         e.* = .init(false);
     }
-    const replayed_steps = try arena.alloc(bool, job.steps.len);
+    const replayed_steps = try arena.alloc(bool, logSteps(job.steps.len));
     @memset(replayed_steps, false);
-    const step_commands = try arena.alloc(Shared.StepCommands, job.steps.len);
+    const step_commands = try arena.alloc(Shared.StepCommands, logSteps(job.steps.len));
     @memset(step_commands, .{});
     var sh: Shared = .{
         .io = io,
@@ -1482,7 +1504,8 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         .event_from_env = step_cache and (try ev.eventJson()).len <= max_event_env,
         .job_secret_env = jobEnvHasSecret(job, ev.job_env.items),
         .run_nonce = try runNonce(arena, io, &ev),
-        .execs = try zeroed(arena, u32, job.steps.len),
+        .execs = try zeroed(arena, u32, logSteps(job.steps.len)),
+        .next_log_step = @intCast(job.steps.len + 1),
         .loaded = try nulls(arena, Exec.LoadResult, job.steps.len),
         .pre_state = try emptySlices(arena, job_mod.EnvVar, job.steps.len),
     };
@@ -1652,6 +1675,8 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     };
     var result = try finish(arena, sh, results, "");
     if (x.hook_failed) result.succeeded = false;
+    result.extra = x.extra.items;
+    result.next_log_step = x.next_log_step;
     return result;
 }
 
@@ -1698,8 +1723,12 @@ const Exec = struct {
     js_runtime: config.JsRuntime,
     /// Whether the JavaScript runtime is in the container yet (it is added by the first JS action).
     js_mounted: bool = false,
-    /// Per step (index = step - 1): execs so far, the action loaded for it, the state its `pre` saved.
+    /// Per log step (index = step - 1, see `ExtraStep`): execs so far.
     execs: []u32,
+    /// The next log step number for a `pre` or `post` script, and the scripts that ran.
+    next_log_step: u32,
+    extra: std.ArrayList(ExtraStep) = .empty,
+    /// Per job step (index = step - 1): the action loaded for it, the state its `pre` saved.
     loaded: []?LoadResult,
     pre_state: [][]const job_mod.EnvVar,
     /// Action directories already mounted (by path), so a later phase sees what an earlier one left.
@@ -1734,6 +1763,8 @@ const Exec = struct {
 
     const Post = struct {
         num: u32,
+        /// "Post Run x@v1": the step's name for the step's own action, the action for a nested one.
+        name: []const u8,
         act: Loaded,
         u: job_mod.Uses,
         script: []const u8,
@@ -2199,6 +2230,7 @@ const Exec = struct {
         // Its `post` runs after the job's steps, with the inputs and the state saved so far.
         if (nd.post) |post| try x.posts.append(x.arena, .{
             .num = num,
+            .name = try x.extraName("Post", num, act),
             .act = act,
             .u = u,
             .script = post,
@@ -2285,10 +2317,16 @@ const Exec = struct {
         var plain: std.ArrayList(job_mod.EnvVar) = .empty;
         var secret: std.ArrayList(SecretRef) = .empty;
         splitEnv(x.arena, x.transport, x.job.*, &x.secret_counter, step_env, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
+        // A step of its own, "Pre Run x@v1", logged under the next log step.
+        const ls = x.next_log_step;
+        x.next_log_step += 1;
+        const started = std.Io.Clock.real.now(x.io).toMilliseconds();
         const pre_out = switch (act.meta.runs) {
-            .docker => |dk| if (try x.dockerRunFor(num, act, u, dk, inputs, plain.items, secret.items, pre)) |dr| try x.runContainer(num, .pre, dr, &.{}) else null,
-            else => try x.runJsScript(num, .pre, act, u, pre, inputs, plain.items, secret.items, &.{}),
+            .docker => |dk| if (try x.dockerRunFor(ls, act, u, dk, inputs, plain.items, secret.items, pre)) |dr| try x.runContainer(ls, .pre, dr, &.{}) else null,
+            else => try x.runJsScript(ls, .pre, act, u, pre, inputs, plain.items, secret.items, &.{}),
         };
+        var ok = false;
+        defer x.extra.append(x.arena, .{ .kind = .pre, .name = x.extraName("Pre", num, act) catch "Pre", .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() }) catch {};
         const out = pre_out orelse {
             ev.job_failed = true;
             x.hook_failed = true;
@@ -2296,10 +2334,18 @@ const Exec = struct {
         };
         x.pre_state[num - 1] = out.state;
         if (out.code != 0) {
-            x.sh.append(num, try std.fmt.allocPrint(x.arena, "##[error]Pre {s} failed (exit code {d})", .{ act.ref_label, out.code }));
+            logExitCode(x.sh, ls, out.code);
             ev.job_failed = true;
             x.hook_failed = true;
-        }
+        } else ok = true;
+    }
+
+    /// The name GitHub gives a `pre` or `post` step: the prefix and the step's name for the step's
+    /// own action ("Post Run actions/cache@v4"), or "<prefix> Run <action>" for an action nested in
+    /// a composite one (`depth` > 0 while a composite action's steps run).
+    fn extraName(x: *Exec, prefix: []const u8, num: u32, act: Loaded) ![]const u8 {
+        if (x.depth == 0) return std.fmt.allocPrint(x.arena, "{s} {s}", .{ prefix, x.job.steps[num - 1].name });
+        return std.fmt.allocPrint(x.arena, "{s} Run {s}", .{ prefix, act.ref_label });
     }
 
     /// Runs the registered `post` scripts, last first, each when its `post-if` (default `always()`)
@@ -2312,16 +2358,23 @@ const Exec = struct {
             x.ev.diag = "";
             const sc = try x.ev.scope(&.{});
             if (!(expr.evalCondition(x.arena, p.condition, sc) catch true)) continue;
+            // A step of its own, "Post Run x@v1", logged under the next log step.
+            const ls = x.next_log_step;
+            x.next_log_step += 1;
+            const started = std.Io.Clock.real.now(x.io).toMilliseconds();
+            x.sh.append(ls, "Post job cleanup.");
             const post_out = if (p.docker) |dr|
-                try x.runContainer(p.num, .post, dr, p.state)
+                try x.runContainer(ls, .post, dr, p.state)
             else
-                try x.runJsScript(p.num, .post, p.act, p.u, p.script, p.inputs, p.step_env, p.step_secret, p.state);
+                try x.runJsScript(ls, .post, p.act, p.u, p.script, p.inputs, p.step_env, p.step_secret, p.state);
+            const ok = if (post_out) |out| out.code == 0 else false;
+            try x.extra.append(x.arena, .{ .kind = .post, .name = p.name, .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() });
             const out = post_out orelse {
                 x.hook_failed = true;
                 continue;
             };
             if (out.code != 0) {
-                x.sh.append(p.num, try std.fmt.allocPrint(x.arena, "##[error]Post {s} failed (exit code {d})", .{ p.act.ref_label, out.code }));
+                logExitCode(x.sh, ls, out.code);
                 x.hook_failed = true;
                 x.ev.job_failed = true;
             }
@@ -2386,7 +2439,9 @@ const Exec = struct {
         try secret.appendSlice(arena, step_secret);
         splitEnv(arena, x.transport, x.job.*, &x.secret_counter, env.items, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
 
-        try x.logGroup(num, phase, act.ref_label, try shownInputs(arena, inputs), step_env, step_secret, &.{});
+        // GitHub folds the action's inputs at the start of its main step; its pre and post steps
+        // start with their output.
+        if (phase == .main) try x.logGroup(num, phase, act.ref_label, try shownInputs(arena, inputs), step_env, step_secret, &.{});
 
         // Started through bash, not sh: dash drops variables whose names are not identifiers
         // (INPUT_GITHUB-TOKEN) when it starts a program; bash passes them on.
@@ -2630,6 +2685,7 @@ const Exec = struct {
             p.entrypoint = post;
             try x.posts.append(x.arena, .{
                 .num = num,
+                .name = try x.extraName("Post", num, act),
                 .act = act,
                 .u = u,
                 .script = post,
@@ -2745,7 +2801,7 @@ const Exec = struct {
             .pull => |ref| try std.fmt.allocPrint(arena, "image: {s}", .{ref}),
             .build => |b| try std.fmt.allocPrint(arena, "image: built from {s}", .{try std.fs.path.resolveAllocPosix(arena, &.{ b.context, b.dockerfile })}),
         };
-        try x.logGroup(num, phase, dr.label, dr.shown, dr.step_env, dr.step_secret, &.{image_line});
+        if (phase == .main) try x.logGroup(num, phase, dr.label, dr.shown, dr.step_env, dr.step_secret, &.{image_line});
         const busybox = (try x.busyboxFile(num)) orelse return null;
         const img = (try x.imageInfo(num, dr.image, dr.label)) orelse return null;
 
@@ -4070,7 +4126,10 @@ test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the
     try std.testing.expect(std.mem.indexOf(u8, seen[18], "'STATE_pid=7'") != null);
     // The action directory and runtime are not mounted again for the post.
     try std.testing.expect(std.mem.indexOf(u8, seen[18], "withDirectory") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Post actions/github-script@v9") != null);
+    // Each post is a step of its own (log steps 4 and 5, after the job's three), starting as GitHub's do.
+    try std.testing.expect(std.mem.indexOf(u8, out, "[job 0 step 4 stdout] Post job cleanup.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[job 0 step 5 stdout] Post job cleanup.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Post") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Run actions/github-script@v9") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "  script: return 42") != null);
 }
@@ -4188,7 +4247,8 @@ test "Docker actions: built or pulled, the workspace copied in and back, args, e
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Run o/dock/sub@v1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "image: built from sub/docker/Dockerfile") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Post o/dock/sub@v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "[job 0 step 3 stdout] Post job cleanup.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "##[group]Post") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "image: alpine:3.22") != null);
 }
 
@@ -4797,10 +4857,16 @@ test "JavaScript pre and post: pre runs first and hands its state on, post-if is
         for (seen) |d| try std.testing.expect(braceBalanced(d));
         try std.testing.expect(!res.succeeded);
         try std.testing.expect(std.mem.indexOf(u8, seen[5], "/github/_actions/o/act/v1/dist/pre.js") != null);
-        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[job 0 step 1 stdout] ##[group]Pre o/act@v1") != null);
+        // The pre is a step of its own, logged after the job's two steps.
+        try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[group]Pre") == null);
+        try std.testing.expectEqual(@as(usize, 1), res.extra.len);
+        try std.testing.expectEqual(@as(u32, 3), res.extra[0].log_step);
+        try std.testing.expect(std.mem.startsWith(u8, res.extra[0].name, "Pre "));
+        try std.testing.expectEqual(@as(u32, 4), res.next_log_step);
         if (pre_fails) {
             try std.testing.expectEqual(@as(usize, 6), seen.len);
-            try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[error]Pre o/act@v1 failed (exit code 1)") != null);
+            try std.testing.expectEqual(Outcome.failure, res.extra[0].outcome);
+            try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[job 0 step 3 stdout] ##[error]Process completed with exit code 1.") != null);
             try std.testing.expectEqual(Outcome.skipped, res.steps[0].outcome);
             try std.testing.expectEqual(Outcome.skipped, res.steps[1].outcome);
         } else {
@@ -4811,6 +4877,7 @@ test "JavaScript pre and post: pre runs first and hands its state on, post-if is
             try std.testing.expectEqual(Outcome.success, res.steps[0].outcome);
             try std.testing.expectEqual(Outcome.failure, res.steps[1].outcome);
             try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Post o/act") == null);
+            try std.testing.expectEqual(Outcome.success, res.extra[0].outcome);
         }
     }
 }

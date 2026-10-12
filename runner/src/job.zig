@@ -211,7 +211,12 @@ fn parseStep(arena: Allocator, sv: Value) Error!Step {
     } else if (std.mem.eql(u8, reference_type, "repository")) {
         const uses_name = path(sv, &.{ "reference", "name" }) orelse "";
         const uses_ref = path(sv, &.{ "reference", "ref" }) orelse "";
-        uses_label = try std.fmt.allocPrint(arena, "{s}@{s}", .{ uses_name, uses_ref });
+        // As GitHub names the step: the action's directory is part of it (`owner/repo/dir@ref`).
+        const uses_path = std.mem.trim(u8, path(sv, &.{ "reference", "path" }) orelse "", "/");
+        uses_label = if (uses_path.len > 0)
+            try std.fmt.allocPrint(arena, "{s}/{s}@{s}", .{ uses_name, uses_path, uses_ref })
+        else
+            try std.fmt.allocPrint(arena, "{s}@{s}", .{ uses_name, uses_ref });
         const repo_type = path(sv, &.{ "reference", "repositoryType" }) orelse "GitHub";
         if (std.ascii.eqlIgnoreCase(repo_type, "self")) {
             const local = path(sv, &.{ "reference", "path" }) orelse uses_name;
@@ -798,7 +803,7 @@ test "uses: references keep their directory and inputs; local actions; docker://
     try std.testing.expectEqualStrings("init", codeql.path);
     try std.testing.expectEqualStrings("go", codeql.inputs[0].value.lit);
     try std.testing.expectEqualStrings("github.token", codeql.inputs[1].value.expr);
-    try std.testing.expectEqualStrings("Run github/codeql-action@v3", job.steps[0].name);
+    try std.testing.expectEqualStrings("Run github/codeql-action/init@v3", job.steps[0].name);
     try std.testing.expectEqualStrings("sub/dir", job.steps[1].action.uses.path);
     const local = job.steps[2].action.uses;
     try std.testing.expect(local.local);
