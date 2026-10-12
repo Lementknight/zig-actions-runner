@@ -65,4 +65,41 @@ there is a question for the team rather than a bug.
 ## Deep links in production
 
 `npm run dev` serves the app for any path, so `/runs/12` reloads fine. A production server must
-do the same and return `index.html` for every path outside `/api`.
+do the same and return `index.html` for every path outside `/api`. The Docker image below does.
+
+## Docker
+
+`Dockerfile` builds the app and serves it, with nothing but Docker on the host. Bun is used inside
+the image only: it installs from `package-lock.json`, runs the same `npm run build` script (Vite
+still bundles), and runs `server.ts`, a small `Bun.serve` server. Local development and CI stay
+on npm.
+
+```sh
+docker build -t zig-runner-web web
+docker run --rm -p 8080:3000 -e API_UPSTREAM=http://host.docker.internal:8081 zig-runner-web
+# open http://localhost:8080
+```
+
+Build arguments, baked into the bundle (only `VITE_` names, so never a secret):
+
+| Argument | Default in the image | Meaning |
+|---|---|---|
+| `VITE_DATA_SOURCE` | `http` | `http` reads the API; `fake` builds the demo with bundled fixtures. |
+| `VITE_API_BASE_URL` | `/api` | Leave as `/api` so the browser calls the server, which proxies it. |
+| `BUN_VERSION` | `1.4.3` | The `oven/bun` tag for both stages. `api/Dockerfile` pins the same version; change both together. |
+
+For example `docker build --build-arg VITE_DATA_SOURCE=fake -t zig-runner-web-demo web` gives an
+image that needs no API.
+
+Runtime environment, read when the container starts:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `API_UPSTREAM` | none | Base URL of the read API, such as `http://api:8080`. `/api/...` is forwarded to it unchanged (path and query kept). Unset or unreachable answers `502`; no answer within 30 s answers `504`. |
+| `PORT` | `3000` | Port the server listens on inside the container. |
+
+What the server answers: a file in `dist/` when one matches (fingerprinted `/assets/` files are
+cached for a year, everything else revalidates), `404` for a missing `/assets/` file, and
+`index.html` for every other path, so deep links like `/runs/1/jobs/2` load the app. The image
+runs as the `bun` user, not root, and stops at once on `docker stop`. `.dockerignore` keeps
+`node_modules`, `dist` and every `.env` file out of the build.
