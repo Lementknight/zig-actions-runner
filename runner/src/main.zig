@@ -116,6 +116,11 @@ pub fn main(init: std.process.Init) !u8 {
         return code;
     }
 
+    // SIGTERM / SIGINT stop the runners gracefully (see `loop.stop_signals`); a second one exits.
+    const act: std.posix.Sigaction = .{ .handler = .{ .handler = onStopSignal }, .mask = std.posix.sigemptyset(), .flags = std.posix.SA.RESTART };
+    std.posix.sigaction(.TERM, &act, null);
+    std.posix.sigaction(.INT, &act, null);
+
     return @backingInt(try loop.pool(.{
         .arena = arena,
         .gpa = init.gpa,
@@ -131,6 +136,10 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 /// Dev helper: runs a saved acquirejob response through the Dagger executor.
+fn onStopSignal(_: std.posix.SIG) callconv(.c) void {
+    if (loop.stop_signals.fetchAdd(1, .acq_rel) >= 1) std.process.exit(130);
+}
+
 fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log: *sink.LogSink, err: *std.Io.Writer) !u8 {
     const arena = init.arena.allocator();
     const io = init.io;
