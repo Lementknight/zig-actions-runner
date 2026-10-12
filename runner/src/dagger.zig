@@ -109,6 +109,9 @@ pub const Fetched = struct {
     ref_label: []const u8,
     /// Absolute directory inside the container.
     mount: []const u8,
+    /// The ref the checkout stands for (`refs/heads/main`, `refs/pull/7/merge`, a bare name from
+    /// `with: ref:`), or null for a sha or a repository's default branch. See `checkoutRefCommands`.
+    git_ref: ?[]const u8 = null,
 };
 
 /// A step with its expressions evaluated, ready to become a script.
@@ -205,7 +208,9 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
             try shellQuote(w, try std.fmt.allocPrint(arena, "Syncing repository: {s}", .{f.repo}));
             try w.writeAll("\nprintf '%s\\n' ");
             try shellQuote(w, try std.fmt.allocPrint(arena, "Checked out {s} into {s} (the runner's built-in checkout replaces actions/checkout)", .{ f.ref_label, f.mount }));
-            try w.writeAll("\nrc=0\n");
+            try w.writeByte('\n');
+            if (f.git_ref) |ref| try w.writeAll(try checkoutRefCommands(arena, f.mount, ref));
+            try w.writeAll("rc=0\n");
         },
     }
     try w.writeAll("mkdir -p " ++ fc_dir ++ " && : ");
@@ -385,6 +390,57 @@ pub fn checkoutQuery(arena: Allocator, job: job_mod.Job, co: job_mod.Checkout) !
     return .{ .doc = aw.written() };
 }
 
+/// Shell lines that give a fetched tree the refs actions/checkout leaves: Dagger's tree has a
+/// detached HEAD and no refs at all. Without a ref at HEAD, a later `git fetch` in the job cannot tell
+/// the server what it already has and downloads the whole tree again; that is also why the dagger
+/// CLI warned "failed to fetch branch" on pull requests (its go-git reads the PR head right after
+/// such a fetch, and does not see the new pack file the large fetch produced).
+///   refs/heads/B        -> refs/remotes/origin/B and a local branch B tracking it, checked out
+///   refs/pull/N/merge   -> refs/remotes/pull/N/merge (detached), likewise refs/pull/N/head
+///   refs/tags/T         -> refs/tags/T (detached)
+///   other refs/...      -> the same ref (detached)
+///   a bare name         -> refs/remotes/origin/<name> (detached)
+/// Failures are ignored (an image without git, say): the checkout itself is already done.
+fn checkoutRefCommands(arena: Allocator, mount: []const u8, ref: []const u8) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("if command -v git >/dev/null 2>&1; then ( cd ");
+    try shellQuote(w, mount);
+    try w.writeAll(" && g() { git -c safe.directory='*' \"$@\"; }");
+    if (std.mem.startsWith(u8, ref, "refs/heads/")) {
+        const branch = ref["refs/heads/".len..];
+        const items = [_][2][]const u8{
+            .{ "update-ref", try std.fmt.allocPrint(arena, "refs/remotes/origin/{s}", .{branch}) },
+            .{ "update-ref", ref },
+        };
+        for (items) |it| {
+            try w.print(" && g {s} ", .{it[0]});
+            try shellQuote(w, it[1]);
+            try w.writeAll(" HEAD");
+        }
+        try w.writeAll(" && g symbolic-ref HEAD ");
+        try shellQuote(w, ref);
+        try w.writeAll(" && g config ");
+        try shellQuote(w, try std.fmt.allocPrint(arena, "branch.{s}.remote", .{branch}));
+        try w.writeAll(" origin && g config ");
+        try shellQuote(w, try std.fmt.allocPrint(arena, "branch.{s}.merge", .{branch}));
+        try w.writeByte(' ');
+        try shellQuote(w, ref);
+    } else {
+        const target = if (std.mem.startsWith(u8, ref, "refs/pull/"))
+            try std.fmt.allocPrint(arena, "refs/remotes/pull/{s}", .{ref["refs/pull/".len..]})
+        else if (std.mem.startsWith(u8, ref, "refs/"))
+            ref
+        else
+            try std.fmt.allocPrint(arena, "refs/remotes/origin/{s}", .{ref});
+        try w.writeAll(" && g update-ref ");
+        try shellQuote(w, target);
+        try w.writeAll(" HEAD");
+    }
+    try w.writeAll(" ) >/dev/null 2>&1 || true; fi\n");
+    return aw.written();
+}
+
 fn looksLikeAuthFailure(text: []const u8) bool {
     const needles = [_][]const u8{ "not found", "authentication", "Authentication", "denied", "403", "401", "could not read Username" };
     for (needles) |n| if (std.mem.indexOf(u8, text, n) != null) return true;
@@ -399,7 +455,9 @@ fn fetchCheckout(arena: Allocator, t: Transport, job: job_mod.Job, co: job_mod.C
         workspace;
     const want = co.ref orelse (if (co.repository == null) job.github.sha else "HEAD");
     const label = if (isSha(want)) want[0..7] else want;
-    var f: Fetched = .{ .result = .{ .failed = "" }, .repo = repo, .ref_label = label, .mount = mount };
+    // The workflow's own commit is named by the ref that triggered the run, as actions/checkout does.
+    const git_ref: ?[]const u8 = if (co.ref) |r| (if (isSha(r)) null else r) else if (co.repository == null and job.github.ref.len > 0) job.github.ref else null;
+    var f: Fetched = .{ .result = .{ .failed = "" }, .repo = repo, .ref_label = label, .mount = mount, .git_ref = git_ref };
 
     const doc = switch (try checkoutQuery(arena, job, co)) {
         .err => |msg| {
@@ -2879,4 +2937,18 @@ test "a step is noted as reused only if none of its live lines ever arrived" {
     try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused from Dagger's cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "step 2") == null);
     try std.testing.expect(std.mem.indexOf(u8, got, "step 3") == null);
+}
+
+test "a checkout gets the refs actions/checkout leaves" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    const branch = try checkoutRefCommands(ar, "/github/workspace", "refs/heads/main");
+    try std.testing.expect(std.mem.indexOf(u8, branch, "g update-ref 'refs/remotes/origin/main' HEAD && g update-ref 'refs/heads/main' HEAD && g symbolic-ref HEAD 'refs/heads/main' && g config 'branch.main.remote' origin && g config 'branch.main.merge' 'refs/heads/main'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try checkoutRefCommands(ar, "/w", "refs/pull/36/merge"), "g update-ref 'refs/remotes/pull/36/merge' HEAD )") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try checkoutRefCommands(ar, "/w", "refs/tags/v1"), "g update-ref 'refs/tags/v1' HEAD )") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try checkoutRefCommands(ar, "/w", "release"), "g update-ref 'refs/remotes/origin/release' HEAD )") != null);
+    // Never fails the step, and only runs where git exists.
+    try std.testing.expect(std.mem.startsWith(u8, branch, "if command -v git >/dev/null 2>&1; then ( cd '/github/workspace' && "));
+    try std.testing.expect(std.mem.endsWith(u8, branch, ") >/dev/null 2>&1 || true; fi\n"));
 }
