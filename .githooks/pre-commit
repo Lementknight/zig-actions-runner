@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Fast checks on the Zig code being committed: formatting (zig fmt) and the errors zig ast-check finds
+# without compiling (syntax, unused locals and parameters, shadowing). The staged content is checked,
+# not the working tree, so a partially staged file is judged as it will be committed.
+# The full build and tests run before a push (pre-push).
+set -euo pipefail
+[ "${SKIP_ZIG_HOOKS:-}" = 1 ] && exit 0
+
+files=()
+while IFS= read -r -d '' f; do files+=("$f"); done < <(git diff --cached --name-only -z --diff-filter=ACMR -- '*.zig' '*.zon')
+[ ${#files[@]} -eq 0 ] && exit 0
+
+# shellcheck source-path=SCRIPTDIR source=zig-common.sh
+. "$(dirname "$0")/zig-common.sh"
+require_zig
+
+failed=0
+for f in "${files[@]}"; do
+	if ! git show ":$f" | zig fmt --stdin --check >/dev/null 2>&1; then
+		say "not formatted: $f   (zig fmt $f, then git add it)"
+		failed=1
+	fi
+	case "$f" in
+	*.zig)
+		if ! out=$(git show ":$f" | zig ast-check 2>&1); then
+			printf '%s\n' "${out//<stdin>/$f}" >&2
+			failed=1
+		fi
+		;;
+	esac
+done
+
+if [ "$failed" -ne 0 ]; then
+	say "commit stopped: fix the Zig issues above."
+	skip_hint commit
+	exit 1
+fi

@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Runs what CI's "Zig unit tests" job runs (zig fmt --check, then the tests), plus zig build, when the
+# commits being pushed that the remote does not have yet change runner/. The pushed commit is checked,
+# not the working tree: in place when the working tree's runner/ is exactly that commit, otherwise in a
+# temporary worktree (sharing runner/.zig-cache, so it stays incremental).
+set -euo pipefail
+[ "${SKIP_ZIG_HOOKS:-}" = 1 ] && exit 0
+
+# shellcheck source-path=SCRIPTDIR source=zig-common.sh
+. "$(dirname "$0")/zig-common.sh"
+
+zero=0000000000000000000000000000000000000000
+remote=${1:-origin}
+
+# Pushed refs whose new commits (those the remote does not have yet) change runner/.
+to_check=()
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+	[ "$local_sha" = "$zero" ] && continue # deleting a remote branch
+	if [ -n "$(git rev-list -n 1 "$local_sha" --not --remotes="$remote" -- runner)" ]; then
+		to_check+=("$local_sha")
+	fi
+done
+[ ${#to_check[@]} -eq 0 ] && exit 0
+
+require_zig
+
+# runner/ in the working tree is exactly commit $1 (nothing modified, staged or untracked).
+worktree_matches() {
+	[ "$(git rev-parse HEAD)" = "$1" ] &&
+		git diff --quiet HEAD -- runner &&
+		git diff --cached --quiet -- runner &&
+		[ -z "$(git ls-files --others --exclude-standard -- runner)" ]
+}
+
+tmp=""
+cleanup() {
+	if [ -n "$tmp" ]; then git worktree remove --force "$tmp" >/dev/null 2>&1 || true; fi
+}
+trap cleanup EXIT
+
+run_checks() { # <runner dir> <cache dir>
+	local dir=$1 cache=$2 step
+	for step in "fmt" "build" "test"; do
+		say "  $step"
+		case $step in
+		fmt) (cd "$dir" && zig fmt --check .) || return 1 ;;
+		build) (cd "$dir" && zig build --cache-dir "$cache") || return 1 ;;
+		test) (cd "$dir" && zig build test --cache-dir "$cache") || return 1 ;;
+		esac
+	done
+}
+
+for sha in "${to_check[@]}"; do
+	short=$(git rev-parse --short "$sha")
+	if worktree_matches "$sha"; then
+		say "checking runner/ at $short (zig fmt --check, zig build, zig build test)"
+		dir="$root/runner"
+	else
+		say "checking runner/ at $short in a temporary worktree (the working tree differs from it)"
+		tmp=$(mktemp -d "${TMPDIR:-/tmp}/zig-pre-push.XXXXXX")
+		git worktree add --quiet --detach "$tmp" "$sha"
+		dir="$tmp/runner"
+	fi
+	if ! run_checks "$dir" "$root/runner/.zig-cache"; then
+		say "push stopped: the Zig checks failed for $short (see above)."
+		skip_hint push
+		exit 1
+	fi
+	cleanup
+	tmp=""
+done
+say "Zig checks passed."
