@@ -1327,6 +1327,8 @@ const Exec = struct {
     job_secret_env: bool,
     /// Differs on every run (and attempt): makes steps that use secrets run every time.
     run_nonce: []const u8,
+    /// The job token as a Dagger secret, for ACTIONS_ID_TOKEN_REQUEST_TOKEN (registered on first use).
+    id_token_secret: ?[]const u8 = null,
 
     const Post = struct {
         num: u32,
@@ -1367,18 +1369,34 @@ const Exec = struct {
         const ev = x.ev;
         // Secret variables are for scripts only; they reach them through aliases (`secretAlias`).
         var resolved = resolved_in;
-        const secret_env: []const SecretRef = if (resolved == .run) secret_env_in else &.{};
+        var secret_env: []const SecretRef = if (resolved == .run) secret_env_in else &.{};
         if (resolved == .run) {
+            const uses_secrets = secret_env.len > 0 or x.job_secret_env or containsSecret(x.job.*, resolved.run.script);
+            // With `id-token: write`, every step can request OIDC tokens, as on GitHub (`curl
+            // "$ACTIONS_ID_TOKEN_REQUEST_URL"` in a script, `core.getIDToken()` in an action).
+            const oidc = x.job.runtime.id_token_url.len > 0;
+            if (oidc) {
+                const token_id = x.id_token_secret orelse id: {
+                    const id = newSecret(arena, x.transport, &x.secret_counter, x.job.job_token, &x.err_msg) catch return error.EngineFailed;
+                    x.id_token_secret = id;
+                    break :id id;
+                };
+                resolved.run.env = try std.mem.concat(arena, job_mod.EnvVar, &.{ resolved.run.env, &.{.{ .name = "ACTIONS_ID_TOKEN_REQUEST_URL", .value = x.job.runtime.id_token_url }} });
+                secret_env = try std.mem.concat(arena, SecretRef, &.{ secret_env, &.{.{ .name = "ACTIONS_ID_TOKEN_REQUEST_TOKEN", .id = token_id }} });
+            }
             const names = try arena.alloc([]const u8, secret_env.len);
             for (secret_env, names) |s, *n| n.* = s.name;
             resolved.run.secret_env = names;
             resolved.run.write_event = x.event_from_env;
             // A step that uses secrets (a deploy, a publish) must not be skipped because an earlier run
             // had the same inputs, and one that reads run-specific values must not replay an earlier
-            // run's; every step after it then runs too.
+            // run's; every step after it then runs too. One that can get OIDC tokens may publish or
+            // deploy without any secret (npm's trusted publishing, cloud logins), so it runs too.
             if (x.step_cache) {
-                const reason: ?[]const u8 = if (secret_env.len > 0 or x.job_secret_env or containsSecret(x.job.*, resolved.run.script))
+                const reason: ?[]const u8 = if (uses_secrets)
                     "it uses secrets"
+                else if (oidc)
+                    "it can request OIDC tokens (id-token: write)"
                 else if (readsRunSpecific(resolved.run.script))
                     "it reads run-specific values"
                 else
@@ -3142,6 +3160,48 @@ test "step caching: run-specific values are volatile, steps with secrets always 
         const got = w.buffered();
         const note = std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused from Dagger's cache") orelse return error.TestUnexpectedResult;
         try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] built").? < note);
+    }
+}
+
+test "with id-token: write, every step can request OIDC tokens, and so always runs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{ testStep("one"), testStep("two") };
+    for ([_]bool{ true, false }) |granted| {
+        var job = testJob(&steps);
+        job.secrets = &.{"ghs_jobtoken"};
+        job.job_token = "ghs_jobtoken";
+        if (granted) job.runtime.id_token_url = "https://token.test/idtoken?api-version=2.0";
+        const answers = [_][]const u8{
+            base_answer,
+            "{\"data\":{\"setSecret\":{\"id\":\"SEC_ID\"}}}", // registered once for the job
+            try exec(arena, "C1", 0, ""),
+            try exec(arena, "C2", 0, ""),
+        };
+        var fake: FakeSession = .{ .answers = if (granted) &answers else &.{ answers[0], answers[2], answers[3] }, .arena = arena };
+        var buf: [4096]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+        try std.testing.expect(res.succeeded);
+        const seen = fake.seen.items;
+        for (seen) |d| try std.testing.expect(braceBalanced(d));
+        if (!granted) {
+            try std.testing.expectEqual(@as(usize, 3), seen.len);
+            for (seen) |d| try std.testing.expect(std.mem.indexOf(u8, d, "ACTIONS_ID_TOKEN") == null);
+            continue;
+        }
+        try std.testing.expectEqual(@as(usize, 4), seen.len);
+        try std.testing.expect(std.mem.indexOf(u8, seen[1], "setSecret") != null);
+        for ([_][]const u8{ seen[2], seen[3] }) |d| {
+            try std.testing.expect(std.mem.indexOf(u8, d, "'ACTIONS_ID_TOKEN_REQUEST_URL=https://token.test/idtoken?api-version=2.0'") != null);
+            try std.testing.expect(std.mem.indexOf(u8, d, "withSecretVariable(name:\"ZIG_SECRET_0\",secret:\"SEC_ID\")") != null);
+            try std.testing.expect(std.mem.indexOf(u8, d, "'ACTIONS_ID_TOKEN_REQUEST_TOKEN='\\\"$ZIG_SECRET_0\\\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, d, "runs this step every time: it can request OIDC tokens (id-token: write)") != null);
+            try std.testing.expect(std.mem.indexOf(u8, d, "ghs_") == null);
+        }
     }
 }
 
