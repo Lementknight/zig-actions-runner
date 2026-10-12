@@ -119,13 +119,16 @@ pub fn writeSetSchema(w: *Io.Writer, schema: []const u8) Io.Writer.Error!void {
 
 pub const Store = struct {
     client: *pg.Client,
+    io: Io,
+    /// One connection, shared by the process's runners: one query at a time.
+    mu: Io.Mutex = .init,
 
     /// Connects. `schema` is for tests (a scratch schema); production uses the default search path.
     pub fn open(gpa: Allocator, io: Io, cfg: pg.Config, schema: ?[]const u8) !Store {
         const c = try pg.Client.connect(gpa, io, cfg);
         errdefer c.close();
         if (schema) |sc| try execWith(gpa, c, writeSetSchemaFn, sc);
-        return .{ .client = c };
+        return .{ .client = c, .io = io };
     }
 
     pub fn close(s: *Store) void {
@@ -145,6 +148,8 @@ pub const Store = struct {
     }
 
     fn run(s: *Store, comptime T: type, comptime build: fn (*Io.Writer, T) Io.Writer.Error!void, row: T) pg.Error!void {
+        s.mu.lockUncancelable(s.io);
+        defer s.mu.unlock(s.io);
         var arena_state: std.heap.ArenaAllocator = .init(s.client.gpa);
         defer arena_state.deinit();
         var aw: Io.Writer.Allocating = .init(arena_state.allocator());

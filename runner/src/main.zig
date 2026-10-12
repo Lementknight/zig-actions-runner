@@ -66,7 +66,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var out_buf: [4096]u8 = undefined;
     var out_w: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
-    var console: sink.LogSink = .{ .stdout = .{ .writer = &out_w.interface, .secrets = secrets } };
+    var console: sink.LogSink = .{ .stdout = .{ .writer = &out_w.interface, .secrets = secrets, .io = io } };
     defer console.close();
 
     var db_sink: sink.LogSink = undefined;
@@ -114,7 +114,7 @@ pub fn main(init: std.process.Init) !u8 {
         return code;
     }
 
-    return @backingInt(try loop.serve(.{
+    return @backingInt(try loop.pool(.{
         .arena = arena,
         .gpa = init.gpa,
         .io = io,
@@ -125,7 +125,7 @@ pub fn main(init: std.process.Init) !u8 {
         .secrets = secrets,
         .name = name,
         .store = if (store) |*st| st else null,
-    }));
+    }, cfg.runners));
 }
 
 /// Dev helper: runs a saved acquirejob response through the Dagger executor.

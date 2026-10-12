@@ -53,6 +53,8 @@ pub const Config = struct {
     /// Stop after one job (or one failed attempt), as an ephemeral runner process. Off by default:
     /// the runner registers again after each job.
     once: bool = false,
+    /// Runners in this process, each serving jobs one after another, concurrently with the others.
+    runners: u32 = 1,
     /// Connect to the configured database, report what is there, and exit (no GitHub credentials needed).
     db_check: bool = false,
     /// Dev: run a saved acquirejob response through the executor without contacting GitHub.
@@ -81,6 +83,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_PACKAGE_CACHES")) |v| c.package_caches = try boolean(v);
         if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
         if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
+        if (environ.get("RUNNER_COUNT")) |v| c.runners = try count(v);
 
         var i: usize = 1; // args[0] is the program name
         while (i < args.len) : (i += 1) {
@@ -127,6 +130,7 @@ pub const Config = struct {
             else if (std.mem.eql(u8, key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
             else if (std.mem.eql(u8, key, "package-caches")) c.package_caches = try boolean(val) //
             else if (std.mem.eql(u8, key, "step-cache")) c.step_cache = try boolean(val) //
+            else if (std.mem.eql(u8, key, "runners")) c.runners = try count(val) //
             else return error.UnknownFlag;
         }
 
@@ -167,6 +171,13 @@ pub const Config = struct {
         return std.fmt.parseInt(T, s, 10) catch error.InvalidNumber;
     }
 
+    /// A runner count: 1 to 1024.
+    fn count(s: []const u8) error{InvalidNumber}!u32 {
+        const n = try num(u32, s);
+        if (n < 1 or n > 1024) return error.InvalidNumber;
+        return n;
+    }
+
     fn boolean(s: []const u8) error{InvalidBool}!bool {
         if (std.ascii.eqlIgnoreCase(s, "true") or std.mem.eql(u8, s, "1")) return true;
         if (std.ascii.eqlIgnoreCase(s, "false") or std.mem.eql(u8, s, "0")) return false;
@@ -202,6 +213,19 @@ test "load: missing token" {
     defer env.deinit();
     try env.put("GH_SCOPE", "o/r");
     try std.testing.expectError(error.MissingGhToken, Config.load(&env, &.{"runner"}));
+}
+
+test "--runners and RUNNER_COUNT" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expectEqual(@as(u32, 1), (try Config.load(&env, &.{"runner"})).runners);
+    try env.put("RUNNER_COUNT", "8");
+    try std.testing.expectEqual(@as(u32, 8), (try Config.load(&env, &.{"runner"})).runners);
+    try std.testing.expectEqual(@as(u32, 20), (try Config.load(&env, &.{ "runner", "--runners=20" })).runners);
+    try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{ "runner", "--runners", "0" }));
+    try std.testing.expect((try Config.load(&env, &.{ "runner", "--once" })).once);
 }
 
 test "--db-check needs no GitHub credentials" {
