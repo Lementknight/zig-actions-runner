@@ -36,6 +36,10 @@ pub const Config = struct {
     image: []const u8 = "ubuntu:24.04",
     log_flush_lines: u32 = 200,
     log_flush_ms: u32 = 500,
+    /// Give each step's commands access to the job's Dagger engine (`experimentalPrivilegedNesting`), so
+    /// `dagger call` inside a job works, as dagger/dagger-for-github expects. That access is enough to run
+    /// privileged containers, so a job can control the runner's host: turn it off for untrusted workflows.
+    dagger_nesting: bool = true,
     dry_run: bool = false,
     /// Connect to the configured database, report what is there, and exit (no GitHub credentials needed).
     db_check: bool = false,
@@ -44,7 +48,7 @@ pub const Config = struct {
     /// Register one runner, print the shape of its config, delete it, exit.
     inspect: bool = false,
 
-    pub const Error = error{ MissingGhToken, MissingGhScope, InvalidScope, InvalidNumber, UnknownFlag, MissingFlagValue };
+    pub const Error = error{ MissingGhToken, MissingGhScope, InvalidScope, InvalidNumber, InvalidBool, UnknownFlag, MissingFlagValue };
 
     /// Values are borrowed from `environ` / `args`, which must outlive the Config.
     pub fn load(environ: *const std.process.Environ.Map, args: []const [:0]const u8) Error!Config {
@@ -60,6 +64,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_IMAGE")) |v| c.image = v;
         if (environ.get("LOG_FLUSH_LINES")) |v| c.log_flush_lines = try num(u32, v);
         if (environ.get("LOG_FLUSH_MS")) |v| c.log_flush_ms = try num(u32, v);
+        if (environ.get("RUNNER_DAGGER_NESTING")) |v| c.dagger_nesting = try boolean(v);
 
         var i: usize = 1; // args[0] is the program name
         while (i < args.len) : (i += 1) {
@@ -98,6 +103,7 @@ pub const Config = struct {
             else if (std.mem.eql(u8, key, "image")) c.image = val //
             else if (std.mem.eql(u8, key, "log-flush-lines")) c.log_flush_lines = try num(u32, val) //
             else if (std.mem.eql(u8, key, "log-flush-ms")) c.log_flush_ms = try num(u32, val) //
+            else if (std.mem.eql(u8, key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
             else return error.UnknownFlag;
         }
 
@@ -132,6 +138,12 @@ pub const Config = struct {
 
     fn num(comptime T: type, s: []const u8) error{InvalidNumber}!T {
         return std.fmt.parseInt(T, s, 10) catch error.InvalidNumber;
+    }
+
+    fn boolean(s: []const u8) error{InvalidBool}!bool {
+        if (std.ascii.eqlIgnoreCase(s, "true") or std.mem.eql(u8, s, "1")) return true;
+        if (std.ascii.eqlIgnoreCase(s, "false") or std.mem.eql(u8, s, "0")) return false;
+        return error.InvalidBool;
     }
 };
 
@@ -170,4 +182,17 @@ test "--db-check needs no GitHub credentials" {
     defer env.deinit();
     const c = try Config.load(&env, &.{ "runner", "--db-check" });
     try std.testing.expect(c.db_check);
+}
+
+test "dagger nesting is on by default and can be turned off" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).dagger_nesting);
+    try env.put("RUNNER_DAGGER_NESTING", "false");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).dagger_nesting);
+    try std.testing.expect((try Config.load(&env, &.{ "runner", "--dagger-nesting=true" })).dagger_nesting);
+    try env.put("RUNNER_DAGGER_NESTING", "maybe");
+    try std.testing.expectError(error.InvalidBool, Config.load(&env, &.{"runner"}));
 }
