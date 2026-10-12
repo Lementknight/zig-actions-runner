@@ -27,6 +27,10 @@ jobs:
         working-directory: runner
         run: zig fmt --check .
 
+      # The git hooks in .githooks/ run these same checks locally (see README.md).
+      - name: Lint the git hooks
+        run: shellcheck -x .githooks/pre-commit .githooks/pre-push .githooks/zig-common.sh
+
       # Database tests skip themselves here: no PG* variables are set on this job.
       - name: Test
         working-directory: runner
