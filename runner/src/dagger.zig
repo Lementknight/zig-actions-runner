@@ -1539,12 +1539,30 @@ const Exec = struct {
         if (!x.js_mounted) {
             const rt = js_runtimes.get(x.js_runtime);
             var msg: []const u8 = "";
-            const doc = try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ file(path:\"{s}\") {{ id }} }} }} }}", .{ rt.image, rt.binary });
+            const doc = if (rt.npm_dir) |npm|
+                try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }} npm: directory(path:\"{s}\") {{ id }} }} }} }}", .{ rt.image, rt.binary, npm })
+            else
+                try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }} }} }} }}", .{ rt.image, rt.binary });
             const data = gql(arena, x.transport, doc, &msg) catch
                 return x.actionFailed(num, "could not get the JavaScript runtime from {s}: {s}", .{ rt.image, msg });
-            const id = jsonFindString(data, "id") orelse return x.actionFailed(num, "could not get the JavaScript runtime from {s}", .{rt.image});
-            try mounts.append(arena, .{ .file = .{ .path = js_runtime_path, .id = id, .permissions = 0o755 } });
+            const bin = (if (jsonFind(data, "bin")) |b| jsonFindString(b, "id") else null) orelse
+                return x.actionFailed(num, "could not get the JavaScript runtime from {s}", .{rt.image});
+            try mounts.append(arena, .{ .file = .{ .path = js_runtime_path, .id = bin, .permissions = 0o755 } });
             try mounts.append(arena, .{ .new_file = .{ .path = js_shim_path, .contents = node_shim, .permissions = 0o755 } });
+            switch (x.js_runtime) {
+                // The same binary named `bun` is Bun's own CLI, for `bun x`.
+                .bun => {
+                    try mounts.append(arena, .{ .file = .{ .path = js_bun_path, .id = bin, .permissions = 0o755 } });
+                    try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npx", .contents = npx_bun_shim, .permissions = 0o755 } });
+                },
+                .node => {
+                    const npm = (if (jsonFind(data, "npm")) |d| jsonFindString(d, "id") else null) orelse
+                        return x.actionFailed(num, "could not get npm from {s}", .{rt.image});
+                    try mounts.append(arena, .{ .dir = .{ .path = js_npm_dir, .id = npm } });
+                    try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npx", .contents = npx_node_shim, .permissions = 0o755 } });
+                    try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npm", .contents = npm_node_shim, .permissions = 0o755 } });
+                },
+            }
         }
         try mounts.append(arena, .{ .dir = .{ .path = act.mount, .id = act.dir } });
 
@@ -1731,11 +1749,34 @@ const node_shim =
     \\
 ;
 
-const JsRuntimeSource = struct { image: []const u8, binary: []const u8 };
+/// `npx` for actions that run a package's binary (FirebaseExtended/action-hosting-deploy runs
+/// `npx firebase-tools@<version> ...`). With Bun it is `bun x`, whose progress goes to stderr, so a
+/// tool's stdout (often JSON the action parses) stays clean. Bun has no `npm`.
+const js_bun_path = "/github/_runtime/node/bun";
+const npx_bun_shim =
+    \\#!/bin/sh
+    \\case "$1" in -y|--yes) shift ;; esac
+    \\exec /github/_runtime/node/bun x "$@"
+    \\
+;
+/// With Node, npm's own package (from the same image) provides `npx` and `npm`.
+const js_npm_dir = "/github/_runtime/npm";
+const npx_node_shim =
+    \\#!/bin/sh
+    \\exec /github/_runtime/node/node /github/_runtime/npm/bin/npx-cli.js "$@"
+    \\
+;
+const npm_node_shim =
+    \\#!/bin/sh
+    \\exec /github/_runtime/node/node /github/_runtime/npm/bin/npm-cli.js "$@"
+    \\
+;
+
+const JsRuntimeSource = struct { image: []const u8, binary: []const u8, npm_dir: ?[]const u8 = null };
 /// Bun is pinned to the version the repository's images use (see api/Dockerfile).
 const js_runtimes: std.EnumArray(config.JsRuntime, JsRuntimeSource) = .init(.{
     .bun = .{ .image = "oven/bun:1.4.3", .binary = "/usr/local/bin/bun" },
-    .node = .{ .image = "node:24-bookworm-slim", .binary = "/usr/local/bin/node" },
+    .node = .{ .image = "node:24-bookworm-slim", .binary = "/usr/local/bin/node", .npm_dir = "/usr/local/lib/node_modules/npm" },
 });
 
 /// Package managers' cache directories (for root, the default images' user), each mounted from its
@@ -2583,7 +2624,7 @@ test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the
         base_answer,
         try treeAnswer(arena, "D1", &.{ "action.yml", "dist" }),
         try fileAnswer(arena, action_yml),
-        "{\"data\":{\"container\":{\"from\":{\"file\":{\"id\":\"BUN\"}}}}}",
+        "{\"data\":{\"container\":{\"from\":{\"bin\":{\"id\":\"BUN\"}}}}}",
         "{\"data\":{\"setSecret\":{\"id\":\"SEC_TOKEN\"}}}", // INPUT_GITHUB-TOKEN
         "{\"data\":{\"setSecret\":{\"id\":\"SEC_RUNTIME\"}}}", // ACTIONS_RUNTIME_TOKEN
         try execFc(arena, "C1", "", "result=42\\n", "", ""),
@@ -2608,10 +2649,13 @@ test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the
     try std.testing.expect(std.mem.indexOf(u8, seen[0], "withNewFile(path:\"/github/workflow/event.json\",contents:\"{\\n  \\\"ref\\\": \\\"refs/heads/x\\\"\\n}\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[0], "withEnvVariable(name:\"GITHUB_EVENT_PATH\",value:\"/github/workflow/event.json\")") != null);
     // Bun comes from its image, once per job.
-    try std.testing.expect(std.mem.indexOf(u8, seen[3], "from(address:\"oven/bun:1.4.3\") { file(path:\"/usr/local/bin/bun\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[3], "from(address:\"oven/bun:1.4.3\") { bin: file(path:\"/usr/local/bin/bun\")") != null);
     const run1 = seen[6];
     try std.testing.expect(std.mem.indexOf(u8, run1, "withFile(path:\"/github/_runtime/node/node\",source:\"BUN\",permissions:493)") != null);
     try std.testing.expect(std.mem.indexOf(u8, run1, "withNewFile(path:\"/github/_runtime/bin/node\"") != null);
+    // npx is `bun x`, through the same binary named bun.
+    try std.testing.expect(std.mem.indexOf(u8, run1, "withFile(path:\"/github/_runtime/node/bun\",source:\"BUN\",permissions:493)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "withNewFile(path:\"/github/_runtime/bin/npx\",contents:\"#!/bin/sh\\ncase \\\"$1\\\" in -y|--yes) shift ;; esac\\nexec /github/_runtime/node/bun x \\\"$@\\\"\\n\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, run1, "withDirectory(path:\"/github/_actions/actions/github-script/v9\",source:\"D1\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, run1, "exec /github/_runtime/node/node '\\\\''/github/_actions/actions/github-script/v9/dist/index.js'\\\\''") != null);
     // Inputs: given, defaulted (github.token, a secret, under its hyphenated name), names upper-cased with spaces as underscores.
