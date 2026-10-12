@@ -262,6 +262,8 @@ pub const Options = struct {
     provision: bool = true,
     /// Key under which output lines are written to the sink.
     sink_job_id: u64 = 0,
+    /// Steps may use the job's Dagger engine (`dagger call` inside a step): `experimentalPrivilegedNesting`.
+    nesting: bool = true,
     /// Tests only: replaces `dagger run ...` (it must print "<port> <token>" first) and the HTTP transport.
     test_session_argv: ?[]const []const u8 = null,
     test_transport: ?Transport = null,
@@ -356,7 +358,8 @@ pub fn checkoutQuery(arena: Allocator, job: job_mod.Job, co: job_mod.Checkout) !
     } else {
         try w.writeAll("head");
     }
-    if (co.fetch_depth == 0) try w.writeAll(" { tree { id } } } }") else try w.print(" {{ tree(depth:{d}) {{ id }} }} }} }}", .{co.fetch_depth});
+    // `depth` is always sent: Dagger's default is 1, and 0 is what fetches the full history.
+    try w.print(" {{ tree(depth:{d}{s}) {{ id }} }} }} }}", .{ co.fetch_depth, if (co.fetch_tags) ",includeTags:true" else "" });
     return .{ .doc = aw.written() };
 }
 
@@ -877,6 +880,7 @@ pub fn run(
         .container_id = container_id,
         .secret_counter = secret_counter,
         .next_fc = @intCast(job.steps.len + 1),
+        .nesting = opts.nesting,
     };
 
     for (job.steps, results, 1..) |step, *res, n| {
@@ -1008,6 +1012,8 @@ const Exec = struct {
     secret_counter: u32,
     /// File-command ids for the steps of composite actions, after the job's own step numbers.
     next_fc: u32,
+    /// Steps may use the job's Dagger engine (see `Options.nesting`).
+    nesting: bool,
 
     const ExecOut = struct { code: i32, outputs: []const job_mod.EnvVar };
 
@@ -1067,7 +1073,9 @@ const Exec = struct {
         }
         try w.writeAll("withExec(args:");
         try std.json.Stringify.value([_][]const u8{ "sh", "-c", script }, .{}, w);
-        try w.writeAll(",expect:ANY) { exitCode stdout stderr");
+        // Nesting gives the step's `dagger` CLI a session on this engine, sharing its cache. The
+        // container id is read after the step's secrets are removed (below).
+        try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
         for ([_][]const u8{ "output", "env", "path" }) |kind| {
             try w.print(" fc_{s}: file(path:\"{s}\") {{ contents }}", .{ kind, try fcPath(arena, kind, fc) });
         }
@@ -1546,7 +1554,9 @@ test "checkoutQuery picks commit, ref or head and honours fetch-depth" {
     const own = (try checkoutQuery(a.allocator(), job, .{})).doc;
     try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { commit(id:\"0123456789012345678901234567890123456789\") { tree(depth:1) { id } } } }", own);
     const by_ref = (try checkoutQuery(a.allocator(), job, .{ .ref = "refs/pull/7/merge", .fetch_depth = 0 })).doc;
-    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { ref(name:\"refs/pull/7/merge\") { tree { id } } } }", by_ref);
+    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { ref(name:\"refs/pull/7/merge\") { tree(depth:0) { id } } } }", by_ref);
+    const tags = (try checkoutQuery(a.allocator(), job, .{ .fetch_tags = true })).doc;
+    try std.testing.expect(std.mem.indexOf(u8, tags, "tree(depth:1,includeTags:true) { id }") != null);
     const other = (try checkoutQuery(a.allocator(), job, .{ .repository = "x/y", .fetch_depth = 3 })).doc;
     try std.testing.expect(std.mem.indexOf(u8, other, "x/y.git") != null and std.mem.indexOf(u8, other, "{ head { tree(depth:3)") != null);
     var empty = job;
@@ -2103,4 +2113,24 @@ test "composite failures: JavaScript actions, a missing action.yml, and a failin
     const out = w.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "o/js@v1 is a JavaScript action (node24); JavaScript actions are not supported yet") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "o/none@v1 has no action.yml or action.yaml") != null);
+}
+
+test "steps get the engine (privileged nesting) unless it is turned off" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("dagger call ci")};
+    for ([_]bool{ true, false }) |nesting| {
+        const answers = [_][]const u8{ base_answer, try exec(arena, "C1", 0, "") };
+        var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+        var buf: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&buf);
+        var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+        _ = try run(arena, std.testing.io, &env, .{ .nesting = nesting, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+        // The setup query (and its provisioning exec) never gets it; the step does when enabled.
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "experimentalPrivilegedNesting") == null);
+        try std.testing.expectEqual(nesting, std.mem.indexOf(u8, fake.seen.items[1], ",expect:ANY,experimentalPrivilegedNesting:true)") != null);
+        try std.testing.expect(braceBalanced(fake.seen.items[1]));
+    }
 }
