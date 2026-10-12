@@ -23,6 +23,8 @@ pub const Scope = union(enum) {
 const pg = @import("pg.zig");
 
 pub const JsRuntime = enum { bun, node };
+/// How jobs reach the Dagger engine: directly (`engine.zig`), or through a `dagger run` child.
+pub const EngineMode = enum { direct, cli };
 
 pub const Config = struct {
     gh_token: []const u8,
@@ -40,6 +42,11 @@ pub const Config = struct {
     log_flush_ms: u32 = 500,
     /// What runs JavaScript actions (`runs.using: node*`). Bun by default; Node for exact Node behaviour.
     js_runtime: JsRuntime = .bun,
+    engine: EngineMode = .direct,
+    /// The engine container `direct` sessions run `buildctl dial-stdio` in.
+    engine_container: []const u8 = "dagger-engine-v0.21.10",
+    /// The Docker API socket (from DOCKER_HOST when it is `unix://`).
+    docker_socket: []const u8 = "/var/run/docker.sock",
     /// Give each step's commands access to the job's Dagger engine (`experimentalPrivilegedNesting`), so
     /// `dagger call` inside a job works, as dagger/dagger-for-github expects. That access is enough to run
     /// privileged containers, so a job can control the runner's host: turn it off for untrusted workflows.
@@ -62,7 +69,7 @@ pub const Config = struct {
     /// Register one runner, print the shape of its config, delete it, exit.
     inspect: bool = false,
 
-    pub const Error = error{ MissingGhToken, MissingGhScope, InvalidScope, InvalidNumber, InvalidJsRuntime, InvalidBool, UnknownFlag, MissingFlagValue };
+    pub const Error = error{ MissingGhToken, MissingGhScope, InvalidScope, InvalidNumber, InvalidJsRuntime, InvalidEngine, InvalidBool, UnknownFlag, MissingFlagValue };
 
     /// Values are borrowed from `environ` / `args`, which must outlive the Config.
     pub fn load(environ: *const std.process.Environ.Map, args: []const [:0]const u8) Error!Config {
@@ -79,6 +86,11 @@ pub const Config = struct {
         if (environ.get("LOG_FLUSH_LINES")) |v| c.log_flush_lines = try num(u32, v);
         if (environ.get("LOG_FLUSH_MS")) |v| c.log_flush_ms = try num(u32, v);
         if (environ.get("RUNNER_JS_RUNTIME")) |v| c.js_runtime = try jsRuntime(v);
+        if (environ.get("RUNNER_ENGINE")) |v| c.engine = try engineMode(v);
+        if (environ.get("RUNNER_ENGINE_CONTAINER")) |v| c.engine_container = v;
+        if (environ.get("DOCKER_HOST")) |v| if (std.mem.startsWith(u8, v, "unix://")) {
+            c.docker_socket = v["unix://".len..];
+        };
         if (environ.get("RUNNER_DAGGER_NESTING")) |v| c.dagger_nesting = try boolean(v);
         if (environ.get("RUNNER_PACKAGE_CACHES")) |v| c.package_caches = try boolean(v);
         if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
@@ -127,6 +139,7 @@ pub const Config = struct {
             else if (std.mem.eql(u8, key, "log-flush-lines")) c.log_flush_lines = try num(u32, val) //
             else if (std.mem.eql(u8, key, "log-flush-ms")) c.log_flush_ms = try num(u32, val) //
             else if (std.mem.eql(u8, key, "js-runtime")) c.js_runtime = try jsRuntime(val) //
+            else if (std.mem.eql(u8, key, "engine")) c.engine = try engineMode(val) //
             else if (std.mem.eql(u8, key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
             else if (std.mem.eql(u8, key, "package-caches")) c.package_caches = try boolean(val) //
             else if (std.mem.eql(u8, key, "step-cache")) c.step_cache = try boolean(val) //
@@ -163,12 +176,24 @@ pub const Config = struct {
         return buf[0..n];
     }
 
+    fn engineMode(s: []const u8) error{InvalidEngine}!EngineMode {
+        return std.meta.stringToEnum(EngineMode, s) orelse error.InvalidEngine;
+    }
+
     fn jsRuntime(s: []const u8) error{InvalidJsRuntime}!JsRuntime {
         return std.meta.stringToEnum(JsRuntime, s) orelse error.InvalidJsRuntime;
     }
 
     fn num(comptime T: type, s: []const u8) error{InvalidNumber}!T {
         return std.fmt.parseInt(T, s, 10) catch error.InvalidNumber;
+    }
+
+    /// How jobs reach the engine, for `dagger.Options.engine`: null means a `dagger run` child.
+    pub fn engineEndpoint(c: *const Config) ?@import("engine.zig").Endpoint {
+        return switch (c.engine) {
+            .direct => .{ .docker_socket = c.docker_socket, .container = c.engine_container },
+            .cli => null,
+        };
     }
 
     /// A runner count: 1 to 1024.
@@ -213,6 +238,23 @@ test "load: missing token" {
     defer env.deinit();
     try env.put("GH_SCOPE", "o/r");
     try std.testing.expectError(error.MissingGhToken, Config.load(&env, &.{"runner"}));
+}
+
+test "RUNNER_ENGINE, RUNNER_ENGINE_CONTAINER and DOCKER_HOST" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    const d = try Config.load(&env, &.{"runner"});
+    try std.testing.expectEqual(EngineMode.direct, d.engine);
+    try std.testing.expectEqualStrings("/var/run/docker.sock", d.docker_socket);
+    try env.put("DOCKER_HOST", "unix:///run/user/1000/docker.sock");
+    try env.put("RUNNER_ENGINE_CONTAINER", "dagger-engine-custom");
+    const c = try Config.load(&env, &.{ "runner", "--engine=cli" });
+    try std.testing.expectEqual(EngineMode.cli, c.engine);
+    try std.testing.expectEqualStrings("/run/user/1000/docker.sock", c.docker_socket);
+    try std.testing.expectEqualStrings("dagger-engine-custom", c.engine_container);
+    try std.testing.expectError(error.InvalidEngine, Config.load(&env, &.{ "runner", "--engine=go" }));
 }
 
 test "--runners and RUNNER_COUNT" {
