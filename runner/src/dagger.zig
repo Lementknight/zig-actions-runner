@@ -175,11 +175,7 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
                 try w.writeAll(" && ");
             }
             try writeEnvCommand(w, arena, "env ", sc.env, sc.secret_env, sc.write_event, fc, action_name);
-            if (sc.shell != null and std.mem.eql(u8, sc.shell.?, "sh")) {
-                try w.writeAll("sh -e -c ");
-            } else {
-                try w.writeAll("bash --noprofile --norc -e -o pipefail -c ");
-            }
+            try w.writeAll(shellCommand(sc.shell));
             try shellQuote(w, sc.script);
             try w.writeAll(" )\nrc=$?\n");
         },
@@ -277,12 +273,12 @@ fn inputEnv(arena: Allocator, inputs: []const expr.Value.Entry) ![]const job_mod
     return out;
 }
 
-/// The resolved inputs that the workflow gave (`with:`), for the log.
-fn shownInputs(arena: Allocator, given: []const job_mod.Input, inputs: []const expr.Value.Entry) ![]const job_mod.EnvVar {
+/// The inputs an action gets, for the log as GitHub shows them: every one with a value (given or
+/// defaulted), in the action's order, then any it does not declare.
+fn shownInputs(arena: Allocator, inputs: []const expr.Value.Entry) ![]const job_mod.EnvVar {
     var out: std.ArrayList(job_mod.EnvVar) = .empty;
-    for (given) |g| for (inputs) |in| if (std.ascii.eqlIgnoreCase(in.key, g.name)) {
+    for (inputs) |in| if (in.value == .string and in.value.string.len > 0) {
         try out.append(arena, .{ .name = in.key, .value = in.value.string });
-        break;
     };
     return out.items;
 }
@@ -320,6 +316,19 @@ fn writeEnvCommand(w: *std.Io.Writer, arena: Allocator, env_cmd: []const u8, env
     }
     try shellQuote(w, try std.fmt.allocPrint(arena, "GITHUB_ACTION={s}", .{action_name}));
     try w.writeByte(' ');
+}
+
+/// How a script runs, as on GitHub: no `shell:` is `bash -e`; `bash` adds pipefail and skips the
+/// profile and rc files; `sh` is `sh -e`.
+fn shellCommand(shell: ?[]const u8) []const u8 {
+    const s = shell orelse return "bash -e -c ";
+    return if (std.mem.eql(u8, s, "sh")) "sh -e -c " else "bash --noprofile --norc -e -o pipefail -c ";
+}
+
+/// The `shell:` line of a run step's log header, as GitHub's runner prints it.
+fn shellLine(shell: ?[]const u8) []const u8 {
+    const s = shell orelse return "shell: /usr/bin/bash -e {0}";
+    return if (std.mem.eql(u8, s, "sh")) "shell: /usr/bin/sh -e {0}" else "shell: /usr/bin/bash --noprofile --norc -e -o pipefail {0}";
 }
 
 /// The name under which a step's `i`th secret variable is attached to the container. Dagger silently
@@ -1214,6 +1223,38 @@ fn engineOpenError(arena: Allocator, e: anyerror, ep: engine.Endpoint) ![]const 
     };
 }
 
+/// actions/checkout's inputs and defaults, in its order, for the step's log header (the token is
+/// the job's GITHUB_TOKEN, a secret; `repository` is the job's).
+const checkout_defaults = [_][2][]const u8{
+    .{ "repository", "" },                    .{ "token", "***" },                .{ "ssh-strict", "true" },
+    .{ "ssh-user", "git" },                   .{ "persist-credentials", "true" }, .{ "clean", "true" },
+    .{ "sparse-checkout-cone-mode", "true" }, .{ "fetch-depth", "1" },            .{ "fetch-tags", "false" },
+    .{ "show-progress", "true" },             .{ "lfs", "false" },                .{ "submodules", "false" },
+    .{ "set-safe-directory", "true" },
+};
+
+/// Opens a `run:` step's log as GitHub's runner does: the command folded away with its shell and the
+/// env it gets (workflow, job and step `env:`, and GITHUB_ENV; secret values are masked by the log).
+fn logRunHeader(arena: Allocator, sh: *Shared, num: u32, script: []const u8, shell: ?[]const u8, env: []const job_mod.EnvVar) !void {
+    sh.append(num, try std.fmt.allocPrint(arena, "##[group]Run {s}", .{firstLine(script)}));
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, script, "\n"), '\n');
+    while (lines.next()) |l| sh.append(num, l);
+    sh.append(num, shellLine(shell));
+    if (env.len > 0) {
+        sh.append(num, "env:");
+        for (env) |e| sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ e.name, firstLine(e.value) }));
+    }
+    sh.append(num, "##[endgroup]");
+}
+
+/// The `env` context a step sees: the job's (workflow, job, GITHUB_ENV), then the step's own.
+fn envContext(arena: Allocator, job_env: []const job_mod.EnvVar, step_env: []const job_mod.EnvVar) ![]const job_mod.EnvVar {
+    var out: std.ArrayList(job_mod.EnvVar) = .empty;
+    try out.appendSlice(arena, job_env);
+    for (step_env) |e| try Evaluator.putEnv(arena, &out, e.name, e.value);
+    return out.items;
+}
+
 /// Sends GraphQL over a direct session.
 const SessionTransport = struct {
     s: *engine.Session,
@@ -1407,6 +1448,22 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
 
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
+    // "Set up job": what GitHub's runner logs before the first step, including fetching every action.
+    try x.logSetUp(opts);
+    var downloaded: std.StringHashMapUnmanaged(void) = .empty;
+    for (job.steps, 1..) |step, n| if (step.action == .uses and !step.action.uses.local) {
+        const lr = try x.loadFor(@intCast(n), step.action.uses);
+        if (lr != .ok) continue;
+        const u = step.action.uses;
+        const label = try std.fmt.allocPrint(arena, "{s}/{s}@{s}", .{ u.owner, u.name, u.ref });
+        if ((try downloaded.getOrPut(arena, label)).found_existing) continue;
+        x.setUpLine(if (lr.ok.sha.len > 0)
+            try std.fmt.allocPrint(arena, "Download action repository '{s}' (SHA:{s})", .{ label, lr.ok.sha })
+        else
+            try std.fmt.allocPrint(arena, "Download action repository '{s}'", .{label}));
+    };
+    x.setUpLine(try std.fmt.allocPrint(arena, "Complete job name: {s}", .{if (job.display_name.len > 0) job.display_name else if (job.github.job.len > 0) job.github.job else "job"}));
+
     // JavaScript actions' `pre` scripts run before any step, as on GitHub.
     for (job.steps, 1..) |step, n| if (step.action == .uses) {
         x.runPre(@intCast(n), step) catch |e| switch (e) {
@@ -1471,12 +1528,30 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
                 };
                 const wd: ?[]const u8 = if (sc.working_directory) |t| (ev.render(t, sc1) catch null) else null;
                 resolved = .{ .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = plain_step_env.items } };
+                try logRunHeader(arena, sh, num, script, shell, try envContext(arena, ev.job_env.items, step_env));
             },
             .checkout => |inputs| {
                 const rendered = ev.renderEnv(inputs, sc1) catch {
                     try failStep(&ev, sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the checkout inputs: {s}", .{ev.diag}), coe);
                     continue;
                 };
+                // As GitHub opens an action's log: the action and the inputs the workflow gave it.
+                sh.append(num, try std.fmt.allocPrint(arena, "##[group]Run {s}", .{if (step.uses.len > 0) step.uses else "actions/checkout"}));
+                // The given inputs, then actions/checkout's defaults (the same in v4 to v6), as GitHub shows them.
+                sh.append(num, "with:");
+                for (rendered) |in| sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ in.name, firstLine(in.value) }));
+                for (checkout_defaults) |d| {
+                    const given = for (rendered) |in| (if (std.mem.eql(u8, in.name, d[0])) break true) else false;
+                    if (given) continue;
+                    const value = if (std.mem.eql(u8, d[0], "repository")) job.github.repository else d[1];
+                    sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ d[0], value }));
+                }
+                const co_env = try envContext(arena, ev.job_env.items, step_env);
+                if (co_env.len > 0) {
+                    sh.append(num, "env:");
+                    for (co_env) |e| sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ e.name, firstLine(e.value) }));
+                }
+                sh.append(num, "##[endgroup]");
                 const co = switch (try job_mod.checkoutFromInputs(arena, rendered)) {
                     .ok => |c| c,
                     .unsupported => |why| {
@@ -1646,6 +1721,9 @@ const Exec = struct {
         ref: []const u8 = "",
         /// The `with:` inputs the workflow gave, for the log.
         shown: []const job_mod.EnvVar = &.{},
+        /// The step's own env (also in `env` and `secret`), shown in the log.
+        step_env: []const job_mod.EnvVar = &.{},
+        step_secret: []const SecretRef = &.{},
 
         const Image = union(enum) {
             pull: []const u8,
@@ -2004,6 +2082,12 @@ const Exec = struct {
             x.sh.append(num, try std.fmt.allocPrint(arena, "##[group]Run {s}", .{display}));
             var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, script, "\n"), '\n');
             while (lines.next()) |l| x.sh.append(num, l);
+            x.sh.append(num, shellLine(shell));
+            const shown_env = try envContext(arena, ev.job_env.items, all_env);
+            if (shown_env.len > 0) {
+                x.sh.append(num, "env:");
+                for (shown_env) |e| x.sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ e.name, firstLine(e.value) }));
+            }
             x.sh.append(num, "##[endgroup]");
 
             // The action's files are mounted once per job; its steps may change them, as on GitHub.
@@ -2204,7 +2288,7 @@ const Exec = struct {
     /// Runs one of a JavaScript action's scripts (`pre`, `main` or `post`, relative to the action's
     /// directory) with the configured runtime (Bun by default, see SPEC §6). `state` reaches it as
     /// STATE_<name>. Null when the runtime could not be set up (the reason is logged).
-    fn runJsScript(x: *Exec, num: u32, phase: Phase, act: Loaded, u: job_mod.Uses, script_rel: []const u8, inputs: []const expr.Value.Entry, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef, state: []const job_mod.EnvVar) !?ExecOut {
+    fn runJsScript(x: *Exec, num: u32, phase: Phase, act: Loaded, _: job_mod.Uses, script_rel: []const u8, inputs: []const expr.Value.Entry, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef, state: []const job_mod.EnvVar) !?ExecOut {
         const arena = x.arena;
         var mounts: std.ArrayList(Mount) = .empty;
         if (!x.js_mounted) {
@@ -2259,7 +2343,7 @@ const Exec = struct {
         try secret.appendSlice(arena, step_secret);
         splitEnv(arena, x.transport, x.job.*, &x.secret_counter, env.items, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
 
-        try x.logGroup(num, phase, act.ref_label, try shownInputs(arena, u.inputs, inputs), &.{});
+        try x.logGroup(num, phase, act.ref_label, try shownInputs(arena, inputs), step_env, step_secret, &.{});
 
         // Started through bash, not sh: dash drops variables whose names are not identifiers
         // (INPUT_GITHUB-TOKEN) when it starts a program; bash passes them on.
@@ -2268,7 +2352,7 @@ const Exec = struct {
         try shellQuote(&script.writer, try std.fmt.allocPrint(arena, "{s}/{s}", .{ act.path, script_rel }));
         const fc = x.next_fc;
         x.next_fc += 1;
-        const out = try x.execScript(num, fc, .{ .run = .{ .script = script.written(), .shell = null, .working_directory = null, .env = plain.items } }, if (act.repository.len > 0) act.repository else act.ref_label, secret.items, mounts.items);
+        const out = try x.execScript(num, fc, .{ .run = .{ .script = script.written(), .shell = "bash", .working_directory = null, .env = plain.items } }, if (act.repository.len > 0) act.repository else act.ref_label, secret.items, mounts.items);
         x.js_mounted = true;
         try x.mounted_actions.put(arena, act.mount, {});
         return out;
@@ -2386,6 +2470,47 @@ const Exec = struct {
         return .{ .ok = try arena.dupe(u8, &hex) };
     }
 
+    /// A line of the job's "Set up job" log (step 0).
+    fn setUpLine(x: *Exec, line: []const u8) void {
+        x.sh.append(0, line);
+    }
+
+    /// The start of "Set up job", in the form GitHub's runner uses for a self-hosted runner: the
+    /// runner, then (for this runner) the image and engine, the GITHUB_TOKEN's permissions, where
+    /// secrets come from, and the preparation steps.
+    fn logSetUp(x: *Exec, opts: Options) !void {
+        const arena = x.arena;
+        x.setUpLine(try std.fmt.allocPrint(arena, "Current runner version: '{s}' (zig-runner)", .{broker.version}));
+        x.setUpLine(try std.fmt.allocPrint(arena, "Runner name: '{s}'", .{opts.runner_name}));
+        if (x.job.runner_group.len > 0) x.setUpLine(try std.fmt.allocPrint(arena, "Runner group name: '{s}'", .{x.job.runner_group}));
+        var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+        if (std.posix.gethostname(&host_buf)) |host| {
+            x.setUpLine(try std.fmt.allocPrint(arena, "Machine name: '{s}'", .{host}));
+        } else |_| {}
+        x.setUpLine("##[group]Runner Image");
+        x.setUpLine(try std.fmt.allocPrint(arena, "Image: {s}", .{opts.image}));
+        x.setUpLine(if (opts.engine) |ep|
+            try std.fmt.allocPrint(arena, "Engine: Dagger {s}, direct session ({s})", .{ engine.client_version, if (ep.host.len > 0) ep.host else ep.container })
+        else
+            "Engine: Dagger, through `dagger run`");
+        x.setUpLine("##[endgroup]");
+        if (x.job.token_permissions.len > 0) {
+            const perms = std.json.parseFromSliceLeaky(std.json.Value, arena, x.job.token_permissions, .{}) catch null;
+            if (perms) |p| if (p == .object) {
+                x.setUpLine("##[group]GITHUB_TOKEN Permissions");
+                var it = p.object.iterator();
+                while (it.next()) |e| if (e.value_ptr.* == .string) {
+                    x.setUpLine(try std.fmt.allocPrint(arena, "{s}: {s}", .{ e.key_ptr.*, e.value_ptr.string }));
+                };
+                x.setUpLine("##[endgroup]");
+            };
+        }
+        x.setUpLine(if (std.mem.eql(u8, x.ev.githubString("actor"), "dependabot[bot]")) "Secret source: Dependabot" else "Secret source: Actions");
+        x.setUpLine("Prepare workflow directory");
+        x.setUpLine("Prepare all required actions");
+        x.setUpLine("Getting action download info");
+    }
+
     /// The job's GITHUB_TOKEN as a Dagger secret, registered on first use: what checkouts (and fetches
     /// of actions in the job's own repository) authenticate with. Null when the job has none or it
     /// could not be registered (the fetch then goes without, as for a public repository).
@@ -2433,12 +2558,20 @@ const Exec = struct {
         for (state) |st| try env.append(x.arena, .{ .name = try std.fmt.allocPrint(x.arena, "STATE_{s}", .{st.name}), .value = st.value });
     }
 
-    /// As GitHub shows an action: `##[group]Run <action>`, the inputs the workflow gave it, `##[endgroup]`.
-    fn logGroup(x: *Exec, num: u32, phase: Phase, label: []const u8, shown: []const job_mod.EnvVar, extra: []const []const u8) !void {
-        x.sh.append(num, try std.fmt.allocPrint(x.arena, "##[group]{s} {s}", .{ phase.label(), label }));
+    /// As GitHub shows an action: `##[group]Run <action>`, its inputs, the env it gets (the job's and
+    /// the step's; secret-backed variables as ***), `##[endgroup]`.
+    fn logGroup(x: *Exec, num: u32, phase: Phase, label: []const u8, shown: []const job_mod.EnvVar, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef, extra: []const []const u8) !void {
+        const arena = x.arena;
+        x.sh.append(num, try std.fmt.allocPrint(arena, "##[group]{s} {s}", .{ phase.label(), label }));
         if (shown.len > 0) {
             x.sh.append(num, "with:");
-            for (shown) |in| x.sh.append(num, try std.fmt.allocPrint(x.arena, "  {s}: {s}", .{ in.name, firstLine(in.value) }));
+            for (shown) |in| x.sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ in.name, firstLine(in.value) }));
+        }
+        var env = try envContext(arena, x.ev.job_env.items, step_env);
+        for (step_secret) |sr| env = try envContext(arena, env, &.{.{ .name = sr.name, .value = "***" }});
+        if (env.len > 0) {
+            x.sh.append(num, "env:");
+            for (env) |e| x.sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ e.name, firstLine(e.value) }));
         }
         for (extra) |l| x.sh.append(num, l);
         x.sh.append(num, "##[endgroup]");
@@ -2471,7 +2604,7 @@ const Exec = struct {
     /// How a Docker action runs: its image (`docker://<image>`, or built from the Dockerfile in its
     /// directory, with the Dockerfile's directory as the context, as GitHub builds it), and its `args`
     /// and `env:` evaluated with its `inputs` in scope. Null when they cannot be evaluated (logged).
-    fn dockerRunFor(x: *Exec, num: u32, act: Loaded, u: job_mod.Uses, dk: @FieldType(action.Runs, "docker"), inputs: []const expr.Value.Entry, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef, entrypoint: ?[]const u8) !?DockerRun {
+    fn dockerRunFor(x: *Exec, num: u32, act: Loaded, _: job_mod.Uses, dk: @FieldType(action.Runs, "docker"), inputs: []const expr.Value.Entry, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef, entrypoint: ?[]const u8) !?DockerRun {
         const arena = x.arena;
         const ev = x.ev;
         const saved_inputs = ev.inputs;
@@ -2516,7 +2649,9 @@ const Exec = struct {
             .label = act.ref_label,
             .repository = act.repository,
             .ref = act.ref,
-            .shown = try shownInputs(arena, u.inputs, inputs),
+            .shown = try shownInputs(arena, inputs),
+            .step_env = step_env,
+            .step_secret = step_secret,
         };
     }
 
@@ -2548,6 +2683,8 @@ const Exec = struct {
             .secret = step_secret,
             .label = label,
             .shown = shown,
+            .step_env = step_env,
+            .step_secret = step_secret,
         };
         const out = (try x.runContainer(num, .main, dr, &.{})) orelse return .{ .failed = true, .exit_code = 1 };
         return .{ .failed = out.code != 0, .exit_code = out.code, .outputs = out.outputs };
@@ -2565,7 +2702,7 @@ const Exec = struct {
             .pull => |ref| try std.fmt.allocPrint(arena, "image: {s}", .{ref}),
             .build => |b| try std.fmt.allocPrint(arena, "image: built from {s}", .{try std.fs.path.resolveAllocPosix(arena, &.{ b.context, b.dockerfile })}),
         };
-        try x.logGroup(num, phase, dr.label, dr.shown, &.{image_line});
+        try x.logGroup(num, phase, dr.label, dr.shown, dr.step_env, dr.step_secret, &.{image_line});
         const busybox = (try x.busyboxFile(num)) orelse return null;
         const img = (try x.imageInfo(num, dr.image, dr.label)) orelse return null;
 
@@ -2771,6 +2908,8 @@ const Exec = struct {
         sub: []const u8 = "",
         /// `owner/repo[/path]@ref` or `./path`, for messages.
         ref_label: []const u8,
+        /// The commit the action's ref resolved to ("" when not known), for the "Set up job" log.
+        sha: []const u8 = "",
         /// `github.action_repository` / `action_ref` (GITHUB_ACTION_REPOSITORY / _REF): `owner/repo`
         /// and the ref, or empty for a local action, as on GitHub.
         repository: []const u8 = "",
@@ -2797,7 +2936,7 @@ const Exec = struct {
         try std.json.Stringify.value(u.ref, .{}, w);
         try w.writeAll(") { tree(depth:1) { id entries(path:");
         try std.json.Stringify.value(if (u.path.len > 0) u.path else ".", .{}, w);
-        try w.writeAll(") } } } }");
+        try w.writeAll(") } sha: commit } } }");
         var msg: []const u8 = "";
         const data = gql(arena, x.transport, doc.written(), &msg) catch
             return .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}: {s}{s}", .{
@@ -2834,6 +2973,7 @@ const Exec = struct {
             .path = if (u.path.len > 0) try std.fmt.allocPrint(arena, "{s}/{s}", .{ mount, u.path }) else mount,
             .sub = u.path,
             .ref_label = ref_label,
+            .sha = jsonFindString(data, "sha") orelse "",
             .repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name }),
             .ref = u.ref,
         } };
@@ -4199,6 +4339,89 @@ test "steps see the name the runner registered under" {
     _ = try run(arena, std.testing.io, &env, .{ .runner_name = "zig-1a2b3c4d", .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "withEnvVariable(name:\"RUNNER_NAME\",value:\"zig-1a2b3c4d\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "echo zig-1a2b3c4d") != null);
+}
+
+test "logs read like GitHub's: Set up job, then each step's header with its shell, env or inputs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var run_step = testStep("echo one\necho two");
+    run_step.env = &.{
+        .{ .name = "GREETING", .value = .{ .lit = "hi" } },
+        .{ .name = "TOKEN", .value = .{ .lit = "s3cr3t-value" } },
+    };
+    var co = testStep("x");
+    co.action = .{ .checkout = &.{.{ .name = "fetch-depth", .value = .{ .lit = "0" } }} };
+    co.uses = "actions/checkout@v4";
+    const action_yml = "runs:\n  using: composite\n  steps:\n    - shell: sh\n      run: echo from-the-action\n";
+    const steps = [_]job_mod.Step{ co, usesStep("act", "o", "act", "v1", &.{}), run_step };
+    var job = testJob(&steps);
+    job.secrets = &.{"s3cr3t-value"};
+    job.display_name = "build (linux)";
+    job.runner_group = "Default";
+    job.token_permissions = "{\"Contents\":\"read\",\"PullRequests\":\"write\"}";
+    job.env = &.{.{ .name = "FROM_JOB", .value = .{ .lit = "j" } }};
+    const answers = [_][]const u8{
+        base_answer,
+        "{\"data\":{\"git\":{\"ref\":{\"tree\":{\"id\":\"D1\",\"entries\":[\"action.yml\"]},\"sha\":\"0123456789abcdef0123456789abcdef01234567\"}}}}",
+        try fileAnswer(arena, action_yml),
+        "{\"data\":{\"git\":{\"commit\":{\"tree\":{\"id\":\"TREE1\"}}}}}",
+        try exec(arena, "C1", 0, ""),
+        try exec(arena, "C2", 0, ""),
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC\"}}}",
+        try exec(arena, "C3", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w, .secrets = &.{"s3cr3t-value"} } };
+    const res = try run(arena, std.testing.io, &env, .{ .runner_name = "zig-1a2b3c4d", .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(res.succeeded);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "tree(depth:1) { id entries(path:\".\") } sha: commit") != null);
+    const out = w.buffered();
+    const want_in_order = [_][]const u8{
+        "[job 0 step 0 stdout] Current runner version: '",
+        "[job 0 step 0 stdout] Runner name: 'zig-1a2b3c4d'",
+        "[job 0 step 0 stdout] Runner group name: 'Default'",
+        "[job 0 step 0 stdout] ##[group]Runner Image",
+        "[job 0 step 0 stdout] Image: ubuntu:24.04",
+        "[job 0 step 0 stdout] ##[group]GITHUB_TOKEN Permissions",
+        "[job 0 step 0 stdout] Contents: read",
+        "[job 0 step 0 stdout] PullRequests: write",
+        "[job 0 step 0 stdout] Secret source: Actions",
+        "[job 0 step 0 stdout] Prepare workflow directory",
+        "[job 0 step 0 stdout] Prepare all required actions",
+        "[job 0 step 0 stdout] Getting action download info",
+        "[job 0 step 0 stdout] Download action repository 'o/act@v1' (SHA:0123456789abcdef0123456789abcdef01234567)",
+        "[job 0 step 0 stdout] Complete job name: build (linux)",
+        "[job 0 step 1 stdout] ##[group]Run actions/checkout@v4",
+        "[job 0 step 1 stdout] with:",
+        "[job 0 step 1 stdout]   fetch-depth: 0",
+        "[job 0 step 1 stdout] ##[endgroup]",
+        "[job 0 step 2 stdout] ##[group]Run echo from-the-action",
+        "[job 0 step 2 stdout] shell: /usr/bin/sh -e {0}",
+        "[job 0 step 3 stdout] ##[group]Run echo one",
+        "[job 0 step 3 stdout] echo one",
+        "[job 0 step 3 stdout] echo two",
+        "[job 0 step 3 stdout] shell: /usr/bin/bash -e {0}",
+        "[job 0 step 3 stdout] env:",
+        "[job 0 step 3 stdout]   FROM_JOB: j",
+        "[job 0 step 3 stdout]   GREETING: hi",
+        "[job 0 step 3 stdout]   TOKEN: ***",
+        "[job 0 step 3 stdout] ##[endgroup]",
+    };
+    var at: usize = 0;
+    for (want_in_order) |want| {
+        const i = std.mem.indexOfPos(u8, out, at, want) orelse {
+            std.debug.print("missing (in order): {s}\nlog:\n{s}\n", .{ want, out });
+            return error.TestUnexpectedResult;
+        };
+        at = i + want.len;
+    }
+    // The default shell is GitHub's `bash -e` (no pipefail); an explicit `sh` stays `sh -e`.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "bash -e -c 'echo one") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], "sh -e -c 'echo from-the-action") != null);
 }
 
 test "splitArgs splits like a command line, with double quotes" {

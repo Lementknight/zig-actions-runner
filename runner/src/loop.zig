@@ -315,7 +315,8 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Cycl
     var collect: sink.LogSink = .{ .collect = .{ .arena = c.arena, .io = c.io, .inner = c.log } };
     collect.setSecrets(try std.mem.concat(c.arena, []const u8, &.{ c.secrets, job.secrets }));
     const log = &collect;
-    try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job acquired: {d} steps", .{job.steps.len}));
+    // For the runner's own console and database only: the job's log starts as GitHub's does.
+    try c.log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job acquired: {d} steps", .{job.steps.len}));
 
     var reporter: ?Reporter = null;
     const job_started_ms = std.Io.Clock.real.now(c.io).toMilliseconds();

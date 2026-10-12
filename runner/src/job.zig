@@ -82,6 +82,9 @@ pub const Step = struct {
     continue_on_error: Template = .{ .lit = "false" },
     env: []const Input = &.{},
     action: Action,
+    /// What the step `uses:` as written (`actions/checkout@v4`, `docker://alpine`), for its log
+    /// header; "" for `run:` steps.
+    uses: []const u8 = "",
 };
 
 pub const Job = struct {
@@ -97,6 +100,11 @@ pub const Job = struct {
     has_container: bool,
     /// `services:` (the message's `jobServiceContainers`), which the runner cannot run yet.
     has_services: bool = false,
+    /// `system.github.token.permissions`: the GITHUB_TOKEN's permissions as JSON
+    /// (`{"Contents":"read",...}`), shown in the "Set up job" log as GitHub's runner does.
+    token_permissions: []const u8 = "",
+    /// `system.runnerGroupName`.
+    runner_group: []const u8 = "",
     /// Literal values that must never reach a log: the job token and every variable marked `isSecret`.
     secrets: []const []const u8,
     /// The `secrets` context: user secrets by name (they arrive as variables flagged `isSecret`),
@@ -167,6 +175,8 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .display_name = path(root, &.{"jobDisplayName"}) orelse "",
         .has_container = if (root.object.get("jobContainer")) |c| c != .null else false,
         .has_services = if (root.object.get("jobServiceContainers")) |c| c != .null else false,
+        .token_permissions = variable(root, "system.github.token.permissions") orelse "",
+        .runner_group = variable(root, "system.runnerGroupName") orelse "",
         .steps = steps,
     };
 }
@@ -249,6 +259,7 @@ fn parseStep(arena: Allocator, sv: Value) Error!Step {
         .continue_on_error = if (o.get("continueOnError")) |c| (tokenTemplate(c) orelse .{ .lit = "false" }) else .{ .lit = "false" },
         .env = env,
         .action = action,
+        .uses = uses_label,
     };
 }
 
@@ -595,7 +606,7 @@ fn jobToken(root: Value) ?[]const u8 {
 
 const fixture =
     \\{"plan":{"planId":"plan-1"},"jobId":"job-1","jobContainer":null,
-    \\ "variables":{"github_token":{"value":"ghs_secret","isSecret":true},"TIGER_HOST":{"value":"db.example","isSecret":true},"system.github.token":{"value":"ghs_secret","isSecret":true},"plain":{"value":"x"},"system.github.results_endpoint":{"value":"https://results.test/"},"actions_uses_cache_service_v2":{"value":"True"}},
+    \\ "variables":{"system.github.token.permissions":{"value":"{\"Contents\":\"read\"}"},"system.runnerGroupName":{"value":"Default"},"github_token":{"value":"ghs_secret","isSecret":true},"TIGER_HOST":{"value":"db.example","isSecret":true},"system.github.token":{"value":"ghs_secret","isSecret":true},"plain":{"value":"x"},"system.github.results_endpoint":{"value":"https://results.test/"},"actions_uses_cache_service_v2":{"value":"True"}},
     \\ "contextData":{"job":{"t":2,"d":[{"k":"status","v":"success"},{"k":"check_run_id","v":777}]},"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"sha","v":"0123456789012345678901234567890123456789"},{"k":"ref","v":"refs/heads/x"},{"k":"event_name","v":"push"}]}},
     \\ "resources":{"endpoints":[{"name":"SystemVssConnection","url":"https://pipelines.test/","authorization":{"parameters":{"AccessToken":"jobtok"},"scheme":"OAuth"},
     \\   "data":{"CacheServerUrl":"https://cache.test/","ResultsServiceUrl":"https://results.test/","PipelinesServiceUrl":"https://pipelines.test/x/","GenerateIdTokenUrl":"https://token.test/"}}]},
@@ -645,6 +656,10 @@ test "parse job fixture" {
     try std.testing.expect(seen_host and seen_token);
     try std.testing.expect(!job.has_container);
     try std.testing.expect(!job.has_services);
+    try std.testing.expectEqualStrings("{\"Contents\":\"read\"}", job.token_permissions);
+    try std.testing.expectEqualStrings("Default", job.runner_group);
+    try std.testing.expectEqualStrings("actions/checkout@v4", job.steps[2].uses);
+    try std.testing.expectEqualStrings("", job.steps[0].uses);
     try std.testing.expectEqual(@as(usize, 8), job.steps.len);
 
     const s1 = job.steps[0];
