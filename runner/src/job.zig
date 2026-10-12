@@ -58,6 +58,8 @@ pub const Checkout = struct {
     path: ?[]const u8 = null,
     /// Commits to fetch; 0 means full history. The real action's default is 1.
     fetch_depth: u32 = 1,
+    /// `fetch-tags`: also fetch the repository's tags.
+    fetch_tags: bool = false,
 };
 
 pub const Step = struct {
@@ -270,9 +272,9 @@ fn parseCheckoutInputs(arena: Allocator, inputs: ?Value) Error!Action {
 }
 
 /// Inputs that change nothing we do (we never persist credentials or run the action's own git).
-const ignored_checkout_inputs = [_][]const u8{ "persist-credentials", "token", "clean", "show-progress", "set-safe-directory", "fetch-tags", "filter", "sparse-checkout-cone-mode", "ssh-strict", "ssh-user" };
+const ignored_checkout_inputs = [_][]const u8{ "persist-credentials", "token", "clean", "show-progress", "set-safe-directory", "filter", "sparse-checkout-cone-mode", "ssh-strict", "ssh-user" };
 /// Inputs that are only acceptable when they ask for the default (off) behaviour.
-const off_only_checkout_inputs = [_][]const u8{ "submodules", "lfs", "sparse-checkout", "ssh-key", "ssh-known-hosts", "github-server-url" };
+const off_only_checkout_inputs = [_][]const u8{ "lfs", "sparse-checkout", "ssh-key", "ssh-known-hosts", "github-server-url" };
 
 pub const CheckoutResult = union(enum) { ok: Checkout, unsupported: []const u8 };
 
@@ -291,6 +293,13 @@ pub fn checkoutFromInputs(arena: Allocator, kv: []const EnvVar) Allocator.Error!
         } else if (std.mem.eql(u8, e.name, "fetch-depth")) {
             co.fetch_depth = std.fmt.parseInt(u32, e.value, 10) catch
                 return .{ .unsupported = try std.fmt.allocPrint(arena, "actions/checkout fetch-depth '{s}' is not a number", .{e.value}) };
+        } else if (std.mem.eql(u8, e.name, "fetch-tags")) {
+            co.fetch_tags = parseBool(e.value) orelse
+                return .{ .unsupported = try std.fmt.allocPrint(arena, "actions/checkout fetch-tags '{s}' is not true or false", .{e.value}) };
+        } else if (std.mem.eql(u8, e.name, "submodules")) {
+            // Dagger's git always checks submodules out, recursively; see SPEC §6.
+            if (parseBool(e.value) == null and !std.ascii.eqlIgnoreCase(e.value, "recursive"))
+                return .{ .unsupported = try std.fmt.allocPrint(arena, "actions/checkout submodules '{s}' is not true, false or recursive", .{e.value}) };
         } else if (inList(&ignored_checkout_inputs, e.name)) {
             continue;
         } else if (inList(&off_only_checkout_inputs, e.name)) {
@@ -305,6 +314,13 @@ pub fn checkoutFromInputs(arena: Allocator, kv: []const EnvVar) Allocator.Error!
 
 fn isDefaultServer(e: EnvVar) bool {
     return std.mem.eql(u8, e.name, "github-server-url") and std.mem.eql(u8, std.mem.trimEnd(u8, e.value, "/"), "https://github.com");
+}
+
+/// A boolean input; "" is false, as an unset input is.
+fn parseBool(s: []const u8) ?bool {
+    if (s.len == 0 or std.ascii.eqlIgnoreCase(s, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(s, "true")) return true;
+    return null;
 }
 
 fn nonEmpty(s: []const u8) ?[]const u8 {
@@ -579,8 +595,16 @@ test "parse job fixture" {
     try std.testing.expectEqualStrings("cache", cache.name);
     try std.testing.expectEqualStrings("v4", cache.ref);
     try std.testing.expectEqualStrings("", cache.path);
-    const sub = try checkoutFromInputs(a.allocator(), try litEnv(a.allocator(), job.steps[5].action.checkout));
-    try std.testing.expect(std.mem.indexOf(u8, sub.unsupported, "submodules: recursive") != null);
+    // submodules are always there (Dagger fetches them recursively), so any valid value is accepted
+    _ = (try checkoutFromInputs(a.allocator(), try litEnv(a.allocator(), job.steps[5].action.checkout))).ok;
+    for ([_][]const u8{ "true", "false", "recursive", "Recursive", "" }) |v| {
+        _ = (try checkoutFromInputs(a.allocator(), &.{.{ .name = "submodules", .value = v }})).ok;
+    }
+    const bad_sub = try checkoutFromInputs(a.allocator(), &.{.{ .name = "submodules", .value = "yes" }});
+    try std.testing.expect(std.mem.indexOf(u8, bad_sub.unsupported, "not true, false or recursive") != null);
+    try std.testing.expect((try checkoutFromInputs(a.allocator(), &.{.{ .name = "fetch-tags", .value = "true" }})).ok.fetch_tags);
+    try std.testing.expect(!(try checkoutFromInputs(a.allocator(), &.{.{ .name = "fetch-tags", .value = "false" }})).ok.fetch_tags);
+    try std.testing.expect((try checkoutFromInputs(a.allocator(), &.{.{ .name = "fetch-tags", .value = "maybe" }})) == .unsupported);
     const escape = try checkoutFromInputs(a.allocator(), try litEnv(a.allocator(), job.steps[6].action.checkout));
     try std.testing.expect(std.mem.indexOf(u8, escape.unsupported, "inside the workspace") != null);
 }
