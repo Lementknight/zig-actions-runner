@@ -118,6 +118,9 @@ pub const Resolved = union(enum) {
         shell: ?[]const u8,
         working_directory: ?[]const u8,
         env: []const job_mod.EnvVar,
+        /// Names of env variables whose values are Dagger secrets. The `i`th arrives in the container as
+        /// `ZIG_SECRET_<i>` and the script gives it its real name (any name works, see `secretAlias`).
+        secret_env: []const []const u8 = &.{},
     },
     checkout: Fetched,
 };
@@ -155,10 +158,16 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
                 try w.writeAll(" && ");
             }
             try w.writeAll("env ");
+            for (sc.secret_env, 0..) |_, i| try w.print("-u {s} ", .{try secretAlias(arena, i)});
             for (sc.env) |e| {
                 const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
                 try shellQuote(w, pair);
                 try w.writeByte(' ');
+            }
+            // The value is expanded by the shell from the alias; only the variable's name is in the command.
+            for (sc.secret_env, 0..) |name, i| {
+                try shellQuote(w, try std.fmt.allocPrint(arena, "{s}=", .{name}));
+                try w.print("\"${s}\" ", .{try secretAlias(arena, i)});
             }
             // Set after the step's own env, so a step cannot point these somewhere else.
             const names = [_][]const u8{ "GITHUB_OUTPUT", "GITHUB_ENV", "GITHUB_PATH", "GITHUB_STEP_SUMMARY" };
@@ -189,6 +198,13 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
     for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, fc)});
     try w.print("\necho '{s}end {d}'\nexit $rc\n", .{ marker, n });
     return aw.written();
+}
+
+/// The name under which a step's `i`th secret variable is attached to the container. Dagger silently
+/// drops variables whose names are not identifiers (`INPUT_GITHUB-TOKEN`), and a variable attached to
+/// the container would outlive the step; the alias is removed again after the step's exec.
+fn secretAlias(arena: Allocator, i: usize) ![]const u8 {
+    return std.fmt.allocPrint(arena, "ZIG_SECRET_{d}", .{i});
 }
 
 pub const Outcome = enum { not_run, success, failure, skipped };
@@ -997,9 +1013,17 @@ const Exec = struct {
 
     /// Runs one script in the job's container, logging as step `num`, and applies its file
     /// commands. `error.EngineFailed` (with `err_msg`) when Dagger itself failed.
-    fn execScript(x: *Exec, num: u32, fc: u32, resolved: Resolved, action_name: []const u8, secret_env: []const SecretRef, mounts: []const Mount) !ExecOut {
+    fn execScript(x: *Exec, num: u32, fc: u32, resolved_in: Resolved, action_name: []const u8, secret_env_in: []const SecretRef, mounts: []const Mount) !ExecOut {
         const arena = x.arena;
         const ev = x.ev;
+        // Secret variables are for scripts only; they reach them through aliases (`secretAlias`).
+        var resolved = resolved_in;
+        const secret_env: []const SecretRef = if (resolved == .run) secret_env_in else &.{};
+        if (resolved == .run) {
+            const names = try arena.alloc([]const u8, secret_env.len);
+            for (secret_env, names) |s, *n| n.* = s.name;
+            resolved.run.secret_env = names;
+        }
         const script = try stepScriptFc(arena, num, fc, resolved, action_name);
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
@@ -1025,7 +1049,14 @@ const Exec = struct {
         }
         ev.pending_env.clearRetainingCapacity();
         ev.pending_path.clearRetainingCapacity();
-        braces += try writeEnvNodes(w, &.{}, secret_env);
+        for (secret_env, 0..) |sr, i| {
+            try w.writeAll("withSecretVariable(name:");
+            try std.json.Stringify.value(try secretAlias(arena, i), .{}, w);
+            try w.writeAll(",secret:");
+            try std.json.Stringify.value(sr.id, .{}, w);
+            try w.writeAll(") { ");
+            braces += 1;
+        }
         for (mounts) |m| {
             try w.writeAll("withDirectory(path:");
             try std.json.Stringify.value(m.path, .{}, w);
@@ -1036,10 +1067,18 @@ const Exec = struct {
         }
         try w.writeAll("withExec(args:");
         try std.json.Stringify.value([_][]const u8{ "sh", "-c", script }, .{}, w);
-        try w.writeAll(",expect:ANY) { id exitCode stdout stderr");
+        try w.writeAll(",expect:ANY) { exitCode stdout stderr");
         for ([_][]const u8{ "output", "env", "path" }) |kind| {
             try w.print(" fc_{s}: file(path:\"{s}\") {{ contents }}", .{ kind, try fcPath(arena, kind, fc) });
         }
+        // The next step starts from this container without the step's secrets.
+        for (secret_env, 0..) |_, i| {
+            try w.writeAll(" withoutSecretVariable(name:");
+            try std.json.Stringify.value(try secretAlias(arena, i), .{}, w);
+            try w.writeAll(") {");
+        }
+        try w.writeAll(" id");
+        for (secret_env) |_| try w.writeAll(" }");
         try w.writeAll(" }");
         for (0..braces) |_| try w.writeAll(" }");
 
@@ -1486,6 +1525,20 @@ test "script quotes, applies env, shell and working directory, and propagates th
     try std.testing.expect(std.mem.endsWith(u8, w, "exit $rc\n"));
 }
 
+test "secret variables reach the script through aliases, whatever their names" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const w = try stepScript(a.allocator(), 1, .{ .run = .{
+        .script = "node main.js",
+        .shell = "sh",
+        .working_directory = null,
+        .env = &.{.{ .name = "PLAIN", .value = "p" }},
+        .secret_env = &.{ "INPUT_GITHUB-TOKEN", "TOKEN" },
+    } }, "a");
+    // Aliases are unset before the assignments; the real names come after the plain env.
+    try std.testing.expect(std.mem.indexOf(u8, w, "env -u ZIG_SECRET_0 -u ZIG_SECRET_1 'PLAIN=p' 'INPUT_GITHUB-TOKEN='\"$ZIG_SECRET_0\" 'TOKEN='\"$ZIG_SECRET_1\" ") != null);
+}
+
 test "checkoutQuery picks commit, ref or head and honours fetch-depth" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -1757,9 +1810,16 @@ test "run evaluates expressions in conditions, names, env, scripts and the steps
     // Job-level env is part of the base container: the plain value inline, the secret as a Dagger secret.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withEnvVariable(name:\"JOB_ENV\",value:\"main-job\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withSecretVariable(name:\"JOB_SECRET\",secret:\"SEC_JOB\")") != null);
-    // Secret-bearing step env is passed as Dagger secrets and appears nowhere in a command.
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "withSecretVariable(name:\"DB_PASSWORD\",secret:\"SEC_A\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "withSecretVariable(name:\"WITH_SECRET\",secret:\"SEC_B\")") != null);
+    // Secret-bearing step env is passed as Dagger secrets under aliases, given its name by the script,
+    // removed again after the step, and appears nowhere in a command.
+    const s5 = fake.seen.items[7];
+    try std.testing.expect(std.mem.indexOf(u8, s5, "withSecretVariable(name:\"ZIG_SECRET_0\",secret:\"SEC_A\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s5, "withSecretVariable(name:\"ZIG_SECRET_1\",secret:\"SEC_B\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s5, "env -u ZIG_SECRET_0 -u ZIG_SECRET_1 ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s5, "'DB_PASSWORD='\\\"$ZIG_SECRET_0\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, s5, "withoutSecretVariable(name:\"ZIG_SECRET_0\") { withoutSecretVariable(name:\"ZIG_SECRET_1\") { id } }") != null);
+    // The next step does not get them.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[8], "ZIG_SECRET") == null);
     for (fake.seen.items, 0..) |d, i| {
         const is_set_secret = std.mem.indexOf(u8, d, "setSecret") != null;
         try std.testing.expectEqual(is_set_secret, std.mem.indexOf(u8, d, "s3cr3t-value") != null);
