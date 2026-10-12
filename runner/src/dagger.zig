@@ -1643,7 +1643,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
                 };
                 const shell: ?[]const u8 = if (sc.shell) |t| (ev.render(t, sc1) catch null) else null;
                 if (shell) |sh_name| if (!job_mod.validShell(sh_name)) {
-                    try failStep(&ev, sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "unsupported shell '{s}' ({s})", .{ sh_name, job_mod.shell_help }), coe);
+                    try failStep(&ev, sh, opts.observer, step, res, num, try job_mod.unsupportedShell(arena, sh_name), coe);
                     continue;
                 };
                 const wd: ?[]const u8 = if (sc.working_directory) |t| (ev.render(t, sc1) catch null) else null;
@@ -2194,7 +2194,7 @@ const Exec = struct {
             if (st.name == null) display = firstLine(script);
             const shell = expr.interpolate(arena, st.shell.?, sc) catch st.shell.?;
             if (!job_mod.validShell(shell)) {
-                try x.nestedFailed(num, ctx_id, display, try std.fmt.allocPrint(arena, "unsupported shell '{s}' ({s})", .{ shell, job_mod.shell_help }), &failed, &exit_code);
+                try x.nestedFailed(num, ctx_id, display, try job_mod.unsupportedShell(arena, shell), &failed, &exit_code);
                 continue;
             }
             const wd: ?[]const u8 = if (st.working_directory) |d| (expr.interpolate(arena, d, sc) catch d) else null;
