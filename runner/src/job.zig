@@ -285,7 +285,7 @@ fn parseScript(arena: Allocator, inputs: ?Value) Error!Action {
     const s = script orelse return .{ .unsupported = "run step has no script" };
     // A literal shell is validated now; an expression is validated when the step runs.
     if (shell) |sh| if (sh == .lit and !validShell(sh.lit))
-        return .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported shell '{s}' ({s})", .{ sh.lit, shell_help }) };
+        return .{ .unsupported = try unsupportedShell(arena, sh.lit) };
     return .{ .script = .{ .script = s, .shell = shell, .working_directory = wd } };
 }
 
@@ -343,8 +343,19 @@ pub fn validShell(sh: []const u8) bool {
     return std.mem.eql(u8, prog, "bash") or std.mem.eql(u8, prog, "sh");
 }
 
-/// Why a shell is refused, for the step's log.
-pub const shell_help = "supported: bash, sh, or a bash or sh command with {0} for the script file, such as `bash -l {0}`";
+/// Why a shell is refused, for the step's log. Only the shells of GitHub's Ubuntu runners run here:
+/// bash (by far the most used) and sh. PowerShell is left out on purpose (it needs .NET).
+pub fn unsupportedShell(arena: Allocator, sh: []const u8) Allocator.Error![]const u8 {
+    var it = std.mem.tokenizeAny(u8, sh, " \t");
+    const prog = std.fs.path.basenamePosix(it.next() orelse "");
+    const why = if (std.mem.eql(u8, prog, "pwsh") or std.mem.eql(u8, prog, "powershell"))
+        "PowerShell is not supported (it needs .NET); use `shell: bash`"
+    else if (std.mem.eql(u8, prog, "cmd"))
+        "cmd is Windows-only; use `shell: bash`"
+    else
+        "this runner runs bash and sh, the shells of GitHub's Ubuntu runners: use `shell: bash`, `sh`, or a bash or sh command with {0} for the script file, such as `bash -l {0}`";
+    return std.fmt.allocPrint(arena, "unsupported shell '{s}': {s}", .{ sh, why });
+}
 
 fn parseCheckoutInputs(arena: Allocator, inputs: ?Value) Error!Action {
     const iv = inputs orelse return .{ .checkout = &.{} };
@@ -773,6 +784,15 @@ test "malformed job" {
     defer a.deinit();
     try std.testing.expectError(error.MalformedJob, parse(a.allocator(), "{}"));
     try std.testing.expectError(error.MalformedJob, parse(a.allocator(), "not json"));
+}
+
+test "unsupportedShell says why" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    try std.testing.expectEqualStrings("unsupported shell 'pwsh': PowerShell is not supported (it needs .NET); use `shell: bash`", try unsupportedShell(a.allocator(), "pwsh"));
+    try std.testing.expect(std.mem.indexOf(u8, try unsupportedShell(a.allocator(), "powershell -command {0}"), "needs .NET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try unsupportedShell(a.allocator(), "cmd"), "Windows-only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, try unsupportedShell(a.allocator(), "python"), "use `shell: bash`") != null);
 }
 
 test "validShell: bash, sh, and custom bash or sh commands with {0}" {
