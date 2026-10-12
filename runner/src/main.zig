@@ -13,6 +13,7 @@ comptime {
     _ = @import("sink.zig");
     _ = @import("redact.zig");
     _ = @import("yaml.zig");
+    _ = @import("action.zig");
     _ = @import("config.zig");
     _ = @import("github/jitconfig.zig");
     _ = @import("github/rsa_sign.zig");
