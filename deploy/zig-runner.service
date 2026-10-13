@@ -18,6 +18,8 @@ KillSignal=SIGTERM
 TimeoutStopSec=60min
 Restart=on-failure
 RestartSec=10
+# Exit 1 (configuration) and 2 (GitHub refused the token or scope) need a fix, not a restart.
+RestartPreventExitStatus=1 2
 # The runner needs no files of its own, only the network and the engine's socket (owned by root
 # unless the engine was started otherwise; to run unprivileged, set User= to an account that can
 # open it).
