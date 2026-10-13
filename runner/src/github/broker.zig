@@ -59,14 +59,21 @@ pub fn request(
     payload: ?[]const u8,
     opts: RequestOptions,
 ) !Response {
-    return requestOnce(arena, io, method, url, payload, opts) catch |err| switch (err) {
-        // A kept-alive connection the server had closed while it sat idle (seen on completejob
-        // after a 16-minute step): no byte came back, so the request was never processed. Again,
-        // on a new connection.
-        error.HttpConnectionClosing => requestOnce(arena, io, method, url, payload, opts),
-        else => err,
-    };
+    // A kept-alive connection the server had closed while it sat idle (seen on completejob after a
+    // 16-minute step): no byte came back, so the request was never processed, and the connection is
+    // dropped. The pool can hold several such connections to the same host (six jobs finishing at
+    // once after minutes of quiet), so try again until a live or new connection answers.
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        return requestOnce(arena, io, method, url, payload, opts) catch |err| switch (err) {
+            error.HttpConnectionClosing => if (attempt < max_stale_retries) continue else err,
+            else => err,
+        };
+    }
 }
+
+/// More than the connections a host plausibly has idle in the pool.
+const max_stale_retries = 8;
 
 fn requestOnce(
     arena: Allocator,
