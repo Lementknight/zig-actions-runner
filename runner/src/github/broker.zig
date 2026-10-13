@@ -137,13 +137,23 @@ fn requestOnce(
     return .{ .status = response.head.status, .body = try arena.dupe(u8, resp.written()) };
 }
 
+/// The machine's architecture as GitHub names it (`runner.arch`, RUNNER_ARCH): the runner, the
+/// engine and the steps' containers all run on it.
+pub const arch = switch (@import("builtin").cpu.arch) {
+    .x86_64 => "X64",
+    .aarch64 => "ARM64",
+    .arm => "ARM",
+    .x86 => "X86",
+    else => @compileError("unsupported architecture"),
+};
+
 /// Prints request stages to stderr (never headers or bodies). Set while probing.
 pub var trace = false;
 
 pub fn messageUrl(arena: Allocator, base: []const u8, session_id: []const u8, status: []const u8) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
-        "{s}message?sessionId={s}&status={s}&runnerVersion={s}&os=Linux&architecture=X64&disableUpdate=true",
+        "{s}message?sessionId={s}&status={s}&runnerVersion={s}&os=Linux&architecture=" ++ arch ++ "&disableUpdate=true",
         .{ base, session_id, status, version },
     );
 }

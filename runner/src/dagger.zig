@@ -1003,7 +1003,7 @@ const Evaluator = struct {
         if (ev.services) |v| job_fields[1] = .{ .key = "services", .value = v };
         const runner_fields = try arena.alloc(expr.Value.Entry, 5);
         runner_fields[0] = .{ .key = "os", .value = .{ .string = "Linux" } };
-        runner_fields[1] = .{ .key = "arch", .value = .{ .string = "X64" } };
+        runner_fields[1] = .{ .key = "arch", .value = .{ .string = broker.arch } };
         runner_fields[2] = .{ .key = "name", .value = .{ .string = ev.runner_name } };
         runner_fields[3] = .{ .key = "temp", .value = .{ .string = "/tmp" } };
         runner_fields[4] = .{ .key = "tool_cache", .value = .{ .string = "/opt/hostedtoolcache" } };
@@ -1099,7 +1099,7 @@ const Evaluator = struct {
             .{ .name = "GITHUB_ACTIONS", .value = "true" },
             .{ .name = "GITHUB_WORKSPACE", .value = workspace },
             .{ .name = "RUNNER_OS", .value = "Linux" },
-            .{ .name = "RUNNER_ARCH", .value = "X64" },
+            .{ .name = "RUNNER_ARCH", .value = broker.arch },
             .{ .name = "RUNNER_NAME", .value = ev.runner_name },
             .{ .name = "RUNNER_TEMP", .value = "/tmp" },
             .{ .name = "RUNNER_TOOL_CACHE", .value = "/opt/hostedtoolcache" },
