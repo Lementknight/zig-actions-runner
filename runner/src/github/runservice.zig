@@ -56,11 +56,25 @@ pub fn complete(
     conclusion: Conclusion,
     /// JSON array of step results (see `loop.zig`).
     step_results: []const u8,
+    /// The job's outputs, read by later jobs as `needs.<job>.outputs.<name>`.
+    outputs: []const @import("../job.zig").EnvVar,
 ) !broker.Response {
+    // Outputs as the runner sends them: name -> {value, isSecret} (actions/runner's VariableValue).
+    var out_json: std.Io.Writer.Allocating = .init(arena);
+    const w = &out_json.writer;
+    try w.writeByte('{');
+    for (outputs, 0..) |o, i| {
+        if (i > 0) try w.writeByte(',');
+        try std.json.Stringify.value(o.name, .{}, w);
+        try w.writeAll(":{\"value\":");
+        try std.json.Stringify.value(o.value, .{}, w);
+        try w.writeAll(",\"isSecret\":false}");
+    }
+    try w.writeByte('}');
     const body = try std.fmt.allocPrint(
         arena,
-        "{{\"planId\":\"{s}\",\"jobId\":\"{s}\",\"conclusion\":\"{s}\",\"outputs\":{{}},\"stepResults\":{s},\"annotations\":[],\"telemetry\":[]}}",
-        .{ plan_id, job_id, @tagName(conclusion), step_results },
+        "{{\"planId\":\"{s}\",\"jobId\":\"{s}\",\"conclusion\":\"{s}\",\"outputs\":{s},\"stepResults\":{s},\"annotations\":[],\"telemetry\":[]}}",
+        .{ plan_id, job_id, @tagName(conclusion), out_json.written(), step_results },
     );
     return post(arena, io, req, token, "completejob", body);
 }

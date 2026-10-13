@@ -427,6 +427,7 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Cycl
     // "Complete job", as GitHub's runner ends a job (the job's containers went with its session).
     const complete_started = std.Io.Clock.real.now(c.io).toMilliseconds();
     const complete_step: u32 = if (result.next_log_step > 0) result.next_log_step else @intCast(job.steps.len + 1);
+    for (result.output_lines) |l| try log.append(job.check_run_id, complete_step, .stdout, l);
     try log.append(job.check_run_id, complete_step, .stdout, "Cleaning up orphan processes");
     try log.flush();
     if (reporter) |*r| {
@@ -438,11 +439,11 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Cycl
 
     const conclusion: runservice.Conclusion = if (result.succeeded) .succeeded else .failed;
     const step_json = try stepResultsJson(c.arena, shown);
-    var done = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, step_json) catch |e| return fail(c, "completejob", e);
+    var done = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, step_json, result.outputs) catch |e| return fail(c, "completejob", e);
     if (done.status.class() != .success) {
         // A held job blocks the run for minutes, so always finish it: retry without step details.
         try c.err.print("completejob with step results failed (HTTP {d}: {s}); retrying without them\n", .{ @backingInt(done.status), done.body[0..@min(done.body.len, 200)] });
-        done = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, "[]") catch |e| return fail(c, "completejob", e);
+        done = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, "[]", result.outputs) catch |e| return fail(c, "completejob", e);
         if (done.status.class() != .success) return failBody(c, "completejob", done);
     }
     try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job {s}", .{@tagName(conclusion)}));

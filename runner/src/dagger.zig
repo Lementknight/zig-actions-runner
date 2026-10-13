@@ -406,6 +406,10 @@ pub const Result = struct {
     extra: []const ExtraStep = &.{},
     /// The first log step number not used (see `ExtraStep.log_step`); 0 means `steps.len + 1`.
     next_log_step: u32 = 0,
+    /// The job's outputs, evaluated after its steps (see `job_mod.Job.outputs`), and what to log
+    /// about them in "Complete job".
+    outputs: []const job_mod.EnvVar = &.{},
+    output_lines: []const []const u8 = &.{},
 };
 
 /// A `pre` or `post` script that ran: a step of its own in GitHub's list ("Pre Run x@v1",
@@ -1733,7 +1737,35 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     if (x.hook_failed) result.succeeded = false;
     result.extra = x.extra.items;
     result.next_log_step = x.next_log_step;
+    try jobOutputs(arena, &ev, job, &result);
     return result;
+}
+
+/// Evaluates the job's outputs as GitHub's runner does when it finishes a job: against the final
+/// contexts (the steps' outputs and outcomes), each output a string. One that would carry a secret is
+/// dropped with GitHub's warning (later jobs could read it); one that cannot be evaluated is dropped
+/// with the reason.
+fn jobOutputs(arena: Allocator, ev: *Evaluator, job: job_mod.Job, result: *Result) !void {
+    if (job.outputs.len == 0) return;
+    var outs: std.ArrayList(job_mod.EnvVar) = .empty;
+    var lines: std.ArrayList([]const u8) = .empty;
+    try lines.append(arena, "Evaluate and set job outputs");
+    for (job.outputs) |o| {
+        ev.diag = "";
+        const sc = try ev.scope(&.{});
+        const value = ev.render(o.value, sc) catch {
+            try lines.append(arena, try std.fmt.allocPrint(arena, "##[warning]Could not evaluate output '{s}': {s}", .{ o.name, ev.diag }));
+            continue;
+        };
+        if (containsSecret(job, value)) {
+            try lines.append(arena, try std.fmt.allocPrint(arena, "##[warning]Skip output '{s}' since it may contain secret.", .{o.name}));
+            continue;
+        }
+        try outs.append(arena, .{ .name = o.name, .value = value });
+        try lines.append(arena, try std.fmt.allocPrint(arena, "Set output '{s}'", .{o.name}));
+    }
+    result.outputs = outs.items;
+    result.output_lines = lines.items;
 }
 
 fn zeroed(arena: Allocator, comptime T: type, n: usize) ![]T {
@@ -4637,6 +4669,42 @@ test "logs read like GitHub's: Set up job, then each step's header with its shel
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "printf '%s' 'echo one\\necho two' > /tmp/zig-runner-step-3.sh") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "\\\"$zig_shell\\\" '-e' '/tmp/zig-runner-step-3.sh'") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], "'sh' '-e' '/tmp/zig-runner-step-") != null);
+}
+
+test "job outputs are evaluated after the steps; one carrying a secret is skipped" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var st = testStep("echo version=1.2.3 >> $GITHUB_OUTPUT");
+    st.context_name = "v";
+    const steps = [_]job_mod.Step{st};
+    var job = testJob(&steps);
+    job.secrets = &.{"s3cr3t-value"};
+    job.outputs = &.{
+        .{ .name = "version", .value = .{ .expr = "steps.v.outputs.version" } },
+        .{ .name = "literal", .value = .{ .lit = "fixed" } },
+        .{ .name = "combined", .value = .{ .expr = "format('v={0}', steps.v.outputs.version)" } },
+        .{ .name = "leak", .value = .{ .lit = "token s3cr3t-value" } },
+    };
+    const answers = [_][]const u8{
+        base_answer,
+        "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\",\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\",\"fc_output\":{\"contents\":\"version=1.2.3\\n\"}}}}}",
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqual(@as(usize, 3), res.outputs.len);
+    try std.testing.expectEqualStrings("version", res.outputs[0].name);
+    try std.testing.expectEqualStrings("1.2.3", res.outputs[0].value);
+    try std.testing.expectEqualStrings("fixed", res.outputs[1].value);
+    try std.testing.expectEqualStrings("v=1.2.3", res.outputs[2].value);
+    const want = [_][]const u8{ "Evaluate and set job outputs", "Set output 'version'", "Set output 'literal'", "Set output 'combined'", "##[warning]Skip output 'leak' since it may contain secret." };
+    try std.testing.expectEqual(want.len, res.output_lines.len);
+    for (want, res.output_lines) |wnt, got| try std.testing.expectEqualStrings(wnt, got);
 }
 
 test "splitArgs splits like a command line, with double quotes" {

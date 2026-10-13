@@ -202,7 +202,7 @@ fn probeRunService(arena: Allocator, io: std.Io, out: *std.Io.Writer, token: []c
         "[]",
     };
     for (candidates, 0..) |cand, i| {
-        const c = try runservice.complete(arena, io, jr, job_token, plan_id, job_id, .succeeded, cand);
+        const c = try runservice.complete(arena, io, jr, job_token, plan_id, job_id, .succeeded, cand, &.{});
         try out.print("POST completejob (stepResults variant {d}) -> HTTP {d}\n", .{ i, @backingInt(c.status) });
         if (c.status.class() == .success) {
             try out.print("  accepted shape: {s}\n", .{cand});
