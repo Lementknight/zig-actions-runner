@@ -74,7 +74,7 @@ pub fn generate(
     const client = @import("http.zig").client(&local);
 
     var resp: std.Io.Writer.Allocating = .init(arena);
-    const result = try client.fetch(.{
+    const result = try @import("http.zig").fetch(client, .{
         .location = .{ .url = url },
         .method = .POST,
         .payload = body.written(),

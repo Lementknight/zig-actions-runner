@@ -92,7 +92,7 @@ pub fn fetchAccessToken(arena: Allocator, io: std.Io, creds: Credentials, jwt: [
     const client = @import("http.zig").client(&local);
 
     var resp: std.Io.Writer.Allocating = .init(arena);
-    const result = try client.fetch(.{
+    const result = try @import("http.zig").fetch(client, .{
         .location = .{ .url = creds.authorization_url },
         .method = .POST,
         .payload = form,

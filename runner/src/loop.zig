@@ -498,15 +498,32 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
     const conclusion: runservice.Conclusion = if (result.cancelled) .canceled else if (result.succeeded) .succeeded else .failed;
     const step_json = try stepResultsJson(c.arena, shown);
     const annotations_json = try annotationsJson(c.arena, shown, result.annotations);
-    var done = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, step_json, result.outputs, annotations_json) catch |e| return fail(c, "completejob", e);
+    var done = completeJob(c, jr, job, conclusion, step_json, result.outputs, annotations_json) catch |e| return fail(c, "completejob", e);
     if (done.status.class() != .success) {
         // A held job blocks the run for minutes, so always finish it: retry without step details.
         try c.err.print("completejob with step results and annotations failed (HTTP {d}: {s}); retrying without them\n", .{ @backingInt(done.status), done.body[0..@min(done.body.len, 200)] });
-        done = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, "[]", result.outputs, "[]") catch |e| return fail(c, "completejob", e);
+        done = completeJob(c, jr, job, conclusion, "[]", result.outputs, "[]") catch |e| return fail(c, "completejob", e);
         if (done.status.class() != .success) return failBody(c, "completejob", done);
     }
     try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job {s}", .{@tagName(conclusion)}));
     return .{ .job = result.succeeded };
+}
+
+/// completejob, tried again (after 2, 5 and 10 s) when the request fails or GitHub answers 5xx:
+/// a job not completed stays held, and once its hold runs out GitHub fails it ("lost
+/// communication") whatever its steps did. The hold is still being renewed meanwhile.
+fn completeJob(c: Context, jr: runservice.JobRequest, job: job_mod.Job, conclusion: runservice.Conclusion, step_json: []const u8, outputs: []const job_mod.EnvVar, annotations_json: []const u8) !broker.Response {
+    const delays = [_]i64{ 2, 5, 10 };
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        const r = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, step_json, outputs, annotations_json);
+        const retry = if (r) |resp| resp.status.class() == .server_error else |_| true;
+        if (!retry or attempt == delays.len) return r;
+        if (r) |resp| {
+            try c.err.print("completejob: HTTP {d}; trying again in {d}s\n", .{ @backingInt(resp.status), delays[attempt] });
+        } else |e| try c.err.print("completejob: {s}; trying again in {d}s\n", .{ @errorName(e), delays[attempt] });
+        c.io.sleep(.fromSeconds(delays[attempt]), .awake) catch {};
+    }
 }
 
 /// A step as GitHub shows it for the job.

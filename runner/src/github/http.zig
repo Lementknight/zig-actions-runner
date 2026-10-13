@@ -11,3 +11,15 @@ pub var shared: ?*std.http.Client = null;
 pub fn client(local: *std.http.Client) *std.http.Client {
     return shared orelse local;
 }
+
+/// `client.fetch`, tried again while a kept-alive connection turns out to be closed (no byte came
+/// back, so nothing was processed or written; see `broker.request`).
+pub fn fetch(c: *std.http.Client, options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
+    var attempt: u32 = 0;
+    while (true) : (attempt += 1) {
+        return c.fetch(options) catch |err| switch (err) {
+            error.HttpConnectionClosing => if (attempt < 8) continue else err,
+            else => err,
+        };
+    }
+}
