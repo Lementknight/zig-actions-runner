@@ -1821,6 +1821,9 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     // Services hold state a cached step would not have changed (a migration replayed from cache
     // leaves a fresh database empty), so a job with services runs every step.
     const step_cache = opts.step_cache and !optsOutOfStepCache(ev.job_env.items) and job.services.len == 0;
+    // `container:` replaces the image every step runs in.
+    const job_image: []const u8 = if (job.container) |jc| (ev.render(jc.image, try ev.scope(&.{})) catch "") else opts.image;
+    if (job_image.len == 0) return fail(sh, results, try std.fmt.allocPrint(arena, "container: has no image: {s}", .{ev.diag}));
     // Package managers' caches persist across jobs in Dagger cache volumes (see `package_cache_dirs`).
     const cache_ids: []const []const u8 = if (opts.package_caches and job.github.repository.len > 0) ids: {
         const scope = try packageCacheScope(arena, &ev, job.github.repository);
@@ -1829,7 +1832,13 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         try w.writeAll("{");
         for (package_cache_dirs, 0..) |d, i| {
             try w.print(" c{d}: cacheVolume(key:", .{i});
-            try std.json.Stringify.value(try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/{s}", .{ job.github.repository, scope, d.name }), .{}, w);
+            // The tool cache holds binaries built for one image (glibc or musl, its libraries), so
+            // each image has its own.
+            const key = if (std.mem.eql(u8, d.name, "toolcache"))
+                try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/{s}/{s}", .{ job.github.repository, scope, d.name, job_image })
+            else
+                try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/{s}", .{ job.github.repository, scope, d.name });
+            try std.json.Stringify.value(key, .{}, w);
             try w.writeAll(") { id }");
         }
         try w.writeAll(" }");
@@ -1842,9 +1851,6 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         break :ids ids;
     } else &.{};
 
-    // `container:` replaces the image every step runs in.
-    const job_image: []const u8 = if (job.container) |jc| (ev.render(jc.image, try ev.scope(&.{})) catch "") else opts.image;
-    if (job_image.len == 0) return fail(sh, results, try std.fmt.allocPrint(arena, "container: has no image: {s}", .{ev.diag}));
     const container_id: []const u8 = blk: {
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
@@ -4039,6 +4045,9 @@ fn muslWrapper(arena: Allocator, name: []const u8) ![]const u8 {
 /// own cache volume. Their contents are caches the tools validate themselves, so sharing them between
 /// jobs is safe; they are keyed by repository (see `packageCacheScope`).
 const package_cache_dirs = [_]struct { name: []const u8, path: []const u8 }{
+    // RUNNER_TOOL_CACHE: what setup-node, setup-python, setup-go and the like download and unpack,
+    // found again by the next job instead of fetched (GitHub's images come with it filled).
+    .{ .name = "toolcache", .path = "/opt/hostedtoolcache" },
     .{ .name = "npm", .path = "/root/.npm" },
     .{ .name = "pnpm", .path = "/root/.local/share/pnpm/store" },
     .{ .name = "yarn", .path = "/usr/local/share/.cache/yarn" },
@@ -5770,11 +5779,14 @@ test "package caches: one volume per tool, keyed by repository, separate for for
         const res = try run(arena, std.testing.io, &env, .{ .package_caches = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
         try std.testing.expect(res.succeeded);
         const scope = if (fork) "fork-pr" else "repo";
-        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "c0: cacheVolume(key:\"zig-runner/o/r/{s}/npm\")", .{scope})) != null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "c1: cacheVolume(key:\"zig-runner/o/r/{s}/npm\")", .{scope})) != null);
+        // The tool cache is also keyed by the job's image (its binaries are built for it).
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "c0: cacheVolume(key:\"zig-runner/o/r/{s}/toolcache/ubuntu:24.04\")", .{scope})) != null);
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], try std.fmt.allocPrint(arena, "cacheVolume(key:\"zig-runner/o/r/{s}/zig\")", .{scope})) != null);
         // Mounted on the base container, so every step has them.
-        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.npm\",cache:\"V0\")") != null);
-        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.cache/zig\",cache:\"V10\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/opt/hostedtoolcache\",cache:\"V0\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.npm\",cache:\"V1\")") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.cache/zig\",cache:\"V11\")") != null);
         try std.testing.expect(braceBalanced(fake.seen.items[1]));
     }
 }
