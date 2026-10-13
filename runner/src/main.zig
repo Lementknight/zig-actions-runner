@@ -23,6 +23,8 @@ comptime {
     _ = @import("github/broker.zig");
     _ = @import("github/runservice.zig");
     _ = @import("github/results.zig");
+    _ = @import("github/feed.zig");
+    _ = @import("live.zig");
     _ = @import("job.zig");
     _ = @import("dagger.zig");
     _ = @import("engine.zig");

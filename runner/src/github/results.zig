@@ -131,6 +131,29 @@ fn uploadSummaryInner(arena: Allocator, io: std.Io, job: job_mod.Job, step_id: [
     return .{ .ok = true, .detail = try std.fmt.allocPrint(arena, "{d} bytes", .{markdown.len}) };
 }
 
+/// Tells GitHub the job's steps and where each stands, so its UI lists them while the job runs
+/// (actions/runner's `WorkflowStepsUpdate`). `steps` is a JSON array of `{external_id, number,
+/// name, status, conclusion, started_at, completed_at}`; a later `change_order` replaces earlier ones.
+pub fn updateSteps(arena: Allocator, io: std.Io, job: job_mod.Job, steps: []const u8, change_order: u64) Result {
+    return updateStepsInner(arena, io, job, steps, change_order) catch |e| .{ .ok = false, .detail = @errorName(e) };
+}
+
+fn updateStepsInner(arena: Allocator, io: std.Io, job: job_mod.Job, steps: []const u8, change_order: u64) !Result {
+    if (job.results_endpoint.len == 0) return .{ .ok = false, .detail = "job has no results endpoint" };
+    const base = std.mem.trimEnd(u8, job.results_endpoint, "/");
+    const url = try std.fmt.allocPrint(arena, "{s}/twirp/github.actions.results.api.v1.WorkflowStepUpdateService/WorkflowStepsUpdate", .{base});
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("{{\"steps\":{s},\"change_order\":{d},\"workflow_job_run_backend_id\":", .{ steps, change_order });
+    try std.json.Stringify.value(job.job_id, .{}, w);
+    try w.writeAll(",\"workflow_run_backend_id\":");
+    try std.json.Stringify.value(job.plan_id, .{}, w);
+    try w.writeByte('}');
+    const r = try broker.call(arena, io, .POST, url, job.job_token, aw.written());
+    if (r.status.class() != .success) return failed(arena, "WorkflowStepsUpdate", r);
+    return .{ .ok = true, .detail = "" };
+}
+
 fn failed(arena: Allocator, what: []const u8, r: broker.Response) !Result {
     return .{ .ok = false, .detail = try std.fmt.allocPrint(arena, "{s}: HTTP {d}: {s}", .{ what, @backingInt(r.status), r.body[0..@min(r.body.len, 300)] }) };
 }

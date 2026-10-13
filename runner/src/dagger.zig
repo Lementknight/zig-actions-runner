@@ -556,7 +556,7 @@ pub const ExtraStep = struct {
 
 /// Log step numbers a job can use: its steps, at most one `pre` and one `post` each, and
 /// "Initialize containers" and "Stop containers" for its services.
-fn logSteps(n: usize) usize {
+pub fn logSteps(n: usize) usize {
     return n * 3 + 3;
 }
 
@@ -660,6 +660,10 @@ pub const Observer = struct {
     ptr: *anyopaque,
     startedFn: *const fn (ptr: *anyopaque, number: u32, name: []const u8, started_ms: i64) void,
     finishedFn: *const fn (ptr: *anyopaque, number: u32, result: StepResult) void,
+    /// The steps the runner adds ("Pre ...", "Post ...", "Initialize containers", "Stop
+    /// containers"), by log step (see `ExtraStep`); optional.
+    extraStartedFn: ?*const fn (ptr: *anyopaque, log_step: u32, name: []const u8, started_ms: i64) void = null,
+    extraFinishedFn: ?*const fn (ptr: *anyopaque, e: ExtraStep) void = null,
 
     fn started(o: Observer, number: u32, name: []const u8, started_ms: i64) void {
         o.startedFn(o.ptr, number, name, started_ms);
@@ -1928,6 +1932,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         .pre_state = try emptySlices(arena, job_mod.EnvVar, job.steps.len),
         .summaries = try emptySlices(arena, u8, logSteps(job.steps.len)),
         .job_image = job_image,
+        .observer = opts.observer,
     };
 
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
@@ -2255,6 +2260,8 @@ const Exec = struct {
     empty_dir: []const u8 = "",
     images: std.StringHashMapUnmanaged(ImageInfo) = .empty,
     docker_home: ?[]const u8 = null,
+    /// Told when the runner's own steps start and finish (see `Observer`).
+    observer: ?Observer = null,
     /// The image the steps run in: `container:`'s, or the runner's.
     job_image: []const u8 = default_image,
     /// The job's image uses musl (Alpine): JavaScript actions get the runtime's musl build.
@@ -2838,12 +2845,14 @@ const Exec = struct {
         const ls = x.next_log_step;
         x.next_log_step += 1;
         const started = std.Io.Clock.real.now(x.io).toMilliseconds();
+        const pre_name = x.extraName("Pre", num, act) catch "Pre";
+        x.startExtra(ls, pre_name, started);
         const pre_out = switch (act.meta.runs) {
             .docker => |dk| if (try x.dockerRunFor(ls, act, u, dk, inputs, plain.items, secret.items, pre)) |dr| try x.runContainer(ls, .pre, dr, &.{}) else null,
             else => try x.runJsScript(ls, .pre, act, u, pre, inputs, plain.items, secret.items, &.{}),
         };
         var ok = false;
-        defer x.extra.append(x.arena, .{ .kind = .pre, .name = x.extraName("Pre", num, act) catch "Pre", .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() }) catch {};
+        defer x.addExtra(.{ .kind = .pre, .name = pre_name, .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() }) catch {};
         const out = pre_out orelse {
             ev.job_failed = true;
             x.hook_failed = true;
@@ -2879,13 +2888,14 @@ const Exec = struct {
             const ls = x.next_log_step;
             x.next_log_step += 1;
             const started = std.Io.Clock.real.now(x.io).toMilliseconds();
+            x.startExtra(ls, p.name, started);
             x.sh.append(ls, "Post job cleanup.");
             const post_out = if (p.docker) |dr|
                 try x.runContainer(ls, .post, dr, p.state)
             else
                 try x.runJsScript(ls, .post, p.act, p.u, p.script, p.inputs, p.step_env, p.step_secret, p.state);
             const ok = if (post_out) |out| out.code == 0 else false;
-            try x.extra.append(x.arena, .{ .kind = .post, .name = p.name, .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() });
+            try x.addExtra(.{ .kind = .post, .name = p.name, .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() });
             const out = post_out orelse {
                 x.hook_failed = true;
                 continue;
@@ -3464,6 +3474,15 @@ const Exec = struct {
     }
 
     /// The static busybox that starts Docker actions' commands (taken from its image once per job).
+    fn startExtra(x: *Exec, log_step: u32, name: []const u8, started_ms: i64) void {
+        if (x.observer) |o| if (o.extraStartedFn) |f| f(o.ptr, log_step, name, started_ms);
+    }
+
+    fn addExtra(x: *Exec, e: ExtraStep) !void {
+        try x.extra.append(x.arena, e);
+        if (x.observer) |o| if (o.extraFinishedFn) |f| f(o.ptr, e);
+    }
+
     /// "Initialize containers": starts each of the job's `services:` and keeps it running for the
     /// whole job (an explicitly started service lives until the session ends, so its data carries
     /// from step to step), then binds them to the job's container under their names and forwards
@@ -3476,7 +3495,8 @@ const Exec = struct {
         x.next_log_step += 1;
         const started = std.Io.Clock.real.now(x.io).toMilliseconds();
         var ok = true;
-        defer x.extra.append(arena, .{ .kind = .pre, .name = "Initialize containers", .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() }) catch {};
+        x.startExtra(ls, "Initialize containers", started);
+        defer x.addExtra(.{ .kind = .pre, .name = "Initialize containers", .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() }) catch {};
         ev.diag = "";
         const sc = try ev.scope(&.{});
         if (x.job.container) |jc| {
@@ -3695,6 +3715,7 @@ const Exec = struct {
         const ls = x.next_log_step;
         x.next_log_step += 1;
         const started = std.Io.Clock.real.now(x.io).toMilliseconds();
+        x.startExtra(ls, "Stop containers", started);
         for (x.services.items, 0..) |r, i| {
             x.sh.append(ls, try std.fmt.allocPrint(x.arena, "Print service container logs: {s}", .{r.name}));
             for (x.sh.takeServiceLog(i)) |l| x.sh.append(ls, l);
@@ -3705,7 +3726,7 @@ const Exec = struct {
         }
         // The job container goes with the job's session.
         if (x.job.container != null) x.sh.append(ls, try std.fmt.allocPrint(x.arena, "Stop and remove container: job ({s})", .{x.job_image}));
-        try x.extra.append(x.arena, .{ .kind = .post, .name = "Stop containers", .log_step = ls, .outcome = .success, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() });
+        try x.addExtra(.{ .kind = .post, .name = "Stop containers", .log_step = ls, .outcome = .success, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() });
     }
 
     fn busyboxFile(x: *Exec, num: u32) !?[]const u8 {
