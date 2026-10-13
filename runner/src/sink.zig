@@ -51,14 +51,22 @@ pub const CollectSink = struct {
     lines: std.ArrayList(CollectedLine) = .empty,
     bytes: usize = 0,
     dropped: usize = 0,
+    /// Told of every line as it is logged, redacted (the live log in GitHub's UI, see `live.zig`).
+    listener: ?Listener = null,
 
     pub const max_bytes: usize = 64 * 1024 * 1024;
+
+    pub const Listener = struct {
+        ptr: *anyopaque,
+        onLine: *const fn (ptr: *anyopaque, step: u32, text: []const u8) void,
+    };
 
     pub fn append(s: *CollectSink, job_id: u64, step_number: u32, stream: Stream, line: []const u8) Error!void {
         var aw: std.Io.Writer.Allocating = .init(s.arena);
         try redact.write(&aw.writer, line, s.secrets);
         const text = aw.written();
         try s.inner.append(job_id, step_number, stream, text);
+        if (s.listener) |l| l.onLine(l.ptr, step_number, text);
         if (s.bytes + text.len > max_bytes) {
             s.dropped += 1;
             return;

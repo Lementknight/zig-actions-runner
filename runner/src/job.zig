@@ -156,6 +156,8 @@ pub const Runtime = struct {
     cache_url: []const u8 = "",
     results_url: []const u8 = "",
     id_token_url: []const u8 = "",
+    /// The live log feed, a WebSocket (`wss://results-receiver.../_ws/ingest.sock`).
+    feed_url: []const u8 = "",
     cache_v2: bool = false,
 };
 
@@ -748,6 +750,7 @@ fn runtime(root: Value) Runtime {
         r.cache_url = path(ep, &.{ "data", "CacheServerUrl" }) orelse "";
         r.results_url = path(ep, &.{ "data", "ResultsServiceUrl" }) orelse "";
         r.id_token_url = path(ep, &.{ "data", "GenerateIdTokenUrl" }) orelse "";
+        r.feed_url = path(ep, &.{ "data", "FeedStreamUrl" }) orelse "";
     }
     return r;
 }

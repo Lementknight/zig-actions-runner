@@ -15,6 +15,7 @@ const db = @import("db.zig");
 const sink = @import("sink.zig");
 const redact = @import("redact.zig");
 const timefmt = @import("timefmt.zig");
+const Live = @import("live.zig").Live;
 
 const Allocator = std.mem.Allocator;
 
@@ -414,6 +415,15 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
     var collect: sink.LogSink = .{ .collect = .{ .arena = c.arena, .io = c.io, .inner = c.log } };
     collect.setSecrets(try std.mem.concat(c.arena, []const u8, &.{ c.secrets, job.secrets }));
     const log = &collect;
+    // The job, live in GitHub's UI: its steps as they run and their lines as they are logged.
+    var live = try Live.init(c.gpa, c.arena, c.io, &job, c.log);
+    collect.collect.listener = live.listener();
+    live.start(std.Io.Clock.real.now(c.io).toMilliseconds());
+    var live_done = false;
+    defer if (!live_done) {
+        collect.collect.listener = null;
+        live.finish(&.{});
+    };
     // For the runner's own console and database only: the job's log starts as GitHub's does.
     try c.log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job acquired: {d} steps", .{job.steps.len}));
 
@@ -446,7 +456,10 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
             .package_caches = c.cfg.package_caches,
             .step_cache = c.cfg.step_cache,
             .cancel = &cancel,
-            .observer = if (reporter) |*r| r.observer() else null,
+            .observer = observer: {
+                live.next = if (reporter) |*r| r.observer() else null;
+                break :observer live.observer();
+            },
             .sink_job_id = job.check_run_id,
             .runner_name = c.name,
         }, job, log);
@@ -463,6 +476,7 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
     // "Complete job", as GitHub's runner ends a job (the job's containers went with its session).
     const complete_started = std.Io.Clock.real.now(c.io).toMilliseconds();
     const complete_step: u32 = if (result.next_log_step > 0) result.next_log_step else @intCast(job.steps.len + 1);
+    live.begin(complete_step, "Complete job", complete_started);
     for (result.output_lines) |l| try log.append(job.check_run_id, complete_step, .stdout, l);
     try log.append(job.check_run_id, complete_step, .stdout, "Cleaning up orphan processes");
     try log.flush();
@@ -470,8 +484,16 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
         r.jobFinished(job, c.name, if (result.cancelled) "cancelled" else if (result.succeeded) "success" else "failure", job_started_ms, std.Io.Clock.real.now(c.io).toMilliseconds());
         if (r.failures > 0) try c.err.print("run state: {d} database write(s) failed (last: {s})\n", .{ r.failures, r.last_error });
     }
-    const shown = try shownSteps(c.arena, c.io, job, result, job_started_ms, .{ .log_step = complete_step, .started_ms = complete_started, .completed_ms = std.Io.Clock.real.now(c.io).toMilliseconds() });
+    const shown = try shownSteps(c.arena, live.ids, job, result, job_started_ms, .{ .log_step = complete_step, .started_ms = complete_started, .completed_ms = std.Io.Clock.real.now(c.io).toMilliseconds() });
     try uploadLogs(c, job, shown, log.collect.lines.items, result.summaries, log.currentSecrets());
+    {
+        // The live view ends with the steps as completejob reports them.
+        const finals = try c.arena.alloc(Live.Final, shown.len);
+        for (shown, finals) |sh, *f| f.* = .{ .id = sh.id, .number = sh.number, .name = sh.name, .conclusion = liveConclusion(sh.conclusion), .started_ms = sh.started_ms, .completed_ms = sh.completed_ms };
+        live_done = true;
+        collect.collect.listener = null;
+        live.finish(finals);
+    }
 
     const conclusion: runservice.Conclusion = if (result.cancelled) .canceled else if (result.succeeded) .succeeded else .failed;
     const step_json = try stepResultsJson(c.arena, shown);
@@ -641,7 +663,8 @@ test "timeSpanMs reads GitHub's cancel timeout" {
 /// The steps GitHub shows for a job, in its runner's order and numbering: "Set up job", the actions'
 /// `pre` scripts, the job's steps, their `post` scripts, "Complete job". GitHub lists only the job's
 /// own steps; its runner adds the others with ids of their own, and so does this one.
-pub fn shownSteps(arena: Allocator, io: std.Io, job: job_mod.Job, result: dagger.Result, job_started_ms: i64, complete: struct { log_step: u32, started_ms: i64, completed_ms: i64 }) ![]Shown {
+/// `ids`: GitHub's id of each log step (see `Live.ids`), the same the live view used.
+pub fn shownSteps(arena: Allocator, ids: []const []const u8, job: job_mod.Job, result: dagger.Result, job_started_ms: i64, complete: struct { log_step: u32, started_ms: i64, completed_ms: i64 }) ![]Shown {
     var out: std.ArrayList(Shown) = .empty;
     var first_started: i64 = complete.started_ms;
     for (result.steps) |r| if (r.started_ms > 0 and r.started_ms < first_started) {
@@ -650,8 +673,8 @@ pub fn shownSteps(arena: Allocator, io: std.Io, job: job_mod.Job, result: dagger
     for (result.extra) |e| if (e.started_ms > 0 and e.started_ms < first_started) {
         first_started = e.started_ms;
     };
-    try out.append(arena, .{ .id = try newId(arena, io), .number = 0, .name = "Set up job", .log_step = 0, .conclusion = "succeeded", .started_ms = job_started_ms, .completed_ms = first_started });
-    for (result.extra) |e| if (e.kind == .pre) try out.append(arena, try extraShown(arena, io, e));
+    try out.append(arena, .{ .id = ids[0], .number = 0, .name = "Set up job", .log_step = 0, .conclusion = "succeeded", .started_ms = job_started_ms, .completed_ms = first_started });
+    for (result.extra) |e| if (e.kind == .pre) try out.append(arena, extraShown(ids, e));
     for (job.steps, result.steps, 1..) |step, r, n| try out.append(arena, .{
         .id = step.id,
         .number = 0,
@@ -667,15 +690,23 @@ pub fn shownSteps(arena: Allocator, io: std.Io, job: job_mod.Job, result: dagger
         .started_ms = r.started_ms,
         .completed_ms = r.completed_ms,
     });
-    for (result.extra) |e| if (e.kind == .post) try out.append(arena, try extraShown(arena, io, e));
-    try out.append(arena, .{ .id = try newId(arena, io), .number = 0, .name = "Complete job", .log_step = complete.log_step, .conclusion = "succeeded", .started_ms = complete.started_ms, .completed_ms = complete.completed_ms });
+    for (result.extra) |e| if (e.kind == .post) try out.append(arena, extraShown(ids, e));
+    try out.append(arena, .{ .id = ids[complete.log_step], .number = 0, .name = "Complete job", .log_step = complete.log_step, .conclusion = "succeeded", .started_ms = complete.started_ms, .completed_ms = complete.completed_ms });
     for (out.items, 1..) |*s, n| s.number = @intCast(n);
     return out.items;
 }
 
-fn extraShown(arena: Allocator, io: std.Io, e: dagger.ExtraStep) !Shown {
+/// The live view's conclusion for a step's completejob one.
+fn liveConclusion(c: []const u8) Live.Conclusion {
+    if (std.mem.eql(u8, c, "succeeded")) return .success;
+    if (std.mem.eql(u8, c, "failed")) return .failure;
+    if (std.mem.eql(u8, c, "canceled")) return .cancelled;
+    return .skipped;
+}
+
+fn extraShown(ids: []const []const u8, e: dagger.ExtraStep) Shown {
     return .{
-        .id = try newId(arena, io),
+        .id = ids[e.log_step],
         .number = 0,
         .name = e.name,
         .log_step = e.log_step,
@@ -683,12 +714,6 @@ fn extraShown(arena: Allocator, io: std.Io, e: dagger.ExtraStep) !Shown {
         .started_ms = e.started_ms,
         .completed_ms = e.completed_ms,
     };
-}
-
-fn newId(arena: Allocator, io: std.Io) ![]const u8 {
-    const id = try arena.alloc(u8, 36);
-    engine.uuid(io, id[0..36]);
-    return id;
 }
 
 /// Uploads each shown step's log, then the whole job's, so GitHub's UI can show them. Failures are
@@ -868,7 +893,8 @@ test "the steps GitHub shows: Set up job, pre, the job's steps, post, Complete j
         .{ .kind = .post, .name = "Post a", .log_step = 6, .outcome = .failure, .started_ms = 3000, .completed_ms = 3100 },
     };
     const result: dagger.Result = .{ .steps = &rs, .engine_error = null, .succeeded = false, .extra = &extra, .next_log_step = 7 };
-    const shown = try shownSteps(arena, std.testing.io, job, result, 500, .{ .log_step = 7, .started_ms = 3200, .completed_ms = 3300 });
+    const ids = [_][]const u8{ "setup", "a", "b", "c", "d", "pre-a", "post-a", "complete" };
+    const shown = try shownSteps(arena, &ids, job, result, 500, .{ .log_step = 7, .started_ms = 3200, .completed_ms = 3300 });
     const names = [_][]const u8{ "Set up job", "Pre a", "a", "b", "c", "d", "Post a", "Complete job" };
     const logs = [_]u32{ 0, 5, 1, 2, 3, 4, 6, 7 };
     try std.testing.expectEqual(names.len, shown.len);
@@ -877,9 +903,11 @@ test "the steps GitHub shows: Set up job, pre, the job's steps, post, Complete j
         try std.testing.expectEqual(ls, sh.log_step);
         try std.testing.expectEqual(@as(u32, @intCast(n)), sh.number);
     }
-    // The added steps get ids of their own; the job's keep GitHub's.
-    try std.testing.expectEqual(@as(usize, 36), shown[0].id.len);
+    // Each step has the id of its log step, the one the live view used: GitHub's for the job's steps.
+    try std.testing.expectEqualStrings("setup", shown[0].id);
+    try std.testing.expectEqualStrings("pre-a", shown[1].id);
     try std.testing.expectEqualStrings("a", shown[2].id);
+    try std.testing.expectEqualStrings("complete", shown[7].id);
     // "Set up job" runs from the job's start until the first step (here the pre).
     try std.testing.expectEqual(@as(i64, 500), shown[0].started_ms);
     try std.testing.expectEqual(@as(i64, 900), shown[0].completed_ms);
