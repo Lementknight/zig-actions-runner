@@ -1,11 +1,17 @@
 # Release: on a version tag, static runner binaries (x86_64 and aarch64 Linux) on a GitHub release,
 # and the runner image (linux/amd64 and linux/arm64) on GitHub's container registry.
 # On pull requests that touch the runner's packaging, only checks that the image builds.
+# Run by hand with a tag to (re)build and push that tag's image.
 name: release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "An existing version tag whose image to build and push (v0.1.0)"
+        required: true
   pull_request:
     paths:
       - runner/Dockerfile
@@ -15,7 +21,9 @@ on:
 
 env:
   ZIG_VERSION: "0.17.0"
-  IMAGE: ghcr.io/${{ github.repository_owner }}/zig-runner
+  # The tag released: pushed, or given by hand.
+  TAG: ${{ inputs.tag || github.ref_name }}
+  PUBLISH: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
 
 jobs:
   binaries:
@@ -57,10 +65,18 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
       - uses: docker/setup-buildx-action@v3
 
+      # Registry names must be lowercase; owners often are not (Lementknight).
+      - name: Image name
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: echo "IMAGE=ghcr.io/${OWNER,,}/zig-runner" >> "$GITHUB_ENV"
+
       - name: Log in to the registry
-        if: startsWith(github.ref, 'refs/tags/')
+        if: env.PUBLISH == 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -72,6 +88,6 @@ jobs:
         with:
           context: runner
           platforms: linux/amd64,linux/arm64
-          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          push: ${{ env.PUBLISH == 'true' }}
           # A pull request's ref (`123/merge`) is no image tag; it builds under a local name.
-          tags: ${{ startsWith(github.ref, 'refs/tags/') && format('{0}:{1},{0}:latest', env.IMAGE, github.ref_name) || 'zig-runner:check' }}
+          tags: ${{ env.PUBLISH == 'true' && format('{0}:{1},{0}:latest', env.IMAGE, env.TAG) || 'zig-runner:check' }}
