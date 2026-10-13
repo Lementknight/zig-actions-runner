@@ -80,6 +80,6 @@ The runner itself is rarely the limit. What jobs need is CPU, memory and disk in
 
 ## Not supported yet
 
-- `container:` jobs and `services:`. Such jobs fail with a clear message.
+- `container:` jobs: they fail with a clear message. (`services:` work: a Postgres service is reached at `localhost:5432` as on GitHub, and keeps its data for the whole job.)
 - Windows and macOS jobs, and shells other than bash and sh.
 - Steps can't be stopped at their timeout, or on cancel, with `RUNNER_ENGINE=cli`.

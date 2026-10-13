@@ -422,8 +422,8 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
     // Fail the job up front rather than run steps that would fail in confusing ways without them.
     const unsupported: ?[]const u8 = if (job.has_container)
         "container: jobs are not supported yet"
-    else if (job.has_services)
-        "services: containers are not supported yet (the job's steps could not reach them)"
+    else if (job.services_error) |why|
+        why
     else
         null;
     if (unsupported) |why| {

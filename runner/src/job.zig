@@ -101,8 +101,10 @@ pub const Job = struct {
     display_name: []const u8 = "",
     /// `container:` jobs are not supported in v0.
     has_container: bool,
-    /// `services:` (the message's `jobServiceContainers`), which the runner cannot run yet.
-    has_services: bool = false,
+    /// `services:` (the message's `jobServiceContainers`), in the workflow's order.
+    services: []const Service = &.{},
+    /// Set when `services:` could not be read (one written as a single expression, say).
+    services_error: ?[]const u8 = null,
     /// `system.github.token.permissions`: the GITHUB_TOKEN's permissions as JSON
     /// (`{"Contents":"read",...}`), shown in the "Set up job" log as GitHub's runner does.
     token_permissions: []const u8 = "",
@@ -130,6 +132,22 @@ pub const Job = struct {
 };
 
 /// From the `SystemVssConnection` endpoint's `data`, and the `actions_uses_cache_service_v2` variable.
+/// A `services:` entry: a container that runs next to the job's steps for the whole job.
+pub const Service = struct {
+    /// The key under `services:`: the name the steps reach it by, and `job.services.<name>`.
+    name: []const u8,
+    image: Template,
+    env: []const Input = &.{},
+    /// As written: `5432:5432`, `6379`, `127.0.0.1:8080:80`, `53/udp`.
+    ports: []const Template = &.{},
+    /// Docker `create` options as one string (`--health-cmd ...`).
+    options: ?Template = null,
+    /// For a private registry.
+    username: ?Template = null,
+    password: ?Template = null,
+    volumes: []const Template = &.{},
+};
+
 pub const Runtime = struct {
     pipelines_url: []const u8 = "",
     cache_url: []const u8 = "",
@@ -166,6 +184,18 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
     const steps = try arena.alloc(Step, steps_v.array.items.len);
     for (steps_v.array.items, steps) |sv, *out| out.* = try parseStep(arena, sv);
 
+    var services: []const Service = &.{};
+    var services_error: ?[]const u8 = null;
+    if (root.object.get("jobServiceContainers")) |sc| if (sc != .null) {
+        services = parseServices(arena, sc) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unsupported => blk: {
+                services_error = "services: could not be read (written as an expression, or in a form the runner does not know)";
+                break :blk &.{};
+            },
+        };
+    };
+
     return .{
         .plan_id = path(root, &.{ "plan", "planId" }) orelse return error.MalformedJob,
         .job_id = path(root, &.{"jobId"}) orelse return error.MalformedJob,
@@ -180,7 +210,8 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .context_data = root.object.get("contextData") orelse .null,
         .display_name = path(root, &.{"jobDisplayName"}) orelse "",
         .has_container = if (root.object.get("jobContainer")) |c| c != .null else false,
-        .has_services = if (root.object.get("jobServiceContainers")) |c| c != .null else false,
+        .services = services,
+        .services_error = services_error,
         .token_permissions = variable(root, "system.github.token.permissions") orelse "",
         .outputs = blk: {
             const jo = root.object.get("jobOutputs") orelse break :blk &.{};
@@ -490,6 +521,61 @@ fn mappingInputs(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![
     return out.items;
 }
 
+/// `jobServiceContainers`: a mapping of name to a mapping (`image`, `env`, `ports`, `options`,
+/// `credentials`, `volumes`), or to just the image.
+fn parseServices(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![]const Service {
+    if (tokenType(v) != 2) return error.Unsupported;
+    var out: std.ArrayList(Service) = .empty;
+    const map = v.object.get("map") orelse return out.items;
+    if (map != .array) return error.Unsupported;
+    for (map.array.items) |pair| {
+        if (pair != .object) return error.Unsupported;
+        const name = literal(pair.object.get("Key") orelse return error.Unsupported) orelse return error.Unsupported;
+        const body = pair.object.get("Value") orelse return error.Unsupported;
+        if (tokenTemplate(body)) |image| {
+            try out.append(arena, .{ .name = name, .image = image });
+            continue;
+        }
+        if (tokenType(body) != 2) return error.Unsupported;
+        var svc: Service = .{ .name = name, .image = .{ .lit = "" } };
+        const fields = body.object.get("map") orelse return error.Unsupported;
+        if (fields != .array) return error.Unsupported;
+        for (fields.array.items) |f| {
+            if (f != .object) return error.Unsupported;
+            const key = literal(f.object.get("Key") orelse return error.Unsupported) orelse return error.Unsupported;
+            const val = f.object.get("Value") orelse return error.Unsupported;
+            if (std.mem.eql(u8, key, "image")) {
+                svc.image = tokenTemplate(val) orelse return error.Unsupported;
+            } else if (std.mem.eql(u8, key, "env")) {
+                svc.env = try mappingInputs(arena, val);
+            } else if (std.mem.eql(u8, key, "ports")) {
+                svc.ports = try sequenceTemplates(arena, val);
+            } else if (std.mem.eql(u8, key, "volumes")) {
+                svc.volumes = try sequenceTemplates(arena, val);
+            } else if (std.mem.eql(u8, key, "options")) {
+                svc.options = tokenTemplate(val) orelse return error.Unsupported;
+            } else if (std.mem.eql(u8, key, "credentials")) {
+                for (try mappingInputs(arena, val)) |c| {
+                    if (std.mem.eql(u8, c.name, "username")) svc.username = c.value;
+                    if (std.mem.eql(u8, c.name, "password")) svc.password = c.value;
+                }
+            }
+        }
+        try out.append(arena, svc);
+    }
+    return out.items;
+}
+
+/// A sequence token of literals or expressions.
+fn sequenceTemplates(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![]const Template {
+    if (tokenType(v) != 1) return error.Unsupported;
+    var out: std.ArrayList(Template) = .empty;
+    const seq = v.object.get("seq") orelse return out.items;
+    if (seq != .array) return error.Unsupported;
+    for (seq.array.items) |item| try out.append(arena, try numberTemplate(arena, item) orelse return error.Unsupported);
+    return out.items;
+}
+
 /// Workflow- and job-level env: `environmentVariables` is a list of mapping tokens.
 fn jobEnv(arena: Allocator, root: Value) Error![]const Input {
     var out: std.ArrayList(Input) = .empty;
@@ -709,7 +795,7 @@ test "parse job fixture" {
     }
     try std.testing.expect(seen_host and seen_token);
     try std.testing.expect(!job.has_container);
-    try std.testing.expect(!job.has_services);
+    try std.testing.expect(job.services.len == 0);
     try std.testing.expectEqualStrings("{\"Contents\":\"read\"}", job.token_permissions);
     try std.testing.expectEqualStrings("Default", job.runner_group);
     try std.testing.expectEqual(@as(usize, 2), job.outputs.len);
@@ -805,13 +891,28 @@ test "expressions are kept as templates: step name, env, inputs, condition, job 
 test "services: arrive as jobServiceContainers" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
+    // As GitHub sent it (verified live; file/line/col fields trimmed).
     const json =
         \\{"plan":{"planId":"p"},"jobId":"j","resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
-        \\ "jobServiceContainers":{"type":2,"map":[{"Key":"redis","Value":{"type":2,"map":[{"Key":"image","Value":"redis:7"}]}}]},
+        \\ "jobServiceContainers":{"type":2,"map":[
+        \\  {"Key":{"type":0,"lit":"postgres"},"Value":{"type":2,"map":[
+        \\    {"Key":{"type":0,"lit":"image"},"Value":{"type":0,"lit":"postgres:17"}},
+        \\    {"Key":{"type":0,"lit":"env"},"Value":{"type":2,"map":[{"Key":{"type":0,"lit":"POSTGRES_PASSWORD"},"Value":{"type":3,"expr":"secrets.PG"}}]}},
+        \\    {"Key":{"type":0,"lit":"ports"},"Value":{"type":1,"seq":[{"type":0,"lit":"5432:5432"}]}},
+        \\    {"Key":{"type":0,"lit":"options"},"Value":{"type":0,"lit":"--health-cmd \"pg_isready\""}}]}},
+        \\  {"Key":{"type":0,"lit":"redis"},"Value":{"type":0,"lit":"redis:7"}}]},
         \\ "steps":[]}
     ;
     const job = try parse(a.allocator(), json);
-    try std.testing.expect(job.has_services);
+    try std.testing.expectEqual(@as(usize, 2), job.services.len);
+    const pg = job.services[0];
+    try std.testing.expectEqualStrings("postgres", pg.name);
+    try std.testing.expectEqualStrings("postgres:17", pg.image.lit);
+    try std.testing.expectEqualStrings("secrets.PG", pg.env[0].value.expr);
+    try std.testing.expectEqualStrings("5432:5432", pg.ports[0].lit);
+    try std.testing.expectEqualStrings("--health-cmd \"pg_isready\"", pg.options.?.lit);
+    try std.testing.expectEqualStrings("redis:7", job.services[1].image.lit);
+    try std.testing.expect(job.services_error == null);
     try std.testing.expect(!job.has_container);
 }
 
