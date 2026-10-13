@@ -14,7 +14,8 @@ const Allocator = std.mem.Allocator;
 pub fn run(arena: Allocator, io: std.Io, cfg: *const Config, name: []const u8, out: *std.Io.Writer) !u8 {
     broker.trace = true;
     var status: std.http.Status = .ok;
-    const jit = jitconfig.generate(arena, io, cfg, name, &status) catch |e| {
+    var message: []const u8 = "";
+    const jit = jitconfig.generate(arena, io, cfg, name, &status, &message) catch |e| {
         try out.print("generate-jitconfig failed: {s} (HTTP {d})\n", .{ @errorName(e), @backingInt(status) });
         return 2;
     };

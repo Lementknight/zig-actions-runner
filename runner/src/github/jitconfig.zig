@@ -44,13 +44,15 @@ pub fn deleteRunner(arena: Allocator, io: std.Io, cfg: *const Config, runner_id:
 }
 
 /// Request a JIT config for `name`. All returned memory is allocated from `arena`.
-/// `status_out` receives the HTTP status for diagnostics.
+/// `status_out` receives the HTTP status, and `message_out` GitHub's reason when it refuses
+/// ("Resource not accessible by personal access token"), for diagnostics.
 pub fn generate(
     arena: Allocator,
     io: std.Io,
     cfg: *const Config,
     name: []const u8,
     status_out: *std.http.Status,
+    message_out: *[]const u8,
 ) Error!Jit {
     const url = try std.fmt.allocPrint(arena, "{s}/generate-jitconfig", .{try runnersUrl(arena, cfg)});
 
@@ -87,9 +89,27 @@ pub fn generate(
         .response_writer = &resp.writer,
     });
     status_out.* = result.status;
-    if (result.status.class() != .success) return error.GithubRejected;
+    if (result.status.class() != .success) {
+        message_out.* = errorMessage(arena, resp.written());
+        return error.GithubRejected;
+    }
 
     return parseResponse(arena, resp.written());
+}
+
+/// The `message` of a GitHub API error body; "" when there is none.
+fn errorMessage(arena: Allocator, body: []const u8) []const u8 {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{}) catch return "";
+    if (v != .object) return "";
+    const m = v.object.get("message") orelse return "";
+    return if (m == .string) m.string else "";
+}
+
+test "a refusal says why" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    try std.testing.expectEqualStrings("Resource not accessible by personal access token", errorMessage(a.allocator(), "{\"message\":\"Resource not accessible by personal access token\",\"documentation_url\":\"x\",\"status\":\"403\"}"));
+    try std.testing.expectEqualStrings("", errorMessage(a.allocator(), "<html>"));
 }
 
 /// Parse the `generate-jitconfig` response body.

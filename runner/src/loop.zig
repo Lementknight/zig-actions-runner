@@ -204,10 +204,19 @@ fn removeRegistration(c: Context, id: u64, name: []const u8) void {
 /// One registration and at most one job.
 pub fn cycle(c: Context) !Cycle {
     var status: std.http.Status = .ok;
-    const jit = jitconfig.generate(c.arena, c.io, c.cfg, c.name, &status) catch |e| {
+    var message: []const u8 = "";
+    const jit = jitconfig.generate(c.arena, c.io, c.cfg, c.name, &status, &message) catch |e| {
         try c.err.writeAll("github error: ");
         try redact.write(c.err, @errorName(e), c.secrets);
-        try c.err.print(" (HTTP {d})\n", .{@backingInt(status)});
+        try c.err.print(" (HTTP {d})", .{@backingInt(status)});
+        if (message.len > 0) {
+            try c.err.writeAll(": ");
+            try redact.write(c.err, message, c.secrets);
+        }
+        // What the token needs, for the refusals a wrong token causes.
+        if (@backingInt(status) == 403 or @backingInt(status) == 404)
+            try c.err.writeAll("\n  GH_TOKEN must be able to manage self-hosted runners of GH_SCOPE: a fine-grained token with \"Administration: read and write\" on the repository (\"Self-hosted runners: read and write\" for an organization), or a classic token with repo (admin:org)");
+        try c.err.writeByte('\n');
         // Rejected credentials or scope will be rejected again; anything else may be transient.
         const fatal = switch (@backingInt(status)) {
             401, 403, 404, 422 => true,
