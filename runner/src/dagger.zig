@@ -211,9 +211,22 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
     }
     try w.writeAll("mkdir -p " ++ fc_dir ++ " && : ");
     for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, fc)});
-    try w.print("\necho '{s}end {d}'\nexit $rc\n", .{ marker, n });
+    try w.writeByte('\n');
+    try writeCombinedFileCommands(w, arena, "", fc);
+    try w.print("echo '{s}end {d}'\nexit $rc\n", .{ marker, n });
     return aw.written();
 }
+
+/// After a step: its file commands in one file (`all_<fc>`), each after a `::zig-file-command::<kind>`
+/// line and followed by one newline, so the query reads one file instead of one per kind (each
+/// read mounts the step's snapshot in the engine). Only `cat` and `printf` are needed.
+fn writeCombinedFileCommands(w: *std.Io.Writer, arena: Allocator, prefix: []const u8, fc: u32) !void {
+    try w.writeAll("{ ");
+    for (fc_kinds) |k| try w.print("printf '%s\\n' '" ++ fc_marker ++ "{s}'; {s}cat {s}; printf '\\n'; ", .{ k, prefix, try fcPath(arena, k, fc) });
+    try w.print("}} > {s}\n", .{try fcPath(arena, "all", fc)});
+}
+
+const fc_marker = "::zig-file-command::";
 
 /// GitHub's limit on composite actions inside composite actions.
 const max_composite_depth = 9;
@@ -249,7 +262,9 @@ fn containerScript(arena: Allocator, n: u32, fc: u32, argv: []const []const u8, 
     }
     try w.writeAll("\nrc=$?\n: ");
     for (fc_kinds) |k| try w.print(">> {s} ", .{try fcPath(arena, k, fc)});
-    try w.print("\necho '{s}end {d}'\nexit $rc\n", .{ marker, n });
+    try w.writeByte('\n');
+    try writeCombinedFileCommands(w, arena, "\"$B\" ", fc);
+    try w.print("echo '{s}end {d}'\nexit $rc\n", .{ marker, n });
     return aw.written();
 }
 
@@ -2478,9 +2493,7 @@ const Exec = struct {
         // Nesting gives the step's `dagger` CLI a session on this engine, sharing its cache. The
         // container id is read after the step's secrets are removed (below).
         try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
-        for ([_][]const u8{ "output", "env", "path", "state", "step_summary" }) |kind| {
-            try w.print(" fc_{s}: file(path:\"{s}\") {{ contents }}", .{ kind, try fcPath(arena, kind, fc) });
-        }
+        try w.print(" fc_all: file(path:\"{s}\") {{ contents }}", .{try fcPath(arena, "all", fc)});
         // The next step starts from this container without the step's secrets.
         for (secret_env, 0..) |_, i| {
             try w.writeAll(" withoutSecretVariable(name:");
@@ -3483,9 +3496,7 @@ const Exec = struct {
         try w.writeAll("withExec(args:");
         try std.json.Stringify.value([_][]const u8{ busybox_path, "sh", "-c", script }, .{}, w);
         try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
-        for ([_][]const u8{ "output", "env", "path", "state", "step_summary" }) |kind| {
-            try w.print(" fc_{s}: file(path:\"{s}\") {{ contents }}", .{ kind, try fcPath(arena, kind, fc) });
-        }
+        try w.print(" fc_all: file(path:\"{s}\") {{ contents }}", .{try fcPath(arena, "all", fc)});
         try w.writeAll(" ws: directory(path:\"" ++ workspace ++ "\") { id } home: directory(path:\"" ++ docker_home ++ "\") { id } }");
         for (0..braces) |_| try w.writeAll(" }");
 
@@ -4150,9 +4161,40 @@ const live_grace_ms = 60;
 
 /// The contents of a file command read by the step's query ("" when the field is absent).
 fn fileCommand(data: std.json.Value, alias: []const u8) ?[]const u8 {
+    if (jsonFind(data, "fc_all")) |all| {
+        const text = combinedFileCommand(jsonFindString(all, "contents") orelse return null, alias["fc_".len..]) orelse return null;
+        return if (text.len == 0) null else text;
+    }
     const f = jsonFind(data, alias) orelse return null;
     const text = jsonFindString(f, "contents") orelse return null;
     return if (text.len == 0) null else text;
+}
+
+/// One kind's contents in a combined file (see `writeCombinedFileCommands`).
+fn combinedFileCommand(all: []const u8, kind: []const u8) ?[]const u8 {
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, all, start, fc_marker)) |i| {
+        const line_end = std.mem.indexOfScalarPos(u8, all, i, '\n') orelse return null;
+        const body = line_end + 1;
+        // The next marker starts a line; the newline before it is the one added after the contents.
+        const next = std.mem.indexOfPos(u8, all, body, "\n" ++ fc_marker) orelse all.len;
+        if (std.mem.eql(u8, all[i + fc_marker.len .. line_end], kind)) {
+            const end = if (next == all.len and all.len > body and all[all.len - 1] == '\n') all.len - 1 else next;
+            return all[body..@max(body, end)];
+        }
+        start = if (next == all.len) all.len else next + 1;
+    }
+    return null;
+}
+
+test "file commands come back from one combined file" {
+    const all = "::zig-file-command::output\nversion=1\nnotes<<EOF\na\nEOF\n\n::zig-file-command::env\n\n::zig-file-command::path\n/opt/x/bin\n\n::zig-file-command::step_summary\nno newline at end\n::zig-file-command::state\n\n";
+    try std.testing.expectEqualStrings("version=1\nnotes<<EOF\na\nEOF\n", combinedFileCommand(all, "output").?);
+    try std.testing.expectEqualStrings("", combinedFileCommand(all, "env").?);
+    try std.testing.expectEqualStrings("/opt/x/bin\n", combinedFileCommand(all, "path").?);
+    try std.testing.expectEqualStrings("no newline at end", combinedFileCommand(all, "step_summary").?);
+    try std.testing.expectEqualStrings("", combinedFileCommand(all, "state").?);
+    try std.testing.expect(combinedFileCommand(all, "missing") == null);
 }
 
 /// Gives the reader a moment to deliver this step's lines; if none show up the step was served from
@@ -4813,7 +4855,9 @@ test "file commands: outputs feed steps.<id>.outputs, GITHUB_ENV and GITHUB_PATH
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "withEnvVariable(name:\"GITHUB_SHA\",value:\"abc\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "name:\"CI\",value:\"true\"") != null);
     // Step 1's query reads the file commands.
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_output: file(path:\"/github/file_commands/output_1\")") != null);
+    // One read for all of a step's file commands, combined by its script.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_all: file(path:\"/github/file_commands/all_1\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_output: file(") == null);
     // Outputs (including a multi-line one) were evaluated into step 2's script.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo version=1.2.3 multi=line a\\nline b env=$FROM_ENV") != null);
     // GITHUB_ENV and GITHUB_PATH apply to the next step's container; reserved names are refused.
@@ -5752,7 +5796,7 @@ test "what a step writes to GITHUB_STEP_SUMMARY is kept for upload" {
     try std.testing.expectEqualStrings("# Results\n| a | b |\n", res.summaries[0]);
     try std.testing.expectEqualStrings("", res.summaries[1]);
     // The query reads the file back.
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_step_summary: file(path:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_all: file(path:") != null);
 }
 
 test "package caches: one volume per tool, keyed by repository, separate for fork pull requests" {
