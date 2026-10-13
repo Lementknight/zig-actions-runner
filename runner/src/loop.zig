@@ -375,6 +375,14 @@ fn handleJob(c: Context, runner_token: []const u8, inner_body: []const u8) !Cycl
 
     // The definition holds secrets; it is parsed but never printed.
     const job = job_mod.parse(c.arena, acq.body) catch |e| return fail(c, "parse job", e);
+
+    // Keep the hold on the job while it runs, as GitHub's runner does (see `Renewer`).
+    var renewer: Renewer = .{ .c = c, .token = job.job_token, .jr = jr, .plan_id = job.plan_id, .job_id = job.job_id, .log_job = job.check_run_id };
+    var renewing: ?std.Io.Future(void) = c.io.concurrent(Renewer.run, .{&renewer}) catch null;
+    defer if (renewing) |*f| {
+        renewer.stop.store(true, .release);
+        f.await(c.io);
+    };
     // Everything the job logs is also kept (redacted, timestamped) so it can be uploaded to GitHub.
     var collect: sink.LogSink = .{ .collect = .{ .arena = c.arena, .io = c.io, .inner = c.log } };
     collect.setSecrets(try std.mem.concat(c.arena, []const u8, &.{ c.secrets, job.secrets }));
@@ -463,6 +471,50 @@ pub const Shown = struct {
     conclusion: []const u8,
     started_ms: i64 = 0,
     completed_ms: i64 = 0,
+};
+
+/// Renews the runner's hold on its job every 60 s while the job runs, as GitHub's runner does
+/// (`renewjob`). Without it GitHub fails the job 10 minutes after it was acquired ("The self-hosted
+/// runner lost communication with the server"), even while its steps still run (SPEC §3). Like
+/// completejob it takes the job's own token; the runner's gets 401. Runs next to the job, so it
+/// has memory of its own and reports through the runner's shared (locked) sink, not the job's log.
+const Renewer = struct {
+    c: Context,
+    token: []const u8,
+    jr: runservice.JobRequest,
+    plan_id: []const u8,
+    job_id: []const u8,
+    log_job: u64,
+    stop: std.atomic.Value(bool) = .init(false),
+
+    pub const interval_secs = 60;
+
+    fn run(r: *Renewer) void {
+        var reported = false;
+        while (true) {
+            var waited: u32 = 0;
+            while (waited < interval_secs * 5 and !r.stop.load(.acquire)) : (waited += 1) r.c.io.sleep(.fromMilliseconds(200), .awake) catch return;
+            if (r.stop.load(.acquire)) return;
+            var call: std.heap.ArenaAllocator = .init(r.c.gpa);
+            defer call.deinit();
+            const arena = call.allocator();
+            const resp = runservice.renew(arena, r.c.io, r.jr, r.token, r.plan_id, r.job_id) catch |e| {
+                r.say(arena, "renewjob failed: {s}", .{@errorName(e)});
+                continue;
+            };
+            if (resp.status.class() != .success) {
+                r.say(arena, "renewjob failed: HTTP {d}: {s}", .{ @backingInt(resp.status), resp.body[0..@min(resp.body.len, 200)] });
+            } else if (!reported) {
+                reported = true;
+                r.say(arena, "job hold renewed (locked until {s})", .{jsonString(arena, resp.body, "lockedUntil") orelse "?"});
+            }
+        }
+    }
+
+    fn say(r: *Renewer, arena: Allocator, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.allocPrint(arena, "job {d}: " ++ fmt, .{r.log_job} ++ args) catch return;
+        r.c.log.append(0, 0, .stderr, text) catch {};
+    }
 };
 
 /// The steps GitHub shows for a job, in its runner's order and numbering: "Set up job", the actions'
