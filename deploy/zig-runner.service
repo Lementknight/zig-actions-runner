@@ -1,0 +1,30 @@
+# The runner as a systemd service, next to a Dagger engine started with a unix socket
+# (docs/DEPLOY.md, "Without containers"). Install:
+#
+#   sudo install -m 0755 runner /usr/local/bin/zig-runner
+#   sudo install -m 0600 runner.env /etc/zig-runner.env
+#   sudo cp zig-runner.service /etc/systemd/system/ && sudo systemctl enable --now zig-runner
+[Unit]
+Description=Zig GitHub Actions runner pool
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/zig-runner.env
+Environment=RUNNER_ENGINE_HOST=unix:///run/dagger/engine.sock
+ExecStart=/usr/local/bin/zig-runner
+# SIGTERM: waiting runners stop and remove their registrations; running jobs finish first.
+KillSignal=SIGTERM
+TimeoutStopSec=60min
+Restart=on-failure
+RestartSec=10
+# The runner needs no files of its own, only the network and the engine's socket (owned by root
+# unless the engine was started otherwise; to run unprivileged, set User= to an account that can
+# open it).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
