@@ -723,6 +723,10 @@ pub const Session = struct {
     health: ?Io.Future(void) = null,
     health_answered: std.atomic.Value(usize) = .init(0),
     query_conn: ?*Conn = null,
+    /// Guards `query_conn` and `in_flight` against `abort`, which runs on another task.
+    query_mu: Io.Mutex = .init,
+    in_flight: bool = false,
+    aborted: bool = false,
     logs_conn: ?*Conn = null,
     logs_task: ?Io.Future(void) = null,
     log_handler: ?LogHandler = null,
@@ -827,11 +831,16 @@ pub const Session = struct {
     pub const Response = struct { status: u16, body: []u8 };
 
     /// One request on the session's query connection (opened on first use, kept alive).
+    /// `error.QueryAborted` when `abort` ended it.
     pub fn request(s: *Session, arena: Allocator, method: []const u8, path: []const u8, body: []const u8) !Response {
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
             if (s.query_conn == null) s.query_conn = try dial(s.gpa, s.io, s.ep);
             const c = s.query_conn.?;
+            s.query_mu.lockUncancelable(s.io);
+            s.in_flight = true;
+            s.aborted = false;
+            s.query_mu.unlock(s.io);
             const result: anyerror!Response = blk: {
                 writeRequest(c.writer(), method, path, &.{
                     .{ "X-Dagger-Client-Metadata", s.metadata },
@@ -843,15 +852,35 @@ pub const Session = struct {
                 const resp = readBody(arena, &c.in, head) catch |e| break :blk e;
                 break :blk .{ .status = head.status, .body = resp };
             };
+            s.query_mu.lockUncancelable(s.io);
+            s.in_flight = false;
+            const aborted = s.aborted;
+            s.query_mu.unlock(s.io);
             return result catch |e| {
-                // A connection the engine closed between requests: dial again, once.
+                s.query_mu.lockUncancelable(s.io);
+                s.query_conn = null;
+                s.query_mu.unlock(s.io);
                 c.close();
                 s.gpa.destroy(c);
-                s.query_conn = null;
+                if (aborted) return error.QueryAborted;
+                // A connection the engine closed between requests: dial again, once.
                 if (attempt == 0 and (e == error.EndOfStream or e == error.BrokenPipe or e == error.ConnectionResetByPeer)) continue;
                 return e;
             };
         }
+    }
+
+    /// Ends the request in flight, if any, by shutting its connection: the engine sees its client
+    /// go and cancels the query (and the exec it runs), and `request` returns `error.QueryAborted`.
+    /// Safe to call from another task; the next request opens a new connection.
+    pub fn abort(s: *Session) bool {
+        s.query_mu.lockUncancelable(s.io);
+        defer s.query_mu.unlock(s.io);
+        if (!s.in_flight) return false;
+        const c = s.query_conn orelse return false;
+        s.aborted = true;
+        c.shutdown();
+        return true;
     }
 
     /// A GraphQL query; the response body.
