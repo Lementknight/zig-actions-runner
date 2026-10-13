@@ -545,8 +545,12 @@ const max_annotations = 10;
 /// A `pre` or `post` script that ran: a step of its own in GitHub's list ("Pre Run x@v1",
 /// "Post Run x@v1"). Its lines are logged under `log_step`, a number after the job's own steps
 /// (0 is "Set up job", 1..n the job's steps).
+pub const ExtraKind = enum { pre, post, initialize, stop };
+
 pub const ExtraStep = struct {
-    kind: enum { pre, post },
+    /// `initialize` and `stop` are "Initialize containers" and "Stop containers", which GitHub lists
+    /// with the pre and post steps but numbers apart from them (see `loop.shownSteps`).
+    kind: ExtraKind,
     name: []const u8,
     log_step: u32,
     outcome: Outcome,
@@ -662,8 +666,11 @@ pub const Observer = struct {
     finishedFn: *const fn (ptr: *anyopaque, number: u32, result: StepResult) void,
     /// The steps the runner adds ("Pre ...", "Post ...", "Initialize containers", "Stop
     /// containers"), by log step (see `ExtraStep`); optional.
-    extraStartedFn: ?*const fn (ptr: *anyopaque, log_step: u32, name: []const u8, started_ms: i64) void = null,
+    extraStartedFn: ?*const fn (ptr: *anyopaque, kind: ExtraKind, log_step: u32, name: []const u8, started_ms: i64) void = null,
     extraFinishedFn: ?*const fn (ptr: *anyopaque, e: ExtraStep) void = null,
+    /// Before the post steps: how many will run, and whether "Stop containers" follows (GitHub
+    /// numbers them apart from the steps before, see `loop.shownSteps`).
+    postsFn: ?*const fn (ptr: *anyopaque, posts: u32, stop: bool) void = null,
 
     fn started(o: Observer, number: u32, name: []const u8, started_ms: i64) void {
         o.startedFn(o.ptr, number, name, started_ms);
@@ -2121,6 +2128,20 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
             else => return e,
         };
         if (resolved == .run and out.code != 0) logExitCode(sh, num, out.code);
+        // As actions/checkout, a post step once the checkout ran (see `Post.checkout`).
+        if (resolved == .checkout) try x.posts.append(arena, .{
+            .num = num,
+            .name = try std.fmt.allocPrint(arena, "Post {s}", .{res.name}),
+            .act = undefined,
+            .u = undefined,
+            .script = "",
+            .condition = "always()",
+            .inputs = &.{},
+            .step_env = &.{},
+            .step_secret = &.{},
+            .state = &.{},
+            .checkout = true,
+        });
         res.completed_ms = std.Io.Clock.real.now(io).toMilliseconds();
         res.exit_code = out.code;
         res.outcome = if (out.code == 0) .success else .failure;
@@ -2129,6 +2150,8 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         if (opts.observer) |o| o.finished(num, res.*);
     }
     // Then their `post` scripts, last first, and the services.
+    const stopping = job.services.len > 0 or job.container != null;
+    if (x.posts.items.len > 0 or stopping) if (opts.observer) |o| if (o.postsFn) |f| f(o.ptr, @intCast(x.posts.items.len), stopping);
     x.runPosts() catch |e| switch (e) {
         error.EngineFailed => return finish(arena, sh, results, x.err_msg),
         else => return e,
@@ -2292,6 +2315,9 @@ const Exec = struct {
         state: []const job_mod.EnvVar,
         /// A Docker action's `post-entrypoint` (`script` is then the entrypoint).
         docker: ?DockerRun = null,
+        /// The built-in checkout's: actions/checkout has a post step (it removes the credentials it
+        /// stored); this checkout stores none, so it only takes its place in the job's steps.
+        checkout: bool = false,
     };
 
     /// A Docker action to run: its image and how it is started (see `runContainer`).
@@ -2846,7 +2872,7 @@ const Exec = struct {
         x.next_log_step += 1;
         const started = std.Io.Clock.real.now(x.io).toMilliseconds();
         const pre_name = x.extraName("Pre", num, act) catch "Pre";
-        x.startExtra(ls, pre_name, started);
+        x.startExtra(.pre, ls, pre_name, started);
         const pre_out = switch (act.meta.runs) {
             .docker => |dk| if (try x.dockerRunFor(ls, act, u, dk, inputs, plain.items, secret.items, pre)) |dr| try x.runContainer(ls, .pre, dr, &.{}) else null,
             else => try x.runJsScript(ls, .pre, act, u, pre, inputs, plain.items, secret.items, &.{}),
@@ -2888,8 +2914,12 @@ const Exec = struct {
             const ls = x.next_log_step;
             x.next_log_step += 1;
             const started = std.Io.Clock.real.now(x.io).toMilliseconds();
-            x.startExtra(ls, p.name, started);
+            x.startExtra(.post, ls, p.name, started);
             x.sh.append(ls, "Post job cleanup.");
+            if (p.checkout) {
+                try x.addExtra(.{ .kind = .post, .name = p.name, .log_step = ls, .outcome = .success, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() });
+                continue;
+            }
             const post_out = if (p.docker) |dr|
                 try x.runContainer(ls, .post, dr, p.state)
             else
@@ -3474,8 +3504,8 @@ const Exec = struct {
     }
 
     /// The static busybox that starts Docker actions' commands (taken from its image once per job).
-    fn startExtra(x: *Exec, log_step: u32, name: []const u8, started_ms: i64) void {
-        if (x.observer) |o| if (o.extraStartedFn) |f| f(o.ptr, log_step, name, started_ms);
+    fn startExtra(x: *Exec, kind: ExtraKind, log_step: u32, name: []const u8, started_ms: i64) void {
+        if (x.observer) |o| if (o.extraStartedFn) |f| f(o.ptr, kind, log_step, name, started_ms);
     }
 
     fn addExtra(x: *Exec, e: ExtraStep) !void {
@@ -3495,8 +3525,8 @@ const Exec = struct {
         x.next_log_step += 1;
         const started = std.Io.Clock.real.now(x.io).toMilliseconds();
         var ok = true;
-        x.startExtra(ls, "Initialize containers", started);
-        defer x.addExtra(.{ .kind = .pre, .name = "Initialize containers", .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() }) catch {};
+        x.startExtra(.initialize, ls, "Initialize containers", started);
+        defer x.addExtra(.{ .kind = .initialize, .name = "Initialize containers", .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() }) catch {};
         ev.diag = "";
         const sc = try ev.scope(&.{});
         if (x.job.container) |jc| {
@@ -3715,7 +3745,7 @@ const Exec = struct {
         const ls = x.next_log_step;
         x.next_log_step += 1;
         const started = std.Io.Clock.real.now(x.io).toMilliseconds();
-        x.startExtra(ls, "Stop containers", started);
+        x.startExtra(.stop, ls, "Stop containers", started);
         for (x.services.items, 0..) |r, i| {
             x.sh.append(ls, try std.fmt.allocPrint(x.arena, "Print service container logs: {s}", .{r.name}));
             for (x.sh.takeServiceLog(i)) |l| x.sh.append(ls, l);
@@ -3726,7 +3756,7 @@ const Exec = struct {
         }
         // The job container goes with the job's session.
         if (x.job.container != null) x.sh.append(ls, try std.fmt.allocPrint(x.arena, "Stop and remove container: job ({s})", .{x.job_image}));
-        try x.addExtra(.{ .kind = .post, .name = "Stop containers", .log_step = ls, .outcome = .success, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() });
+        try x.addExtra(.{ .kind = .stop, .name = "Stop containers", .log_step = ls, .outcome = .success, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() });
     }
 
     fn busyboxFile(x: *Exec, num: u32) !?[]const u8 {
