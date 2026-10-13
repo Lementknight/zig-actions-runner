@@ -105,6 +105,9 @@ pub const Job = struct {
     token_permissions: []const u8 = "",
     /// `system.runnerGroupName`.
     runner_group: []const u8 = "",
+    /// The job's `outputs:` (the message's `jobOutputs`), evaluated after its steps and sent with
+    /// completejob, so later jobs read them as `needs.<job>.outputs.<name>`.
+    outputs: []const Input = &.{},
     /// Literal values that must never reach a log: the job token and every variable marked `isSecret`.
     secrets: []const []const u8,
     /// The `secrets` context: user secrets by name (they arrive as variables flagged `isSecret`),
@@ -176,6 +179,14 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .has_container = if (root.object.get("jobContainer")) |c| c != .null else false,
         .has_services = if (root.object.get("jobServiceContainers")) |c| c != .null else false,
         .token_permissions = variable(root, "system.github.token.permissions") orelse "",
+        .outputs = blk: {
+            const jo = root.object.get("jobOutputs") orelse break :blk &.{};
+            if (jo == .null) break :blk &.{};
+            break :blk mappingInputs(arena, jo) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Unsupported => &.{},
+            };
+        },
         .runner_group = variable(root, "system.runnerGroupName") orelse "",
         .steps = steps,
     };
@@ -630,7 +641,7 @@ fn jobToken(root: Value) ?[]const u8 {
 }
 
 const fixture =
-    \\{"plan":{"planId":"plan-1"},"jobId":"job-1","jobContainer":null,
+    \\{"plan":{"planId":"plan-1"},"jobId":"job-1","jobContainer":null,"jobOutputs":{"type":2,"map":[{"Key":{"type":0,"lit":"version"},"Value":{"type":3,"expr":"steps.v.outputs.version"}},{"Key":{"type":0,"lit":"literal"},"Value":{"type":0,"lit":"fixed"}}]},
     \\ "variables":{"system.github.token.permissions":{"value":"{\"Contents\":\"read\"}"},"system.runnerGroupName":{"value":"Default"},"github_token":{"value":"ghs_secret","isSecret":true},"TIGER_HOST":{"value":"db.example","isSecret":true},"system.github.token":{"value":"ghs_secret","isSecret":true},"plain":{"value":"x"},"system.github.results_endpoint":{"value":"https://results.test/"},"actions_uses_cache_service_v2":{"value":"True"}},
     \\ "contextData":{"job":{"t":2,"d":[{"k":"status","v":"success"},{"k":"check_run_id","v":777}]},"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"sha","v":"0123456789012345678901234567890123456789"},{"k":"ref","v":"refs/heads/x"},{"k":"event_name","v":"push"}]}},
     \\ "resources":{"endpoints":[{"name":"SystemVssConnection","url":"https://pipelines.test/","authorization":{"parameters":{"AccessToken":"jobtok"},"scheme":"OAuth"},
@@ -683,6 +694,10 @@ test "parse job fixture" {
     try std.testing.expect(!job.has_services);
     try std.testing.expectEqualStrings("{\"Contents\":\"read\"}", job.token_permissions);
     try std.testing.expectEqualStrings("Default", job.runner_group);
+    try std.testing.expectEqual(@as(usize, 2), job.outputs.len);
+    try std.testing.expectEqualStrings("version", job.outputs[0].name);
+    try std.testing.expectEqualStrings("steps.v.outputs.version", job.outputs[0].value.expr);
+    try std.testing.expectEqualStrings("fixed", job.outputs[1].value.lit);
     try std.testing.expectEqualStrings("actions/checkout@v4", job.steps[2].uses);
     try std.testing.expectEqualStrings("", job.steps[0].uses);
     try std.testing.expectEqual(@as(usize, 8), job.steps.len);
