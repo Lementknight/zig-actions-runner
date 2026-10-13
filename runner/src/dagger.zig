@@ -412,7 +412,19 @@ pub const Result = struct {
     /// about them in "Complete job".
     outputs: []const job_mod.EnvVar = &.{},
     output_lines: []const []const u8 = &.{},
+    annotations: []const Annotation = &.{},
 };
+
+/// An annotation and the log step it came from (mapped to GitHub's step number at completion).
+pub const Annotation = struct { step: u32, an: commands.Annotation };
+
+/// The log lines a message takes (an annotation's message is logged one line per line).
+fn countLines(msg: []const u8) u32 {
+    return @intCast(std.mem.count(u8, msg, "\n") + 1);
+}
+
+/// Per level and step, as GitHub's runner limits them.
+const max_annotations = 10;
 
 /// A `pre` or `post` script that ran: a step of its own in GitHub's list ("Pre Run x@v1",
 /// "Post Run x@v1"). Its lines are logged under `log_step`, a number after the job's own steps
@@ -1108,6 +1120,12 @@ const Shared = struct {
     replayed_steps: []bool = &.{},
     /// `ACTIONS_STEP_DEBUG`: show `::debug::` lines.
     step_debug: bool = false,
+    /// `::error`/`::warning`/`::notice` lines and the runner's own errors, sent with completejob so
+    /// GitHub shows them on the run (guarded by `mu`).
+    annotations: std.ArrayList(Annotation) = .empty,
+    /// Lines logged per log step so far (guarded by `mu`): an annotation without a file points to
+    /// its line in the step's log, as GitHub's runner does.
+    line_counts: []u32 = &.{},
 
     const StepCommands = struct {
         stop_token: ?[]const u8 = null,
@@ -1125,6 +1143,7 @@ const Shared = struct {
 
     fn appendLocked(sh: *Shared, step: u32, text: []const u8) void {
         sh.log.append(sh.sink_job_id, step, .stdout, text) catch {};
+        if (step < sh.line_counts.len) sh.line_counts[step] += 1;
     }
 
     /// A line of a step's output: workflow commands (`::add-mask::`, `::group::`, ...) are carried out
@@ -1134,7 +1153,10 @@ const Shared = struct {
         defer sh.mu.unlock(sh.io);
         if (step == 0 or step > sh.commands.len) return sh.appendLocked(step, text);
         const st = &sh.commands[step - 1];
-        const cmd = commands.parseWorkflow(sh.arena, text, st.stop_token) catch return sh.appendLocked(step, text);
+        // What a command keeps (an annotation, an output, a stop token) can be a slice of its line,
+        // and a direct session's line lives only as long as its log record: keep the line.
+        const line = if (std.mem.indexOf(u8, text, "::") != null) sh.arena.dupe(u8, text) catch return else text;
+        const cmd = commands.parseWorkflow(sh.arena, line, st.stop_token) catch return sh.appendLocked(step, line);
         switch (cmd) {
             .none => sh.appendLocked(step, text),
             .add_mask => |value| sh.addMask(value),
@@ -1144,15 +1166,48 @@ const Shared = struct {
                 var lines = std.mem.splitScalar(u8, an.message, '\n');
                 sh.appendFmt(step, "##[{s}]{s}", .{ an.level, std.mem.trimEnd(u8, lines.first(), "\r") });
                 while (lines.next()) |l| sh.appendLocked(step, std.mem.trimEnd(u8, l, "\r"));
+                sh.annotateLocked(step, an);
             },
             .debug => |msg| if (sh.step_debug) sh.appendFmt(step, "##[debug]{s}", .{msg}),
             .stop => |token| st.stop_token = token,
             .resume_commands => st.stop_token = null,
             .set_output => |kv| st.outputs.append(sh.arena, kv) catch {},
             .save_state => |kv| st.state.append(sh.arena, kv) catch {},
-            .disabled => |name| sh.appendFmt(step, "##[error]The `{s}` command is disabled. Please upgrade to using Environment Files or opt into unsecure command execution by setting the `ACTIONS_ALLOW_UNSECURE_COMMANDS` environment variable to `true`. For more information see: https://github.blog/changelog/2020-10-01-github-actions-deprecating-set-env-and-add-path-commands/", .{name}),
+            .disabled => |name| {
+                const msg = std.fmt.allocPrint(sh.arena, "The `{s}` command is disabled. Please upgrade to using Environment Files or opt into unsecure command execution by setting the `ACTIONS_ALLOW_UNSECURE_COMMANDS` environment variable to `true`. For more information see: https://github.blog/changelog/2020-10-01-github-actions-deprecating-set-env-and-add-path-commands/", .{name}) catch return;
+                sh.errorLineLocked(step, msg);
+            },
             .echo => {},
         }
+    }
+
+    /// An error of the runner's own (a failed exit code, a timeout): logged as `##[error]<msg>` and
+    /// annotated, as GitHub's runner does.
+    fn errorLine(sh: *Shared, step: u32, msg: []const u8) void {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        sh.errorLineLocked(step, msg);
+    }
+
+    fn errorLineLocked(sh: *Shared, step: u32, msg: []const u8) void {
+        sh.appendFmt(step, "##[error]{s}", .{msg});
+        sh.annotateLocked(step, .{ .level = "error", .message = msg });
+    }
+
+    /// Keeps an annotation for completejob. Like GitHub's runner, at most `max_annotations` of each
+    /// level per step (the rest are only logged), and a file in the workspace is named from its root.
+    fn annotateLocked(sh: *Shared, step: u32, an: commands.Annotation) void {
+        var same: usize = 0;
+        for (sh.annotations.items) |a| {
+            if (a.step == step and std.mem.eql(u8, a.an.level, an.level)) same += 1;
+        }
+        if (same >= max_annotations) return;
+        var copy = an;
+        if (an.file) |f| copy.file = if (std.mem.startsWith(u8, f, workspace ++ "/")) f[workspace.len + 1 ..] else f;
+        // Its line in the log: the annotation's own line was logged just before this.
+        if (an.file == null and an.line == null and step < sh.line_counts.len and sh.line_counts[step] > 0)
+            copy.line = std.fmt.allocPrint(sh.arena, "{d}", .{sh.line_counts[step] - countLines(an.message) + 1}) catch null;
+        sh.annotations.append(sh.arena, .{ .step = step, .an = copy }) catch {};
     }
 
     fn appendFmt(sh: *Shared, step: u32, comptime fmt: []const u8, args: anytype) void {
@@ -1337,6 +1392,8 @@ pub fn run(
     @memset(replayed_steps, false);
     const step_commands = try arena.alloc(Shared.StepCommands, logSteps(job.steps.len));
     @memset(step_commands, .{});
+    const line_counts = try arena.alloc(u32, logSteps(job.steps.len));
+    @memset(line_counts, 0);
     var sh: Shared = .{
         .io = io,
         .arena = arena,
@@ -1346,6 +1403,7 @@ pub fn run(
         .ended = ended,
         .commands = step_commands,
         .replayed_steps = replayed_steps,
+        .line_counts = line_counts,
         .step_debug = stepDebug(arena, job),
     };
 
@@ -1459,8 +1517,7 @@ fn logRunHeader(arena: Allocator, sh: *Shared, num: u32, script: []const u8, she
 
 /// What GitHub's runner logs when a script exits non-zero.
 fn logExitCode(sh: *Shared, num: u32, code: i32) void {
-    var buf: [64]u8 = undefined;
-    sh.append(num, std.fmt.bufPrint(&buf, "##[error]Process completed with exit code {d}.", .{code}) catch return);
+    sh.errorLine(num, std.fmt.allocPrint(sh.arena, "Process completed with exit code {d}.", .{code}) catch return);
 }
 
 /// The `env` context a step sees: the job's (workflow, job, GITHUB_ENV), then the step's own.
@@ -3208,7 +3265,7 @@ const Exec = struct {
 
     /// Logs why one of a composite action's steps could not run, and fails the action.
     fn nestedFailed(x: *Exec, num: u32, ctx_id: []const u8, display: []const u8, msg: []const u8, failed: *bool, exit_code: *i32) !void {
-        x.sh.append(num, try std.fmt.allocPrint(x.arena, "##[error]{s}: {s}", .{ display, msg }));
+        x.sh.errorLine(num, try std.fmt.allocPrint(x.arena, "{s}: {s}", .{ display, msg }));
         try x.ev.steps.append(x.arena, .{ .id = ctx_id, .outcome = "failure", .conclusion = "failure", .outputs = &.{} });
         failed.* = true;
         x.ev.job_failed = true;
@@ -3491,12 +3548,12 @@ fn stepInterrupted(ev: *Evaluator, sh: *Shared, observer: ?Observer, step: job_m
     res.exit_code = 1;
     switch (intr) {
         .timed_out => {
-            sh.append(num, try std.fmt.allocPrint(ev.arena, "##[error]The action '{s}' has timed out after {s} minutes.", .{ res.name, std.mem.trim(u8, timeout, " ") }));
+            sh.errorLine(num, try std.fmt.allocPrint(ev.arena, "The action '{s}' has timed out after {s} minutes.", .{ res.name, std.mem.trim(u8, timeout, " ") }));
             res.outcome = .failure;
             if (!coe) ev.job_failed = true;
         },
         .cancelled, .none => {
-            sh.append(num, "##[error]The operation was canceled.");
+            sh.errorLine(num, "The operation was canceled.");
             res.outcome = .cancelled;
             ev.cancelled = true;
         },
@@ -3598,7 +3655,7 @@ fn finish(arena: Allocator, sh: *Shared, results: []StepResult, engine_msg: []co
         else
             tail;
     }
-    return .{ .steps = results, .engine_error = engine_error, .succeeded = !any_failed and engine_error == null };
+    return .{ .steps = results, .engine_error = engine_error, .succeeded = !any_failed and engine_error == null, .annotations = sh.annotations.items };
 }
 
 // --- tests ---
@@ -5025,6 +5082,26 @@ test "workflow commands in a step's output: masks, groups, annotations, debug, s
     // The mask holds for later steps, and set-output reached steps.<id>.outputs.
     try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 2 stdout] *** in step 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "echo got=42") != null);
+    // Annotations for completejob: the error points to its file; the others, to their line in the
+    // step's log.
+    try std.testing.expectEqual(@as(usize, 4), res.annotations.len);
+    const err = res.annotations[0];
+    try std.testing.expectEqual(@as(u32, 1), err.step);
+    try std.testing.expectEqualStrings("a.js", err.an.file.?);
+    try std.testing.expectEqualStrings("1", err.an.line.?);
+    try std.testing.expectEqualStrings("bad\nsecond line", err.an.message);
+    var n: u32 = 0;
+    var lines = std.mem.splitScalar(u8, got, '\n');
+    while (lines.next()) |l| {
+        if (!std.mem.startsWith(u8, l, "[job 0 step 1 stdout] ")) continue;
+        n += 1;
+        if (std.mem.endsWith(u8, l, "##[warning]careful")) break;
+    }
+    try std.testing.expectEqualStrings("warning", res.annotations[1].an.level);
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{d}", .{n}), res.annotations[1].an.line.?);
+    try std.testing.expect(std.mem.startsWith(u8, res.annotations[2].an.message, "The `set-env` command is disabled."));
+    try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena, "{d}", .{n + 1}), res.annotations[2].an.line.?);
+    try std.testing.expectEqualStrings("notice", res.annotations[3].an.level);
 }
 
 test "ACTIONS_STEP_DEBUG shows ::debug:: lines" {

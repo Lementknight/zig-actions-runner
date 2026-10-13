@@ -471,11 +471,12 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
 
     const conclusion: runservice.Conclusion = if (result.cancelled) .canceled else if (result.succeeded) .succeeded else .failed;
     const step_json = try stepResultsJson(c.arena, shown);
-    var done = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, step_json, result.outputs) catch |e| return fail(c, "completejob", e);
+    const annotations_json = try annotationsJson(c.arena, shown, result.annotations);
+    var done = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, step_json, result.outputs, annotations_json) catch |e| return fail(c, "completejob", e);
     if (done.status.class() != .success) {
         // A held job blocks the run for minutes, so always finish it: retry without step details.
-        try c.err.print("completejob with step results failed (HTTP {d}: {s}); retrying without them\n", .{ @backingInt(done.status), done.body[0..@min(done.body.len, 200)] });
-        done = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, "[]", result.outputs) catch |e| return fail(c, "completejob", e);
+        try c.err.print("completejob with step results and annotations failed (HTTP {d}: {s}); retrying without them\n", .{ @backingInt(done.status), done.body[0..@min(done.body.len, 200)] });
+        done = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, "[]", result.outputs, "[]") catch |e| return fail(c, "completejob", e);
         if (done.status.class() != .success) return failBody(c, "completejob", done);
     }
     try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job {s}", .{@tagName(conclusion)}));
@@ -704,6 +705,65 @@ fn uploadLogs(c: Context, job: job_mod.Job, shown: []const Shown, lines: []const
 
 /// `stepResults` for completejob. Field names follow `actions/runner`'s StepResult; verified live
 /// by checking the steps GitHub reports for the job.
+/// `annotations` for completejob, as actions/runner sends them (its `Annotation` contract): level
+/// FAILURE / WARNING / NOTICE, the message, and where it points (a repository path and lines and
+/// columns) when the workflow command said, with the number of the step it came from. An annotation
+/// without a file is shown by GitHub on the job's line in the workflow file.
+pub fn annotationsJson(arena: Allocator, shown: []const Shown, annotations: []const dagger.Annotation) ![]const u8 {
+    const Item = struct {
+        level: []const u8,
+        message: []const u8,
+        title: ?[]const u8 = null,
+        path: ?[]const u8 = null,
+        startLine: ?u32 = null,
+        endLine: ?u32 = null,
+        startColumn: ?u32 = null,
+        endColumn: ?u32 = null,
+        stepNumber: ?u32 = null,
+        isInfrastructureIssue: bool = false,
+    };
+    const items = try arena.alloc(Item, annotations.len);
+    for (items, annotations) |*it, a| {
+        const an = a.an;
+        const line = propertyNumber(an.line);
+        const col = propertyNumber(an.col);
+        it.* = .{
+            .level = if (std.mem.eql(u8, an.level, "error")) "FAILURE" else if (std.mem.eql(u8, an.level, "warning")) "WARNING" else "NOTICE",
+            .message = an.message,
+            .title = if (an.title) |t| (if (t.len > 0) t else null) else null,
+            .path = if (an.file) |f| (if (f.len > 0) f else null) else null,
+            .startLine = line,
+            .endLine = propertyNumber(an.end_line) orelse line,
+            .startColumn = col,
+            .endColumn = propertyNumber(an.end_column) orelse col,
+            .stepNumber = for (shown) |s| (if (s.log_step == a.step) break s.number) else null,
+        };
+    }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(items, .{ .emit_null_optional_fields = false }, &aw.writer);
+    return aw.written();
+}
+
+fn propertyNumber(text: ?[]const u8) ?u32 {
+    return std.fmt.parseInt(u32, std.mem.trim(u8, text orelse return null, " "), 10) catch null;
+}
+
+test "annotations: GitHub's levels, the place they point to, and the step they came from" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const shown = [_]Shown{
+        .{ .id = "s", .number = 1, .name = "Set up job", .log_step = 0, .conclusion = "succeeded" },
+        .{ .id = "b", .number = 2, .name = "Build", .log_step = 1, .conclusion = "failed" },
+    };
+    const json = try annotationsJson(a.allocator(), &shown, &.{
+        .{ .step = 1, .an = .{ .level = "error", .message = "bad", .file = "src/a.zig", .line = "3", .col = "5", .title = "T" } },
+        .{ .step = 1, .an = .{ .level = "notice", .message = "fyi", .line = "x" } },
+    });
+    try std.testing.expectEqualStrings(
+        \\[{"level":"FAILURE","message":"bad","title":"T","path":"src/a.zig","startLine":3,"endLine":3,"startColumn":5,"endColumn":5,"stepNumber":2,"isInfrastructureIssue":false},{"level":"NOTICE","message":"fyi","stepNumber":2,"isInfrastructureIssue":false}]
+    , json);
+}
+
 pub fn stepResultsJson(arena: Allocator, shown: []const Shown) ![]const u8 {
     const Item = struct {
         external_id: []const u8,
