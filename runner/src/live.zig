@@ -41,6 +41,9 @@ pub const Live = struct {
 
     socket: feed.Socket = undefined,
     feed_open: bool = false,
+    /// When the feed last sent something (see `keepalive_ms`); used by the sending task only.
+    feed_last_ms: i64 = 0,
+    feed_reopened: u32 = 0,
     steps_failed: bool = false,
     stop: std.atomic.Value(bool) = .init(false),
     /// Set by `finish`: later lines and steps are ignored (guarded by `mu`).
@@ -84,6 +87,7 @@ pub const Live = struct {
         if (l.job.runtime.feed_url.len > 0) {
             if (l.socket.open(l.gpa, l.io, l.job.runtime.feed_url, l.job.job_token)) |_| {
                 l.feed_open = true;
+                l.feed_last_ms = std.Io.Clock.real.now(l.io).toMilliseconds();
             } else |e| l.say("live log feed unavailable ({s}); the log appears when the job ends", .{@errorName(e)});
         }
         l.begin(0, "Set up job", started_ms);
@@ -240,11 +244,36 @@ pub const Live = struct {
             defer freeLines(l.gpa, b.lines);
             if (!l.feed_open) continue;
             const msg = feedMessage(arena, l.ids[b.log_step], b.lines, b.start_line) catch continue;
-            l.socket.sendText(msg) catch |e| {
-                l.feed_open = false;
+            l.feedSend(msg);
+        }
+        // A step that prints nothing for a while (`npm install`, a compiler) would leave the feed
+        // idle, and idle feeds were closed on the way within about a minute.
+        if (l.feed_open and std.Io.Clock.real.now(l.io).toMilliseconds() - l.feed_last_ms >= keepalive_ms) l.feedSend(null);
+    }
+
+    const keepalive_ms = 15_000;
+    /// Times the feed is opened again after it was lost, before it is given up for the job.
+    const max_reopen = 3;
+
+    /// Sends a message (a ping when null). A feed found closed is opened again and the message sent
+    /// once more; when that fails too, the rest of the log appears when the job ends.
+    fn feedSend(l: *Live, msg: ?[]const u8) void {
+        var attempt: u32 = 0;
+        while (true) : (attempt += 1) {
+            const sent = if (msg) |m| l.socket.sendText(m) else l.socket.ping();
+            if (sent) |_| {
+                l.feed_last_ms = std.Io.Clock.real.now(l.io).toMilliseconds();
+                return;
+            } else |e| {
                 l.socket.close(l.gpa);
+                if (attempt == 0 and l.feed_reopened < max_reopen) {
+                    l.feed_reopened += 1;
+                    if (l.socket.open(l.gpa, l.io, l.job.runtime.feed_url, l.job.job_token)) |_| continue else |_| {}
+                }
+                l.feed_open = false;
                 l.say("live log feed lost ({s}); the log appears when the job ends", .{@errorName(e)});
-            };
+                return;
+            }
         }
     }
 
