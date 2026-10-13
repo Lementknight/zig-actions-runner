@@ -78,6 +78,12 @@ pub const Socket = struct {
         try s.req.connection.?.flush();
     }
 
+    /// A ping, so a feed that has nothing to say for a while is not closed as idle on the way.
+    pub fn ping(s: *Socket) !void {
+        try writeFrame(s.io, s.req.connection.?.writer(), 0x9, true, &.{});
+        try s.req.connection.?.flush();
+    }
+
     pub fn close(s: *Socket, gpa: Allocator) void {
         const w = s.req.connection.?.writer();
         // A close frame with status 1000 (normal closure).
