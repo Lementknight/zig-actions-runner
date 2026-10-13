@@ -51,7 +51,8 @@ pub fn renew(arena: Allocator, io: std.Io, req: JobRequest, token: []const u8, p
     return post(arena, io, req, token, "renewjob", body);
 }
 
-pub const Conclusion = enum { succeeded, failed, cancelled };
+/// As the run service spells them (the .NET TaskResult names): "cancelled" is rejected with 400.
+pub const Conclusion = enum { succeeded, failed, canceled };
 
 pub fn complete(
     arena: Allocator,

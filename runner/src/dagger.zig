@@ -383,7 +383,7 @@ fn secretAlias(arena: Allocator, i: usize) ![]const u8 {
     return std.fmt.allocPrint(arena, "ZIG_SECRET_{d}", .{i});
 }
 
-pub const Outcome = enum { not_run, success, failure, skipped };
+pub const Outcome = enum { not_run, success, failure, skipped, cancelled };
 
 pub const StepResult = struct {
     /// The step's display name with expressions evaluated; empty when it was never evaluated.
@@ -402,6 +402,8 @@ pub const Result = struct {
     engine_error: ?[]const u8,
     /// False if any step failed without continue-on-error, or the engine failed before running them.
     succeeded: bool,
+    /// GitHub cancelled the job while it ran (a cancel in the UI, or the job's `timeout-minutes`).
+    cancelled: bool = false,
     /// Actions' `pre` and `post` scripts that ran, as GitHub shows them: steps of their own.
     extra: []const ExtraStep = &.{},
     /// The first log step number not used (see `ExtraStep.log_step`); 0 means `steps.len + 1`.
@@ -433,9 +435,94 @@ fn logSteps(n: usize) usize {
 pub const Transport = struct {
     ptr: *anyopaque,
     sendFn: *const fn (ptr: *anyopaque, arena: Allocator, doc: []const u8) anyerror![]const u8,
+    /// Ends the document being sent, from another task, so `send` fails; false when none was in
+    /// flight. Null when the transport cannot (the `dagger run` CLI): steps then run to their end.
+    abortFn: ?*const fn (ptr: *anyopaque) bool = null,
 
     fn send(t: Transport, arena: Allocator, doc: []const u8) ![]const u8 {
         return t.sendFn(t.ptr, arena, doc);
+    }
+
+    fn abort(t: Transport) bool {
+        return if (t.abortFn) |f| f(t.ptr) else false;
+    }
+};
+
+/// Set by the runner when GitHub cancels the job (a `JobCancellation` message), read by the job.
+pub const Cancel = struct {
+    requested: std.atomic.Value(bool) = .init(false),
+    /// When whatever still runs is stopped too (the grace period GitHub gives after a cancel), in
+    /// ms since the epoch; 0 for none.
+    hard_deadline_ms: std.atomic.Value(i64) = .init(0),
+};
+
+/// Stops a step that runs past its `timeout-minutes`, or that is running when the job is cancelled,
+/// by aborting the step's query (the engine then cancels the exec). A task of its own checks every
+/// 200 ms; `begin` and `end` bracket each step, so an interrupt meant for one step never reaches the
+/// next.
+const Watch = struct {
+    io: std.Io,
+    transport: Transport,
+    cancel: ?*Cancel,
+    mu: std.Io.Mutex = .init,
+    in_step: bool = false,
+    deadline_ms: i64 = 0,
+    /// A cancel arrived while this step ran and its query is still to be aborted.
+    cancel_pending: bool = false,
+    cancel_seen: bool = false,
+    interrupt: Interrupt = .none,
+    done: std.atomic.Value(bool) = .init(false),
+
+    const Interrupt = enum { none, timed_out, cancelled };
+
+    fn begin(w: *Watch, deadline_ms: i64) void {
+        w.mu.lockUncancelable(w.io);
+        defer w.mu.unlock(w.io);
+        w.in_step = true;
+        w.deadline_ms = deadline_ms;
+        w.interrupt = .none;
+        w.cancel_pending = false;
+    }
+
+    /// How the step was interrupted, if it was.
+    fn end(w: *Watch) Interrupt {
+        w.mu.lockUncancelable(w.io);
+        defer w.mu.unlock(w.io);
+        w.in_step = false;
+        w.deadline_ms = 0;
+        w.cancel_pending = false;
+        defer w.interrupt = .none;
+        return w.interrupt;
+    }
+
+    fn run(w: *Watch) void {
+        while (!w.done.load(.acquire)) {
+            w.io.sleep(.fromMilliseconds(200), .awake) catch return;
+            w.tick(std.Io.Clock.real.now(w.io).toMilliseconds());
+        }
+    }
+
+    fn tick(w: *Watch, now: i64) void {
+        w.mu.lockUncancelable(w.io);
+        defer w.mu.unlock(w.io);
+        if (w.cancel) |c| {
+            if (!w.cancel_seen and c.requested.load(.acquire)) {
+                w.cancel_seen = true;
+                w.cancel_pending = w.in_step;
+            }
+            const hard = c.hard_deadline_ms.load(.acquire);
+            // Past the grace period nothing runs on: whatever is in flight is ended.
+            if (w.cancel_seen and hard > 0 and now > hard) w.cancel_pending = true;
+        }
+        if (w.cancel_pending and w.transport.abort()) {
+            w.interrupt = .cancelled;
+            w.cancel_pending = false;
+            return;
+        }
+        if (w.in_step and w.deadline_ms > 0 and now > w.deadline_ms and w.transport.abort()) {
+            w.interrupt = .timed_out;
+            w.deadline_ms = 0;
+        }
     }
 };
 
@@ -475,6 +562,8 @@ pub const Options = struct {
     /// Reuse unchanged steps' results across runs (see `volatile_env`). The runner turns this on
     /// (`RUNNER_STEP_CACHE`, on by default).
     step_cache: bool = false,
+    /// Set by the runner when GitHub cancels the job.
+    cancel: ?*Cancel = null,
     /// Talk to the Dagger engine directly (`engine.zig`) instead of through a `dagger run` child.
     engine: ?engine.Endpoint = null,
     /// Backs the direct session's long-lived buffers and tasks; must be thread-safe.
@@ -747,6 +836,8 @@ const Evaluator = struct {
     pending_env: std.ArrayList(job_mod.EnvVar) = .empty,
     pending_path: std.ArrayList([]const u8) = .empty,
     job_failed: bool = false,
+    /// Set once GitHub cancelled the job: `cancelled()` is true and `success()` false from then on.
+    cancelled: bool = false,
     diag: []const u8 = "",
     /// Reads the job's files for `hashFiles()`, once the job's container exists.
     hash_files: ?expr.HashFiles = null,
@@ -809,7 +900,7 @@ const Evaluator = struct {
         }
 
         const job_fields = try arena.alloc(expr.Value.Entry, 1);
-        job_fields[0] = .{ .key = "status", .value = .{ .string = if (ev.job_failed) "failure" else "success" } };
+        job_fields[0] = .{ .key = "status", .value = .{ .string = if (ev.cancelled) "cancelled" else if (ev.job_failed) "failure" else "success" } };
         const runner_fields = try arena.alloc(expr.Value.Entry, 5);
         runner_fields[0] = .{ .key = "os", .value = .{ .string = "Linux" } };
         runner_fields[1] = .{ .key = "arch", .value = .{ .string = "X64" } };
@@ -835,6 +926,7 @@ const Evaluator = struct {
         return .{
             .contexts = ctxs,
             .job_failed = ev.job_failed,
+            .cancelled = ev.cancelled,
             .diag = &ev.diag,
             .hash_files = ev.hash_files,
         };
@@ -857,6 +949,7 @@ const Evaluator = struct {
         const raw: []const u8 = switch (outcome) {
             .success => "success",
             .failure => "failure",
+            .cancelled => "cancelled",
             .skipped, .not_run => "skipped",
         };
         const conclusion: []const u8 = if (outcome == .failure and continued) "success" else raw;
@@ -1311,7 +1404,7 @@ fn runDirect(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: 
         sh.flush();
     }
     var st: SessionTransport = .{ .s = &sess };
-    return runSteps(arena, io, opts, job, sh, results, .{ .ptr = &st, .sendFn = SessionTransport.send });
+    return runSteps(arena, io, opts, job, sh, results, .{ .ptr = &st, .sendFn = SessionTransport.send, .abortFn = SessionTransport.abort });
 }
 
 /// Opens a session, starting the engine container first if it exists but is stopped, and having the
@@ -1385,6 +1478,11 @@ const SessionTransport = struct {
     fn send(ptr: *anyopaque, arena: Allocator, doc: []const u8) anyerror![]const u8 {
         const t: *SessionTransport = @ptrCast(@alignCast(ptr));
         return t.s.query(arena, doc);
+    }
+
+    fn abort(ptr: *anyopaque) bool {
+        const t: *SessionTransport = @ptrCast(@alignCast(ptr));
+        return t.s.abort();
     }
 };
 
@@ -1572,6 +1670,13 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
 
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
+    var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel };
+    var watching: ?std.Io.Future(void) = if (transport.abortFn != null) (io.concurrent(Watch.run, .{&watch}) catch null) else null;
+    defer if (watching) |*f| {
+        watch.done.store(true, .release);
+        f.cancel(io);
+    };
+
     // "Set up job": what GitHub's runner logs before the first step, including fetching every action.
     try x.logSetUp(opts);
     var downloaded: std.StringHashMapUnmanaged(void) = .empty;
@@ -1599,6 +1704,9 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     for (job.steps, results, 1..) |step, *res, n| {
         const num: u32 = @intCast(n);
         res.name = step.name;
+        if (opts.cancel) |c| if (c.requested.load(.acquire)) {
+            ev.cancelled = true;
+        };
 
         // 1. The condition, with the job env visible.
         ev.diag = "";
@@ -1623,6 +1731,11 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         const sc1 = try ev.scope(step_env);
         const coe = std.mem.eql(u8, ev.render(step.continue_on_error, sc1) catch "false", "true");
         res.continued = coe;
+        const timeout: ?[]const u8 = if (step.timeout_minutes) |t| (ev.render(t, sc1) catch null) else null;
+        const timeout_ms: i64 = if (timeout) |t| ms: {
+            const minutes = std.fmt.parseFloat(f64, std.mem.trim(u8, t, " ")) catch break :ms 0;
+            break :ms if (minutes > 0) @intFromFloat(minutes * 60_000) else 0;
+        } else 0;
 
         // Env that carries a secret goes in as a Dagger secret, the rest in the script.
         var plain_step_env: std.ArrayList(job_mod.EnvVar) = .empty;
@@ -1695,13 +1808,18 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
             .uses, .docker => {
                 res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
                 if (opts.observer) |o| o.started(num, res.name, res.started_ms);
+                watch.begin(if (timeout_ms > 0) res.started_ms + timeout_ms else 0);
                 const ran = switch (step.action) {
                     .uses => |u| x.runAction(num, u, sc1, plain_step_env.items, secret_step_env.items, false),
                     .docker => |d| x.runImageStep(num, d, sc1, plain_step_env.items, secret_step_env.items),
                     else => unreachable,
                 };
+                const intr = watch.end();
                 const out = ran catch |e| switch (e) {
-                    error.EngineFailed => return engineFailed(&x, opts.observer, res, num, coe, results),
+                    error.EngineFailed => if (intr != .none) {
+                        try stepInterrupted(&ev, sh, opts.observer, step, res, num, coe, intr, timeout orelse "");
+                        continue;
+                    } else return engineFailed(&x, opts.observer, res, num, coe, results),
                     else => return e,
                 };
                 res.completed_ms = std.Io.Clock.real.now(io).toMilliseconds();
@@ -1716,8 +1834,14 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
 
         res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
         if (opts.observer) |o| o.started(num, res.name, res.started_ms);
-        const out = x.execScript(num, num, resolved, if (step.context_name.len > 0) step.context_name else step.id, secret_step_env.items, mounts) catch |e| switch (e) {
-            error.EngineFailed => return engineFailed(&x, opts.observer, res, num, coe, results),
+        watch.begin(if (timeout_ms > 0) res.started_ms + timeout_ms else 0);
+        const ran = x.execScript(num, num, resolved, if (step.context_name.len > 0) step.context_name else step.id, secret_step_env.items, mounts);
+        const intr = watch.end();
+        const out = ran catch |e| switch (e) {
+            error.EngineFailed => if (intr != .none) {
+                try stepInterrupted(&ev, sh, opts.observer, step, res, num, coe, intr, timeout orelse "");
+                continue;
+            } else return engineFailed(&x, opts.observer, res, num, coe, results),
             else => return e,
         };
         if (resolved == .run and out.code != 0) logExitCode(sh, num, out.code);
@@ -1735,6 +1859,13 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     };
     var result = try finish(arena, sh, results, "");
     if (x.hook_failed) result.succeeded = false;
+    if (opts.cancel) |c| if (c.requested.load(.acquire)) {
+        ev.cancelled = true;
+    };
+    if (ev.cancelled) {
+        result.cancelled = true;
+        result.succeeded = false;
+    }
     result.extra = x.extra.items;
     result.next_log_step = x.next_log_step;
     try jobOutputs(arena, &ev, job, &result);
@@ -3353,6 +3484,27 @@ fn firstLine(s: []const u8) []const u8 {
 }
 
 /// Dagger itself failed during a step: the step and the job fail with what Dagger said.
+/// A step its timeout or the job's cancellation stopped, logged as GitHub's runner logs it. A timed
+/// out step failed (continue-on-error applies); a cancelled one is `cancelled`, and so is the job.
+fn stepInterrupted(ev: *Evaluator, sh: *Shared, observer: ?Observer, step: job_mod.Step, res: *StepResult, num: u32, coe: bool, intr: Watch.Interrupt, timeout: []const u8) !void {
+    res.completed_ms = std.Io.Clock.real.now(sh.io).toMilliseconds();
+    res.exit_code = 1;
+    switch (intr) {
+        .timed_out => {
+            sh.append(num, try std.fmt.allocPrint(ev.arena, "##[error]The action '{s}' has timed out after {s} minutes.", .{ res.name, std.mem.trim(u8, timeout, " ") }));
+            res.outcome = .failure;
+            if (!coe) ev.job_failed = true;
+        },
+        .cancelled, .none => {
+            sh.append(num, "##[error]The operation was canceled.");
+            res.outcome = .cancelled;
+            ev.cancelled = true;
+        },
+    }
+    try ev.record(step, res.outcome, coe, &.{});
+    if (observer) |o| o.finished(num, res.*);
+}
+
 fn engineFailed(x: *Exec, observer: ?Observer, res: *StepResult, num: u32, coe: bool, results: []StepResult) !Result {
     res.* = .{ .name = res.name, .continued = coe, .outcome = .failure, .exit_code = 1, .started_ms = res.started_ms, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() };
     x.sh.append(num, try std.fmt.allocPrint(x.arena, "Dagger error: {s}", .{x.err_msg}));
@@ -3450,6 +3602,90 @@ fn finish(arena: Allocator, sh: *Shared, results: []StepResult, engine_msg: []co
 }
 
 // --- tests ---
+
+const FakeAbort = struct {
+    in_flight: bool = false,
+    aborted: u32 = 0,
+
+    fn send(_: *anyopaque, _: Allocator, _: []const u8) anyerror![]const u8 {
+        return "";
+    }
+    fn abort(ptr: *anyopaque) bool {
+        const f: *FakeAbort = @ptrCast(@alignCast(ptr));
+        if (!f.in_flight) return false;
+        f.aborted += 1;
+        f.in_flight = false;
+        return true;
+    }
+    fn transport(f: *FakeAbort) Transport {
+        return .{ .ptr = f, .sendFn = send, .abortFn = abort };
+    }
+};
+
+test "a step past its timeout is stopped, and only that step" {
+    var f: FakeAbort = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = null };
+    w.begin(1_000);
+    f.in_flight = true;
+    w.tick(999);
+    try std.testing.expectEqual(@as(u32, 0), f.aborted);
+    w.tick(1_001);
+    try std.testing.expectEqual(@as(u32, 1), f.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.timed_out, w.end());
+    // The next step has no timeout: nothing reaches it.
+    w.begin(0);
+    f.in_flight = true;
+    w.tick(5_000);
+    try std.testing.expectEqual(@as(u32, 1), f.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.none, w.end());
+}
+
+test "a deadline passed between a step's queries stops its next query" {
+    var f: FakeAbort = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = null };
+    w.begin(1_000);
+    w.tick(2_000); // no query in flight
+    f.in_flight = true;
+    w.tick(2_200);
+    try std.testing.expectEqual(Watch.Interrupt.timed_out, w.end());
+}
+
+test "a cancel stops the running step, not the always() steps after it, until the grace period ends" {
+    var f: FakeAbort = .{};
+    var c: Cancel = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
+    w.begin(0);
+    f.in_flight = true;
+    c.hard_deadline_ms.store(10_000, .release);
+    c.requested.store(true, .release);
+    w.tick(1_000);
+    try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
+    // An `if: always()` step after it runs.
+    w.begin(0);
+    f.in_flight = true;
+    w.tick(2_000);
+    try std.testing.expectEqual(@as(u32, 1), f.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.none, w.end());
+    // Past the grace period, whatever runs is stopped.
+    w.begin(0);
+    f.in_flight = true;
+    w.tick(10_001);
+    try std.testing.expectEqual(@as(u32, 2), f.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.cancelled, w.end());
+}
+
+test "a cancel between steps does not stop the next step" {
+    var f: FakeAbort = .{};
+    var c: Cancel = .{};
+    var w: Watch = .{ .io = std.testing.io, .transport = f.transport(), .cancel = &c };
+    c.requested.store(true, .release);
+    w.tick(1_000);
+    w.begin(0);
+    f.in_flight = true;
+    w.tick(1_200);
+    try std.testing.expectEqual(@as(u32, 0), f.aborted);
+    try std.testing.expectEqual(Watch.Interrupt.none, w.end());
+}
 
 fn testStep(script: []const u8) job_mod.Step {
     return .{ .id = "x", .name = "n", .condition = "success()", .action = .{ .script = .{ .script = .{ .lit = script }, .shell = null, .working_directory = null } } };

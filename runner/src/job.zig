@@ -80,6 +80,9 @@ pub const Step = struct {
     /// `success()` when the workflow sets no `if:`. An expression.
     condition: []const u8,
     continue_on_error: Template = .{ .lit = "false" },
+    /// `timeout-minutes:`, null when the step sets none (GitHub's default is the job's limit, which
+    /// GitHub enforces itself by cancelling the job).
+    timeout_minutes: ?Template = null,
     env: []const Input = &.{},
     action: Action,
     /// What the step `uses:` as written (`actions/checkout@v4`, `docker://alpine`), for its log
@@ -273,6 +276,7 @@ fn parseStep(arena: Allocator, sv: Value) Error!Step {
         .name_expr = name_expr,
         .condition = condition,
         .continue_on_error = if (o.get("continueOnError")) |c| (tokenTemplate(c) orelse .{ .lit = "false" }) else .{ .lit = "false" },
+        .timeout_minutes = if (o.get("timeoutInMinutes")) |t| try numberTemplate(arena, t) else null,
         .env = env,
         .action = action,
         .uses = uses_label,
@@ -533,6 +537,20 @@ pub fn tokenTemplate(v: Value) ?Template {
     return null;
 }
 
+/// A number token (`{"type":6,"num":1}`, how GitHub sends `timeout-minutes: 1`) as text; other
+/// tokens as `tokenTemplate` reads them.
+fn numberTemplate(arena: Allocator, v: Value) Allocator.Error!?Template {
+    if (v == .object and tokenType(v) == 6) {
+        const n = v.object.get("num") orelse return null;
+        return .{ .lit = switch (n) {
+            .integer => |i| try std.fmt.allocPrint(arena, "{d}", .{i}),
+            .float => |f| try std.fmt.allocPrint(arena, "{d}", .{f}),
+            else => return null,
+        } };
+    }
+    return tokenTemplate(v);
+}
+
 fn displayName(arena: Allocator, name: []const u8, script: []const u8, uses_label: []const u8) Allocator.Error![]const u8 {
     if (name.len > 0 and !std.mem.startsWith(u8, name, "__")) return name;
     if (uses_label.len > 0) return std.fmt.allocPrint(arena, "Run {s}", .{uses_label});
@@ -649,7 +667,7 @@ const fixture =
     \\ "steps":[
     \\  {"type":"action","reference":{"type":"script"},"id":"s1","contextName":"__run","name":"__run","condition":"success()","continueOnError":null,
     \\   "inputs":{"type":2,"map":[{"Key":{"type":0,"lit":"script"},"Value":{"type":0,"file":1,"line":7,"col":14,"lit":"echo hello && sleep 2 && echo done"}}]}},
-    \\  {"type":"action","reference":{"type":"script"},"id":"s2","name":"__run_2","displayNameToken":{"type":0,"lit":"Build"},"condition":"always()","continueOnError":{"type":5,"bool":true},
+    \\  {"type":"action","reference":{"type":"script"},"id":"s2","name":"__run_2","displayNameToken":{"type":0,"lit":"Build"},"condition":"always()","continueOnError":{"type":5,"bool":true},"timeoutInMinutes":{"type":6,"num":1},
     \\   "environment":{"type":2,"map":[{"Key":{"lit":"A"},"Value":{"lit":"1"}}]},
     \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"lit":"make"}},{"Key":{"lit":"shell"},"Value":{"lit":"bash"}},{"Key":{"lit":"workingDirectory"},"Value":{"lit":"sub"}}]}},
     \\  {"type":"action","reference":{"type":"repository","name":"actions/checkout","ref":"v4"},"id":"s3","name":"Checkout","condition":"success()",
@@ -706,11 +724,13 @@ test "parse job fixture" {
     try std.testing.expectEqualStrings("Run echo hello && sleep 2 && echo done", s1.name);
     try std.testing.expectEqualStrings("echo hello && sleep 2 && echo done", s1.action.script.script.lit);
     try std.testing.expectEqualStrings("false", s1.continue_on_error.lit);
+    try std.testing.expect(s1.timeout_minutes == null);
 
     const s2 = job.steps[1];
     try std.testing.expectEqualStrings("Build", s2.name);
     try std.testing.expectEqualStrings("always()", s2.condition);
     try std.testing.expectEqualStrings("true", s2.continue_on_error.lit);
+    try std.testing.expectEqualStrings("1", s2.timeout_minutes.?.lit);
     try std.testing.expectEqualStrings("bash", s2.action.script.shell.?.lit);
     try std.testing.expectEqualStrings("sub", s2.action.script.working_directory.?.lit);
     try std.testing.expectEqualStrings("A", s2.env[0].name);
@@ -763,7 +783,7 @@ test "expressions are kept as templates: step name, env, inputs, condition, job 
         \\ "contextData":{"matrix":null,"github":{"t":2,"d":[{"k":"ref_name","v":"main"}]}},
         \\ "steps":[{"type":"action","reference":{"type":"script"},"id":"g","contextName":"first","name":"first",
         \\   "displayNameToken":{"type":3,"expr":"format('Build {0}', github.ref_name)"},
-        \\   "condition":"success() && (github.ref == 'x')","continueOnError":{"type":3,"expr":"github.event_name == 'push'"},
+        \\   "condition":"success() && (github.ref == 'x')","continueOnError":{"type":3,"expr":"github.event_name == 'push'"},"timeoutInMinutes":{"type":3,"expr":"inputs.limit"},
         \\   "environment":{"type":2,"map":[{"Key":{"lit":"STEP_ENV"},"Value":{"type":3,"expr":"github.sha"}}]},
         \\   "inputs":{"type":2,"map":[{"Key":{"lit":"script"},"Value":{"type":3,"expr":"format('echo {0}', github.sha)"}}]}}]}
     ;
@@ -773,6 +793,7 @@ test "expressions are kept as templates: step name, env, inputs, condition, job 
     try std.testing.expectEqualStrings("format('Build {0}', github.ref_name)", s.name_expr.?);
     try std.testing.expectEqualStrings("success() && (github.ref == 'x')", s.condition);
     try std.testing.expectEqualStrings("github.event_name == 'push'", s.continue_on_error.expr);
+    try std.testing.expectEqualStrings("inputs.limit", s.timeout_minutes.?.expr);
     try std.testing.expectEqualStrings("github.sha", s.env[0].value.expr);
     try std.testing.expectEqualStrings("format('echo {0}', github.sha)", s.action.script.script.expr);
     try std.testing.expectEqual(@as(usize, 2), job.env.len);
