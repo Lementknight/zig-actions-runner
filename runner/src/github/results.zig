@@ -161,7 +161,7 @@ test "formatBlob prefixes timestamps and filters by step" {
 test "request bodies" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
-    const job: job_mod.Job = .{ .plan_id = "P", .job_id = "J", .job_token = "t", .check_run_id = 1, .has_container = false, .secrets = &.{}, .steps = &.{} };
+    const job: job_mod.Job = .{ .plan_id = "P", .job_id = "J", .job_token = "t", .check_run_id = 1, .secrets = &.{}, .steps = &.{} };
     try std.testing.expectEqualStrings(
         "{\"workflow_run_backend_id\":\"P\",\"workflow_job_run_backend_id\":\"J\",\"step_backend_id\":\"S\",\"uploaded_at\":\"T\",\"line_count\":3}",
         try ids(a.allocator(), job, .{ .step = "S" }, .{ .uploaded_at = "T", .line_count = 3 }),

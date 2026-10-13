@@ -471,6 +471,31 @@ fn registryHost(image: []const u8) []const u8 {
     return "docker.io";
 }
 
+/// `withRegistryAuth(...) { ` for a service's or the job container's `credentials`, or null without
+/// them. Sets `err_msg` (and returns null) when the password could not be registered as a secret.
+fn registryAuthNode(arena: Allocator, ev: *Evaluator, transport: Transport, counter: *u32, svc: job_mod.Service, image: []const u8, err_msg: *[]const u8) !?[]const u8 {
+    const ut = svc.username orelse return null;
+    const pt = svc.password orelse return null;
+    const sc = try ev.scope(&.{});
+    const user = ev.render(ut, sc) catch "";
+    const pass = ev.render(pt, sc) catch "";
+    if (user.len == 0 or pass.len == 0) return null;
+    const secret = newSecret(arena, transport, counter, pass, err_msg) catch {
+        err_msg.* = try std.fmt.allocPrint(arena, "could not register the credentials for {s}: {s}", .{ image, err_msg.* });
+        return null;
+    };
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.writeAll("withRegistryAuth(address:");
+    try std.json.Stringify.value(registryHost(image), .{}, w);
+    try w.writeAll(",username:");
+    try std.json.Stringify.value(user, .{}, w);
+    try w.writeAll(",secret:");
+    try std.json.Stringify.value(secret, .{}, w);
+    try w.writeAll(") { ");
+    return aw.written();
+}
+
 /// The `options:` of a service that are not carried out, as written. Health checks are: the service
 /// is ready when its ports accept connections (`--health-*` is accepted and not run).
 fn ignoredServiceOptions(arena: Allocator, options: []const u8) ![]const u8 {
@@ -1806,13 +1831,37 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         break :ids ids;
     } else &.{};
 
+    // `container:` replaces the image every step runs in.
+    const job_image: []const u8 = if (job.container) |jc| (ev.render(jc.image, try ev.scope(&.{})) catch "") else opts.image;
+    if (job_image.len == 0) return fail(sh, results, try std.fmt.allocPrint(arena, "container: has no image: {s}", .{ev.diag}));
     const container_id: []const u8 = blk: {
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
-        try w.writeAll("{ container { from(address:");
-        try std.json.Stringify.value(opts.image, .{}, w);
+        try w.writeAll("{ container { ");
+        var extra_braces: usize = 0;
+        if (job.container) |jc| {
+            // A private image: its registry's credentials.
+            if (try registryAuthNode(arena, &ev, transport, &secret_counter, jc, job_image, &err_msg)) |node| {
+                try w.writeAll(node);
+                extra_braces += 1;
+            } else if (err_msg.len > 0) return fail(sh, results, err_msg);
+        }
+        try w.writeAll("from(address:");
+        try std.json.Stringify.value(job_image, .{}, w);
         try w.writeAll(") { ");
-        const provision = opts.provision and std.mem.eql(u8, opts.image, default_image);
+        if (job.container) |jc| {
+            // The container's env, as `docker create -e` sets it: every step sees it.
+            const env = ev.renderEnv(jc.env, try ev.scope(&.{})) catch return fail(sh, results, try std.fmt.allocPrint(arena, "could not evaluate the container's env: {s}", .{ev.diag}));
+            for (env) |e| {
+                try w.writeAll("withEnvVariable(name:");
+                try std.json.Stringify.value(e.name, .{}, w);
+                try w.writeAll(",value:");
+                try std.json.Stringify.value(e.value, .{}, w);
+                try w.writeAll(") { ");
+                extra_braces += 1;
+            }
+        }
+        const provision = opts.provision and std.mem.eql(u8, job_image, default_image);
         if (provision) {
             try w.writeAll("withExec(args:");
             try std.json.Stringify.value([_][]const u8{ "sh", "-c", provision_script }, .{}, w);
@@ -1852,7 +1901,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         splitEnv(arena, transport, job, &secret_counter, ev.job_env.items, &plain_job, &secret_job, &err_msg) catch return fail(sh, results, err_msg);
         const job_env_nodes = try writeEnvNodes(w, plain_job.items, secret_job.items);
         try w.writeAll("id");
-        for (0..defaults.len + job_env_nodes + cache_ids.len + 5 + @as(usize, if (provision) 1 else 0)) |_| try w.writeAll(" }");
+        for (0..defaults.len + job_env_nodes + cache_ids.len + 5 + extra_braces + @as(usize, if (provision) 1 else 0)) |_| try w.writeAll(" }");
         const data = gql(arena, transport, doc.written(), &err_msg) catch return fail(sh, results, err_msg);
         break :blk jsonFindString(data, "id") orelse return fail(sh, results, "Dagger returned no container");
     };
@@ -1878,6 +1927,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         .loaded = try nulls(arena, Exec.LoadResult, job.steps.len),
         .pre_state = try emptySlices(arena, job_mod.EnvVar, job.steps.len),
         .summaries = try emptySlices(arena, u8, logSteps(job.steps.len)),
+        .job_image = job_image,
     };
 
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
@@ -1905,7 +1955,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     };
     x.setUpLine(try std.fmt.allocPrint(arena, "Complete job name: {s}", .{if (job.display_name.len > 0) job.display_name else if (job.github.job.len > 0) job.github.job else "job"}));
 
-    if (job.services.len > 0 and !try x.startServices()) {
+    if ((job.container != null or job.services.len > 0) and !try x.startServices()) {
         var failed = try finish(arena, sh, results, "");
         failed.succeeded = false;
         failed.engine_error = null;
@@ -2205,6 +2255,10 @@ const Exec = struct {
     empty_dir: []const u8 = "",
     images: std.StringHashMapUnmanaged(ImageInfo) = .empty,
     docker_home: ?[]const u8 = null,
+    /// The image the steps run in: `container:`'s, or the runner's.
+    job_image: []const u8 = default_image,
+    /// The job's image uses musl (Alpine): JavaScript actions get the runtime's musl build.
+    musl: bool = false,
     /// The job's `services:`, running for the whole job (see `startServices`).
     services: std.ArrayList(RunningService) = .empty,
     /// Shell lines at the start of every step that forward `localhost:<port>` to the services, as
@@ -2851,12 +2905,13 @@ const Exec = struct {
         const arena = x.arena;
         var mounts: std.ArrayList(Mount) = .empty;
         if (!x.js_mounted) {
-            const rt = js_runtimes.get(x.js_runtime);
+            const rt = (if (x.musl) js_runtimes_musl else js_runtimes).get(x.js_runtime);
             var msg: []const u8 = "";
+            const libs: []const u8 = if (x.musl) " libs: directory(path:\"/usr/lib\") { filter(include:[\"libstdc++.so*\",\"libgcc_s.so*\"]) { id } }" else "";
             const doc = if (rt.npm_dir) |npm|
-                try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }} npm: directory(path:\"{s}\") {{ id }} }} }} }}", .{ rt.image, rt.binary, npm })
+                try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }} npm: directory(path:\"{s}\") {{ id }}{s} }} }} }}", .{ rt.image, rt.binary, npm, libs })
             else
-                try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }} }} }} }}", .{ rt.image, rt.binary });
+                try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }}{s} }} }} }}", .{ rt.image, rt.binary, libs });
             const data = gql(arena, x.transport, doc, &msg) catch {
                 _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}: {s}", .{ rt.image, msg });
                 return null;
@@ -2865,12 +2920,23 @@ const Exec = struct {
                 _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}", .{rt.image});
                 return null;
             };
-            try mounts.append(arena, .{ .file = .{ .path = js_runtime_path, .id = bin, .permissions = 0o755 } });
+            if (x.musl) {
+                const libs_id = (if (jsonFind(data, "libs")) |l| jsonFindString(l, "id") else null) orelse {
+                    _ = try x.actionFailed(num, "could not get the C++ runtime from {s}", .{rt.image});
+                    return null;
+                };
+                try mounts.append(arena, .{ .dir = .{ .path = js_lib_dir, .id = libs_id } });
+                try mounts.append(arena, .{ .file = .{ .path = js_musl_dir ++ "/node", .id = bin, .permissions = 0o755 } });
+                try mounts.append(arena, .{ .new_file = .{ .path = js_runtime_path, .contents = try muslWrapper(arena, "node"), .permissions = 0o755 } });
+            } else try mounts.append(arena, .{ .file = .{ .path = js_runtime_path, .id = bin, .permissions = 0o755 } });
             try mounts.append(arena, .{ .new_file = .{ .path = js_shim_path, .contents = node_shim, .permissions = 0o755 } });
             switch (x.js_runtime) {
                 // The same binary named `bun` is Bun's own CLI, for `bun x`.
                 .bun => {
-                    try mounts.append(arena, .{ .file = .{ .path = js_bun_path, .id = bin, .permissions = 0o755 } });
+                    if (x.musl) {
+                        try mounts.append(arena, .{ .file = .{ .path = js_musl_dir ++ "/bun", .id = bin, .permissions = 0o755 } });
+                        try mounts.append(arena, .{ .new_file = .{ .path = js_bun_path, .contents = try muslWrapper(arena, "bun"), .permissions = 0o755 } });
+                    } else try mounts.append(arena, .{ .file = .{ .path = js_bun_path, .id = bin, .permissions = 0o755 } });
                     try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npx", .contents = npx_bun_shim, .permissions = 0o755 } });
                 },
                 .node => {
@@ -2906,14 +2972,15 @@ const Exec = struct {
         // start with their output.
         if (phase == .main) try x.logGroup(num, phase, act.ref_label, try shownInputs(arena, inputs), step_env, step_secret, &.{});
 
-        // Started through bash, not sh: dash drops variables whose names are not identifiers
-        // (INPUT_GITHUB-TOKEN) when it starts a program; bash passes them on.
+        // Started through bash where there is one: dash drops variables whose names are not
+        // identifiers (INPUT_GITHUB-TOKEN) when it starts a program; bash, and busybox's sh (Alpine
+        // images, which have no bash), pass them on.
         var script: std.Io.Writer.Allocating = .init(arena);
         try script.writer.writeAll("PATH=\"" ++ js_bin_dir ++ ":$PATH\" exec " ++ js_runtime_path ++ " ");
         try shellQuote(&script.writer, try std.fmt.allocPrint(arena, "{s}/{s}", .{ act.path, script_rel }));
         const fc = x.next_fc;
         x.next_fc += 1;
-        const out = try x.execScript(num, fc, .{ .run = .{ .script = script.written(), .shell = "bash", .working_directory = null, .env = plain.items } }, if (act.repository.len > 0) act.repository else act.ref_label, secret.items, mounts.items);
+        const out = try x.execScript(num, fc, .{ .run = .{ .script = script.written(), .shell = null, .working_directory = null, .env = plain.items } }, if (act.repository.len > 0) act.repository else act.ref_label, secret.items, mounts.items);
         x.js_mounted = true;
         try x.mounted_actions.put(arena, act.mount, {});
         return out;
@@ -3049,7 +3116,7 @@ const Exec = struct {
             x.setUpLine(try std.fmt.allocPrint(arena, "Machine name: '{s}'", .{host}));
         } else |_| {}
         x.setUpLine("##[group]Runner Image");
-        x.setUpLine(try std.fmt.allocPrint(arena, "Image: {s}", .{opts.image}));
+        x.setUpLine(try std.fmt.allocPrint(arena, "Image: {s}", .{x.job_image}));
         x.setUpLine(if (opts.engine) |ep|
             try std.fmt.allocPrint(arena, "Engine: Dagger {s}, direct session ({s})", .{ engine.client_version, if (ep.host.len > 0) ep.host else ep.container })
         else
@@ -3412,6 +3479,33 @@ const Exec = struct {
         defer x.extra.append(arena, .{ .kind = .pre, .name = "Initialize containers", .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() }) catch {};
         ev.diag = "";
         const sc = try ev.scope(&.{});
+        if (x.job.container) |jc| {
+            // The job's own container (built with the job, see `runSteps`): what it was pulled as,
+            // and whether it is musl-based, for JavaScript actions' runtime.
+            x.sh.append(ls, "##[group]Starting job container");
+            x.sh.append(ls, try std.fmt.allocPrint(arena, "Pulling {s}", .{x.job_image}));
+            var auth_msg: []const u8 = "";
+            const head = try std.fmt.allocPrint(arena, "{{ container {{ {s}from(address:{f}) {{ ", .{ (try registryAuthNode(arena, ev, x.transport, &x.secret_counter, jc, x.job_image, &auth_msg)) orelse "", std.json.fmt(x.job_image, .{}) });
+            const closing = if (std.mem.indexOf(u8, head, "withRegistryAuth") != null) " } } } }" else " } } }";
+            var msg: []const u8 = "";
+            const cfg = gql(arena, x.transport, try std.mem.concat(arena, u8, &.{ head, "imageRef", closing }), &msg) catch {
+                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to pull {s}: {s}", .{ x.job_image, msg }));
+                x.sh.append(ls, "##[endgroup]");
+                ok = false;
+                return false;
+            };
+            if (jsonFindString(cfg, "imageRef")) |ref| if (std.mem.indexOf(u8, ref, "@sha256:")) |at| {
+                x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{ref[at + 1 ..]}));
+            };
+            // No /lib (a scratch image) is not musl.
+            if (gql(arena, x.transport, try std.mem.concat(arena, u8, &.{ head, "directory(path:\"/lib\") { entries }", closing }), &msg)) |lib| {
+                if (jsonFind(lib, "entries")) |entries| if (entries == .array) for (entries.array.items) |e| {
+                    if (e == .string and std.mem.startsWith(u8, e.string, "ld-musl-")) x.musl = true;
+                };
+            } else |_| {}
+            x.sh.append(ls, "##[endgroup]");
+            if (x.job.services.len == 0) return true;
+        }
         // Each service starts through busybox's sh, which names the service's log (see below).
         const busybox = (try x.busyboxFile(ls)) orelse {
             ok = false;
@@ -3597,7 +3691,7 @@ const Exec = struct {
 
     /// "Stop containers", after the post scripts, as GitHub's runner ends a job with services.
     fn stopServices(x: *Exec) !void {
-        if (x.services.items.len == 0) return;
+        if (x.services.items.len == 0 and x.job.container == null) return;
         const ls = x.next_log_step;
         x.next_log_step += 1;
         const started = std.Io.Clock.real.now(x.io).toMilliseconds();
@@ -3609,6 +3703,8 @@ const Exec = struct {
             var msg: []const u8 = "";
             _ = gql(x.arena, x.transport, doc, &msg) catch x.sh.append(ls, try std.fmt.allocPrint(x.arena, "##[warning]Could not stop {s}: {s}", .{ r.name, msg }));
         }
+        // The job container goes with the job's session.
+        if (x.job.container != null) x.sh.append(ls, try std.fmt.allocPrint(x.arena, "Stop and remove container: job ({s})", .{x.job_image}));
         try x.extra.append(x.arena, .{ .kind = .post, .name = "Stop containers", .log_step = ls, .outcome = .success, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() });
     }
 
@@ -3874,6 +3970,19 @@ const js_runtimes: std.EnumArray(config.JsRuntime, JsRuntimeSource) = .init(.{
     .bun = .{ .image = "oven/bun:1.4.3", .binary = "/usr/local/bin/bun" },
     .node = .{ .image = "node:24-bookworm-slim", .binary = "/usr/local/bin/node", .npm_dir = "/usr/local/lib/node_modules/npm" },
 });
+/// For a musl job image (`container: alpine`): the runtimes' Alpine builds, which also need the
+/// C++ runtime from their image (mounted at `js_lib_dir`).
+const js_runtimes_musl: std.EnumArray(config.JsRuntime, JsRuntimeSource) = .init(.{
+    .bun = .{ .image = "oven/bun:1.4.3-alpine", .binary = "/usr/local/bin/bun" },
+    .node = .{ .image = "node:24-alpine", .binary = "/usr/local/bin/node", .npm_dir = "/usr/local/lib/node_modules/npm" },
+});
+const js_lib_dir = "/github/_runtime/lib";
+const js_musl_dir = "/github/_runtime/musl";
+
+/// On musl, `js_runtime_path` (and `js_bun_path`) start the binary with its C++ runtime found.
+fn muslWrapper(arena: Allocator, name: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "#!/bin/sh\nLD_LIBRARY_PATH=" ++ js_lib_dir ++ "${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}} exec " ++ js_musl_dir ++ "/{s} \"$@\"\n", .{name});
+}
 
 /// Package managers' cache directories (for root, the default images' user), each mounted from its
 /// own cache volume. Their contents are caches the tools validate themselves, so sharing them between
@@ -4199,7 +4308,7 @@ fn testJob(steps: []const job_mod.Step) job_mod.Job {
         .job_id = "j",
         .job_token = "t",
         .check_run_id = 1,
-        .has_container = false,
+
         .secrets = &.{},
         .github = .{ .repository = "o/r", .sha = "0123456789012345678901234567890123456789", .ref = "refs/heads/x" },
         .steps = steps,
@@ -4975,9 +5084,10 @@ test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the
     try std.testing.expect(std.mem.indexOf(u8, run1, "'ACTIONS_CACHE_URL=https://cache.test/'") != null);
     try std.testing.expect(std.mem.indexOf(u8, run1, "'ACTIONS_CACHE_SERVICE_V2=True'") != null);
     try std.testing.expect(std.mem.indexOf(u8, run1, "GITHUB_STATE=") != null);
-    // bash, not sh, starts the runtime (dash would drop INPUT_GITHUB-TOKEN).
+    // bash where there is one, not dash, starts the runtime (dash would drop INPUT_GITHUB-TOKEN).
     try std.testing.expect(std.mem.indexOf(u8, run1, "printf '%s' 'PATH=\\\"/github/_runtime/bin:$PATH\\\" exec") != null);
-    try std.testing.expect(std.mem.indexOf(u8, run1, "'bash' '--noprofile' '--norc' '-e' '-o' 'pipefail' '/tmp/zig-runner-step-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "if command -v bash >/dev/null 2>&1; then zig_shell=bash; else zig_shell=sh; fi") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "$zig_shell\\\" '-e' '/tmp/zig-runner-step-") != null);
     // No token in any command; the runtime is fetched only once.
     for (seen) |d| if (std.mem.indexOf(u8, d, "setSecret") == null) try std.testing.expect(std.mem.indexOf(u8, d, "ghs_") == null);
     try std.testing.expect(std.mem.indexOf(u8, seen[11], "withFile(path:\"/github/_runtime/node/node\"") == null);
