@@ -417,6 +417,85 @@ pub const Result = struct {
     summaries: []const []const u8 = &.{},
 };
 
+/// A published service port: steps reach `localhost:<host>`, forwarded to the service's `container`.
+pub const ServicePort = struct { host: u16, container: u16 };
+
+/// `5432`, `5432:5432`, `127.0.0.1:15432:5432`, `5432/tcp`. On GitHub a bare container port is
+/// published on a random host port (read back as `job.services.<name>.ports[...]`); here it keeps
+/// its own number. Null for UDP and what is not a port.
+pub fn parseServicePort(text: []const u8) ?ServicePort {
+    var t = std.mem.trim(u8, text, " ");
+    if (std.mem.indexOfScalar(u8, t, '/')) |slash| {
+        if (!std.ascii.eqlIgnoreCase(t[slash + 1 ..], "tcp")) return null;
+        t = t[0..slash];
+    }
+    var parts: [3][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, t, ':');
+    while (it.next()) |p| {
+        if (n == 3) return null;
+        parts[n] = p;
+        n += 1;
+    }
+    const container = std.fmt.parseInt(u16, parts[n - 1], 10) catch return null;
+    const host = if (n >= 2 and parts[n - 2].len > 0) std.fmt.parseInt(u16, parts[n - 2], 10) catch return null else container;
+    if (container == 0 or host == 0) return null;
+    return .{ .host = host, .container = container };
+}
+
+/// Shell lines that forward each published port from localhost (IPv4 and IPv6) to its service, with
+/// busybox's `tcpsvd` and `nc`, in the background for the step's duration.
+fn forwardPrelude(arena: Allocator, services: []const Exec.RunningService) ![]const u8 {
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    for (services) |r| for (r.ports) |p| {
+        for ([_][]const u8{ "127.0.0.1", "::1" }) |addr| {
+            try w.print("\"" ++ busybox_path ++ "\" tcpsvd {s} {d} \"" ++ busybox_path ++ "\" nc ", .{ addr, p.host });
+            try shellQuote(w, r.name);
+            try w.print(" {d} >/dev/null 2>&1 &\n", .{p.container});
+        }
+    };
+    return aw.written();
+}
+
+/// The registry an image is pulled from, for its credentials: the first part of the reference when
+/// it names a host (a dot, a port or `localhost`), else Docker Hub.
+fn registryHost(image: []const u8) []const u8 {
+    const slash = std.mem.indexOfScalar(u8, image, '/') orelse return "docker.io";
+    const first = image[0..slash];
+    if (std.mem.indexOfAny(u8, first, ".:") != null or std.mem.eql(u8, first, "localhost")) return first;
+    return "docker.io";
+}
+
+/// The `options:` of a service that are not carried out, as written. Health checks are: the service
+/// is ready when its ports accept connections (`--health-*` is accepted and not run).
+fn ignoredServiceOptions(arena: Allocator, options: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var it = std.mem.tokenizeAny(u8, options, " \t\n");
+    var skip_value = false;
+    var in_quote: ?u8 = null;
+    while (it.next()) |tok| {
+        if (in_quote) |q| {
+            if (tok[tok.len - 1] == q) in_quote = null;
+            continue;
+        }
+        if (skip_value) {
+            skip_value = false;
+            if (tok[0] == '"' or tok[0] == '\'') {
+                if (tok.len == 1 or tok[tok.len - 1] != tok[0]) in_quote = tok[0];
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, tok, "--health-")) {
+            skip_value = std.mem.indexOfScalar(u8, tok, '=') == null;
+            continue;
+        }
+        if (out.items.len > 0) try out.append(arena, ' ');
+        try out.appendSlice(arena, tok);
+    }
+    return out.items;
+}
+
 /// An annotation and the log step it came from (mapped to GitHub's step number at completion).
 pub const Annotation = struct { step: u32, an: commands.Annotation };
 
@@ -443,9 +522,10 @@ pub const ExtraStep = struct {
     completed_ms: i64,
 };
 
-/// Log step numbers a job can use: its steps, and at most one `pre` and one `post` each.
+/// Log step numbers a job can use: its steps, at most one `pre` and one `post` each, and
+/// "Initialize containers" and "Stop containers" for its services.
 fn logSteps(n: usize) usize {
-    return n * 3 + 1;
+    return n * 3 + 3;
 }
 
 /// Sends one GraphQL document to the Dagger session and returns the response body.
@@ -855,6 +935,8 @@ const Evaluator = struct {
     job_failed: bool = false,
     /// Set once GitHub cancelled the job: `cancelled()` is true and `success()` false from then on.
     cancelled: bool = false,
+    /// `job.services`: `{<name>: {id, network, ports: {<container port>: <host port>}}}`.
+    services: ?expr.Value = null,
     diag: []const u8 = "",
     /// Reads the job's files for `hashFiles()`, once the job's container exists.
     hash_files: ?expr.HashFiles = null,
@@ -916,8 +998,9 @@ const Evaluator = struct {
             o.* = .{ .key = sc.id, .value = .{ .object = fields } };
         }
 
-        const job_fields = try arena.alloc(expr.Value.Entry, 1);
+        const job_fields = try arena.alloc(expr.Value.Entry, if (ev.services != null) 2 else 1);
         job_fields[0] = .{ .key = "status", .value = .{ .string = if (ev.cancelled) "cancelled" else if (ev.job_failed) "failure" else "success" } };
+        if (ev.services) |v| job_fields[1] = .{ .key = "services", .value = v };
         const runner_fields = try arena.alloc(expr.Value.Entry, 5);
         runner_fields[0] = .{ .key = "os", .value = .{ .string = "Linux" } };
         runner_fields[1] = .{ .key = "arch", .value = .{ .string = "X64" } };
@@ -960,6 +1043,24 @@ const Evaluator = struct {
         const out = try ev.arena.alloc(job_mod.EnvVar, inputs.len);
         for (inputs, out) |in, *o| o.* = .{ .name = in.name, .value = try ev.render(in.value, sc) };
         return out;
+    }
+
+    fn setServices(ev: *Evaluator, running: []const Exec.RunningService) !void {
+        const arena = ev.arena;
+        const entries = try arena.alloc(expr.Value.Entry, running.len);
+        for (running, entries) |r, *e| {
+            const ports = try arena.alloc(expr.Value.Entry, r.ports.len);
+            for (r.ports, ports) |p, *pe| pe.* = .{ .key = try std.fmt.allocPrint(arena, "{d}", .{p.container}), .value = .{ .string = try std.fmt.allocPrint(arena, "{d}", .{p.host}) } };
+            // A stable id of the running service (GitHub gives the container's id).
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(r.id, &digest, .{});
+            const fields = try arena.alloc(expr.Value.Entry, 3);
+            fields[0] = .{ .key = "id", .value = .{ .string = try std.fmt.allocPrint(arena, "{x}", .{&digest}) } };
+            fields[1] = .{ .key = "network", .value = .{ .string = "dagger" } };
+            fields[2] = .{ .key = "ports", .value = .{ .object = ports } };
+            e.* = .{ .key = r.name, .value = .{ .object = fields } };
+        }
+        ev.services = .{ .object = entries };
     }
 
     fn record(ev: *Evaluator, step: job_mod.Step, outcome: Outcome, continued: bool, outputs: []const job_mod.EnvVar) !void {
@@ -1635,7 +1736,9 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     ev.runner_name = opts.runner_name;
     var secret_counter: u32 = 0;
     var err_msg: []const u8 = "";
-    const step_cache = opts.step_cache and !optsOutOfStepCache(ev.job_env.items);
+    // Services hold state a cached step would not have changed (a migration replayed from cache
+    // leaves a fresh database empty), so a job with services runs every step.
+    const step_cache = opts.step_cache and !optsOutOfStepCache(ev.job_env.items) and job.services.len == 0;
     // Package managers' caches persist across jobs in Dagger cache volumes (see `package_cache_dirs`).
     const cache_ids: []const []const u8 = if (opts.package_caches and job.github.repository.len > 0) ids: {
         const scope = try packageCacheScope(arena, &ev, job.github.repository);
@@ -1755,6 +1858,15 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
             try std.fmt.allocPrint(arena, "Download action repository '{s}'", .{label}));
     };
     x.setUpLine(try std.fmt.allocPrint(arena, "Complete job name: {s}", .{if (job.display_name.len > 0) job.display_name else if (job.github.job.len > 0) job.github.job else "job"}));
+
+    if (job.services.len > 0 and !try x.startServices()) {
+        var failed = try finish(arena, sh, results, "");
+        failed.succeeded = false;
+        failed.engine_error = null;
+        failed.extra = x.extra.items;
+        failed.next_log_step = x.next_log_step;
+        return failed;
+    }
 
     // JavaScript actions' `pre` scripts run before any step, as on GitHub.
     for (job.steps, 1..) |step, n| if (step.action == .uses) {
@@ -1915,11 +2027,12 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         if (res.outcome == .failure and !coe) ev.job_failed = true;
         if (opts.observer) |o| o.finished(num, res.*);
     }
-    // Then their `post` scripts, last first.
+    // Then their `post` scripts, last first, and the services.
     x.runPosts() catch |e| switch (e) {
         error.EngineFailed => return finish(arena, sh, results, x.err_msg),
         else => return e,
     };
+    try x.stopServices();
     var result = try finish(arena, sh, results, "");
     if (x.hook_failed) result.succeeded = false;
     if (opts.cancel) |c| if (c.requested.load(.acquire)) {
@@ -2046,6 +2159,17 @@ const Exec = struct {
     empty_dir: []const u8 = "",
     images: std.StringHashMapUnmanaged(ImageInfo) = .empty,
     docker_home: ?[]const u8 = null,
+    /// The job's `services:`, running for the whole job (see `startServices`).
+    services: std.ArrayList(RunningService) = .empty,
+    /// Shell lines at the start of every step that forward `localhost:<port>` to the services, as
+    /// a job on GitHub's runner reaches them through ports published on its host.
+    forward_prelude: []const u8 = "",
+
+    const RunningService = struct {
+        name: []const u8,
+        id: []const u8,
+        ports: []const ServicePort,
+    };
 
     const Post = struct {
         num: u32,
@@ -2151,7 +2275,7 @@ const Exec = struct {
                 if (reason) |r| resolved.run.always_run = try std.fmt.allocPrint(arena, "zig-runner runs this step every time: {s} (run {s})", .{ r, x.run_nonce });
             }
         }
-        const script = try stepScriptFc(arena, num, fc, resolved, action_name);
+        const script = try std.mem.concat(arena, u8, &.{ x.forward_prelude, try stepScriptFc(arena, num, fc, resolved, action_name) });
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
         try w.writeAll("{ loadContainerFromID(id:");
@@ -3195,6 +3319,8 @@ const Exec = struct {
             try w.writeAll(") { ");
             braces += 1;
         }
+        // A Docker action reaches the job's services by name, as on GitHub's container network.
+        braces += try x.writeServiceBindings(w);
         try w.writeAll("withExec(args:");
         try std.json.Stringify.value([_][]const u8{ busybox_path, "sh", "-c", script }, .{}, w);
         try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
@@ -3225,6 +3351,174 @@ const Exec = struct {
     }
 
     /// The static busybox that starts Docker actions' commands (taken from its image once per job).
+    /// "Initialize containers": starts each of the job's `services:` and keeps it running for the
+    /// whole job (an explicitly started service lives until the session ends, so its data carries
+    /// from step to step), then binds them to the job's container under their names and forwards
+    /// their published ports to localhost in every step. False when one could not start: the job
+    /// then fails without running its steps, as on GitHub.
+    fn startServices(x: *Exec) !bool {
+        const arena = x.arena;
+        const ev = x.ev;
+        const ls = x.next_log_step;
+        x.next_log_step += 1;
+        const started = std.Io.Clock.real.now(x.io).toMilliseconds();
+        var ok = true;
+        defer x.extra.append(arena, .{ .kind = .pre, .name = "Initialize containers", .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() }) catch {};
+        ev.diag = "";
+        const sc = try ev.scope(&.{});
+        for (x.job.services) |svc| {
+            x.sh.append(ls, try std.fmt.allocPrint(arena, "##[group]Starting {s} service container", .{svc.name}));
+            defer x.sh.append(ls, "##[endgroup]");
+            const image = ev.render(svc.image, sc) catch "";
+            if (image.len == 0) {
+                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "The service '{s}' has no image: {s}", .{ svc.name, ev.diag }));
+                ok = false;
+                return false;
+            }
+            const env = ev.renderEnv(svc.env, sc) catch {
+                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Could not evaluate the env of service '{s}': {s}", .{ svc.name, ev.diag }));
+                ok = false;
+                return false;
+            };
+            var ports: std.ArrayList(ServicePort) = .empty;
+            for (svc.ports) |t| {
+                const text = ev.render(t, sc) catch "";
+                const port = parseServicePort(text) orelse {
+                    x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Unsupported port '{s}' for service '{s}' (TCP ports only: 'container', 'host:container' or 'ip:host:container')", .{ text, svc.name }));
+                    ok = false;
+                    return false;
+                };
+                try ports.append(arena, port);
+            }
+            x.sh.append(ls, try std.fmt.allocPrint(arena, "Image: {s}", .{image}));
+            if (svc.options) |t| {
+                const ignored = try ignoredServiceOptions(arena, ev.render(t, sc) catch "");
+                if (ignored.len > 0) x.sh.append(ls, try std.fmt.allocPrint(arena, "##[warning]Service options not supported and ignored: {s}", .{ignored}));
+            }
+            if (svc.volumes.len > 0) x.sh.append(ls, "##[warning]Service volumes are not supported and were ignored.");
+
+            var doc: std.Io.Writer.Allocating = .init(arena);
+            const w = &doc.writer;
+            try w.writeAll("{ container { ");
+            var braces: usize = 2;
+            if (svc.username) |ut| if (svc.password) |pt| {
+                const user = ev.render(ut, sc) catch "";
+                const pass = ev.render(pt, sc) catch "";
+                if (user.len > 0 and pass.len > 0) {
+                    const secret = newSecret(arena, x.transport, &x.secret_counter, pass, &x.err_msg) catch {
+                        x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Could not register the credentials of service '{s}': {s}", .{ svc.name, x.err_msg }));
+                        ok = false;
+                        return false;
+                    };
+                    try w.writeAll("withRegistryAuth(address:");
+                    try std.json.Stringify.value(registryHost(image), .{}, w);
+                    try w.writeAll(",username:");
+                    try std.json.Stringify.value(user, .{}, w);
+                    try w.writeAll(",secret:");
+                    try std.json.Stringify.value(secret, .{}, w);
+                    try w.writeAll(") { ");
+                    braces += 1;
+                }
+            };
+            try w.writeAll("from(address:");
+            try std.json.Stringify.value(image, .{}, w);
+            try w.writeAll(") { ");
+            braces += 1;
+            // As GitHub's runner sets them for service containers.
+            const defaults = [_]job_mod.EnvVar{ .{ .name = "GITHUB_ACTIONS", .value = "true" }, .{ .name = "CI", .value = "true" } };
+            for (&defaults) |e| {
+                try w.print("withEnvVariable(name:\"{s}\",value:\"{s}\") {{ ", .{ e.name, e.value });
+                braces += 1;
+            }
+            for (env) |e| {
+                try w.writeAll("withEnvVariable(name:");
+                try std.json.Stringify.value(e.name, .{}, w);
+                try w.writeAll(",value:");
+                try std.json.Stringify.value(e.value, .{}, w);
+                try w.writeAll(") { ");
+                braces += 1;
+            }
+            for (ports.items) |p| {
+                try w.print("withExposedPort(port:{d}) {{ ", .{p.container});
+                braces += 1;
+            }
+            // `start` waits until the exposed ports accept connections, which is when servers such
+            // as Postgres are ready (during its first-run setup it listens on no TCP port).
+            try w.writeAll("asService(useEntrypoint:true) { start }");
+            for (0..braces) |_| try w.writeAll(" }");
+            const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch {
+                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to start service container {s}: {s}", .{ svc.name, x.err_msg }));
+                ok = false;
+                return false;
+            };
+            const id = jsonFindString(data, "start") orelse {
+                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to start service container {s}", .{svc.name}));
+                ok = false;
+                return false;
+            };
+            for (ports.items) |p| x.sh.append(ls, try std.fmt.allocPrint(arena, "{d}/tcp -> localhost:{d}", .{ p.container, p.host }));
+            try x.services.append(arena, .{ .name = svc.name, .id = id, .ports = ports.items });
+        }
+        x.sh.append(ls, "##[group]Waiting for all services to be ready");
+        for (x.services.items) |r| x.sh.append(ls, try std.fmt.allocPrint(arena, "{s} service is healthy.", .{r.name}));
+        x.sh.append(ls, "##[endgroup]");
+
+        // The job's container: the services under their names, and busybox for the forwarders.
+        const busybox = (try x.busyboxFile(ls)) orelse {
+            ok = false;
+            return false;
+        };
+        var doc: std.Io.Writer.Allocating = .init(arena);
+        const w = &doc.writer;
+        try w.writeAll("{ loadContainerFromID(id:");
+        try std.json.Stringify.value(x.container_id, .{}, w);
+        try w.writeAll(") { withFile(path:\"" ++ busybox_path ++ "\",permissions:493,source:");
+        try std.json.Stringify.value(busybox, .{}, w);
+        try w.writeAll(") { ");
+        const braces = 3 + try x.writeServiceBindings(w);
+        try w.writeAll("id");
+        for (0..braces) |_| try w.writeAll(" }");
+        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch {
+            x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Could not bind the services to the job: {s}", .{x.err_msg}));
+            ok = false;
+            return false;
+        };
+        x.container_id = jsonFindString(data, "id") orelse {
+            ok = false;
+            return false;
+        };
+        x.forward_prelude = try forwardPrelude(arena, x.services.items);
+        try ev.setServices(x.services.items);
+        return true;
+    }
+
+    /// `withServiceBinding` for each service, open (the caller closes the braces); how many.
+    fn writeServiceBindings(x: *Exec, w: *std.Io.Writer) !usize {
+        for (x.services.items) |r| {
+            try w.writeAll("withServiceBinding(alias:");
+            try std.json.Stringify.value(r.name, .{}, w);
+            try w.writeAll(",service:");
+            try std.json.Stringify.value(r.id, .{}, w);
+            try w.writeAll(") { ");
+        }
+        return x.services.items.len;
+    }
+
+    /// "Stop containers", after the post scripts, as GitHub's runner ends a job with services.
+    fn stopServices(x: *Exec) !void {
+        if (x.services.items.len == 0) return;
+        const ls = x.next_log_step;
+        x.next_log_step += 1;
+        const started = std.Io.Clock.real.now(x.io).toMilliseconds();
+        for (x.services.items) |r| {
+            x.sh.append(ls, try std.fmt.allocPrint(x.arena, "Stop and remove container: {s}", .{r.name}));
+            const doc = try std.fmt.allocPrint(x.arena, "{{ loadServiceFromID(id:{f}) {{ stop }} }}", .{std.json.fmt(r.id, .{})});
+            var msg: []const u8 = "";
+            _ = gql(x.arena, x.transport, doc, &msg) catch x.sh.append(ls, try std.fmt.allocPrint(x.arena, "##[warning]Could not stop {s}: {s}", .{ r.name, msg }));
+        }
+        try x.extra.append(x.arena, .{ .kind = .post, .name = "Stop containers", .log_step = ls, .outcome = .success, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() });
+    }
+
     fn busyboxFile(x: *Exec, num: u32) !?[]const u8 {
         if (x.busybox_id) |id| return id;
         var msg: []const u8 = "";
@@ -3676,6 +3970,42 @@ fn finish(arena: Allocator, sh: *Shared, results: []StepResult, engine_msg: []co
 }
 
 // --- tests ---
+
+test "service ports: as GitHub writes them" {
+    try std.testing.expectEqual(ServicePort{ .host = 5432, .container = 5432 }, parseServicePort("5432:5432").?);
+    try std.testing.expectEqual(ServicePort{ .host = 6379, .container = 6379 }, parseServicePort("6379").?);
+    try std.testing.expectEqual(ServicePort{ .host = 15432, .container = 5432 }, parseServicePort("127.0.0.1:15432:5432").?);
+    try std.testing.expectEqual(ServicePort{ .host = 80, .container = 80 }, parseServicePort(" 80/tcp ").?);
+    try std.testing.expect(parseServicePort("53/udp") == null);
+    try std.testing.expect(parseServicePort("http") == null);
+    try std.testing.expect(parseServicePort("0") == null);
+}
+
+test "service options: health checks are accepted, the rest reported" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    try std.testing.expectEqualStrings("", try ignoredServiceOptions(ar, "--health-cmd \"pg_isready -U postgres\" --health-interval 2s --health-timeout=5s --health-retries 30"));
+    try std.testing.expectEqualStrings("--shm-size 1g", try ignoredServiceOptions(ar, "--health-cmd 'redis-cli ping' --shm-size 1g"));
+}
+
+test "service credentials go to the image's registry" {
+    try std.testing.expectEqualStrings("docker.io", registryHost("postgres:17"));
+    try std.testing.expectEqualStrings("docker.io", registryHost("bitnami/postgresql:17"));
+    try std.testing.expectEqualStrings("ghcr.io", registryHost("ghcr.io/acme/db:1"));
+    try std.testing.expectEqualStrings("localhost:5000", registryHost("localhost:5000/db"));
+}
+
+test "each published port is forwarded from localhost to its service" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const svcs = [_]Exec.RunningService{.{ .name = "postgres", .id = "S", .ports = &.{.{ .host = 15432, .container = 5432 }} }};
+    try std.testing.expectEqualStrings(
+        "\"" ++ busybox_path ++ "\" tcpsvd 127.0.0.1 15432 \"" ++ busybox_path ++ "\" nc 'postgres' 5432 >/dev/null 2>&1 &\n" ++
+            "\"" ++ busybox_path ++ "\" tcpsvd ::1 15432 \"" ++ busybox_path ++ "\" nc 'postgres' 5432 >/dev/null 2>&1 &\n",
+        try forwardPrelude(a.allocator(), &svcs),
+    );
+}
 
 const FakeAbort = struct {
     in_flight: bool = false,
