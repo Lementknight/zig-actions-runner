@@ -674,6 +674,7 @@ pub fn shownSteps(arena: Allocator, ids: []const []const u8, job: job_mod.Job, r
         first_started = e.started_ms;
     };
     try out.append(arena, .{ .id = ids[0], .number = 0, .name = "Set up job", .log_step = 0, .conclusion = "succeeded", .started_ms = job_started_ms, .completed_ms = first_started });
+    for (result.extra) |e| if (e.kind == .initialize) try out.append(arena, extraShown(ids, e));
     for (result.extra) |e| if (e.kind == .pre) try out.append(arena, extraShown(ids, e));
     for (job.steps, result.steps, 1..) |step, r, n| try out.append(arena, .{
         .id = step.id,
@@ -690,9 +691,36 @@ pub fn shownSteps(arena: Allocator, ids: []const []const u8, job: job_mod.Job, r
         .started_ms = r.started_ms,
         .completed_ms = r.completed_ms,
     });
-    for (result.extra) |e| if (e.kind == .post) try out.append(arena, extraShown(ids, e));
+    const main_end = out.items.len;
+    var posts: u32 = 0;
+    var pres: u32 = 0;
+    for (result.extra) |e| switch (e.kind) {
+        .post => {
+            try out.append(arena, extraShown(ids, e));
+            posts += 1;
+        },
+        .pre => pres += 1,
+        else => {},
+    };
+    const stop_at = out.items.len;
+    for (result.extra) |e| if (e.kind == .stop) try out.append(arena, extraShown(ids, e));
+    const has_stop = out.items.len > stop_at;
     try out.append(arena, .{ .id = ids[complete.log_step], .number = 0, .name = "Complete job", .log_step = complete.log_step, .conclusion = "succeeded", .started_ms = complete.started_ms, .completed_ms = complete.completed_ms });
-    for (out.items, 1..) |*s, n| s.number = @intCast(n);
+
+    // GitHub's numbers (seen on every hosted job compared): in order up to the last main step. With
+    // post steps or "Stop containers", one number is set aside after it for each step that could
+    // have a post (the job's steps and the pre steps) and one more; the post steps take the last of
+    // those, then "Stop containers" and "Complete job" follow.
+    for (out.items[0..main_end], 1..) |*s, n| s.number = @intCast(n);
+    var next: u32 = @intCast(main_end + 1);
+    if (posts > 0 or has_stop) {
+        const reserved: u32 = @as(u32, @intCast(job.steps.len)) + pres + 1;
+        next = @as(u32, @intCast(main_end)) + 1 + reserved - posts;
+    }
+    for (out.items[main_end..]) |*s| {
+        s.number = next;
+        next += 1;
+    }
     return out.items;
 }
 
@@ -897,11 +925,13 @@ test "the steps GitHub shows: Set up job, pre, the job's steps, post, Complete j
     const shown = try shownSteps(arena, &ids, job, result, 500, .{ .log_step = 7, .started_ms = 3200, .completed_ms = 3300 });
     const names = [_][]const u8{ "Set up job", "Pre a", "a", "b", "c", "d", "Post a", "Complete job" };
     const logs = [_]u32{ 0, 5, 1, 2, 3, 4, 6, 7 };
+    // After the main steps GitHub sets aside 4 job steps + 1 pre + 1 numbers; the post takes the last.
+    const numbers = [_]u32{ 1, 2, 3, 4, 5, 6, 12, 13 };
     try std.testing.expectEqual(names.len, shown.len);
-    for (shown, names, logs, 1..) |sh, name, ls, n| {
+    for (shown, names, logs, numbers) |sh, name, ls, n| {
         try std.testing.expectEqualStrings(name, sh.name);
         try std.testing.expectEqual(ls, sh.log_step);
-        try std.testing.expectEqual(@as(u32, @intCast(n)), sh.number);
+        try std.testing.expectEqual(n, sh.number);
     }
     // Each step has the id of its log step, the one the live view used: GitHub's for the job's steps.
     try std.testing.expectEqualStrings("setup", shown[0].id);
@@ -916,6 +946,41 @@ test "the steps GitHub shows: Set up job, pre, the job's steps, post, Complete j
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"b\",\"status\":\"completed\",\"conclusion\":\"succeeded\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"c\",\"status\":\"completed\",\"conclusion\":\"failed\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"d\",\"status\":\"completed\",\"conclusion\":\"skipped\"}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"number\":7,\"name\":\"Post a\",\"status\":\"completed\",\"conclusion\":\"failed\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"number\":8,\"name\":\"Complete job\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"number\":12,\"name\":\"Post a\",\"status\":\"completed\",\"conclusion\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"number\":13,\"name\":\"Complete job\"") != null);
+}
+
+test "step numbers as GitHub gives them (cases from hosted jobs)" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const mk = struct {
+        fn step(id: []const u8) job_mod.Step {
+            return .{ .id = id, .name = id, .condition = "success()", .action = .{ .unsupported = "x" } };
+        }
+    };
+    const ids = [_][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" };
+    const Case = struct { steps: usize, extra: []const dagger.ExtraStep, complete_log: u32, want: []const u32 };
+    const cases = [_]Case{
+        // checkout, a run step, github-script; checkout's post: 1 2 3 4 · 8 9.
+        .{ .steps = 3, .extra = &.{.{ .kind = .post, .name = "Post Run actions/checkout@v6", .log_step = 4, .outcome = .success, .started_ms = 0, .completed_ms = 0 }}, .complete_log = 5, .want = &.{ 1, 2, 3, 4, 8, 9 } },
+        // services, four steps, no post: 1 2(Initialize) 3-6 · 12(Stop) 13.
+        .{ .steps = 4, .extra = &.{
+            .{ .kind = .initialize, .name = "Initialize containers", .log_step = 5, .outcome = .success, .started_ms = 0, .completed_ms = 0 },
+            .{ .kind = .stop, .name = "Stop containers", .log_step = 6, .outcome = .success, .started_ms = 0, .completed_ms = 0 },
+        }, .complete_log = 7, .want = &.{ 1, 2, 3, 4, 5, 6, 12, 13 } },
+        // no post, no services: no gap.
+        .{ .steps = 2, .extra = &.{}, .complete_log = 3, .want = &.{ 1, 2, 3, 4 } },
+    };
+    for (cases) |cs| {
+        const steps = try arena.alloc(job_mod.Step, cs.steps);
+        for (steps, 0..) |*st, i| st.* = mk.step(ids[i + 1]);
+        const rs = try arena.alloc(dagger.StepResult, cs.steps);
+        @memset(rs, .{ .outcome = .success });
+        const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 1, .secrets = &.{}, .steps = steps };
+        const result: dagger.Result = .{ .steps = rs, .engine_error = null, .succeeded = true, .extra = cs.extra, .next_log_step = cs.complete_log };
+        const shown = try shownSteps(arena, &ids, job, result, 0, .{ .log_step = cs.complete_log, .started_ms = 0, .completed_ms = 0 });
+        try std.testing.expectEqual(cs.want.len, shown.len);
+        for (shown, cs.want) |sh, n| try std.testing.expectEqual(n, sh.number);
+    }
 }

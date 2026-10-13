@@ -35,6 +35,9 @@ pub const Live = struct {
     steps: std.ArrayList(Step) = .empty,
     steps_changed: bool = false,
     change_order: u64 = 0,
+    /// The number the next step gets, and the pre steps so far (guarded by `mu`; see `posts`).
+    next_number: u32 = 1,
+    pres: u32 = 0,
 
     socket: feed.Socket = undefined,
     feed_open: bool = false,
@@ -92,7 +95,17 @@ pub const Live = struct {
     }
 
     pub fn observer(l: *Live) dagger.Observer {
-        return .{ .ptr = l, .startedFn = stepStarted, .finishedFn = stepFinished, .extraStartedFn = extraStarted, .extraFinishedFn = extraFinished };
+        return .{ .ptr = l, .startedFn = stepStarted, .finishedFn = stepFinished, .extraStartedFn = extraStarted, .extraFinishedFn = extraFinished, .postsFn = posts };
+    }
+
+    /// GitHub's numbering after the main steps (see `loop.shownSteps`): one number per step that
+    /// could have a post and one more are set aside, the post steps take the last of them.
+    fn posts(ptr: *anyopaque, count: u32, _: bool) void {
+        const l: *Live = @ptrCast(@alignCast(ptr));
+        l.mu.lockUncancelable(l.io);
+        defer l.mu.unlock(l.io);
+        const reserved: u32 = @as(u32, @intCast(l.job.steps.len)) + l.pres + 1;
+        l.next_number = l.next_number + reserved - count;
     }
 
     fn onLine(ptr: *anyopaque, step: u32, text: []const u8) void {
@@ -122,10 +135,11 @@ pub const Live = struct {
             s.completed_ms = started_ms;
         };
         const name_copy = l.gpa.dupe(u8, name) catch return null;
-        l.steps.append(l.gpa, .{ .log_step = log_step, .number = @intCast(l.steps.items.len + 1), .name = name_copy, .started_ms = started_ms }) catch {
+        l.steps.append(l.gpa, .{ .log_step = log_step, .number = l.next_number, .name = name_copy, .started_ms = started_ms }) catch {
             l.gpa.free(name_copy);
             return null;
         };
+        l.next_number += 1;
         l.steps_changed = true;
         return &l.steps.items[l.steps.items.len - 1];
     }
@@ -154,8 +168,13 @@ pub const Live = struct {
         if (l.next) |o| o.finishedFn(o.ptr, number, res);
     }
 
-    fn extraStarted(ptr: *anyopaque, log_step: u32, name: []const u8, started_ms: i64) void {
+    fn extraStarted(ptr: *anyopaque, kind: dagger.ExtraKind, log_step: u32, name: []const u8, started_ms: i64) void {
         const l: *Live = @ptrCast(@alignCast(ptr));
+        if (kind == .pre) {
+            l.mu.lockUncancelable(l.io);
+            l.pres += 1;
+            l.mu.unlock(l.io);
+        }
         l.begin(log_step, name, started_ms);
     }
 
