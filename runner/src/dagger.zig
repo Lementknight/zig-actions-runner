@@ -44,6 +44,8 @@ pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteracti
 pub const Marker = union(enum) {
     begin: u32,
     end: u32,
+    /// The first line a service prints (see `startServices`): its output is service n's (0-based).
+    service: u32,
 };
 
 pub const Scan = struct {
@@ -62,6 +64,8 @@ pub fn scan(line: []const u8) ?Scan {
         .{ .begin = step }
     else if (std.mem.eql(u8, kind, "end"))
         .{ .end = step }
+    else if (std.mem.eql(u8, kind, "service"))
+        .{ .service = step }
     else
         return null;
     return .{ .before = line[0..i], .marker = m };
@@ -503,6 +507,9 @@ pub const Annotation = struct { step: u32, an: commands.Annotation };
 fn countLines(msg: []const u8) u32 {
     return @intCast(std.mem.count(u8, msg, "\n") + 1);
 }
+
+/// Per service, kept for "Stop containers".
+const max_service_log_lines = 10_000;
 
 /// The largest step summary GitHub accepts (its `soft_size_limit`).
 const max_summary_bytes = 1024 * 1024;
@@ -1229,6 +1236,10 @@ const Shared = struct {
     /// `::error`/`::warning`/`::notice` lines and the runner's own errors, sent with completejob so
     /// GitHub shows them on the run (guarded by `mu`).
     annotations: std.ArrayList(Annotation) = .empty,
+    /// Each service's output (index = service), printed in "Stop containers" as GitHub's runner
+    /// prints `docker logs` (guarded by `mu`); lines past `max_service_log_lines` are counted.
+    service_logs: []std.ArrayList([]const u8) = &.{},
+    service_dropped: []u32 = &.{},
     /// Lines logged per log step so far (guarded by `mu`): an annotation without a file points to
     /// its line in the step's log, as GitHub's runner does.
     line_counts: []u32 = &.{},
@@ -1403,6 +1414,29 @@ const Shared = struct {
         sh.stepOutput(step, text);
     }
 
+    /// Service `n`'s output so far, and a note when lines were left out.
+    fn takeServiceLog(sh: *Shared, n: usize) []const []const u8 {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        if (n >= sh.service_logs.len) return &.{};
+        if (sh.service_dropped[n] > 0) {
+            const note = std.fmt.allocPrint(sh.arena, "... {d} more lines not kept", .{sh.service_dropped[n]}) catch return sh.service_logs[n].items;
+            sh.service_logs[n].append(sh.arena, note) catch {};
+        }
+        return sh.service_logs[n].items;
+    }
+
+    fn serviceLine(sh: *Shared, n: u32, line: []const u8) void {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        if (n >= sh.service_logs.len) return;
+        if (sh.service_logs[n].items.len >= max_service_log_lines) {
+            sh.service_dropped[n] += 1;
+            return;
+        }
+        sh.service_logs[n].append(sh.arena, sh.arena.dupe(u8, line) catch return) catch {};
+    }
+
     fn noise(sh: *Shared, line: []const u8) void {
         sh.mu.lockUncancelable(sh.io);
         defer sh.mu.unlock(sh.io);
@@ -1435,6 +1469,7 @@ const Demux = struct {
                     d.sh.flush();
                     d.span_step = null;
                 },
+                .service => {},
             }
         } else if (d.span_step) |c| {
             d.sh.emitLive(c, line);
@@ -1500,6 +1535,10 @@ pub fn run(
     @memset(step_commands, .{});
     const line_counts = try arena.alloc(u32, logSteps(job.steps.len));
     @memset(line_counts, 0);
+    const service_logs = try arena.alloc(std.ArrayList([]const u8), job.services.len);
+    @memset(service_logs, .empty);
+    const service_dropped = try arena.alloc(u32, job.services.len);
+    @memset(service_dropped, 0);
     var sh: Shared = .{
         .io = io,
         .arena = arena,
@@ -1510,6 +1549,8 @@ pub fn run(
         .commands = step_commands,
         .replayed_steps = replayed_steps,
         .line_counts = line_counts,
+        .service_logs = service_logs,
+        .service_dropped = service_dropped,
         .step_debug = stepDebug(arena, job),
     };
 
@@ -1661,6 +1702,8 @@ const SpanDemux = struct {
 
     const Span = struct {
         step: ?u32 = null,
+        /// The span is a service's (its output is kept for "Stop containers").
+        service: ?u32 = null,
         partial: std.ArrayList(u8) = .empty,
     };
 
@@ -1701,9 +1744,12 @@ const SpanDemux = struct {
                     d.sh.flush();
                     span.step = null;
                 },
+                .service => |n| span.service = n,
             }
         } else if (span.step) |c| {
             d.sh.emitLive(c, text);
+        } else if (span.service) |n| {
+            d.sh.serviceLine(n, text);
         } else if (text.len > 0) {
             d.sh.noise(text);
         }
@@ -3366,7 +3412,12 @@ const Exec = struct {
         defer x.extra.append(arena, .{ .kind = .pre, .name = "Initialize containers", .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() }) catch {};
         ev.diag = "";
         const sc = try ev.scope(&.{});
-        for (x.job.services) |svc| {
+        // Each service starts through busybox's sh, which names the service's log (see below).
+        const busybox = (try x.busyboxFile(ls)) orelse {
+            ok = false;
+            return false;
+        };
+        for (x.job.services, 0..) |svc, svc_index| {
             x.sh.append(ls, try std.fmt.allocPrint(arena, "##[group]Starting {s} service container", .{svc.name}));
             defer x.sh.append(ls, "##[endgroup]");
             const image = ev.render(svc.image, sc) catch "";
@@ -3397,10 +3448,10 @@ const Exec = struct {
             }
             if (svc.volumes.len > 0) x.sh.append(ls, "##[warning]Service volumes are not supported and were ignored.");
 
-            var doc: std.Io.Writer.Allocating = .init(arena);
-            const w = &doc.writer;
-            try w.writeAll("{ container { ");
-            var braces: usize = 2;
+            // `container {` and, for a private registry, its credentials, as both queries start.
+            var head: std.Io.Writer.Allocating = .init(arena);
+            var head_braces: usize = 2;
+            try head.writer.writeAll("{ container { ");
             if (svc.username) |ut| if (svc.password) |pt| {
                 const user = ev.render(ut, sc) catch "";
                 const pass = ev.render(pt, sc) catch "";
@@ -3410,20 +3461,56 @@ const Exec = struct {
                         ok = false;
                         return false;
                     };
-                    try w.writeAll("withRegistryAuth(address:");
-                    try std.json.Stringify.value(registryHost(image), .{}, w);
-                    try w.writeAll(",username:");
-                    try std.json.Stringify.value(user, .{}, w);
-                    try w.writeAll(",secret:");
-                    try std.json.Stringify.value(secret, .{}, w);
-                    try w.writeAll(") { ");
-                    braces += 1;
+                    const hw = &head.writer;
+                    try hw.writeAll("withRegistryAuth(address:");
+                    try std.json.Stringify.value(registryHost(image), .{}, hw);
+                    try hw.writeAll(",username:");
+                    try std.json.Stringify.value(user, .{}, hw);
+                    try hw.writeAll(",secret:");
+                    try std.json.Stringify.value(secret, .{}, hw);
+                    try hw.writeAll(") { ");
+                    head_braces += 1;
                 }
             };
-            try w.writeAll("from(address:");
-            try std.json.Stringify.value(image, .{}, w);
+            try head.writer.writeAll("from(address:");
+            try std.json.Stringify.value(image, .{}, &head.writer);
+            try head.writer.writeAll(") { ");
+            head_braces += 1;
+
+            // The image's configuration first: its entrypoint and command (the service runs them),
+            // and the digest it resolved to, as GitHub's runner logs its `docker pull`.
+            x.sh.append(ls, try std.fmt.allocPrint(arena, "Pulling {s}", .{image}));
+            var cfg_doc: std.Io.Writer.Allocating = .init(arena);
+            try cfg_doc.writer.writeAll(head.written());
+            try cfg_doc.writer.writeAll("entrypoint defaultArgs imageRef");
+            for (0..head_braces) |_| try cfg_doc.writer.writeAll(" }");
+            const cfg = gql(arena, x.transport, cfg_doc.written(), &x.err_msg) catch {
+                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to pull {s} for service {s}: {s}", .{ image, svc.name, x.err_msg }));
+                ok = false;
+                return false;
+            };
+            if (jsonFindString(cfg, "imageRef")) |ref| if (std.mem.indexOf(u8, ref, "@sha256:")) |at| {
+                x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{ref[at + 1 ..]}));
+            };
+            const entrypoint = try jsonStrings(arena, jsonFind(cfg, "entrypoint"));
+            const cmd = try jsonStrings(arena, jsonFind(cfg, "defaultArgs"));
+            if (entrypoint.len + cmd.len == 0) {
+                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "The image {s} of service {s} has no entrypoint or command to run", .{ image, svc.name }));
+                ok = false;
+                return false;
+            }
+
+            var doc: std.Io.Writer.Allocating = .init(arena);
+            const w = &doc.writer;
+            try w.writeAll(head.written());
+            var braces = head_braces;
+            try w.writeAll("withFile(path:\"" ++ busybox_path ++ "\",permissions:493,source:");
+            try std.json.Stringify.value(busybox, .{}, w);
             try w.writeAll(") { ");
             braces += 1;
+            // The services started before this one, by name, as on a shared network. (A service
+            // cannot reach one started after it: a binding needs the service to exist.)
+            braces += try x.writeServiceBindings(w);
             // As GitHub's runner sets them for service containers.
             const defaults = [_]job_mod.EnvVar{ .{ .name = "GITHUB_ACTIONS", .value = "true" }, .{ .name = "CI", .value = "true" } };
             for (&defaults) |e| {
@@ -3442,9 +3529,17 @@ const Exec = struct {
                 try w.print("withExposedPort(port:{d}) {{ ", .{p.container});
                 braces += 1;
             }
-            // `start` waits until the exposed ports accept connections, which is when servers such
-            // as Postgres are ready (during its first-run setup it listens on no TCP port).
-            try w.writeAll("asService(useEntrypoint:true) { start }");
+            // The image's entrypoint and command, started by a shell that first prints the marker
+            // that names this service's output. `start` waits until the exposed ports accept
+            // connections, which is when servers such as Postgres are ready (during its first-run
+            // setup it listens on no TCP port).
+            var args: std.ArrayList([]const u8) = .empty;
+            try args.appendSlice(arena, &.{ busybox_path, "sh", "-c", try std.fmt.allocPrint(arena, "echo '{s}service {d}'; exec \"$@\"", .{ marker, svc_index }), "zig-service" });
+            try args.appendSlice(arena, entrypoint);
+            try args.appendSlice(arena, cmd);
+            try w.writeAll("asService(args:");
+            try std.json.Stringify.value(args.items, .{}, w);
+            try w.writeAll(") { start }");
             for (0..braces) |_| try w.writeAll(" }");
             const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch {
                 x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to start service container {s}: {s}", .{ svc.name, x.err_msg }));
@@ -3464,10 +3559,6 @@ const Exec = struct {
         x.sh.append(ls, "##[endgroup]");
 
         // The job's container: the services under their names, and busybox for the forwarders.
-        const busybox = (try x.busyboxFile(ls)) orelse {
-            ok = false;
-            return false;
-        };
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
         try w.writeAll("{ loadContainerFromID(id:");
@@ -3510,7 +3601,9 @@ const Exec = struct {
         const ls = x.next_log_step;
         x.next_log_step += 1;
         const started = std.Io.Clock.real.now(x.io).toMilliseconds();
-        for (x.services.items) |r| {
+        for (x.services.items, 0..) |r, i| {
+            x.sh.append(ls, try std.fmt.allocPrint(x.arena, "Print service container logs: {s}", .{r.name}));
+            for (x.sh.takeServiceLog(i)) |l| x.sh.append(ls, l);
             x.sh.append(ls, try std.fmt.allocPrint(x.arena, "Stop and remove container: {s}", .{r.name}));
             const doc = try std.fmt.allocPrint(x.arena, "{{ loadServiceFromID(id:{f}) {{ stop }} }}", .{std.json.fmt(r.id, .{})});
             var msg: []const u8 = "";
@@ -3970,6 +4063,11 @@ fn finish(arena: Allocator, sh: *Shared, results: []StepResult, engine_msg: []co
 }
 
 // --- tests ---
+
+test "a service's first line names its output" {
+    const sc = scan("::zig-step::service 1").?;
+    try std.testing.expectEqual(Marker{ .service = 1 }, sc.marker);
+}
 
 test "service ports: as GitHub writes them" {
     try std.testing.expectEqual(ServicePort{ .host = 5432, .container = 5432 }, parseServicePort("5432:5432").?);
