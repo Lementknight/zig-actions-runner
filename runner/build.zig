@@ -3,6 +3,8 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    // Release builds for deployment drop debug info (`zig build -Doptimize=ReleaseSafe -Dstrip`).
+    const strip = b.option(bool, "strip", "Omit debug information") orelse null;
 
     const exe = b.addExecutable(.{
         .name = "runner",
@@ -10,6 +12,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
         }),
     });
     b.installArtifact(exe);

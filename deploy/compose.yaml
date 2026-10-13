@@ -1,0 +1,40 @@
+# A pool of runners and the Dagger engine their jobs run in, on one machine (docs/DEPLOY.md).
+#
+#   cp deploy/runner.env.example deploy/runner.env   # then fill it in
+#   docker compose -f deploy/compose.yaml up -d --build
+#
+# The runner reaches the engine through a unix socket on a shared volume: no Docker socket is
+# mounted into the runner and no network listener is opened.
+name: zig-runner
+
+services:
+  engine:
+    image: registry.dagger.io/engine:v0.21.10
+    # The engine runs each step in its own container, which needs privileges.
+    privileged: true
+    command: ["--addr", "unix:///run/dagger/engine.sock"]
+    volumes:
+      - engine-state:/var/lib/dagger
+      - engine-socket:/run/dagger
+    restart: unless-stopped
+
+  runner:
+    build: ../runner
+    image: zig-runner:local
+    env_file: runner.env
+    environment:
+      RUNNER_ENGINE_HOST: unix:///run/dagger/engine.sock
+    volumes:
+      - engine-socket:/run/dagger
+    depends_on:
+      - engine
+    restart: unless-stopped
+    # On `docker compose stop` / `down`, waiting runners stop at once and running jobs finish first.
+    # Jobs that may run longer need a longer grace period; past it Docker kills the runner, and
+    # GitHub fails its jobs ("lost communication") once their hold runs out.
+    stop_grace_period: 60m
+
+volumes:
+  # The engine's cache: images, layers, and the step and package caches that make reruns fast.
+  engine-state:
+  engine-socket:

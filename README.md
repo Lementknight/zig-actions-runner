@@ -4,8 +4,16 @@ A lightweight, Zig-based alternative to the official GitHub Actions runner. Jobs
 
 - [Design document](docs/DESIGN.md)
 - [Spec sheet](docs/SPEC.md)
+- [Deploying the runner](docs/DEPLOY.md): Docker Compose, systemd, or a plain binary
 
-Status: design phase.
+Quick start, on a Linux machine with Docker:
+
+```sh
+cp deploy/runner.env.example deploy/runner.env   # fill in GH_TOKEN and GH_SCOPE
+docker compose -f deploy/compose.yaml up -d --build
+```
+
+Then select the runners in a workflow with `runs-on: [self-hosted, zig]`.
 
 ## Git hooks
 
