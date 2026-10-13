@@ -429,12 +429,7 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
 
     var result: dagger.Result = undefined;
     // Fail the job up front rather than run steps that would fail in confusing ways without them.
-    const unsupported: ?[]const u8 = if (job.has_container)
-        "container: jobs are not supported yet"
-    else if (job.services_error) |why|
-        why
-    else
-        null;
+    const unsupported: ?[]const u8 = job.container_error orelse job.services_error;
     if (unsupported) |why| {
         const step_results = try c.arena.alloc(dagger.StepResult, job.steps.len);
         @memset(step_results, .{});
@@ -861,7 +856,7 @@ test "the steps GitHub shows: Set up job, pre, the job's steps, post, Complete j
         }
     };
     const steps = [_]job_mod.Step{ mk.step("a"), mk.step("b"), mk.step("c"), mk.step("d") };
-    const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 1, .has_container = false, .secrets = &.{}, .steps = &steps };
+    const job: job_mod.Job = .{ .plan_id = "p", .job_id = "j", .job_token = "t", .check_run_id = 1, .secrets = &.{}, .steps = &steps };
     var rs = [_]dagger.StepResult{
         .{ .outcome = .success, .started_ms = 1000, .completed_ms = 2000 },
         .{ .outcome = .failure, .exit_code = 5, .continued = true },

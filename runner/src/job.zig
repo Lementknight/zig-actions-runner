@@ -99,8 +99,11 @@ pub const Job = struct {
     check_run_id: u64,
     /// The job's name as shown on GitHub (`jobDisplayName`).
     display_name: []const u8 = "",
-    /// `container:` jobs are not supported in v0.
-    has_container: bool,
+    /// `container:`: the image every step runs in, with its env and registry credentials (the
+    /// message's `jobContainer`, in the same shape as a service; `name` is "job").
+    container: ?Service = null,
+    /// Set when `container:` could not be read.
+    container_error: ?[]const u8 = null,
     /// `services:` (the message's `jobServiceContainers`), in the workflow's order.
     services: []const Service = &.{},
     /// Set when `services:` could not be read (one written as a single expression, say).
@@ -196,6 +199,18 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         };
     };
 
+    var container: ?Service = null;
+    var container_error: ?[]const u8 = null;
+    if (root.object.get("jobContainer")) |jc| if (jc != .null) {
+        container = parseService(arena, "job", jc) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unsupported => blk: {
+                container_error = "container: could not be read (written as an expression, or in a form the runner does not know)";
+                break :blk null;
+            },
+        };
+    };
+
     return .{
         .plan_id = path(root, &.{ "plan", "planId" }) orelse return error.MalformedJob,
         .job_id = path(root, &.{"jobId"}) orelse return error.MalformedJob,
@@ -209,7 +224,8 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .env = try jobEnv(arena, root),
         .context_data = root.object.get("contextData") orelse .null,
         .display_name = path(root, &.{"jobDisplayName"}) orelse "",
-        .has_container = if (root.object.get("jobContainer")) |c| c != .null else false,
+        .container = container,
+        .container_error = container_error,
         .services = services,
         .services_error = services_error,
         .token_permissions = variable(root, "system.github.token.permissions") orelse "",
@@ -531,11 +547,15 @@ fn parseServices(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![
     for (map.array.items) |pair| {
         if (pair != .object) return error.Unsupported;
         const name = literal(pair.object.get("Key") orelse return error.Unsupported) orelse return error.Unsupported;
-        const body = pair.object.get("Value") orelse return error.Unsupported;
-        if (tokenTemplate(body)) |image| {
-            try out.append(arena, .{ .name = name, .image = image });
-            continue;
-        }
+        try out.append(arena, try parseService(arena, name, pair.object.get("Value") orelse return error.Unsupported));
+    }
+    return out.items;
+}
+
+/// One service, or the job's container: a mapping, or just the image.
+fn parseService(arena: Allocator, name: []const u8, body: Value) error{ OutOfMemory, Unsupported }!Service {
+    {
+        if (tokenTemplate(body)) |image| return .{ .name = name, .image = image };
         if (tokenType(body) != 2) return error.Unsupported;
         var svc: Service = .{ .name = name, .image = .{ .lit = "" } };
         const fields = body.object.get("map") orelse return error.Unsupported;
@@ -561,9 +581,8 @@ fn parseServices(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![
                 }
             }
         }
-        try out.append(arena, svc);
+        return svc;
     }
-    return out.items;
 }
 
 /// A sequence token of literals or expressions.
@@ -794,7 +813,7 @@ test "parse job fixture" {
         if (std.mem.eql(u8, sv.name, "GITHUB_TOKEN")) seen_token = std.mem.eql(u8, sv.value, "ghs_secret");
     }
     try std.testing.expect(seen_host and seen_token);
-    try std.testing.expect(!job.has_container);
+    try std.testing.expect(job.container == null);
     try std.testing.expect(job.services.len == 0);
     try std.testing.expectEqualStrings("{\"Contents\":\"read\"}", job.token_permissions);
     try std.testing.expectEqualStrings("Default", job.runner_group);
@@ -913,7 +932,22 @@ test "services: arrive as jobServiceContainers" {
     try std.testing.expectEqualStrings("--health-cmd \"pg_isready\"", pg.options.?.lit);
     try std.testing.expectEqualStrings("redis:7", job.services[1].image.lit);
     try std.testing.expect(job.services_error == null);
-    try std.testing.expect(!job.has_container);
+    try std.testing.expect(job.container == null);
+}
+
+test "container: arrives as jobContainer, a mapping or just the image" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const head = "{\"plan\":{\"planId\":\"p\"},\"jobId\":\"j\",\"resources\":{\"endpoints\":[{\"authorization\":{\"parameters\":{\"AccessToken\":\"t\"}}}]},\"steps\":[],";
+    const mapped = try parse(a.allocator(), head ++
+        \\"jobContainer":{"type":2,"map":[{"Key":{"type":0,"lit":"image"},"Value":{"type":3,"expr":"matrix.image"}},
+        \\ {"Key":{"type":0,"lit":"env"},"Value":{"type":2,"map":[{"Key":{"type":0,"lit":"NODE_ENV"},"Value":{"type":0,"lit":"test"}}]}}]}}
+    );
+    try std.testing.expectEqualStrings("matrix.image", mapped.container.?.image.expr);
+    try std.testing.expectEqualStrings("NODE_ENV", mapped.container.?.env[0].name);
+    const short = try parse(a.allocator(), head ++ "\"jobContainer\":{\"type\":0,\"lit\":\"node:22\"}}");
+    try std.testing.expectEqualStrings("node:22", short.container.?.image.lit);
+    try std.testing.expect(short.container_error == null);
 }
 
 test "malformed job" {
