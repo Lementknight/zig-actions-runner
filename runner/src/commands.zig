@@ -139,7 +139,7 @@ pub const Workflow = union(enum) {
     group: []const u8,
     endgroup,
     /// `error`, `warning` or `notice`, logged as `##[<level>]<message>`.
-    annotation: struct { level: []const u8, message: []const u8 },
+    annotation: Annotation,
     debug: []const u8,
     /// `::stop-commands::<token>`: no commands until `::<token>::`.
     stop: []const u8,
@@ -152,6 +152,19 @@ pub const Workflow = union(enum) {
     disabled: []const u8,
     /// `::echo::on|off` only changes whether commands are echoed; this runner never echoes them.
     echo,
+};
+
+/// `::error file=a.js,line=3,endLine=4,col=1,endColumn=9,title=T::message`. The properties are as
+/// written (null when absent); GitHub's runner reads the same names.
+pub const Annotation = struct {
+    level: []const u8,
+    message: []const u8,
+    title: ?[]const u8 = null,
+    file: ?[]const u8 = null,
+    line: ?[]const u8 = null,
+    end_line: ?[]const u8 = null,
+    col: ?[]const u8 = null,
+    end_column: ?[]const u8 = null,
 };
 
 /// Parses one line of a step's output. `stopped_token` is the token of an active `stop-commands`.
@@ -182,7 +195,16 @@ pub fn parseWorkflow(arena: Allocator, line: []const u8, stopped_token: ?[]const
     if (eql(name, "stop-commands")) return if (data.len > 0) .{ .stop = data } else .none;
     if (eql(name, "set-env") or eql(name, "add-path")) return .{ .disabled = name };
     for ([_][]const u8{ "error", "warning", "notice" }) |level| if (eql(name, level))
-        return .{ .annotation = .{ .level = level, .message = try unescape(arena, data, false) } };
+        return .{ .annotation = .{
+            .level = level,
+            .message = try unescape(arena, data, false),
+            .title = try property(arena, props, "title"),
+            .file = try property(arena, props, "file"),
+            .line = try property(arena, props, "line"),
+            .end_line = try property(arena, props, "endLine"),
+            .col = try property(arena, props, "col"),
+            .end_column = try property(arena, props, "endColumn"),
+        } };
     if (eql(name, "set-output") or eql(name, "save-state")) {
         const key = (try property(arena, props, "name")) orelse return .none;
         const kv: job_mod.EnvVar = .{ .name = key, .value = try unescape(arena, data, false) };
@@ -236,6 +258,10 @@ test "workflow commands" {
     const err = (try parseWorkflow(ar, "::error file=a.js,line=3,title=Oops::two%0Alines 100%25", null)).annotation;
     try std.testing.expectEqualStrings("error", err.level);
     try std.testing.expectEqualStrings("two\nlines 100%", err.message);
+    try std.testing.expectEqualStrings("a.js", err.file.?);
+    try std.testing.expectEqualStrings("3", err.line.?);
+    try std.testing.expectEqualStrings("Oops", err.title.?);
+    try std.testing.expect(err.end_line == null and err.col == null);
     try std.testing.expectEqualStrings("warning", (try parseWorkflow(ar, "::warning::w", null)).annotation.level);
     try std.testing.expectEqualStrings("d", (try parseWorkflow(ar, "::debug::d", null)).debug);
     const out = (try parseWorkflow(ar, "::set-output name=a%3Ab::v%0A2", null)).set_output;
