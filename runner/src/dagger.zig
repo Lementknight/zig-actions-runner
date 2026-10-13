@@ -36,10 +36,27 @@ pub const default_image = "ubuntu:24.04";
 pub const workspace = "/github/workspace";
 pub const marker = "::zig-step::";
 
-/// Makes `ubuntu:24.04` usable for typical steps: git (checked-out workspaces are real repositories), xz (to unpack toolchains),
-/// curl, CA certificates and jq (which composite actions often assume, as on GitHub's hosted images). Dagger caches this
-/// exec, so only the first run pays for it.
-pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends git ca-certificates curl xz-utils jq >/dev/null && rm -rf /var/lib/apt/lists/*";
+/// What the default image (`ubuntu:24.04`) gets before a job: what workflows written for GitHub's
+/// `ubuntu-latest` most often assume without a setup action. `sudo` (steps run as root, but many call
+/// `sudo apt-get`), compilers and `make`, Python with pip and venv (and `python`), `psql` for a
+/// Postgres service, archive and transfer tools, and what composite actions often use (`jq`,
+/// `curl`). Installed once per engine: Dagger caches this exec, so only the first job pays for it.
+pub const provision_packages = [_][]const u8{
+    "git",               "git-lfs",        "ca-certificates", "curl",        "wget",         "xz-utils",
+    "bzip2",             "zstd",           "zip",             "unzip",       "jq",           "sudo",
+    "gnupg",             "openssh-client", "rsync",           "file",        "lsb-release",  "tzdata",
+    "build-essential",   "pkg-config",     "python3",         "python3-pip", "python3-venv", "python-is-python3",
+    "postgresql-client", "netcat-openbsd", "procps",
+};
+pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends " ++ packageList() ++ " >/dev/null && rm -rf /var/lib/apt/lists/*";
+
+fn packageList() []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (provision_packages, 0..) |p, n| out = out ++ (if (n == 0) "" else " ") ++ p;
+        return out;
+    }
+}
 
 pub const Marker = union(enum) {
     begin: u32,

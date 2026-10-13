@@ -281,7 +281,7 @@ Runners response (a bare array, ordered by `name`):
 
 ## 6. Dagger execution
 
-- One Dagger pipeline per job; base image defaults to `ubuntu:24.04` unless the job specifies `container:` (below) or `RUNNER_IMAGE` is set. The default image has `git`, `curl`, `xz-utils`, `jq` (composite actions often assume it, as GitHub's hosted images have it) and `ca-certificates` installed by one `apt-get` exec at the start of the job's container (cached by Dagger: about 13 s the first time, nothing after); a custom `RUNNER_IMAGE` is used as is, so it must bring its own tools.
+- One Dagger pipeline per job; base image defaults to `ubuntu:24.04` unless the job specifies `container:` (below) or `RUNNER_IMAGE` is set. The default image gets what workflows written for `ubuntu-latest` most often assume without a setup action (`provision_packages` in `src/dagger.zig`): `sudo` (steps run as root, but many call `sudo apt-get`), `build-essential` and `pkg-config`, Python 3 with pip, venv and `python`, `postgresql-client`, `git` and `git-lfs`, `curl`, `wget`, `jq`, archive tools (`zip`, `unzip`, `xz`, `bzip2`, `zstd`), `rsync`, `openssh-client`, `gnupg`, `file`, `lsb-release`, `netcat`, `procps` and `ca-certificates`, installed by one `apt-get` exec at the start of the job's container (cached by Dagger: once per engine, about 30 s on a Mac and 40 s on a Raspberry Pi 5, nothing after; no cost per job); a custom `RUNNER_IMAGE` is used as is, so it must bring its own tools.
 - Workspace: the checked-out repo mounted at `/github/workspace`.
 - `run:` steps become `withExec(["sh","-e","-c", script])`, honoring `working-directory`, `env` and `shell: bash|sh`.
 - Step stdout/stderr lines go to `LogSink` as they arrive, in order.
