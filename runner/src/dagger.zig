@@ -413,6 +413,8 @@ pub const Result = struct {
     outputs: []const job_mod.EnvVar = &.{},
     output_lines: []const []const u8 = &.{},
     annotations: []const Annotation = &.{},
+    /// $GITHUB_STEP_SUMMARY per log step (index = log step - 1; empty when none was written).
+    summaries: []const []const u8 = &.{},
 };
 
 /// An annotation and the log step it came from (mapped to GitHub's step number at completion).
@@ -422,6 +424,9 @@ pub const Annotation = struct { step: u32, an: commands.Annotation };
 fn countLines(msg: []const u8) u32 {
     return @intCast(std.mem.count(u8, msg, "\n") + 1);
 }
+
+/// The largest step summary GitHub accepts (its `soft_size_limit`).
+const max_summary_bytes = 1024 * 1024;
 
 /// Per level and step, as GitHub's runner limits them.
 const max_annotations = 10;
@@ -1723,6 +1728,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         .next_log_step = @intCast(job.steps.len + 1),
         .loaded = try nulls(arena, Exec.LoadResult, job.steps.len),
         .pre_state = try emptySlices(arena, job_mod.EnvVar, job.steps.len),
+        .summaries = try emptySlices(arena, u8, logSteps(job.steps.len)),
     };
 
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
@@ -1925,6 +1931,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     }
     result.extra = x.extra.items;
     result.next_log_step = x.next_log_step;
+    result.summaries = x.summaries;
     try jobOutputs(arena, &ev, job, &result);
     return result;
 }
@@ -2007,6 +2014,9 @@ const Exec = struct {
     /// Per job step (index = step - 1): the action loaded for it, the state its `pre` saved.
     loaded: []?LoadResult,
     pre_state: [][]const job_mod.EnvVar,
+    /// What each log step wrote to $GITHUB_STEP_SUMMARY (index = log step - 1), uploaded with the
+    /// logs so GitHub shows it on the run's summary page.
+    summaries: [][]const u8,
     /// Action directories already mounted (by path), so a later phase sees what an earlier one left.
     mounted_actions: std.StringHashMapUnmanaged(void) = .empty,
     /// JavaScript actions' `post` scripts, run after the job's steps in reverse order.
@@ -2205,7 +2215,7 @@ const Exec = struct {
         // Nesting gives the step's `dagger` CLI a session on this engine, sharing its cache. The
         // container id is read after the step's secrets are removed (below).
         try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
-        for ([_][]const u8{ "output", "env", "path", "state" }) |kind| {
+        for ([_][]const u8{ "output", "env", "path", "state", "step_summary" }) |kind| {
             try w.print(" fc_{s}: file(path:\"{s}\") {{ contents }}", .{ kind, try fcPath(arena, kind, fc) });
         }
         // The next step starts from this container without the step's secrets.
@@ -2264,6 +2274,13 @@ const Exec = struct {
             .invalid => |why| cmd_error = try std.fmt.allocPrint(arena, "Unable to process the GITHUB_ENV file command: {s}", .{why}),
         };
         if (fileCommand(data, "fc_path")) |text| for (try commands.parsePaths(arena, text)) |dir| try ev.pending_path.append(arena, dir);
+        if (fileCommand(data, "fc_step_summary")) |text| if (text.len > 0 and num <= x.summaries.len) {
+            const so_far = x.summaries[num - 1];
+            if (so_far.len + text.len > max_summary_bytes) {
+                // GitHub's runner's words; the summary is not uploaded.
+                x.sh.append(num, try std.fmt.allocPrint(arena, "##[error]$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of {d}k, got {d}k. For more information see: https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions#adding-a-markdown-summary", .{ max_summary_bytes / 1024, (so_far.len + text.len) / 1024 }));
+            } else x.summaries[num - 1] = try std.mem.concat(arena, u8, &.{ so_far, text });
+        };
         if (cmd_error) |msg| {
             x.sh.append(num, msg);
             if (code == 0) code = 1;
@@ -3181,7 +3198,7 @@ const Exec = struct {
         try w.writeAll("withExec(args:");
         try std.json.Stringify.value([_][]const u8{ busybox_path, "sh", "-c", script }, .{}, w);
         try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
-        for ([_][]const u8{ "output", "env", "path", "state" }) |kind| {
+        for ([_][]const u8{ "output", "env", "path", "state", "step_summary" }) |kind| {
             try w.print(" fc_{s}: file(path:\"{s}\") {{ contents }}", .{ kind, try fcPath(arena, kind, fc) });
         }
         try w.writeAll(" ws: directory(path:\"" ++ workspace ++ "\") { id } home: directory(path:\"" ++ docker_home ++ "\") { id } }");
@@ -5119,6 +5136,25 @@ test "ACTIONS_STEP_DEBUG shows ::debug:: lines" {
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
     _ = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "##[debug]shown\nnow") != null);
+}
+
+test "what a step writes to GITHUB_STEP_SUMMARY is kept for upload" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{ testStep("x"), testStep("y") };
+    const with_summary = "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\",\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\",\"fc_step_summary\":{\"contents\":\"# Results\\n| a | b |\\n\"}}}}}";
+    const answers = [_][]const u8{ base_answer, with_summary, try exec(arena, "C2", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [2048]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expectEqualStrings("# Results\n| a | b |\n", res.summaries[0]);
+    try std.testing.expectEqualStrings("", res.summaries[1]);
+    // The query reads the file back.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_step_summary: file(path:") != null);
 }
 
 test "package caches: one volume per tool, keyed by repository, separate for fork pull requests" {

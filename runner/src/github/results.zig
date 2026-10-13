@@ -104,6 +104,33 @@ fn uploadInner(arena: Allocator, io: std.Io, job: job_mod.Job, which: Which, blo
     return .{ .ok = true, .detail = try std.fmt.allocPrint(arena, "{d} lines", .{blob.line_count}) };
 }
 
+/// Uploads what a step wrote to $GITHUB_STEP_SUMMARY, as actions/runner does: a signed URL from
+/// `GetStepSummarySignedBlobURL` (`summary_url`), the markdown PUT to it, then
+/// `CreateStepSummaryMetadata` with its size. GitHub shows it on the run's summary page.
+pub fn uploadSummary(arena: Allocator, io: std.Io, job: job_mod.Job, step_id: []const u8, markdown: []const u8) Result {
+    return uploadSummaryInner(arena, io, job, step_id, markdown) catch |e| .{ .ok = false, .detail = @errorName(e) };
+}
+
+fn uploadSummaryInner(arena: Allocator, io: std.Io, job: job_mod.Job, step_id: []const u8, markdown: []const u8) !Result {
+    if (job.results_endpoint.len == 0) return .{ .ok = false, .detail = "job has no results endpoint" };
+    const which: Which = .{ .step = step_id };
+    const signed = try broker.call(arena, io, .POST, try twirpUrl(arena, job.results_endpoint, "GetStepSummarySignedBlobURL"), job.job_token, try ids(arena, job, which, null));
+    if (signed.status.class() != .success) return failed(arena, "GetStepSummarySignedBlobURL", signed);
+    const url = jsonString(arena, signed.body, "summary_url") orelse return .{ .ok = false, .detail = "GetStepSummarySignedBlobURL: no summary_url in response" };
+    const put = try broker.request(arena, io, .PUT, url, markdown, .{
+        .content_type = "text/plain",
+        .extra_headers = &.{.{ .name = "x-ms-blob-type", .value = "BlockBlob" }},
+    });
+    if (put.status.class() != .success) return failed(arena, "summary upload", put);
+    const uploaded_at = try timefmt.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds());
+    // The ids, then the size and time (the object's closing brace is replaced).
+    const head = try ids(arena, job, which, null);
+    const body = try std.fmt.allocPrint(arena, "{s},\"upload_size\":{d},\"uploaded_at\":\"{s}\"}}", .{ head[0 .. head.len - 1], markdown.len, uploaded_at });
+    const meta = try broker.call(arena, io, .POST, try twirpUrl(arena, job.results_endpoint, "CreateStepSummaryMetadata"), job.job_token, body);
+    if (meta.status.class() != .success) return failed(arena, "CreateStepSummaryMetadata", meta);
+    return .{ .ok = true, .detail = try std.fmt.allocPrint(arena, "{d} bytes", .{markdown.len}) };
+}
+
 fn failed(arena: Allocator, what: []const u8, r: broker.Response) !Result {
     return .{ .ok = false, .detail = try std.fmt.allocPrint(arena, "{s}: HTTP {d}: {s}", .{ what, @backingInt(r.status), r.body[0..@min(r.body.len, 300)] }) };
 }

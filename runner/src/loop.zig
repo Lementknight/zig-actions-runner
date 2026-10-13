@@ -467,7 +467,7 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
         if (r.failures > 0) try c.err.print("run state: {d} database write(s) failed (last: {s})\n", .{ r.failures, r.last_error });
     }
     const shown = try shownSteps(c.arena, c.io, job, result, job_started_ms, .{ .log_step = complete_step, .started_ms = complete_started, .completed_ms = std.Io.Clock.real.now(c.io).toMilliseconds() });
-    try uploadLogs(c, job, shown, log.collect.lines.items);
+    try uploadLogs(c, job, shown, log.collect.lines.items, result.summaries, log.currentSecrets());
 
     const conclusion: runservice.Conclusion = if (result.cancelled) .canceled else if (result.succeeded) .succeeded else .failed;
     const step_json = try stepResultsJson(c.arena, shown);
@@ -689,12 +689,22 @@ fn newId(arena: Allocator, io: std.Io) ![]const u8 {
 
 /// Uploads each shown step's log, then the whole job's, so GitHub's UI can show them. Failures are
 /// reported but never stop the job from completing.
-fn uploadLogs(c: Context, job: job_mod.Job, shown: []const Shown, lines: []const sink.CollectedLine) !void {
+fn uploadLogs(c: Context, job: job_mod.Job, shown: []const Shown, lines: []const sink.CollectedLine, summaries: []const []const u8, secrets: []const []const u8) !void {
     for (shown) |s| {
         const blob = try results.formatBlob(c.arena, lines, s.log_step);
         if (blob.line_count == 0) continue;
         const r = results.upload(c.arena, c.io, job, .{ .step = s.id }, blob);
         try c.err.print("job {d}: log upload '{s}': {s}{s}\n", .{ job.check_run_id, s.name, if (r.ok) "ok, " else "FAILED: ", r.detail });
+    }
+    // Step summaries, masked as the logs are.
+    for (shown) |s| {
+        if (s.log_step == 0 or s.log_step > summaries.len) continue;
+        const md = summaries[s.log_step - 1];
+        if (md.len == 0) continue;
+        var masked: std.Io.Writer.Allocating = .init(c.arena);
+        try redact.write(&masked.writer, md, secrets);
+        const r = results.uploadSummary(c.arena, c.io, job, s.id, masked.written());
+        try c.err.print("job {d}: summary upload '{s}': {s}{s}\n", .{ job.check_run_id, s.name, if (r.ok) "ok, " else "FAILED: ", r.detail });
     }
     const all = try results.formatBlob(c.arena, lines, null);
     if (all.line_count > 0) {
