@@ -101,7 +101,9 @@ Verified live (run service, 2026-10-11), `run_service_url` from the `RunnerJobRe
   - Then `CreateStepLogsMetadata` / `CreateJobLogsMetadata` with the same ids plus `{uploaded_at, line_count}`.
   - After this, `jobs/{id}/logs` returns the job log and the run's log archive has a file per step (named after the step) plus GitHub's own `system.txt`.
   - Uploads happen after the steps finish and before `completejob`; a failed upload is reported and never blocks completion. Logs are kept in memory (redacted, capped at 64 MiB) until then, so a live console feed while the job runs is not provided.
-- Still unverified: `renewjob` (extends `lockedUntil` during long jobs), annotations, and the live console feed (`FeedStreamUrl`).
+- `POST {run_service_url}/renewjob` with `{"planId","jobId"}` and the job's `AccessToken` (the runner's token gets 401 "Not authorized for this job", as for completejob) returns 200 with `{"lockedUntil": "<ISO-8601>", ...}`, 10 minutes after the call. `acquirejob`'s own `lockedUntil` is the zero date (`0001-01-01T00:00:00`). Without renewal GitHub fails the job exactly 10 minutes after `acquirejob` with the annotation "The self-hosted runner lost communication with the server", while its steps still run (verified live: a 16-minute step). The runner renews every 60 s for the whole job, as `actions/runner` does, from a task next to the job.
+- A kept-alive connection that the server closed while it sat idle returns no bytes (`HttpConnectionClosing`, seen on completejob after a 16-minute step); the request was not processed, so the runner sends it once more on a new connection.
+- Still unverified: annotations and the live console feed (`FeedStreamUrl`).
 - Zig 0.17 `std.http.Client` pitfalls: for 204 responses without `Content-Length`, `Request.deinit` blocks draining the body (set `connection.closing = true` first); the default 1 KiB write buffer is smaller than the ~1.6 KiB bearer token, so raise `write_buffer_size`.
 
 Findings from M2–M4 must be written back into this section.

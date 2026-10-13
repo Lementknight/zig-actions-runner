@@ -1,4 +1,4 @@
-//! Run service calls for the v2 flow: acknowledge, acquirejob, completejob.
+//! Run service calls for the v2 flow: acknowledge, acquirejob, renewjob, completejob.
 //! The URL comes from the broker's `RunnerJobRequest` message. Request shapes are from the
 //! `actions/runner` source; live findings are recorded in SPEC §3.
 const std = @import("std");
@@ -42,6 +42,13 @@ pub fn acquire(arena: Allocator, io: std.Io, req: JobRequest, token: []const u8)
         .{ req.runner_request_id, req.billing_owner_id },
     );
     return post(arena, io, req, token, "acquirejob", body);
+}
+
+/// Renews the runner's hold on the job, as actions/runner does every 60 s while a job runs (its
+/// RenewJobRequest). Returns `{lockedUntil, ...}`.
+pub fn renew(arena: Allocator, io: std.Io, req: JobRequest, token: []const u8, plan_id: []const u8, job_id: []const u8) !broker.Response {
+    const body = try std.fmt.allocPrint(arena, "{{\"planId\":\"{s}\",\"jobId\":\"{s}\"}}", .{ plan_id, job_id });
+    return post(arena, io, req, token, "renewjob", body);
 }
 
 pub const Conclusion = enum { succeeded, failed, cancelled };

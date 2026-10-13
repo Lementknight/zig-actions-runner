@@ -59,6 +59,23 @@ pub fn request(
     payload: ?[]const u8,
     opts: RequestOptions,
 ) !Response {
+    return requestOnce(arena, io, method, url, payload, opts) catch |err| switch (err) {
+        // A kept-alive connection the server had closed while it sat idle (seen on completejob
+        // after a 16-minute step): no byte came back, so the request was never processed. Again,
+        // on a new connection.
+        error.HttpConnectionClosing => requestOnce(arena, io, method, url, payload, opts),
+        else => err,
+    };
+}
+
+fn requestOnce(
+    arena: Allocator,
+    io: std.Io,
+    method: std.http.Method,
+    url: []const u8,
+    payload: ?[]const u8,
+    opts: RequestOptions,
+) !Response {
     // What the request needs only while it runs (headers, the decompression window) is freed with
     // it; only the response body goes to `arena`, which a waiting runner keeps until its next job.
     var scratch_state: std.heap.ArenaAllocator = .init(if (http.shared) |c| c.allocator else arena);
