@@ -249,10 +249,56 @@ The store had 27 digests after one day of experiments, so it needs pruning. It i
 
 **Still open before this can be on by default:** none of the prototype's known gaps remain. What's left is to run it on the target workloads for a while, with the per-job line showing how often it applies, and to measure the cost of the store on the Pi over days rather than single runs.
 
-## 8. Next
+## 8. Experiment 4: the overhead floor and the engine's memory on the Pi
 
-- **The overhead floor:** the small Go projects (chi, cobra) and an empty job, to measure what the runner adds when the tests take almost nothing.
+**Questions.** What does the runner itself cost on a job that does almost nothing? And why do first runs on the Pi spend 25–30% of their time waiting on the SD card?
+
+### 8.1 The overhead floor
+
+An empty job (one `true` step), and the small Go projects chi and cobra (`setup-go`, checkout, `go test`), three times each, one at a time, with output keys on.
+
+- **The runner is cheap:** an empty job takes 2–4 s and 0.1 s of engine CPU.
+- **In a small Go job, almost all the time went to output keys' diff after `setup-go`: 13.5–21 s.** The action itself took 2 s. Timing each phase of the output-key work (PR #136) found this; the per-job total alone would not have.
+- **cobra fails on this runner but not on GitHub.** `TestFailGenFishCompletionFile` expects writing to a `0400` file to fail. Steps run as root here, and root ignores file permissions; GitHub runs them as the non-root user `runner`. Any test suite that checks permissions will differ the same way. Fixing it means running steps as a non-root user with `sudo`, as GitHub does: a design change of its own, not done yet.
+
+### 8.2 The engine's memory
+
+Read from the engine's cgroup (`memory.stat`, `memory.events`) and the kernel's slab caches, without restarting anything:
+
+| | Measured |
+|---|---|
+| Engine memory | at its 4 GB cap; the cap hit 121,907 times |
+| Kernel slab charged to the engine | 1.68–2.0 GB, mostly ext4 inode cache (1.45–1.73 GB) |
+| Page cache | 0.8 GB |
+| Engine cache on disk | 67 GB in 17,000 snapshots; 25 GB of the 117 GB card free |
+
+The engine had no configuration. Dagger's default garbage collection lets the cache reach about three quarters of the disk before collecting anything. The kernel's record of the cache's files filled the engine's memory and crowded out its page cache. So every walk of a container's files went to the SD card: the diff, and Go's toolchain on a first run.
+
+**One measurement perturbed the system.** My first snapshot script ran `du` over the 67 GB cache, which itself pulled about 300 MB of inodes into memory. Later snapshots took disk use from the engine's own log.
+
+**A control restart reset everything.** I restarted the engine without changing anything, as the control for a cache cap. Within minutes, the cache went from 67 GB to 2.4 GB (329 snapshots), and the next restart's log mentioned 128 network namespaces "left over from previous run". In Dagger v0.21, the engine keeps its index of cached results in memory. After a restart, the snapshots on disk are unreferenced, and garbage collection removes them. **So every engine restart empties the step cache,** which DEPLOY.md now says.
+
+On the fresh engine, the same workflow:
+
+| | 67 GB cache | Fresh engine |
+|---|---|---|
+| Diff after `setup-go` | 13.5–20.9 s | 0.73–1.0 s |
+| All output-key work | 14.4–25.7 s | 1.0–1.3 s |
+| chi job (steps replayed) | 23–55 s | 5 s |
+| Page cache / slab | 798 / 1,999 MB | 3,417 / 206 MB |
+
+**The fix:** cap the cache at 20 GB (`deploy/engine.json`, PR #138); the engine reports the policy as active. A logger on the Pi records the engine's memory every 15 minutes, to check whether slab stays small as the cache fills up to the cap.
+
+### 8.3 Found along the way
+
+- **Log uploads failed for two minutes,** all of a job's blobs within the same second. A request that failed was giving its dead connection back to the shared pool. Now a failed connection is dropped, and failed writes are retried (PR #137). Why the failures stopped by themselves is not known.
+- **The leftover network namespaces** suggest sessions that did not clean up. They are not investigated yet.
+
+## 9. Next
+
 - **Python with uv:** the same questions for `uv sync`, ruff and pytest. Pytest has no built-in equivalent of Go's test cache, so test selection there is a real gap to look into.
-- **Engine memory on the Pi:** why kernel slab fills the engine's cgroup, and whether first runs can stop re-reading the toolchain from the SD card.
+- **Engine memory over days:** the 15-minute log, as the cache refills towards its 20 GB cap.
+- **Steps as a non-root user,** as on GitHub (cobra's permission test).
+- **The leftover network namespaces** after an engine restart.
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
 - **Breaking down the engine's cost:** Dagger (~720 ms per 10 trivial steps on the Mac), BuildKit alone (~300 ms) and raw overlayfs with namespaces (~35 ms). The BuildKit layer will be split into its parts: runc, snapshot metadata, cgroups, gRPC.
