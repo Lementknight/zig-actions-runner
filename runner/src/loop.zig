@@ -479,6 +479,12 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
     // "Complete job", as GitHub's runner ends a job (the job's containers went with its session).
     const complete_started = std.Io.Clock.real.now(c.io).toMilliseconds();
     const complete_step: u32 = if (result.next_log_step > 0) result.next_log_step else @intCast(job.steps.len + 1);
+    if (result.set_up_failed) {
+        // GitHub keeps a step's first conclusion and number: say "Set up job" failed before "Complete
+        // job" starts (which would end it as a success), and number the steps that did not run.
+        live.end(0, "Set up job", .failure, job_started_ms, complete_started);
+        live.skipNumbers(@intCast(job.steps.len));
+    }
     live.begin(complete_step, "Complete job", complete_started);
     for (result.output_lines) |l| try log.append(job.check_run_id, complete_step, .stdout, l);
     try log.append(job.check_run_id, complete_step, .stdout, "Cleaning up orphan processes");
