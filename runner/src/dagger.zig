@@ -1926,6 +1926,16 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         try w.writeAll("from(address:");
         try std.json.Stringify.value(job_image, .{}, w);
         try w.writeAll(") { ");
+        if (job.container != null) for (cache_ids, 0..) |_, i| {
+            // Before the container's env, so its own value wins.
+            if (package_cache_dirs[i].env.len == 0) continue;
+            try w.writeAll("withEnvVariable(name:");
+            try std.json.Stringify.value(package_cache_dirs[i].env, .{}, w);
+            try w.writeAll(",value:");
+            try std.json.Stringify.value(package_cache_dirs[i].path, .{}, w);
+            try w.writeAll(") { ");
+            extra_braces += 1;
+        };
         if (job.container) |jc| {
             // The container's env, as `docker create -e` sets it: every step sees it.
             const env = ev.renderEnv(jc.env, try ev.scope(&.{})) catch return fail(sh, results, try std.fmt.allocPrint(arena, "could not evaluate the container's env: {s}", .{ev.diag}));
@@ -4102,21 +4112,27 @@ fn muslWrapper(arena: Allocator, name: []const u8) ![]const u8 {
 /// Package managers' cache directories (for root, the default images' user), each mounted from its
 /// own cache volume. Their contents are caches the tools validate themselves, so sharing them between
 /// jobs is safe; they are keyed by repository (see `packageCacheScope`).
-const package_cache_dirs = [_]struct { name: []const u8, path: []const u8 }{
+///
+/// A `container:` image may put them elsewhere (the golang image's GOPATH is /go), so in a container
+/// job a tool with a variable naming its cache directory gets the variable pointing at the volume.
+/// The paths stay the default image's: Go keys compiled packages on their source directory, so a
+/// module cache at one path everywhere lets every image share the build cache. The container's or
+/// the workflow's own value wins (and the tool then works without the volume).
+const package_cache_dirs = [_]struct { name: []const u8, path: []const u8, env: []const u8 = "" }{
     // RUNNER_TOOL_CACHE: what setup-node, setup-python, setup-go and the like download and unpack,
     // found again by the next job instead of fetched (GitHub's images come with it filled).
     .{ .name = "toolcache", .path = "/opt/hostedtoolcache" },
-    .{ .name = "npm", .path = "/root/.npm" },
+    .{ .name = "npm", .path = "/root/.npm", .env = "npm_config_cache" },
     .{ .name = "pnpm", .path = "/root/.local/share/pnpm/store" },
     .{ .name = "yarn", .path = "/usr/local/share/.cache/yarn" },
-    .{ .name = "pip", .path = "/root/.cache/pip" },
-    .{ .name = "uv", .path = "/root/.cache/uv" },
-    .{ .name = "go-mod", .path = "/root/go/pkg/mod" },
-    .{ .name = "go-build", .path = "/root/.cache/go-build" },
+    .{ .name = "pip", .path = "/root/.cache/pip", .env = "PIP_CACHE_DIR" },
+    .{ .name = "uv", .path = "/root/.cache/uv", .env = "UV_CACHE_DIR" },
+    .{ .name = "go-mod", .path = "/root/go/pkg/mod", .env = "GOMODCACHE" },
+    .{ .name = "go-build", .path = "/root/.cache/go-build", .env = "GOCACHE" },
     .{ .name = "cargo-registry", .path = "/root/.cargo/registry" },
     .{ .name = "cargo-git", .path = "/root/.cargo/git" },
-    .{ .name = "bun", .path = "/root/.bun/install/cache" },
-    .{ .name = "zig", .path = "/root/.cache/zig" },
+    .{ .name = "bun", .path = "/root/.bun/install/cache", .env = "BUN_INSTALL_CACHE_DIR" },
+    .{ .name = "zig", .path = "/root/.cache/zig", .env = "ZIG_GLOBAL_CACHE_DIR" },
     .{ .name = "gradle", .path = "/root/.gradle/caches" },
     .{ .name = "maven", .path = "/root/.m2/repository" },
 };
@@ -5880,6 +5896,38 @@ test "package caches: one volume per tool, keyed by repository, separate for for
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.cache/zig\",cache:\"V11\")") != null);
         try std.testing.expect(braceBalanced(fake.seen.items[1]));
     }
+}
+
+test "package caches in a container job: variables point the tools at the volumes, the image's own value winning" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("go test ./...")};
+    var job = testJob(&steps);
+    job.container = .{ .name = "", .image = .{ .lit = "golang:1.25" }, .env = &.{.{ .name = "GOCACHE", .value = .{ .lit = "/tmp/gocache" } }} };
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print("{s}\"c{d}\":{{\"id\":\"V{d}\"}}", .{ if (i == 0) "" else ",", i, i });
+    try vols.writer.writeAll("}}");
+    // Only the base container matters here: the job stops when the answers run out.
+    const answers = [_][]const u8{ vols.written(), base_answer };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    _ = try run(arena, std.testing.io, &env, .{ .package_caches = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    const base = fake.seen.items[1];
+    // The golang image's GOPATH is /go, not /root/go: the variable says where the volume is.
+    try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"GOMODCACHE\",value:\"/root/go/pkg/mod\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "withMountedCache(path:\"/root/go/pkg/mod\"") != null);
+    // A tool without such a variable gets none.
+    try std.testing.expect(std.mem.indexOf(u8, base, "CARGO_HOME") == null);
+    // The container's env comes after, so its GOCACHE is the one the steps see.
+    const ours = std.mem.indexOf(u8, base, "withEnvVariable(name:\"GOCACHE\",value:\"/root/.cache/go-build\")").?;
+    const theirs = std.mem.indexOf(u8, base, "withEnvVariable(name:\"GOCACHE\",value:\"/tmp/gocache\")").?;
+    try std.testing.expect(ours < theirs);
+    try std.testing.expect(braceBalanced(base));
 }
 
 test "step caching: run-specific values are volatile, steps with secrets always run, workflows can opt out" {
