@@ -2039,7 +2039,9 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
             null,
         .event_from_env = step_cache and (try ev.eventJson()).len <= max_event_env,
         .job_secret_env = jobEnvHasSecret(job, ev.job_env.items),
-        .run_nonce = try runNonce(arena, io, &ev),
+        // Per job, not per run: a run's matrix jobs share its id and attempt, and a step that must run
+        // in each of them would otherwise be replayed from the first one's result.
+        .run_nonce = try std.fmt.allocPrint(arena, "{s}, job {s}", .{ try runNonce(arena, io, &ev), ran_marker }),
         .ran_marker = ran_marker,
         .execs = try zeroed(arena, u32, logSteps(job.steps.len)),
         .next_log_step = @intCast(job.steps.len + 1),
@@ -2382,7 +2384,8 @@ const Exec = struct {
     event_from_env: bool,
     /// Workflow- or job-level env carries a secret, so every step uses secrets.
     job_secret_env: bool,
-    /// Differs on every run (and attempt): makes steps that use secrets run every time.
+    /// Differs for every job (the run, its attempt, and `ran_marker`): makes steps that use secrets
+    /// run every time, in every job.
     run_nonce: []const u8,
     /// This job's value of `ran_env`.
     ran_marker: []const u8,
@@ -6302,7 +6305,7 @@ test "step caching: run-specific values are volatile, steps with secrets always 
         var buf: [4096]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-        const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .runner_name = "zig-pi-1a2b3c4d", .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+        const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .runner_name = "zig-pi-1a2b3c4d", .test_ran_marker = "j1", .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
         try std.testing.expect(res.succeeded);
         const base = fake.seen.items[0];
         const build = fake.seen.items[1];
@@ -6319,9 +6322,10 @@ test "step caching: run-specific values are volatile, steps with secrets always 
             // Each step writes the event file from the volatile variable and hides the variable.
             try std.testing.expect(std.mem.indexOf(u8, build, "printf '%s' \\\"$ZIG_RUNNER_EVENT\\\" > /github/workflow/event.json") != null);
             try std.testing.expect(std.mem.indexOf(u8, build, "-u ZIG_RUNNER_EVENT ") != null);
-            // Only the step with a secret is forced to run, with a per-run value.
+            // Only the step with a secret is forced to run, with a value new for every job (a run's
+            // matrix jobs share its id).
             try std.testing.expect(std.mem.indexOf(u8, build, "runs this step every time") == null);
-            try std.testing.expect(std.mem.indexOf(u8, deploy, ": 'zig-runner runs this step every time: it uses secrets (run 123.2)'") != null);
+            try std.testing.expect(std.mem.indexOf(u8, deploy, ": 'zig-runner runs this step every time: it uses secrets (run 123.2, job j1)'") != null);
         } else {
             try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"GITHUB_RUN_ID\",value:\"123\")") != null);
             try std.testing.expect(std.mem.indexOf(u8, base, "withNewFile(path:\"/github/workflow/event.json\"") != null);
