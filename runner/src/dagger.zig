@@ -495,6 +495,8 @@ pub const Result = struct {
     /// many fell back, and why the last one did. For the runner's own log, so an operator sees how
     /// often they apply without turning on step debug.
     output_keys: struct { applied: u32 = 0, fell_back: u32 = 0, last_reason: []const u8 = "", ms: i64 = 0 } = .{},
+    /// "Set up job" failed (an action could not be resolved), so no step ran.
+    set_up_failed: bool = false,
 };
 
 /// A published service port: steps reach `localhost:<host>`, forwarded to the service's `container`.
@@ -989,6 +991,20 @@ fn checkoutRefCommands(arena: Allocator, mount: []const u8, ref: []const u8) ![]
     }
     try w.writeAll(" ) >/dev/null 2>&1 || true; fi\n");
     return aw.written();
+}
+
+/// GitHub's error for an action it cannot resolve (verified next to `ubuntu-latest`): a missing
+/// version names the action and the version, a repository it cannot see is "not found" by its
+/// lower-case name. Dagger's message is kept for other failures (a network error).
+fn unresolvedMessage(arena: Allocator, u: job_mod.Uses, msg: []const u8, own_repo: bool) ![]const u8 {
+    if (std.mem.indexOf(u8, msg, "does not contain ref") != null)
+        return std.fmt.allocPrint(arena, "Unable to resolve action `{s}/{s}@{s}`, unable to find version `{s}`", .{ u.owner, u.name, u.ref, u.ref });
+    if (looksLikeAuthFailure(msg)) {
+        const repo = try std.ascii.allocLowerString(arena, try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name }));
+        // GitHub can be given access to a private action elsewhere; this runner fetches it anonymously.
+        return std.fmt.allocPrint(arena, "Unable to resolve action {s}, repository not found{s}", .{ repo, if (own_repo) "" else " (or private: the job's GITHUB_TOKEN reads only the job's own repository)" });
+    }
+    return std.fmt.allocPrint(arena, "Unable to resolve action `{s}/{s}@{s}`, {s}", .{ u.owner, u.name, u.ref, msg });
 }
 
 fn looksLikeAuthFailure(text: []const u8) bool {
@@ -2126,8 +2142,10 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     // "Set up job": what GitHub's runner logs before the first step, including fetching every action.
     try x.logSetUp(opts);
     var downloaded: std.StringHashMapUnmanaged(void) = .empty;
+    var unresolved: std.StringArrayHashMapUnmanaged(void) = .empty;
     for (job.steps, 1..) |step, n| if (step.action == .uses and !step.action.uses.local) {
         const lr = try x.loadFor(@intCast(n), step.action.uses);
+        if (lr == .unresolved) try unresolved.put(arena, lr.unresolved, {});
         if (lr != .ok) continue;
         const u = step.action.uses;
         const label = try std.fmt.allocPrint(arena, "{s}/{s}@{s}", .{ u.owner, u.name, u.ref });
@@ -2137,6 +2155,16 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         else
             try std.fmt.allocPrint(arena, "Download action repository '{s}'", .{label}));
     };
+    // As on GitHub, an action that cannot be resolved (even one whose step would be skipped) fails
+    // "Set up job" with one error naming them all, and no step runs.
+    if (unresolved.count() > 0) {
+        sh.errorLine(0, try std.mem.join(arena, ". ", unresolved.keys()));
+        var failed = try finish(arena, sh, results, "");
+        failed.succeeded = false;
+        failed.engine_error = null;
+        failed.set_up_failed = true;
+        return failed;
+    }
     x.setUpLine(try std.fmt.allocPrint(arena, "Complete job name: {s}", .{if (job.display_name.len > 0) job.display_name else if (job.github.job.len > 0) job.github.job else "job"}));
 
     if ((job.container != null or job.services.len > 0) and !try x.startServices()) {
@@ -3012,7 +3040,7 @@ const Exec = struct {
         const ev = x.ev;
         const loaded = if (!nested) try x.loadFor(num, u) else if (u.local) try x.loadLocal(u) else try x.loadAction(u);
         const act = switch (loaded) {
-            .failed => |msg| return x.actionFailed(num, "{s}", .{msg}),
+            .failed, .unresolved => |msg| return x.actionFailed(num, "{s}", .{msg}),
             .ok => |a| a,
         };
 
@@ -3235,7 +3263,9 @@ const Exec = struct {
         return .{ .failed = out.code != 0, .exit_code = out.code, .outputs = out.outputs };
     }
 
-    const LoadResult = union(enum) { ok: Loaded, failed: []const u8 };
+    /// `unresolved`: the action's repository or ref could not be fetched, which GitHub reports in
+    /// "Set up job", before any step runs.
+    const LoadResult = union(enum) { ok: Loaded, failed: []const u8, unresolved: []const u8 };
 
     /// The action's repository, loaded once per step, whether it loads or not: the `pre` pass at the
     /// start of the job (as GitHub downloads every action in "Set up job") and the step itself share it.
@@ -3288,7 +3318,7 @@ const Exec = struct {
         // A local action is read when its step runs, after the checkout; GitHub runs no `pre` for it.
         if (u.local) return;
         const act = switch (try x.loadFor(num, u)) {
-            .failed => return,
+            .failed, .unresolved => return,
             .ok => |a| a,
         };
         const pre: []const u8, const pre_if: ?[]const u8 = switch (act.meta.runs) {
@@ -4376,9 +4406,7 @@ const Exec = struct {
         try w.writeAll(") } sha: commit } } }");
         var msg: []const u8 = "";
         const data = gql(arena, x.transport, doc.written(), &msg) catch
-            return .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}: {s}{s}", .{
-                ref_label, msg, if (looksLikeAuthFailure(msg)) " (the job's GITHUB_TOKEN reads only the job's own repository; a private action elsewhere cannot be fetched)" else "",
-            }) };
+            return .{ .unresolved = try unresolvedMessage(arena, u, msg, own_repo) };
         const dir = jsonFindString(data, "id") orelse return .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}: Dagger returned no tree", .{ref_label}) };
         var file_name: ?[]const u8 = null;
         if (jsonFind(data, "entries")) |entries| if (entries == .array) for (entries.array.items) |e| {
@@ -6192,6 +6220,49 @@ test "steps see the name the runner registered under" {
     _ = try run(arena, std.testing.io, &env, .{ .runner_name = "zig-1a2b3c4d", .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "withEnvVariable(name:\"RUNNER_NAME\",value:\"zig-1a2b3c4d\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "echo zig-1a2b3c4d") != null);
+}
+
+test "an action that cannot be resolved: GitHub's message" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const u: job_mod.Uses = .{ .owner = "astral-sh", .name = "setup-uv", .ref = "v10" };
+    try std.testing.expectEqualStrings("Unable to resolve action `astral-sh/setup-uv@v10`, unable to find version `v10`", try unresolvedMessage(arena, u, "git error: repository does not contain ref \"v10\"", false));
+    const missing: job_mod.Uses = .{ .owner = "Lementknight", .name = "No-Such", .ref = "v1" };
+    try std.testing.expectEqualStrings("Unable to resolve action lementknight/no-such, repository not found (or private: the job's GITHUB_TOKEN reads only the job's own repository)", try unresolvedMessage(arena, missing, "git error: git authentication failed", false));
+    try std.testing.expectEqualStrings("Unable to resolve action lementknight/no-such, repository not found", try unresolvedMessage(arena, missing, "git error: git authentication failed", true));
+    try std.testing.expectEqualStrings("Unable to resolve action `astral-sh/setup-uv@v10`, dial tcp: i/o timeout", try unresolvedMessage(arena, u, "dial tcp: i/o timeout", false));
+}
+
+test "an action that cannot be resolved fails Set up job, and no step runs" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    // The second action's step would be skipped; GitHub resolves it anyway.
+    var skipped = usesStep("gone", "Someone", "Gone", "v1", &.{});
+    skipped.condition = "failure()";
+    const steps = [_]job_mod.Step{ testStep("echo before"), usesStep("uv", "astral-sh", "setup-uv", "v10", &.{}), skipped };
+    const job = testJob(&steps);
+    const answers = [_][]const u8{
+        base_answer,
+        "{\"errors\":[{\"message\":\"git error: repository does not contain ref \\\"v10\\\"\"}]}",
+        "{\"errors\":[{\"message\":\"git error: git authentication failed\"}]}",
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(!res.succeeded and res.set_up_failed);
+    try std.testing.expect(res.engine_error == null);
+    for (res.steps) |r| try std.testing.expectEqual(Outcome.not_run, r.outcome);
+    // Nothing ran: the base container and the two fetches were the only queries.
+    try std.testing.expectEqual(@as(usize, 3), fake.seen.items.len);
+    const out = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "[job 0 step 0 stdout] ##[error]Unable to resolve action `astral-sh/setup-uv@v10`, unable to find version `v10`. Unable to resolve action someone/gone, repository not found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Complete job name") == null);
+    try std.testing.expectEqual(@as(usize, 1), res.annotations.len);
 }
 
 test "logs read like GitHub's: Set up job, then each step's header with its shell, env or inputs" {
