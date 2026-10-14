@@ -2660,16 +2660,6 @@ const Exec = struct {
             }
         }.line;
         var msg: []const u8 = "";
-        const busybox = (try x.busyboxFile(num)) orelse return null;
-        const volume = x.outputs_volume orelse vol: {
-            const data = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ cacheVolume(key:{f}) {{ id }} }}", .{std.json.fmt(x.output_keys.?, .{})}), &msg) catch {
-                debug(x, num, "Output keys: no store: {s}", .{msg});
-                return null;
-            };
-            const id = jsonFindString(data, "id") orelse return null;
-            x.outputs_volume = id;
-            break :vol id;
-        };
 
         // What the step changed in the container's filesystem (cache volumes and mounts are not part
         // of it), as a directory with its digest, and what it removed.
@@ -2696,10 +2686,54 @@ const Exec = struct {
         const layer_id = jsonFindString(layer, "id") orelse return null;
         const digest_full = jsonFindString(layer, "digest") orelse return null;
         const digest = if (std.mem.indexOfScalar(u8, digest_full, ':')) |c| digest_full[c + 1 ..] else digest_full;
-        if (digest.len == 0 or std.mem.indexOfNone(u8, digest, "0123456789abcdef") != null) return null;
         var removed: std.ArrayList([]const u8) = .empty;
         if (jsonFind(changes, "removedPaths")) |r| if (r == .array) for (r.array.items) |p| {
             if (p == .string) try removed.append(arena, p.string);
+        };
+        return x.storeAndApply(num, base, user, layer_id, digest, .{ .changes = removed.items });
+    }
+
+    /// For a Docker action, which runs in its own image: the job's container with the workspace the
+    /// action left (`ws_out`) copied in by its digest. Null when that could not be done.
+    fn outputKeyedWorkspace(x: *Exec, num: u32, ws_out: []const u8) !?[]const u8 {
+        var msg: []const u8 = "";
+        const data = gql(x.arena, x.transport, try std.fmt.allocPrint(x.arena, "{{ loadContainerFromID(id:{f}) {{ user }} loadDirectoryFromID(id:{f}) {{ digest }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(ws_out, .{}) }), &msg) catch {
+            if (x.sh.step_debug) x.sh.appendFmt(num, "##[debug]Output keys: {s}", .{msg});
+            return null;
+        };
+        const digest_full = jsonFindString(data, "digest") orelse return null;
+        const digest = if (std.mem.indexOfScalar(u8, digest_full, ':')) |c| digest_full[c + 1 ..] else digest_full;
+        return x.storeAndApply(num, x.container_id, jsonFindString(data, "user") orelse "", ws_out, digest, .{ .replace_dir = workspace });
+    }
+
+    /// Where `storeAndApply` puts a stored output in the next step's container: over the whole
+    /// filesystem, deleting the paths the step removed (a step's changes), or as the whole contents of
+    /// one directory (the workspace a Docker action leaves).
+    const OutputTarget = union(enum) {
+        changes: []const []const u8,
+        replace_dir: []const u8,
+    };
+
+    /// Stores an output (`layer_id`, a Directory, whose content digest is `digest`) and returns the
+    /// container the next step starts from: `base` with the output copied in by digest, as `user`.
+    fn storeAndApply(x: *Exec, num: u32, base: []const u8, user: []const u8, layer_id: []const u8, digest: []const u8, target: OutputTarget) !?[]const u8 {
+        const arena = x.arena;
+        const debug = struct {
+            fn line(ex: *Exec, n: u32, comptime fmt: []const u8, args: anytype) void {
+                if (ex.sh.step_debug) ex.sh.appendFmt(n, "##[debug]" ++ fmt, args);
+            }
+        }.line;
+        if (digest.len == 0 or std.mem.indexOfNone(u8, digest, "0123456789abcdef") != null) return null;
+        var msg: []const u8 = "";
+        const busybox = (try x.busyboxFile(num)) orelse return null;
+        const volume = x.outputs_volume orelse vol: {
+            const data = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ cacheVolume(key:{f}) {{ id }} }}", .{std.json.fmt(x.output_keys.?, .{})}), &msg) catch {
+                debug(x, num, "Output keys: no store: {s}", .{msg});
+                return null;
+            };
+            const id = jsonFindString(data, "id") orelse return null;
+            x.outputs_volume = id;
+            break :vol id;
         };
 
         // Store it under its digest unless it is there. Another job may store the same digest at the
@@ -2735,15 +2769,27 @@ const Exec = struct {
         var apply: std.Io.Writer.Allocating = .init(arena);
         const aw = &apply.writer;
         try aw.writeAll("set -e\ncd /\n");
-        if (removed.items.len > 0) {
-            try aw.writeAll(outputs_busybox ++ " rm -rf --");
-            for (removed.items) |p| {
-                try aw.writeAll(" ");
-                try shellQuote(aw, try std.fmt.allocPrint(arena, "/{s}", .{std.mem.trimStart(u8, p, "/")}));
-            }
-            try aw.writeAll("\n");
+        switch (target) {
+            .changes => |removed| {
+                if (removed.len > 0) {
+                    try aw.writeAll(outputs_busybox ++ " rm -rf --");
+                    for (removed) |p| {
+                        try aw.writeAll(" ");
+                        try shellQuote(aw, try std.fmt.allocPrint(arena, "/{s}", .{std.mem.trimStart(u8, p, "/")}));
+                    }
+                    try aw.writeAll("\n");
+                }
+                try aw.print(outputs_busybox ++ " cp -a " ++ outputs_store ++ "/{s}/. /\n", .{digest});
+            },
+            .replace_dir => |dir| {
+                try aw.writeAll(outputs_busybox ++ " rm -rf ");
+                try shellQuote(aw, dir);
+                try aw.writeAll("\n" ++ outputs_busybox ++ " cp -a " ++ outputs_store);
+                try aw.print("/{s} ", .{digest});
+                try shellQuote(aw, dir);
+                try aw.writeAll("\n");
+            },
         }
-        try aw.print(outputs_busybox ++ " cp -a " ++ outputs_store ++ "/{s}/. /\n", .{digest});
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
         try w.print("{{ loadContainerFromID(id:{f}) {{ ", .{std.json.fmt(base, .{})});
@@ -2758,7 +2804,10 @@ const Exec = struct {
             return null;
         };
         const id = jsonFindString(next, "id") orelse return null;
-        debug(x, num, "Output keys: the next steps start from this step's output, sha256:{s} ({d} removed paths)", .{ digest[0..@min(12, digest.len)], removed.items.len });
+        switch (target) {
+            .changes => |removed| debug(x, num, "Output keys: the next steps start from this step's output, sha256:{s} ({d} removed paths)", .{ digest[0..@min(12, digest.len)], removed.len }),
+            .replace_dir => |dir| debug(x, num, "Output keys: the next steps start from this step's {s}, sha256:{s}", .{ dir, digest[0..@min(12, digest.len)] }),
+        }
         return id;
     }
 
@@ -3829,6 +3878,14 @@ const Exec = struct {
             x.err_msg = "Dagger returned no workspace directory";
             return error.EngineFailed;
         };
+        // The action always runs (it has the job token); with output keys the next steps are keyed
+        // on the workspace it left, not on its run (see `Options.output_keys`).
+        if (x.output_keys != null and out.code == 0) {
+            if (try x.outputKeyedWorkspace(num, ws_out)) |id| {
+                x.container_id = id;
+                return out;
+            }
+        }
         const back = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ withoutDirectory(path:\"" ++ workspace ++ "\") {{ withDirectory(path:\"" ++ workspace ++ "\",source:{f}) {{ id }} }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(ws_out, .{}) });
         const bdata = gql(arena, x.transport, back, &x.err_msg) catch return error.EngineFailed;
         x.container_id = jsonFindString(bdata, "id") orelse {
@@ -5638,6 +5695,53 @@ test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the
     try std.testing.expect(std.mem.indexOf(u8, out, "  script: return 42") != null);
 }
 
+test "output keys: after a Docker action, the next steps start from the workspace it left, by digest" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var pulled = testStep("");
+    pulled.action = .{ .docker = .{ .image = "alpine:3.22", .inputs = &.{} } };
+    const steps = [_]job_mod.Step{pulled};
+    var job = testJob(&steps);
+    job.secrets = &.{"ghs_jobtoken"};
+    job.job_token = "ghs_jobtoken";
+    job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"}]}}
+    , .{});
+    const answers = [_][]const u8{
+        base_answer,
+        "{\"data\":{\"bb\":{\"from\":{\"file\":{\"id\":\"BB\"}}},\"empty\":{\"id\":\"EMPTY\"}}}",
+        "{\"data\":{\"container\":{\"from\":{\"id\":\"ALP\",\"entrypoint\":[],\"defaultArgs\":[\"/bin/sh\"]}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"directory\":{\"id\":\"WS0\"}}}}",
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC\"}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"exitCode\":0,\"stdout\":\"\",\"stderr\":\"\",\"ws\":{\"id\":\"WS1\"},\"home\":{\"id\":\"H1\"}}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"user\":\"\"},\"loadDirectoryFromID\":{\"digest\":\"sha256:abcd12\"}}}",
+        "{\"data\":{\"cacheVolume\":{\"id\":\"VOL\"}}}",
+        "{\"data\":{\"container\":{\"withExec\":{\"exitCode\":0}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"withUser\":{\"withExec\":{\"exitCode\":0,\"withoutUser\":{\"withoutMount\":{\"withoutMount\":{\"id\":\"N1\"}}}}}}}}",
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .output_keys = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    const seen = fake.seen.items;
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqual(@as(usize, 10), seen.len);
+    for (seen) |d| try std.testing.expect(braceBalanced(d));
+    // The workspace the action left, by its digest, and the job container's user.
+    try std.testing.expect(std.mem.indexOf(u8, seen[6], "loadContainerFromID(id:\"C0\") { user } loadDirectoryFromID(id:\"WS1\") { digest }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[8], "withMountedDirectory(path:\"/in\",source:\"WS1\")") != null);
+    // The job's container before the action, its workspace replaced by the stored copy; the
+    // action's own run is not part of it.
+    const apply = seen[9];
+    try std.testing.expect(std.mem.startsWith(u8, apply, "{ loadContainerFromID(id:\"C0\") {"));
+    try std.testing.expect(std.mem.indexOf(u8, apply, "rm -rf '/github/workspace'\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, apply, "cp -a /zig-runner-outputs/abcd12 '/github/workspace'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, apply, "WS1") == null);
+}
+
 test "Docker actions: built or pulled, the workspace copied in and back, args, env, entrypoints and post" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -6395,10 +6499,10 @@ test "output keys: the step after one that always runs starts from that step's o
         base_answer,
         "{\"data\":{\"setSecret\":{\"id\":\"SEC\"}}}",
         try exec(arena, "C1", 0, ""),
-        "{\"data\":{\"bb\":{\"from\":{\"file\":{\"id\":\"BB\"}}},\"empty\":{\"id\":\"E\"}}}",
-        "{\"data\":{\"cacheVolume\":{\"id\":\"VOL\"}}}",
         "{\"data\":{\"loadContainerFromID\":{\"zig_base\":\"B0\",\"zig_user\":\"circleci\",\"zig_fs\":{\"id\":\"R0\"}}}}",
         "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{\"changes\":{\"removedPaths\":[\"tmp/it's gone\"],\"layer\":{\"id\":\"L\",\"digest\":\"sha256:0123abcd\"}}}}}}",
+        "{\"data\":{\"bb\":{\"from\":{\"file\":{\"id\":\"BB\"}}},\"empty\":{\"id\":\"E\"}}}",
+        "{\"data\":{\"cacheVolume\":{\"id\":\"VOL\"}}}",
         "{\"data\":{\"container\":{\"withExec\":{\"exitCode\":0}}}}",
         "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"exitCode\":0,\"withoutMount\":{\"withoutMount\":{\"id\":\"N1\"}}}}}}",
         try exec(arena, "C2", 0, ""),
@@ -6412,10 +6516,10 @@ test "output keys: the step after one that always runs starts from that step's o
     for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
     try std.testing.expectEqual(@as(usize, 10), fake.seen.items.len);
     // The store, scoped like the package caches.
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "cacheVolume(key:\"zig-runner/o/r/repo/step-outputs\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[6], "cacheVolume(key:\"zig-runner/o/r/repo/step-outputs\")") != null);
     // What the step changed: the container after it against the one before it.
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], "loadContainerFromID(id:\"C0\") { zig_base: id zig_user: user zig_fs: rootfs { withoutDirectory(path:\"/github/file_commands\") {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[6], "loadContainerFromID(id:\"C1\") { rootfs { withoutDirectory(path:\"/github/file_commands\") { changes(from:\"R0\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[3], "loadContainerFromID(id:\"C0\") { zig_base: id zig_user: user zig_fs: rootfs { withoutDirectory(path:\"/github/file_commands\") {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "loadContainerFromID(id:\"C1\") { rootfs { withoutDirectory(path:\"/github/file_commands\") { changes(from:\"R0\")") != null);
     // Stored under its digest, the layer mounted.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "withMountedDirectory(path:\"/in\",source:\"L\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "d=/store/0123abcd;") != null);
