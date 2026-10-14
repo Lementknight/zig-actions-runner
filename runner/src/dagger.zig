@@ -734,6 +734,12 @@ pub const Options = struct {
     /// Reuse unchanged steps' results across runs (see `volatile_env`). The runner turns this on
     /// (`RUNNER_STEP_CACHE`, on by default).
     step_cache: bool = false,
+    /// Experimental, with `step_cache`: a step that always runs (it uses secrets) no longer makes
+    /// every later step run too. What it changed is stored by content digest in a cache volume (see
+    /// `Exec.outputKeyed`), and the next step starts from the container before it plus a copy of
+    /// that content, so its key depends on what the step produced, not on the step having run. The
+    /// runner turns this on with `RUNNER_OUTPUT_KEYS`.
+    output_keys: bool = false,
     /// Set by the runner when GitHub cancels the job.
     cancel: ?*Cancel = null,
     /// Talk to the Dagger engine directly (`engine.zig`) instead of through a `dagger run` child.
@@ -2006,6 +2012,10 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         .js_runtime = opts.js_runtime,
         .nesting = opts.nesting,
         .step_cache = step_cache,
+        .output_keys = if (step_cache and opts.output_keys and job.github.repository.len > 0)
+            try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/step-outputs", .{ job.github.repository, try packageCacheScope(arena, &ev, job.github.repository) })
+        else
+            null,
         .event_from_env = step_cache and (try ev.eventJson()).len <= max_event_env,
         .job_secret_env = jobEnvHasSecret(job, ev.job_env.items),
         .run_nonce = try runNonce(arena, io, &ev),
@@ -2340,6 +2350,10 @@ const Exec = struct {
     nesting: bool,
     /// Unchanged steps may be reused across runs (see `Options.step_cache`).
     step_cache: bool,
+    /// With `Options.output_keys`: the key of the cache volume that stores steps' changes by digest
+    /// (scoped like the package caches), and the volume once created.
+    output_keys: ?[]const u8,
+    outputs_volume: ?[]const u8 = null,
     /// The event payload is in ZIG_RUNNER_EVENT; each step writes it to GITHUB_EVENT_PATH.
     event_from_env: bool,
     /// Workflow- or job-level env carries a secret, so every step uses secrets.
@@ -2485,11 +2499,13 @@ const Exec = struct {
             }
         }
         const script = try std.mem.concat(arena, u8, &.{ x.forward_prelude, try stepScriptFc(arena, num, fc, resolved, action_name) });
+        const before = x.container_id;
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
         try w.writeAll("{ loadContainerFromID(id:");
         try std.json.Stringify.value(x.container_id, .{}, w);
         try w.writeAll(") { ");
+        const env_start = doc.written().len;
         var braces: usize = 2; // query + loadContainerFromID
         // Variables and PATH entries the previous steps asked for through $GITHUB_ENV / $GITHUB_PATH.
         for (ev.pending_env.items) |e| {
@@ -2509,6 +2525,36 @@ const Exec = struct {
         }
         ev.pending_env.clearRetainingCapacity();
         ev.pending_path.clearRetainingCapacity();
+        // The variables earlier steps set, which the container before this step lacks.
+        const env_nodes = try arena.dupe(u8, doc.written()[env_start..]);
+        const env_braces = braces - 2;
+        var mount_doc: std.Io.Writer.Allocating = .init(arena);
+        const mw = &mount_doc.writer;
+        for (mounts) |m| {
+            switch (m) {
+                .dir => |d| {
+                    try mw.writeAll("withDirectory(path:");
+                    try std.json.Stringify.value(d.path, .{}, mw);
+                    try mw.writeAll(",source:");
+                    try std.json.Stringify.value(d.id, .{}, mw);
+                },
+                .file => |f| {
+                    try mw.writeAll("withFile(path:");
+                    try std.json.Stringify.value(f.path, .{}, mw);
+                    try mw.writeAll(",source:");
+                    try std.json.Stringify.value(f.id, .{}, mw);
+                    try mw.print(",permissions:{d}", .{f.permissions});
+                },
+                .new_file => |f| {
+                    try mw.writeAll("withNewFile(path:");
+                    try std.json.Stringify.value(f.path, .{}, mw);
+                    try mw.writeAll(",contents:");
+                    try std.json.Stringify.value(f.contents, .{}, mw);
+                    try mw.print(",permissions:{d}", .{f.permissions});
+                },
+            }
+            try mw.writeAll(") { ");
+        }
         for (secret_env, 0..) |sr, i| {
             try w.writeAll("withSecretVariable(name:");
             try std.json.Stringify.value(try secretAlias(arena, i), .{}, w);
@@ -2517,32 +2563,8 @@ const Exec = struct {
             try w.writeAll(") { ");
             braces += 1;
         }
-        for (mounts) |m| {
-            switch (m) {
-                .dir => |d| {
-                    try w.writeAll("withDirectory(path:");
-                    try std.json.Stringify.value(d.path, .{}, w);
-                    try w.writeAll(",source:");
-                    try std.json.Stringify.value(d.id, .{}, w);
-                },
-                .file => |f| {
-                    try w.writeAll("withFile(path:");
-                    try std.json.Stringify.value(f.path, .{}, w);
-                    try w.writeAll(",source:");
-                    try std.json.Stringify.value(f.id, .{}, w);
-                    try w.print(",permissions:{d}", .{f.permissions});
-                },
-                .new_file => |f| {
-                    try w.writeAll("withNewFile(path:");
-                    try std.json.Stringify.value(f.path, .{}, w);
-                    try w.writeAll(",contents:");
-                    try std.json.Stringify.value(f.contents, .{}, w);
-                    try w.print(",permissions:{d}", .{f.permissions});
-                },
-            }
-            try w.writeAll(") { ");
-            braces += 1;
-        }
+        try w.writeAll(mount_doc.written());
+        braces += mounts.len;
         try w.writeAll("withExec(args:");
         try std.json.Stringify.value([_][]const u8{ "sh", "-c", script }, .{}, w);
         // Nesting gives the step's `dagger` CLI a session on this engine, sharing its cache. The
@@ -2563,7 +2585,133 @@ const Exec = struct {
         x.beginExec(num);
         const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch return error.EngineFailed;
         if (jsonFindString(data, "id")) |id| x.container_id = id;
-        return x.collect(num, data);
+        const out = try x.collect(num, data);
+        if (x.output_keys != null and resolved == .run and resolved.run.always_run != null and out.code == 0) {
+            const pre = try std.mem.concat(arena, u8, &.{ env_nodes, mount_doc.written() });
+            if (try x.outputKeyed(num, before, pre, env_braces + mounts.len, x.container_id)) |id| x.container_id = id;
+        }
+        return out;
+    }
+
+    /// Where a step's changes are stored, and where the next step's container mounts the store and
+    /// busybox while copying them in.
+    const outputs_store = "/zig-runner-outputs";
+    /// Paths whose changes are left out of a step's output: neither keyed nor carried to the next
+    /// step. They change on every run without being anything a later step uses, so keying on them
+    /// would make every digest new. Each step's file commands (the runner has read them, and
+    /// @actions/core writes a random delimiter into them), and Go's local telemetry counters
+    /// (rewritten by every `go` command).
+    const outputs_ignored = [_][]const u8{ fc_dir, "/root/.config/go/telemetry" };
+
+    /// Busybox takes its first argument as the applet only when its own name starts with "busybox".
+    const outputs_busybox = "/busybox.zig-runner";
+
+    /// For a step that always runs: the container the next step starts from, keyed on what the step
+    /// produced rather than on the step. That is `before` (the container before the step) with what
+    /// the runner added for the step (`pre`, `pre_braces` nodes: the variables earlier steps set, the
+    /// action's code and the JavaScript runtime, whose recipes do not change from run to run), and
+    /// one exec that applies the step's changes (copied from the store at their content digest, removed paths deleted). When
+    /// the step produces the same files as in an earlier run, the digest, the exec, and so every
+    /// later step's key are the same, and the later steps can be replayed.
+    ///
+    /// The content stays in the engine: the runner only handles the digest and removed paths. Null
+    /// (keep the step's own container) when anything fails, so the job runs as without output keys.
+    fn outputKeyed(x: *Exec, num: u32, before: []const u8, pre: []const u8, pre_braces: usize, after: []const u8) !?[]const u8 {
+        const arena = x.arena;
+        const debug = struct {
+            fn line(ex: *Exec, n: u32, comptime fmt: []const u8, args: anytype) void {
+                if (ex.sh.step_debug) ex.sh.appendFmt(n, "##[debug]" ++ fmt, args);
+            }
+        }.line;
+        var msg: []const u8 = "";
+        const busybox = (try x.busyboxFile(num)) orelse return null;
+        const volume = x.outputs_volume orelse vol: {
+            const data = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ cacheVolume(key:{f}) {{ id }} }}", .{std.json.fmt(x.output_keys.?, .{})}), &msg) catch {
+                debug(x, num, "Output keys: no store: {s}", .{msg});
+                return null;
+            };
+            const id = jsonFindString(data, "id") orelse return null;
+            x.outputs_volume = id;
+            break :vol id;
+        };
+
+        // What the step changed in the container's filesystem (cache volumes and mounts are not part
+        // of it), as a directory with its digest, and what it removed.
+        var without: std.Io.Writer.Allocating = .init(arena);
+        for (outputs_ignored) |p| try without.writer.print("withoutDirectory(path:{f}) {{ ", .{std.json.fmt(p, .{})});
+        const closing = try arena.alloc(u8, 2 * outputs_ignored.len);
+        for (0..outputs_ignored.len) |i| @memcpy(closing[2 * i ..][0..2], " }");
+        const pre_closing = try arena.alloc(u8, 2 * pre_braces);
+        for (0..pre_braces) |i| @memcpy(pre_closing[2 * i ..][0..2], " }");
+        const older = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ {s}zig_base: id zig_fs: rootfs {{ {s}id{s} }}{s} }} }}", .{ std.json.fmt(before, .{}), pre, without.written(), closing, pre_closing }), &msg) catch {
+            debug(x, num, "Output keys: {s}", .{msg});
+            return null;
+        };
+        const base = jsonFindString(older, "zig_base") orelse return null;
+        const older_id = (if (jsonFind(older, "zig_fs")) |f| jsonFindString(f, "id") else null) orelse return null;
+        const changes = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ rootfs {{ {s}changes(from:{f}) {{ removedPaths layer {{ id digest }} }}{s} }} }} }}", .{ std.json.fmt(after, .{}), without.written(), std.json.fmt(older_id, .{}), closing }), &msg) catch {
+            debug(x, num, "Output keys: {s}", .{msg});
+            return null;
+        };
+        const layer = jsonFind(changes, "layer") orelse return null;
+        const layer_id = jsonFindString(layer, "id") orelse return null;
+        const digest_full = jsonFindString(layer, "digest") orelse return null;
+        const digest = if (std.mem.indexOfScalar(u8, digest_full, ':')) |c| digest_full[c + 1 ..] else digest_full;
+        if (digest.len == 0 or std.mem.indexOfNone(u8, digest, "0123456789abcdef") != null) return null;
+        var removed: std.ArrayList([]const u8) = .empty;
+        if (jsonFind(changes, "removedPaths")) |r| if (r == .array) for (r.array.items) |p| {
+            if (p == .string) try removed.append(arena, p.string);
+        };
+
+        // Store it under its digest unless it is there. Another job may store the same digest at the
+        // same time: `mv -T` onto an existing directory fails and leaves it as it was. Each store
+        // copies to its own temporary name (the run's nonce is shared by its matrix jobs).
+        var tmp_raw: [8]u8 = undefined;
+        x.io.random(&tmp_raw);
+        const tmp_name = std.fmt.bytesToHex(tmp_raw, .lower);
+        const store_script = try std.fmt.allocPrint(arena,
+            \\d=/store/{s}; test -d "$d" && exit 0
+            \\t="$d.tmp.{s}"; /bin/busybox rm -rf "$t"; /bin/busybox cp -a /in/. "$t" || exit 1
+            \\/bin/busybox mv -T "$t" "$d" 2>/dev/null || /bin/busybox rm -rf "$t"; test -d "$d"
+        , .{ digest, &tmp_name });
+        _ = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ container {{ withFile(path:\"/bin/busybox\",source:{f},permissions:493) {{ withMountedCache(path:\"/store\",cache:{f}) {{ withMountedDirectory(path:\"/in\",source:{f}) {{ withExec(args:{f}) {{ exitCode }} }} }} }} }} }}", .{
+            std.json.fmt(busybox, .{}),
+            std.json.fmt(volume, .{}),
+            std.json.fmt(layer_id, .{}),
+            std.json.fmt([_][]const u8{ "/bin/busybox", "sh", "-c", store_script }, .{}),
+        }), &msg) catch {
+            debug(x, num, "Output keys: could not store the step's changes: {s}", .{msg});
+            return null;
+        };
+
+        // The next step's container: the digest and removed paths are the exec's arguments, so they
+        // are what its key depends on.
+        var apply: std.Io.Writer.Allocating = .init(arena);
+        const aw = &apply.writer;
+        try aw.writeAll("set -e\ncd /\n");
+        if (removed.items.len > 0) {
+            try aw.writeAll(outputs_busybox ++ " rm -rf --");
+            for (removed.items) |p| {
+                try aw.writeAll(" ");
+                try shellQuote(aw, try std.fmt.allocPrint(arena, "/{s}", .{std.mem.trimStart(u8, p, "/")}));
+            }
+            try aw.writeAll("\n");
+        }
+        try aw.print(outputs_busybox ++ " cp -a " ++ outputs_store ++ "/{s}/. /\n", .{digest});
+        var doc: std.Io.Writer.Allocating = .init(arena);
+        const w = &doc.writer;
+        try w.print("{{ loadContainerFromID(id:{f}) {{ ", .{std.json.fmt(base, .{})});
+        try w.print("withMountedCache(path:\"" ++ outputs_store ++ "\",cache:{f}) {{ withMountedFile(path:\"" ++ outputs_busybox ++ "\",source:{f}) {{ ", .{ std.json.fmt(volume, .{}), std.json.fmt(busybox, .{}) });
+        // Run now (exitCode), so a failure falls back here rather than failing the next step.
+        try w.print("withExec(args:{f}) {{ exitCode withoutMount(path:\"" ++ outputs_store ++ "\") {{ withoutMount(path:\"" ++ outputs_busybox ++ "\") {{ id", .{std.json.fmt([_][]const u8{ outputs_busybox, "sh", "-c", apply.written() }, .{})});
+        for (0..5 + 2) |_| try w.writeAll(" }");
+        const next = gql(arena, x.transport, doc.written(), &msg) catch {
+            debug(x, num, "Output keys: could not apply the step's changes: {s}", .{msg});
+            return null;
+        };
+        const id = jsonFindString(next, "id") orelse return null;
+        debug(x, num, "Output keys: the next steps start from this step's output, sha256:{s} ({d} removed paths)", .{ digest[0..@min(12, digest.len)], removed.items.len });
+        return id;
     }
 
     /// Several execs can log as one step (a composite action's steps, a JavaScript action's pre, main
@@ -2977,6 +3125,8 @@ const Exec = struct {
     /// Runs the registered `post` scripts, last first, each when its `post-if` (default `always()`)
     /// holds. A failing one fails the job; the steps' own results stay as they were.
     fn runPosts(x: *Exec) !void {
+        // Only posts follow a post, and they always run: keying them on its output gains nothing.
+        x.output_keys = null;
         var i = x.posts.items.len;
         while (i > 0) {
             i -= 1;
@@ -5988,6 +6138,61 @@ test "step caching: run-specific values are volatile, steps with secrets always 
         const note = std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused from Dagger's cache") orelse return error.TestUnexpectedResult;
         try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] built").? < note);
     }
+}
+
+test "output keys: the step after one that always runs starts from that step's output, by digest" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const ctx_json =
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"run_id","v":"123"},{"k":"run_attempt","v":"1"}]}}
+    ;
+    var with_secret = testStep("setup");
+    with_secret.env = &.{.{ .name = "TOKEN", .value = .{ .lit = "s3cr3t-value" } }};
+    const steps = [_]job_mod.Step{ with_secret, testStep("build") };
+    var job = testJob(&steps);
+    job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena, ctx_json, .{});
+    job.secrets = &.{"s3cr3t-value"};
+    const answers = [_][]const u8{
+        base_answer,
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC\"}}}",
+        try exec(arena, "C1", 0, ""),
+        "{\"data\":{\"bb\":{\"from\":{\"file\":{\"id\":\"BB\"}}},\"empty\":{\"id\":\"E\"}}}",
+        "{\"data\":{\"cacheVolume\":{\"id\":\"VOL\"}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"zig_base\":\"B0\",\"zig_fs\":{\"id\":\"R0\"}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{\"changes\":{\"removedPaths\":[\"tmp/it's gone\"],\"layer\":{\"id\":\"L\",\"digest\":\"sha256:0123abcd\"}}}}}}",
+        "{\"data\":{\"container\":{\"withExec\":{\"exitCode\":0}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"exitCode\":0,\"withoutMount\":{\"withoutMount\":{\"id\":\"N1\"}}}}}}",
+        try exec(arena, "C2", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .output_keys = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(res.succeeded);
+    for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
+    try std.testing.expectEqual(@as(usize, 10), fake.seen.items.len);
+    // The store, scoped like the package caches.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "cacheVolume(key:\"zig-runner/o/r/repo/step-outputs\")") != null);
+    // What the step changed: the container after it against the one before it.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], "loadContainerFromID(id:\"C0\") { zig_base: id zig_fs: rootfs { withoutDirectory(path:\"/github/file_commands\") {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[6], "loadContainerFromID(id:\"C1\") { rootfs { withoutDirectory(path:\"/github/file_commands\") { withoutDirectory(path:\"/root/.config/go/telemetry\") { changes(from:\"R0\")") != null);
+    // Stored under its digest, the layer mounted.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "withMountedDirectory(path:\"/in\",source:\"L\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "d=/store/0123abcd;") != null);
+    // Matrix jobs share the run's nonce (123.1): the temporary name is the store's own.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], ".tmp.123") == null);
+    // The next container: the one before the step (with what the runner added for it), the removed
+    // path deleted and the content copied in, by digest; the step itself is not part of it.
+    const apply = fake.seen.items[8];
+    try std.testing.expect(std.mem.startsWith(u8, apply, "{ loadContainerFromID(id:\"B0\") {"));
+    try std.testing.expect(std.mem.indexOf(u8, apply, "rm -rf -- '/tmp/it'\\\\''s gone'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, apply, "cp -a /zig-runner-outputs/0123abcd/. /") != null);
+    try std.testing.expect(std.mem.indexOf(u8, apply, "C1") == null);
+    // The next step starts there.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[9], "loadContainerFromID(id:\"N1\")") != null);
 }
 
 test "with id-token: write, every step can request OIDC tokens, and so always runs" {

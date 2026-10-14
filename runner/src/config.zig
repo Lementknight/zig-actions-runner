@@ -59,6 +59,9 @@ pub const Config = struct {
     /// Reuse a step's result from an earlier run when its inputs are unchanged (steps that use secrets
     /// always run). A workflow can opt out with `ZIG_RUNNER_STEP_CACHE: false` in its env.
     step_cache: bool = true,
+    /// Experimental: key the steps after one that always runs on what it produced rather than on
+    /// the step itself (see `dagger.Options.output_keys`).
+    output_keys: bool = false,
     dry_run: bool = false,
     /// Stop after one job (or one failed attempt), as an ephemeral runner process. Off by default:
     /// the runner registers again after each job.
@@ -98,6 +101,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_DAGGER_NESTING")) |v| c.dagger_nesting = try boolean(v);
         if (environ.get("RUNNER_PACKAGE_CACHES")) |v| c.package_caches = try boolean(v);
         if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
+        if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
         if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
         if (environ.get("RUNNER_COUNT")) |v| c.runners = try count(v);
 
@@ -148,6 +152,7 @@ pub const Config = struct {
             else if (std.mem.eql(u8, key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
             else if (std.mem.eql(u8, key, "package-caches")) c.package_caches = try boolean(val) //
             else if (std.mem.eql(u8, key, "step-cache")) c.step_cache = try boolean(val) //
+            else if (std.mem.eql(u8, key, "output-keys")) c.output_keys = try boolean(val) //
             else if (std.mem.eql(u8, key, "runners")) c.runners = try count(val) //
             else return error.UnknownFlag;
         }
