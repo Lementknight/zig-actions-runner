@@ -169,6 +169,7 @@ fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log
         .nesting = cfg.dagger_nesting,
         .package_caches = cfg.package_caches,
         .step_cache = cfg.step_cache,
+        .output_keys = cfg.output_keys,
         .sink_job_id = job.check_run_id,
     }, job, log);
     for (res.steps, job.steps, 1..) |r, st, n| {
