@@ -454,6 +454,10 @@ pub const Result = struct {
     annotations: []const Annotation = &.{},
     /// $GITHUB_STEP_SUMMARY per log step (index = log step - 1; empty when none was written).
     summaries: []const []const u8 = &.{},
+    /// With output keys: how many always-run steps keyed the steps after them on their output, how
+    /// many fell back, and why the last one did. For the runner's own log, so an operator sees how
+    /// often they apply without turning on step debug.
+    output_keys: struct { applied: u32 = 0, fell_back: u32 = 0, last_reason: []const u8 = "" } = .{},
 };
 
 /// A published service port: steps reach `localhost:<host>`, forwarded to the service's `container`.
@@ -2280,6 +2284,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         result.succeeded = false;
     }
     result.extra = x.extra.items;
+    result.output_keys = .{ .applied = x.outputs_applied, .fell_back = x.outputs_fell_back, .last_reason = x.outputs_last_reason };
     result.next_log_step = x.next_log_step;
     result.summaries = x.summaries;
     try jobOutputs(arena, &ev, job, &result);
@@ -2385,6 +2390,13 @@ const Exec = struct {
     outputs_volume: ?[]const u8 = null,
     /// See `Options.output_keys_days`.
     outputs_days: u32,
+    /// Always-run steps whose output keyed the next steps, and those that fell back to their own
+    /// container (see `Result.output_keys`); why the last one fell back, and the reason, if any, given
+    /// during the current attempt.
+    outputs_applied: u32 = 0,
+    outputs_fell_back: u32 = 0,
+    outputs_last_reason: []const u8 = "",
+    outputs_reason: ?[]const u8 = null,
     /// The event payload is in ZIG_RUNNER_EVENT; each step writes it to GITHUB_EVENT_PATH.
     event_from_env: bool,
     /// Workflow- or job-level env carries a secret, so every step uses secrets.
@@ -2624,7 +2636,7 @@ const Exec = struct {
         const out = try x.collect(num, data);
         if (x.output_keys != null and resolved == .run and resolved.run.always_run != null and out.code == 0) {
             const pre = try std.mem.concat(arena, u8, &.{ env_nodes, mount_doc.written() });
-            if (try x.outputKeyed(num, before, pre, env_braces + mounts.len, x.container_id)) |id| x.container_id = id;
+            if (x.countOutputKeyed(try x.outputKeyed(num, before, pre, env_braces + mounts.len, x.container_id))) |id| x.container_id = id;
         }
         return out;
     }
@@ -2654,11 +2666,6 @@ const Exec = struct {
     /// (keep the step's own container) when anything fails, so the job runs as without output keys.
     fn outputKeyed(x: *Exec, num: u32, before: []const u8, pre: []const u8, pre_braces: usize, after: []const u8) !?[]const u8 {
         const arena = x.arena;
-        const debug = struct {
-            fn line(ex: *Exec, n: u32, comptime fmt: []const u8, args: anytype) void {
-                if (ex.sh.step_debug) ex.sh.appendFmt(n, "##[debug]" ++ fmt, args);
-            }
-        }.line;
         var msg: []const u8 = "";
 
         // What the step changed in the container's filesystem (cache volumes and mounts are not part
@@ -2670,7 +2677,7 @@ const Exec = struct {
         const pre_closing = try arena.alloc(u8, 2 * pre_braces);
         for (0..pre_braces) |i| @memcpy(pre_closing[2 * i ..][0..2], " }");
         const older = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ {s}zig_base: id zig_user: user zig_fs: rootfs {{ {s}id{s} }}{s} }} }}", .{ std.json.fmt(before, .{}), pre, without.written(), closing, pre_closing }), &msg) catch {
-            debug(x, num, "Output keys: {s}", .{msg});
+            x.outputsFallback(num, "{s}", .{msg});
             return null;
         };
         const base = jsonFindString(older, "zig_base") orelse return null;
@@ -2679,7 +2686,7 @@ const Exec = struct {
         const user = jsonFindString(older, "zig_user") orelse "";
         const older_id = (if (jsonFind(older, "zig_fs")) |f| jsonFindString(f, "id") else null) orelse return null;
         const changes = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ rootfs {{ {s}changes(from:{f}) {{ removedPaths layer {{ id digest }} }}{s} }} }} }}", .{ std.json.fmt(after, .{}), without.written(), std.json.fmt(older_id, .{}), closing }), &msg) catch {
-            debug(x, num, "Output keys: {s}", .{msg});
+            x.outputsFallback(num, "{s}", .{msg});
             return null;
         };
         const layer = jsonFind(changes, "layer") orelse return null;
@@ -2693,12 +2700,33 @@ const Exec = struct {
         return x.storeAndApply(num, base, user, layer_id, digest, .{ .changes = removed.items });
     }
 
+    /// Why output keys did not apply to step `num`: shown with step debug, and kept for the runner's
+    /// own log line (see `Result.output_keys`).
+    fn outputsFallback(x: *Exec, num: u32, comptime fmt: []const u8, args: anytype) void {
+        const why = std.fmt.allocPrint(x.arena, fmt, args) catch return;
+        x.outputs_reason = why;
+        if (x.sh.step_debug) x.sh.appendFmt(num, "##[debug]Output keys: {s}", .{why});
+    }
+
+    /// Counts one always-run step: `id`, the container keyed on its output, or null when it fell
+    /// back. Returns `id`.
+    fn countOutputKeyed(x: *Exec, id: ?[]const u8) ?[]const u8 {
+        if (id != null) {
+            x.outputs_applied += 1;
+        } else {
+            x.outputs_fell_back += 1;
+            x.outputs_last_reason = x.outputs_reason orelse "an answer from Dagger lacked a field the runner needs";
+        }
+        x.outputs_reason = null;
+        return id;
+    }
+
     /// For a Docker action, which runs in its own image: the job's container with the workspace the
     /// action left (`ws_out`) copied in by its digest. Null when that could not be done.
     fn outputKeyedWorkspace(x: *Exec, num: u32, ws_out: []const u8) !?[]const u8 {
         var msg: []const u8 = "";
         const data = gql(x.arena, x.transport, try std.fmt.allocPrint(x.arena, "{{ loadContainerFromID(id:{f}) {{ user }} loadDirectoryFromID(id:{f}) {{ digest }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(ws_out, .{}) }), &msg) catch {
-            if (x.sh.step_debug) x.sh.appendFmt(num, "##[debug]Output keys: {s}", .{msg});
+            x.outputsFallback(num, "{s}", .{msg});
             return null;
         };
         const digest_full = jsonFindString(data, "digest") orelse return null;
@@ -2728,7 +2756,7 @@ const Exec = struct {
         const busybox = (try x.busyboxFile(num)) orelse return null;
         const volume = x.outputs_volume orelse vol: {
             const data = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ cacheVolume(key:{f}) {{ id }} }}", .{std.json.fmt(x.output_keys.?, .{})}), &msg) catch {
-                debug(x, num, "Output keys: no store: {s}", .{msg});
+                x.outputsFallback(num, "no store: {s}", .{msg});
                 return null;
             };
             const id = jsonFindString(data, "id") orelse return null;
@@ -2760,7 +2788,7 @@ const Exec = struct {
             std.json.fmt(layer_id, .{}),
             std.json.fmt([_][]const u8{ "/bin/busybox", "sh", "-c", store_script }, .{}),
         }), &msg) catch {
-            debug(x, num, "Output keys: could not store the step's changes: {s}", .{msg});
+            x.outputsFallback(num, "could not store the step's output: {s}", .{msg});
             return null;
         };
 
@@ -2800,7 +2828,7 @@ const Exec = struct {
         try w.writeAll("withoutMount(path:\"" ++ outputs_store ++ "\") { withoutMount(path:\"" ++ outputs_busybox ++ "\") { id");
         for (0..5 + 4) |_| try w.writeAll(" }");
         const next = gql(arena, x.transport, doc.written(), &msg) catch {
-            debug(x, num, "Output keys: could not apply the step's changes: {s}", .{msg});
+            x.outputsFallback(num, "could not copy the step's output into the next container: {s}", .{msg});
             return null;
         };
         const id = jsonFindString(next, "id") orelse return null;
@@ -3881,7 +3909,7 @@ const Exec = struct {
         // The action always runs (it has the job token); with output keys the next steps are keyed
         // on the workspace it left, not on its run (see `Options.output_keys`).
         if (x.output_keys != null and out.code == 0) {
-            if (try x.outputKeyedWorkspace(num, ws_out)) |id| {
+            if (x.countOutputKeyed(try x.outputKeyedWorkspace(num, ws_out))) |id| {
                 x.container_id = id;
                 return out;
             }
@@ -6541,6 +6569,41 @@ test "output keys: the step after one that always runs starts from that step's o
     try std.testing.expect(std.mem.indexOf(u8, apply, "exitCode withUser(name:\"circleci\") { withoutMount(").? > as_root);
     // The next step starts there.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[9], "loadContainerFromID(id:\"N1\")") != null);
+    try std.testing.expectEqual(@as(u32, 1), res.output_keys.applied);
+    try std.testing.expectEqual(@as(u32, 0), res.output_keys.fell_back);
+}
+
+test "output keys: when they cannot apply, the next step starts from the step's own container, and the job says why" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var with_secret = testStep("setup");
+    with_secret.env = &.{.{ .name = "TOKEN", .value = .{ .lit = "s3cr3t-value" } }};
+    const steps = [_]job_mod.Step{ with_secret, testStep("build") };
+    var job = testJob(&steps);
+    job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"}]}}
+    , .{});
+    job.secrets = &.{"s3cr3t-value"};
+    const answers = [_][]const u8{
+        base_answer,
+        "{\"data\":{\"setSecret\":{\"id\":\"SEC\"}}}",
+        try exec(arena, "C1", 0, ""),
+        "{\"data\":{\"loadContainerFromID\":{\"zig_base\":\"B0\",\"zig_user\":\"\",\"zig_fs\":{\"id\":\"R0\"}}}}",
+        "{\"errors\":[{\"message\":\"no space left on device\"}]}",
+        try exec(arena, "C2", 0, ""),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .output_keys = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(res.succeeded);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], "loadContainerFromID(id:\"C1\")") != null);
+    try std.testing.expectEqual(@as(u32, 0), res.output_keys.applied);
+    try std.testing.expectEqual(@as(u32, 1), res.output_keys.fell_back);
+    try std.testing.expect(std.mem.indexOf(u8, res.output_keys.last_reason, "no space left on device") != null);
 }
 
 test "with id-token: write, every step can request OIDC tokens, and so always runs" {
