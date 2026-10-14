@@ -1,9 +1,9 @@
 # web
 
 The runner's frontend (milestone M6): a run list, a run page and a job view with live logs,
-built to read as GitHub Actions. React, TypeScript and Vite on Primer React. The plan is
-`docs/plans/2026-10-11-1237-feat-m6-actions-frontend-plan.md`; the API it reads is
-`docs/SPEC.md` §5.3.
+built to read as GitHub Actions. React, TypeScript and Vite on Primer React. Its hackathon plan is
+archived on the [`archive/hackathon-plan`](https://github.com/Lementknight/zig-actions-runner/blob/archive/hackathon-plan/docs/plans/2026-10-11-1237-feat-m6-actions-frontend-plan.md)
+branch; the API it reads is `docs/SPEC.md` §5.3.
 
 ## Run it
 
