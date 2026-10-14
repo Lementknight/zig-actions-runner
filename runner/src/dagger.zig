@@ -2607,10 +2607,10 @@ const Exec = struct {
     const outputs_store = "/zig-runner-outputs";
     /// Paths whose changes are left out of a step's output: neither keyed nor carried to the next
     /// step. They change on every run without being anything a later step uses, so keying on them
-    /// would make every digest new. Each step's file commands (the runner has read them, and
-    /// @actions/core writes a random delimiter into them), and Go's local telemetry counters
-    /// (rewritten by every `go` command).
-    const outputs_ignored = [_][]const u8{ fc_dir, "/root/.config/go/telemetry" };
+    /// would make every digest new: each step's file commands (the runner has read them, and
+    /// @actions/core writes a random delimiter into them). Tools' own such state (Go's telemetry,
+    /// Node's compile cache) is in cache volumes instead (see `package_cache_dirs`).
+    const outputs_ignored = [_][]const u8{fc_dir};
 
     /// Busybox takes its first argument as the applet only when its own name starts with "busybox".
     const outputs_busybox = "/busybox.zig-runner";
@@ -4358,6 +4358,13 @@ const package_cache_dirs = [_]struct { name: []const u8, path: []const u8, env: 
     .{ .name = "zig", .path = "/root/.cache/zig", .env = "ZIG_GLOBAL_CACHE_DIR" },
     .{ .name = "gradle", .path = "/root/.gradle/caches" },
     .{ .name = "maven", .path = "/root/.m2/repository" },
+    // Not package caches, but state tools rewrite on every run, kept out of the container's
+    // filesystem so that what a step leaves there is what it produced (see `Options.output_keys`).
+    // Node's compile cache: V8 code npm and Node write and Node validates, which also lets them start
+    // faster. No variable: NODE_COMPILE_CACHE would turn it on for every Node program; this is where
+    // Node puts it when a program turns it on. And Go's local telemetry counters.
+    .{ .name = "node-compile-cache", .path = "/tmp/node-compile-cache" },
+    .{ .name = "go-telemetry", .path = "/root/.config/go/telemetry" },
 };
 
 /// Pull requests from forks get their own volumes, so untrusted code cannot plant content in the
@@ -6194,6 +6201,9 @@ test "package caches: one volume per tool, keyed by repository, separate for for
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/opt/hostedtoolcache\",cache:\"V0\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.npm\",cache:\"V1\")") != null);
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.cache/zig\",cache:\"V11\")") != null);
+        // State tools rewrite on every run stays out of the container's filesystem.
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/tmp/node-compile-cache\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.config/go/telemetry\"") != null);
         try std.testing.expect(braceBalanced(fake.seen.items[1]));
     }
 }
@@ -6342,7 +6352,7 @@ test "output keys: the step after one that always runs starts from that step's o
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "cacheVolume(key:\"zig-runner/o/r/repo/step-outputs\")") != null);
     // What the step changed: the container after it against the one before it.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], "loadContainerFromID(id:\"C0\") { zig_base: id zig_fs: rootfs { withoutDirectory(path:\"/github/file_commands\") {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[6], "loadContainerFromID(id:\"C1\") { rootfs { withoutDirectory(path:\"/github/file_commands\") { withoutDirectory(path:\"/root/.config/go/telemetry\") { changes(from:\"R0\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[6], "loadContainerFromID(id:\"C1\") { rootfs { withoutDirectory(path:\"/github/file_commands\") { changes(from:\"R0\")") != null);
     // Stored under its digest, the layer mounted.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "withMountedDirectory(path:\"/in\",source:\"L\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "d=/store/0123abcd;") != null);
