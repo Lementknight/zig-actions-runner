@@ -211,6 +211,23 @@ The test also caught a bug in review: the temporary name came from the run's non
 
 **Deletions, empty directories and metadata.** A secret step deleted two files (one with a quote in its name) and a directory tree, created nested empty directories, and changed a mode, a symlink and an owner. The step after it, starting from the rebuilt container, checked all of them, and every check passed. On a re-run the step produced the same digest (3 removed paths), and the check was replayed.
 
+**Noise survey: Python and Node.** The same re-run test with the always-run setup steps of uv and Node projects (click, flask, express):
+
+| Setup step | Same digest on a re-run? | What differed |
+|---|---|---|
+| `astral-sh/setup-uv` v9 | yes, and the same for click and flask | — |
+| `actions/setup-node` v4 | no | `/tmp/node-compile-cache`: V8 bytecode that Node and npm write on every run, not byte-identical between runs |
+| `actions/setup-go` v5 | yes, once its noise was excluded | Go's telemetry counters (§7.3) |
+
+So far the noise is all tool caches or telemetry that the tool rebuilds itself, so leaving it out is safe. Leaving out a whole directory such as `/tmp` would not be: steps legitimately leave files there for later steps.
+
+The survey also found three runner bugs unrelated to output keys:
+- `github.workspace` was empty, so `setup-uv` failed (fixed).
+- A step's output was lost when it arrived after the step's end marker, as Bun's error does when it refuses an action (fixed).
+- The same timing can label a step that ran as "Reused from Dagger's cache" (open).
+
+It also found that Bun cannot load `actions/setup-python` v7, whose bundle mixes ES `import` with CommonJS `exports`; Node runs it.
+
 The store had 27 digests after one day of experiments, so pruning is needed before output keys can be on by default.
 
 ### 7.5 Findings
