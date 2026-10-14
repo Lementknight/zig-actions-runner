@@ -296,9 +296,44 @@ On the fresh engine, the same workflow:
 - **Log uploads failed for two minutes,** all of a job's blobs within the same second. A request that failed was giving its dead connection back to the shared pool. Now a failed connection is dropped, and failed writes are retried (PR #137). Why the failures stopped by themselves is not known.
 - **The leftover network namespaces are not a leak.** Dagger keeps a warm pool of 128 network namespaces (`CNIPoolSize`, default 128 in `cmd/engine/config.go`), prefilled at engine start: 128 in 9.4 s on the Pi, 7.8 s of engine CPU. A restart cannot release the old pool's namespaces, because their mounts went away with the old container, hence the warnings; they do not pile up on disk. The pool could be shrunk (`cniPoolSize` in `engine.toml`, 16 is plenty for three runners), but that only saves those ~8 s per engine start, so it is left as it is.
 
-## 9. Next
+## 9. Experiment 5: hits across commits
 
-- **Python with uv:** the same questions for `uv sync`, ruff and pytest. Pytest has no built-in equivalent of Go's test cache, so test selection there is a real gap to look into.
+**Question.** Experiment 2 found that a new commit misses every step after the checkout, and estimated that keying steps on their real inputs would save about a third of check-step time. Can the runner do that on Dagger, and what does it save in practice?
+
+**Design (PR #145).** Two parts:
+
+- **The commit and refs are volatile,** as run ids already were. Removing `GITHUB_SHA` from the key costs nothing in correctness: the checkout already keys every later step on the files it produced. A script that names one of these variables always runs, as for run ids. Experiment 2's worry, a step that reads the commit indirectly (`git describe`), is handled the same way: `.git` is in the workspace, so the checkout still keys it.
+- **Declared inputs.** A `run:` step may list what it reads in `ZIG_RUNNER_INPUTS` (workspace globs, plus `$GITHUB_SHA` and the like if it needs them). It then runs in a container built from content: the job's base, what earlier steps changed outside the workspace and the variables they set, and only the declared files as the workspace, each part stored by digest. What it changes is copied back into the job's container. This reuses experiment 3's content store.
+
+The trade-off is in who is trusted to be right. Inferring inputs (tracing what a step reads) needs no declaration but can miss reads and replay a wrong result. A declaration can also be wrong, but here it is enforced: an undeclared file is not in the container, so the step fails instead of replaying a wrong result. The cost of that safety is that the declaration must be complete, which a project's maintainers can do once per step.
+
+**Workload.** Experiment 2's first six go-task commits, one job each, with `setup-go`, the checkout, and three declared steps: `go mod download` (`go.mod go.sum`), gofmt (`**/*.go`), and `go vet` (both); `go test` is undeclared.
+
+| Commit | Job | go mod download | gofmt | go vet | go test |
+|---|---|---|---|---|---|
+| 2ecc2d2 (cold) | 211 s | ran 60 s | ran 2 s | ran 11 s | 116 s |
+| 4ac7726 | 49 s | **replayed** 1 s | ran 2 s | ran 3 s | 24 s |
+| 2ec5ffa | 23 s | **replayed** 2 s | **replayed** 1 s | **replayed** 1 s | 10 s |
+| f34e517 (new module versions) | 117 s | ran 41 s | **replayed** 1 s | ran 3 s | 62 s |
+| 24c4ee6 | 40 s | **replayed** 2 s | ran 2 s | ran 2 s | 26 s |
+| 490d779 | 29 s | **replayed** 1 s | ran 2 s | ran 3 s | 15 s |
+
+**Results.**
+
+- **The keys are right.** Each declared step replayed exactly when its declared files were unchanged and ran when they changed; none fell back. The earlier steps' changes (`setup-go`'s toolchain) had the same digest on every commit, which is what makes any of this possible.
+- **The savings here are small, and that is a finding.** A replayed declared step takes 1–2 s on the Pi, mostly building its container, which is what gofmt and a warm `go vet` take to run. `go mod download`'s 41–60 s runs were a cold module cache (the first job) and new module versions (f34e517), exactly the cases where it cannot replay; with a warm cache it takes about a second either way. Go's own caches, kept between jobs in cache volumes, already capture most of what finer keys would save. That agrees with experiment 2, where the tools' caches made the estimate a third rather than half.
+- **The time goes where nothing is declared:** `go test` was 10–116 s, most of every job. Declaring it (everything but docs and CI configuration) would replay it on documentation commits; on the others Go's test cache already reruns only affected packages.
+
+**Findings.**
+
+1. **Content keys across commits work on Dagger,** with the same store as output keys.
+2. **Declare expensive steps whose tool has no cache of its own.** For Go, its caches do most of the work, and declaring cheap steps costs as much as it saves. The case to measure next is Python, where pytest has no test cache: a declared test step would be the main saving.
+3. **Enforcement makes declarations safe to get wrong, but not free.** This run did not test a step that reads an undeclared file (go-task's vet reads only Go files); a project with `//go:embed` of other files must declare them.
+
+## 10. Next
+
+- **Python with uv:** the same questions for `uv sync`, ruff and pytest. Pytest has no built-in equivalent of Go's test cache, so test selection there is a real gap to look into, and declared inputs are the first thing to try.
+- **Inferring inputs** instead of declaring them, from a language's manifest or by tracing reads, and what it would cost to be wrong.
 - **Engine memory over days:** the 15-minute log, as the cache refills towards its 20 GB cap.
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
 - **Breaking down the engine's cost:** Dagger (~720 ms per 10 trivial steps on the Mac), BuildKit alone (~300 ms) and raw overlayfs with namespaces (~35 ms). The BuildKit layer will be split into its parts: runc, snapshot metadata, cgroups, gRPC.
