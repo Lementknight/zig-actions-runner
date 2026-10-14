@@ -222,7 +222,13 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .secret_vars = try collectSecretVars(arena, root),
         .results_endpoint = variable(root, "system.github.results_endpoint") orelse "",
         .runtime = runtime(root),
-        .github = githubContext(arena, root),
+        .github = github: {
+            var g = githubContext(arena, root);
+            // GitHub leaves `job` out of the github context. The job's key in the workflow is the
+            // `system.github.job` variable (`jobName` is a matrix job's leg, such as "zig").
+            if (g.job.len == 0) g.job = variable(root, "system.github.job") orelse path(root, &.{"jobName"}) orelse "";
+            break :github g;
+        },
         .env = try jobEnv(arena, root),
         .context_data = root.object.get("contextData") orelse .null,
         .display_name = path(root, &.{"jobDisplayName"}) orelse "",
@@ -951,6 +957,18 @@ test "container: arrives as jobContainer, a mapping or just the image" {
     const short = try parse(a.allocator(), head ++ "\"jobContainer\":{\"type\":0,\"lit\":\"node:22\"}}");
     try std.testing.expectEqualStrings("node:22", short.container.?.image.lit);
     try std.testing.expect(short.container_error == null);
+}
+
+test "github.job comes from system.github.job when the context leaves it out" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const job = try parse(a.allocator(),
+        \\{"plan":{"planId":"p"},"jobId":"j","jobName":"zig","jobDisplayName":"which-job (zig)","resources":{"endpoints":[{"authorization":{"parameters":{"AccessToken":"t"}}}]},
+        \\ "variables":{"system.github.job":{"value":"which-job"}},
+        \\ "contextData":{"github":{"t":2,"d":[{"k":"repository","v":"o/r"}]}},"steps":[]}
+    );
+    // As seen live for a matrix job: the key is the variable, not the leg in jobName.
+    try std.testing.expectEqualStrings("which-job", job.github.job);
 }
 
 test "malformed job" {
