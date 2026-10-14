@@ -209,6 +209,8 @@ In the re-run, `setup-go` runs, as a step with the token must, produces the same
 
 The test also caught a bug in review: the temporary name came from the run's nonce, which a run's matrix legs share. Each store now uses its own random name.
 
+**Deletions, empty directories and metadata.** A secret step deleted two files (one with a quote in its name) and a directory tree, created nested empty directories, and changed a mode, a symlink and an owner. The step after it, starting from the rebuilt container, checked all of them, and every check passed. On a re-run the step produced the same digest (3 removed paths), and the check was replayed.
+
 The store had 27 digests after one day of experiments, so pruning is needed before output keys can be on by default.
 
 ### 7.5 Findings
@@ -219,7 +221,6 @@ The store had 27 digests after one day of experiments, so pruning is needed befo
 4. **One hypothesis was wrong.** I thought stripping the ignored paths before the diff forced a full filesystem walk; the Mac showed no difference.
 
 **Still open before this can be on by default:**
-- deletions and empty directories, covered by the design but not yet by a Pi run;
 - images with a non-root `USER`, where `cp -a` cannot set owners, so the runner falls back;
 - pruning the store;
 - Docker actions, which copy their workspace back by a separate path and are not covered;
