@@ -486,6 +486,12 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
         r.jobFinished(job, c.name, if (result.cancelled) "cancelled" else if (result.succeeded) "success" else "failure", job_started_ms, std.Io.Clock.real.now(c.io).toMilliseconds());
         if (r.failures > 0) try c.err.print("run state: {d} database write(s) failed (last: {s})\n", .{ r.failures, r.last_error });
     }
+    const ok = result.output_keys;
+    if (ok.applied + ok.fell_back > 0) {
+        try c.err.print("job {d}: output keys: {d} of {d} always-run steps applied", .{ job.check_run_id, ok.applied, ok.applied + ok.fell_back });
+        if (ok.fell_back > 0) try c.err.print("; {d} fell back (last: {s})", .{ ok.fell_back, ok.last_reason });
+        try c.err.writeAll("\n");
+    }
     const shown = try shownSteps(c.arena, live.ids, job, result, job_started_ms, .{ .log_step = complete_step, .started_ms = complete_started, .completed_ms = std.Io.Clock.real.now(c.io).toMilliseconds() });
     try uploadLogs(c, job, shown, log.collect.lines.items, result.summaries, log.currentSecrets());
     {
