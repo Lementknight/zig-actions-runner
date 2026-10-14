@@ -78,9 +78,68 @@ The step cache keys a step on its entire parent container. A checkout of a new c
 
 **What it means for the engine.** The fine-grained caching that matters most for these workloads lives in the tools, and needs only cheap, persistent, per-repository directories. Any engine must keep those. The engine's own step cache matters for steps without such a tool cache, such as scripts, downloads and generated files.
 
-## 6. Next
+## 6. Experiment 2: what does the step cache replay?
+
+**Question.** Under a realistic stream of commits, and under re-runs, which steps does the runner's step cache replay, and what does it save?
+
+**Workload.** A typical Go CI job on `go-task/task`: setup, checkout, `go mod download`, gofmt, `go vet`, `go build`, `go test`. The series is the project's own last 21 commits, oldest first, one job at a time. They are an unbiased mix: of the 20 changes after the first commit, 11 touch no Go code (website, changelog, CI configuration), 3 change only `go.mod` or `go.sum`, and the rest change Go source.
+
+### 6.1 A bug: no deployed runner ever replayed a step
+
+The first re-runs replayed nothing, even of identical jobs with no secrets. The cause was that `RUNNER_NAME` was part of every step's cache key, and a runner pool registers every job under a new name. Step caching had been verified with `--exec-job`, under a fixed name, before the pool existed. With `RUNNER_NAME` made volatile (PR #126), GitHub's re-run of the same jobs:
+
+| Commit | First run | Re-run | Steps replayed |
+|---|---|---|---|
+| 2ecc2d2 | 61 s | 3 s | 6 of 6 |
+| 4ac7726 | 73 s | 4 s | 6 of 6 |
+| 2ec5ffa | 66 s | 3 s | 6 of 6 |
+| f34e517 | 73 s | 3 s | 6 of 6 |
+| 24c4ee6 | 80 s | 4 s | 6 of 6 |
+| 490d779 | 84 s | 4 s | 6 of 6 |
+
+A re-run is about 20 times faster. Re-running jobs is common: a flaky test, a required check, a cancelled run.
+
+### 6.2 One step that uses a secret stops the cache for every step after it
+
+The same six jobs with `actions/setup-go` instead of a Go image: `setup-go` has a `token` input that defaults to the job's `GITHUB_TOKEN`. The runner always runs a step that uses a secret, and marks its result with a per-run value. Every later step then has a parent no earlier run had, so nothing after it can be replayed:
+
+| | Re-run time per job | Steps replayed after the first |
+|---|---|---|
+| Go from the image (no secret) | 3–4 s | all 6 |
+| `setup-go` (token by default) | 22–27 s | none |
+
+Most `setup-*` actions, and `actions/checkout`, take the token by default. So in practice this rule, not the cache itself, decides whether a real workflow benefits.
+
+### 6.3 New commits always miss
+
+Every new commit missed every step after checkout, documentation-only commits included. That's by construction: each step's key is its whole parent container, which includes the workspace and per-commit variables such as `GITHUB_SHA` and `GITHUB_REF`.
+
+What a finer key would have saved can be computed from the series. Suppose each step were keyed only on its real inputs:
+
+- `go.mod`/`go.sum` for `go mod download`;
+- `*.go` for gofmt;
+- `*.go`, `go.mod`, `go.sum` for `go vet` and `go build`;
+- everything except documentation, website and CI configuration for `go test`.
+
+Under that rule, of the 20 changes, `go test` could have been replayed for 9 and `go vet`/`go build` for 10. That is **33% of the five check steps' measured time** (241 of 735 s). It's less than the commit mix suggests, because the tool caches already make those steps cheap on commits that don't touch Go: `go vet` took 1–7 s on them, against 71 s for the first commit.
+
+### 6.4 Container jobs miss the package caches
+
+The persistent cache volumes are mounted at the default image's paths (`/root/go/pkg/mod`, `/root/.cache/go-build`). The `golang` image keeps Go's module cache in `/go/pkg/mod`, so in a `container: golang:1.26` job `go mod download` took 35–54 s every time, against 0–1 s with the default image.
+
+### Findings
+
+1. **The step cache works now, and pays off for re-runs:** about 20 times faster when nothing changed. It had never worked in a deployed runner, and only measuring re-runs on the reference machine showed that.
+2. **The secret rule is the real limit.** It is correct that a step using a secret must run: it may deploy or publish. But it shouldn't take every later step with it when its result is the same. Two designs to compare:
+   - **Key steps on their parent's *content* rather than its *inputs*** (output-addressed rather than input-addressed, as in Nix's content-addressed derivations): a step that must run but produces the same files as before leaves the next steps' keys unchanged. Dagger keys on inputs, so this needs either a different engine or an extra hashing pass.
+   - **Treat a defaulted `GITHUB_TOKEN` input differently from a secret the workflow passes:** smaller, but a judgement call about what a token can affect.
+3. **Across commits, finer keys would save about a third of check-step time** on this project, on top of the tool caches. Getting there means keying steps on declared or inferred inputs. It also means taking per-commit variables such as `GITHUB_SHA` out of the key for steps that don't read them, which risks replaying a step that does read them indirectly (a version stamp from `git describe`, say).
+4. **Cache paths should follow the image, not assume the default one,** for container jobs. For example, set `GOMODCACHE`/`GOCACHE` to the mounted paths, or mount at the paths the image reports.
+5. **Method notes.** Two early analyses were wrong and are corrected here. A "second pass" pushed a new commit, which changes `GITHUB_SHA`, so it could not hit by construction; GitHub's re-run is the right way to repeat a run. And a parsing slip counted a trailing newline as a replayed step.
+
+## 7. Next
 
 - **The overhead floor:** the small Go projects (chi, cobra) and an empty job, to measure what the runner adds when the tests take almost nothing.
 - **Python with uv:** the same questions for `uv sync`, ruff and pytest. Pytest has no built-in equivalent of Go's test cache, so test selection there is a real gap to look into.
-- **Step-cache hit rates** under a scripted series of realistic commits (source edits, dependency bumps, documentation edits).
+- **The secret rule:** prototype output-addressed keys for the steps after an always-run step, and measure what they save on real workflows.
 - **Breaking down the engine's cost:** Dagger (~720 ms per 10 trivial steps on the Mac), BuildKit alone (~300 ms) and raw overlayfs with namespaces (~35 ms). The BuildKit layer will be split into its parts: runc, snapshot metadata, cgroups, gRPC.
