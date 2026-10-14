@@ -2334,6 +2334,8 @@ const Exec = struct {
     js_runtime: config.JsRuntime,
     /// Whether the JavaScript runtime is in the container yet (it is added by the first JS action).
     js_mounted: bool = false,
+    /// Whether Node, for actions Bun cannot load, is in the container yet (see `nodeFallback`).
+    node_fallback_mounted: bool = false,
     /// Per log step (index = step - 1, see `ExtraStep`): execs so far.
     execs: []u32,
     /// The next log step number for a `pre` or `post` script, and the scripts that ran.
@@ -2464,6 +2466,8 @@ const Exec = struct {
         outputs: []const job_mod.EnvVar,
         /// From GITHUB_STATE and `::save-state`; a JavaScript action's later phases get it as STATE_*.
         state: []const job_mod.EnvVar = &.{},
+        /// Bun refused to load the program (see `bun_load_errors`): nothing of it ran.
+        bun_refused: bool = false,
     };
 
     /// Runs one script in the job's container, logging as step `num`, and applies its file
@@ -2777,7 +2781,10 @@ const Exec = struct {
             .ok => |kv| state = try std.mem.concat(arena, job_mod.EnvVar, &.{ state, kv }),
             .invalid => |why| x.sh.append(num, try std.fmt.allocPrint(arena, "Unable to process the GITHUB_STATE file command: {s}", .{why})),
         };
-        return .{ .code = code, .outputs = outputs, .state = state };
+        const refused = code != 0 and for (bun_load_errors) |e| {
+            if (std.mem.indexOf(u8, jsonFindString(data, "stderr") orelse "", e) != null) break true;
+        } else false;
+        return .{ .code = code, .outputs = outputs, .state = state, .bun_refused = refused };
     }
 
     const ActionOut = struct { failed: bool, exit_code: i32 = 0, outputs: []const job_mod.EnvVar = &.{} };
@@ -3249,10 +3256,63 @@ const Exec = struct {
         try shellQuote(&script.writer, try std.fmt.allocPrint(arena, "{s}/{s}", .{ act.path, script_rel }));
         const fc = x.next_fc;
         x.next_fc += 1;
+        // What the first try starts from and uses up, should Node have to run it again.
+        const before = x.container_id;
+        const pending_env = try arena.dupe(job_mod.EnvVar, x.ev.pending_env.items);
+        const pending_path = try arena.dupe([]const u8, x.ev.pending_path.items);
         const out = try x.execScript(num, fc, .{ .run = .{ .script = script.written(), .shell = null, .working_directory = null, .env = plain.items } }, if (act.repository.len > 0) act.repository else act.ref_label, secret.items, mounts.items);
         x.js_mounted = true;
         try x.mounted_actions.put(arena, act.mount, {});
-        return out;
+        if (!out.bun_refused or x.js_runtime != .bun) return out;
+
+        // Bun refused the action's code before running any of it, so running it again with Node
+        // repeats nothing. The second try starts where the first did, not from the refused exec:
+        // with step caching that exec always runs (it has the job token), and starting from it would
+        // keep every later step from being replayed.
+        x.sh.append(num, "Bun could not load this action's code; running it with Node instead.");
+        const node_mounts = (try x.nodeFallback(num)) orelse return out;
+        x.container_id = before;
+        x.ev.pending_env.clearRetainingCapacity();
+        try x.ev.pending_env.appendSlice(arena, pending_env);
+        x.ev.pending_path.clearRetainingCapacity();
+        try x.ev.pending_path.appendSlice(arena, pending_path);
+        var again: std.Io.Writer.Allocating = .init(arena);
+        try again.writer.writeAll("PATH=\"" ++ js_bin_dir ++ ":$PATH\" exec " ++ js_fallback_path ++ " ");
+        try shellQuote(&again.writer, try std.fmt.allocPrint(arena, "{s}/{s}", .{ act.path, script_rel }));
+        const fc_again = x.next_fc;
+        x.next_fc += 1;
+        return try x.execScript(num, fc_again, .{ .run = .{ .script = again.written(), .shell = null, .working_directory = null, .env = plain.items } }, if (act.repository.len > 0) act.repository else act.ref_label, secret.items, try std.mem.concat(arena, Mount, &.{ mounts.items, node_mounts }));
+    }
+
+    /// Node at `js_fallback_path`, for an action Bun cannot load, from the same images as
+    /// `RUNNER_JS_RUNTIME=node` (with its own C++ runtime on musl). The mounts, once per job; null,
+    /// with the step failed, when the image could not be had.
+    fn nodeFallback(x: *Exec, num: u32) !?[]const Mount {
+        if (x.node_fallback_mounted) return &.{};
+        const arena = x.arena;
+        const rt = (if (x.musl) js_runtimes_musl else js_runtimes).get(.node);
+        var msg: []const u8 = "";
+        const libs: []const u8 = if (x.musl) " libs: directory(path:\"/usr/lib\") { filter(include:[\"libstdc++.so*\",\"libgcc_s.so*\"]) { id } }" else "";
+        const data = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }}{s} }} }} }}", .{ rt.image, rt.binary, libs }), &msg) catch {
+            _ = try x.actionFailed(num, "could not get Node from {s}: {s}", .{ rt.image, msg });
+            return null;
+        };
+        const bin = (if (jsonFind(data, "bin")) |b| jsonFindString(b, "id") else null) orelse {
+            _ = try x.actionFailed(num, "could not get Node from {s}", .{rt.image});
+            return null;
+        };
+        var mounts: std.ArrayList(Mount) = .empty;
+        if (x.musl) {
+            const libs_id = (if (jsonFind(data, "libs")) |l| jsonFindString(l, "id") else null) orelse {
+                _ = try x.actionFailed(num, "could not get the C++ runtime from {s}", .{rt.image});
+                return null;
+            };
+            try mounts.append(arena, .{ .dir = .{ .path = js_fallback_dir ++ "/lib", .id = libs_id } });
+            try mounts.append(arena, .{ .file = .{ .path = js_fallback_dir ++ "/node-musl", .id = bin, .permissions = 0o755 } });
+            try mounts.append(arena, .{ .new_file = .{ .path = js_fallback_path, .contents = "#!/bin/sh\nLD_LIBRARY_PATH=" ++ js_fallback_dir ++ "/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} exec " ++ js_fallback_dir ++ "/node-musl \"$@\"\n", .permissions = 0o755 } });
+        } else try mounts.append(arena, .{ .file = .{ .path = js_fallback_path, .id = bin, .permissions = 0o755 } });
+        x.node_fallback_mounted = true;
+        return mounts.items;
     }
 
     /// `hashFiles(patterns)`, as GitHub computes it: the SHA-256 of the SHA-256 digests of the matching
@@ -4258,6 +4318,14 @@ const js_runtimes_musl: std.EnumArray(config.JsRuntime, JsRuntimeSource) = .init
 });
 const js_lib_dir = "/github/_runtime/lib";
 const js_musl_dir = "/github/_runtime/musl";
+
+/// Node, for JavaScript actions Bun refuses to load when Bun is the runtime (see `bun_load_errors`).
+const js_fallback_dir = "/github/_runtime/fallback";
+const js_fallback_path = js_fallback_dir ++ "/node";
+/// What Bun prints when it refuses a program before running any of it, so the program can be run
+/// again with Node. actions/setup-python v7's bundle mixes an ES `import` with CommonJS `exports`,
+/// which Node accepts.
+const bun_load_errors = [_][]const u8{"error: Cannot use import statement with CommonJS-only features"};
 
 /// On musl, `js_runtime_path` (and `js_bun_path`) start the binary with its C++ runtime found.
 fn muslWrapper(arena: Allocator, name: []const u8) ![]const u8 {
@@ -5317,6 +5385,79 @@ test "action failures: an image that cannot be pulled, a missing action.yml, and
     // As GitHub's runner logs a script that exits non-zero.
     try std.testing.expect(std.mem.indexOf(u8, out, "##[error]Process completed with exit code 3.") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "o/none@v1 has no action.yml or action.yaml") != null);
+}
+
+test "a JavaScript action Bun refuses to load runs again with Node" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const action_yml =
+        \\runs:
+        \\  using: node24
+        \\  main: dist/setup/index.js
+    ;
+    const steps = [_]job_mod.Step{usesStep("sp", "actions", "setup-python", "v7", &.{})};
+    const job = testJob(&steps);
+    const refused = "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\",\"exitCode\":1,\"stdout\":\"\",\"stderr\":\"error: Cannot use import statement with CommonJS-only features\\n\"}}}}";
+    const answers = [_][]const u8{
+        base_answer,
+        try treeAnswer(arena, "D1", &.{ "action.yml", "dist" }),
+        try fileAnswer(arena, action_yml),
+        "{\"data\":{\"container\":{\"from\":{\"bin\":{\"id\":\"BUN\"}}}}}",
+        refused,
+        "{\"data\":{\"container\":{\"from\":{\"bin\":{\"id\":\"NODE\"}}}}}",
+        try exec(arena, "C2", 0, "set up\\n"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    const seen = fake.seen.items;
+    try std.testing.expect(res.succeeded);
+    try std.testing.expectEqual(@as(usize, 7), seen.len);
+    for (seen) |d| try std.testing.expect(braceBalanced(d));
+    // Bun first; then Node, from the image RUNNER_JS_RUNTIME=node uses, for the same script.
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "exec /github/_runtime/node/node") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "from(address:\"node:24-bookworm-slim\") { bin: file(path:\"/usr/local/bin/node\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[6], "withFile(path:\"/github/_runtime/fallback/node\",source:\"NODE\"") != null);
+    // From where the first try started, not from its result, with the action's code mounted again.
+    try std.testing.expect(std.mem.startsWith(u8, seen[6], "{ loadContainerFromID(id:\"C0\")"));
+    try std.testing.expect(std.mem.indexOf(u8, seen[6], "withDirectory(path:\"/github/_actions/actions/setup-python/v7\",source:\"D1\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[6], "exec /github/_runtime/fallback/node ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[6], "dist/setup/index.js") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Bun could not load this action's code; running it with Node instead.") != null);
+}
+
+test "a JavaScript action that fails for another reason does not run again" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const action_yml =
+        \\runs:
+        \\  using: node24
+        \\  main: dist/index.js
+    ;
+    const steps = [_]job_mod.Step{usesStep("x", "o", "act", "v1", &.{})};
+    const job = testJob(&steps);
+    const failed = "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"id\":\"C1\",\"exitCode\":1,\"stdout\":\"\",\"stderr\":\"TypeError: x is not a function\\n\"}}}}";
+    const answers = [_][]const u8{
+        base_answer,
+        try treeAnswer(arena, "D1", &.{ "action.yml", "dist" }),
+        try fileAnswer(arena, action_yml),
+        "{\"data\":{\"container\":{\"from\":{\"bin\":{\"id\":\"BUN\"}}}}}",
+        failed,
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(!res.succeeded);
+    try std.testing.expectEqual(@as(usize, 5), fake.seen.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "running it with Node") == null);
 }
 
 test "a JavaScript action runs its main with the runtime, inputs as INPUT_*, the runtime services, and the event" {
