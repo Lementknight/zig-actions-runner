@@ -146,9 +146,29 @@ The choice of path turned out to matter. The first version mounted the volumes a
 4. **Cache paths must not assume the default image.** Fixed for container jobs by pointing each tool's variable at its volume, which made jobs about 3 times faster and halved engine CPU. **A cache's path can be part of another cache's key:** Go's build cache is keyed partly on where module sources live, so every image should use the same module cache path.
 5. **Method notes.** Two early analyses were wrong and are corrected here. A "second pass" pushed a new commit, which changes `GITHUB_SHA`, so it could not hit by construction; GitHub's re-run is the right way to repeat a run. And a parsing slip counted a trailing newline as a replayed step.
 
-## 7. Next
+## 7. Experiment 3 (in progress): output-addressed keys on Dagger
+
+**Question.** Can the steps after an always-run step keep their cache keys when that step produces the same files as before, without leaving Dagger?
+
+**Why it is hard.** In an input-addressed cache, "always run S" also means "always run everything after S": each step's key includes its parent's key, and S's key changes every run. The ways out are to make fewer steps always run, or to key later steps on S's *output*.
+
+**Probes (Mac, Dagger v0.21.10, alpine; a nonce in S's script forces it to run, as the runner does):**
+
+| Parent of the next step T | T in runs 2 and 3 |
+|---|---|
+| S itself (today) | re-runs |
+| the base plus S's `diff`, copied | re-runs: Dagger keys the copy on the diff's recipe, which includes S |
+| the base plus S's `changes` applied with `withPatch(patch:)`, the patch passed as a literal | **cached** (1.2 s instead of 4.1 s), binary files included |
+
+Dagger keys every value on how it was made, so the only way to get content into a key is to pass the content in as an argument. A patch does that: it costs one round trip through the runner per always-run step, and nothing later (IDs are 29-byte session handles whatever their arguments).
+
+**Cost of the worst common case,** a `checkout` of go-task/task: the source is a 2.7 MB patch, made in about 0.4 s. Diffing the whole root filesystem instead of only the workspace adds 47 KB. A `setup-*` step's patch is small, since the tool cache is a volume and not in the diff.
+
+**Known gaps of a git patch:** empty directories, owners, timestamps, and special files are not carried. Very large outputs (a built binary) would pass through the runner's memory, so a size cap with a fallback to today's behaviour is needed.
+
+## 8. Next
 
 - **The overhead floor:** the small Go projects (chi, cobra) and an empty job, to measure what the runner adds when the tests take almost nothing.
 - **Python with uv:** the same questions for `uv sync`, ruff and pytest. Pytest has no built-in equivalent of Go's test cache, so test selection there is a real gap to look into.
-- **The secret rule:** prototype output-addressed keys for the steps after an always-run step, and measure what they save on real workflows.
+- **The secret rule:** prototype the patch approach of experiment 3 in the runner, and measure what it saves on real workflows on the Pi.
 - **Breaking down the engine's cost:** Dagger (~720 ms per 10 trivial steps on the Mac), BuildKit alone (~300 ms) and raw overlayfs with namespaces (~35 ms). The BuildKit layer will be split into its parts: runc, snapshot metadata, cgroups, gRPC.
