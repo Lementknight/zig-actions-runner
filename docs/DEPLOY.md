@@ -38,9 +38,12 @@ Start the engine once, with a socket on the host and a restart policy:
 
 ```sh
 docker run -d --name dagger-engine-runners --restart unless-stopped --privileged \
+  -e GOGC=400 \
   -v dagger-engine-runners:/var/lib/dagger -v /run/dagger:/run/dagger \
   registry.dagger.io/engine:v0.21.10 --addr unix:///run/dagger/engine.sock
 ```
+
+On a machine that also runs other services, cap the engine and lower its CPU priority, so CI cannot starve them: add `--memory 4g --memory-swap 4g --cpus 3 --cpu-shares 128 -e GOMEMLIMIT=3500MiB` (`GOMEMLIMIT` makes the engine collect harder near the cap instead of hitting it). On Raspberry Pi OS the memory cap needs `cgroup_enable=memory` added to `/boot/firmware/cmdline.txt` and a reboot; without it Docker ignores `--memory`.
 
 Then install the binary (from a release, or `zig build -Doptimize=ReleaseSafe -Dstrip` in `runner/`), its configuration and [`deploy/zig-runner.service`](../deploy/zig-runner.service):
 
@@ -69,6 +72,8 @@ Each connection then costs a `buildctl dial-stdio` process in the engine contain
 Measured with release builds on Linux ([SPEC §7](SPEC.md)):
 - **Idle:** 20 waiting runners take 29 MB in one process.
 - **Busy:** 10 concurrent jobs peak at 44 MB, about 1.5 MB per running job.
+
+The engine's CPU is the cost to manage. `GOGC=400` on the engine (in `deploy/compose.yaml` and above) makes its garbage collector run a quarter as often: 2 collections per 10 jobs instead of 10, about 200 MB more memory, 6% less engine CPU per job on a Mac and 13% on a Raspberry Pi 5. On a Raspberry Pi 5 with 8 GB (engine capped at 3 CPUs and 4 GB), real Node builds against a Postgres service took about 60 s each two at a time and about 3 minutes each six at a time, with the engine at its CPU cap from two jobs on: three runners is a good balance there.
 
 The runner itself is rarely the limit. What jobs need is CPU, memory and disk in the engine (their containers, images and caches), so set `RUNNER_COUNT` by what the machine can run at once.
 
