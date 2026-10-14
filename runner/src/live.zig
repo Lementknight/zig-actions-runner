@@ -122,6 +122,14 @@ pub const Live = struct {
         l.pending[step].append(l.gpa, copy) catch l.gpa.free(copy);
     }
 
+    /// Steps that will not run (the job failed in "Set up job") still have their numbers in the
+    /// final step list, so the steps after them start later.
+    pub fn skipNumbers(l: *Live, count: u32) void {
+        l.mu.lockUncancelable(l.io);
+        defer l.mu.unlock(l.io);
+        l.next_number += count;
+    }
+
     /// A step started: it gets the next number (steps start in the order GitHub lists them), and
     /// "Set up job" is over once any other step starts.
     pub fn begin(l: *Live, log_step: u32, name: []const u8, started_ms: i64) void {
