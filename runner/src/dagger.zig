@@ -1037,6 +1037,11 @@ const Evaluator = struct {
                 ev.github = try withEntries(arena, ev.github, &.{.{ .key = "token", .value = .{ .string = sv.value } }});
             };
         }
+        // Nor is `github.job` (GITHUB_JOB, the job's key in the workflow): it comes from the message's
+        // `jobName`.
+        if (ev.github == .object and !hasKey(ev.github, "job") and job.github.job.len > 0) {
+            ev.github = try withEntries(arena, ev.github, &.{.{ .key = "job", .value = .{ .string = job.github.job } }});
+        }
         for (job.env) |in| {
             const sc = try ev.scope(&.{});
             const val = ev.render(in.value, sc) catch continue; // an env value that cannot be evaluated stays unset
