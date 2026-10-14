@@ -205,6 +205,12 @@ Experiment 2's `setup-go` workflow (go-task/task at 6 commits), on the Pi. The f
 
 In the re-run, `setup-go` runs, as a step with the token must, produces the same digest, and the six steps after it are replayed. A first run costs about the same as without output keys. The exception is the first job to store a new digest, which takes about 10 s more.
 
+**Concurrent jobs.** In a run of the same matrix three legs at a time, an always-run step wrote the run's commit SHA, so every leg produced the same new digest. All six jobs succeeded. The store ended up with one directory for the digest, containing only what the step wrote, and no leftover temporary directories. The legs started in the same second, but this does not prove their store calls overlapped: a leg that arrives late finds the directory and skips. It does show the concurrent path is safe.
+
+The test also caught a bug in review: the temporary name came from the run's nonce, which a run's matrix legs share. Each store now uses its own random name.
+
+The store had 27 digests after one day of experiments, so pruning is needed before output keys can be on by default.
+
 ### 7.5 Findings
 
 1. **Output-addressed keys work on Dagger** without a new engine, through a content store and a digest in an exec's arguments. They lift experiment 2's main limit: one secret-using step no longer forces every later step to run.
