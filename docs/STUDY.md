@@ -219,14 +219,18 @@ The test also caught a bug in review: the temporary name came from the run's non
 | `actions/setup-node` v4 | no | `/tmp/node-compile-cache`: V8 bytecode that Node and npm write on every run, not byte-identical between runs |
 | `actions/setup-go` v5 | yes, once its noise was excluded | Go's telemetry counters (§7.3) |
 
-So far the noise is all tool caches or telemetry that the tool rebuilds itself, so leaving it out is safe. Leaving out a whole directory such as `/tmp` would not be: steps legitimately leave files there for later steps.
+So far the noise is all tool caches or telemetry that the tool rebuilds itself. Rather than keep a growing per-tool ignore list, these now live in cache volumes like the package caches (PR #131). That puts them outside the container's filesystem by construction, and Node starts faster on the Pi with its compile cache kept. Output keys now ignore only the runner's own file commands. Leaving out a whole directory such as `/tmp` would not be: steps legitimately leave files there for later steps.
 
 The survey also found three runner bugs unrelated to output keys:
 - `github.workspace` was empty, so `setup-uv` failed (fixed).
 - A step's output was lost when it arrived after the step's end marker, as Bun's error does when it refuses an action (fixed).
-- The same timing can label a step that ran as "Reused from Dagger's cache" (open).
+- The same timing could label a step that ran as "Reused from Dagger's cache". The runner no longer guesses (PR #132). Each job has a random value in a volatile variable, which is not part of any cache key. Each step writes it with its file commands, so a replayed result carries an earlier job's value.
 
-It also found that Bun cannot load `actions/setup-python` v7, whose bundle mixes ES `import` with CommonJS `exports`; Node runs it.
+**The exact label found a bug on its first run.** Secret-using steps were forced to run by a nonce made from the run's ID and attempt. A run's matrix jobs share those, so in a matrix, the second job replayed the first job's secret steps. For a deploy in a matrix, that would mean deploying once instead of in each job, as GitHub does. The nonce is now per job (PR #132). This shows why an exact signal beats a heuristic: the timing guess had hidden the bug.
+
+With all of this, one fresh run and one re-run of click, flask and Express on the Pi labelled every step correctly. In the first run, nothing was labelled reused. In the re-run, exactly the steps after the setup steps were, in all three jobs. `setup-uv`, `setup-python` (through the Node fallback) and `setup-node` each produced the same digest in both runs.
+
+It also found that Bun cannot load `actions/setup-python` v7, whose bundle mixes ES `import` with CommonJS `exports`; Node runs it. The runner now retries an action with Node when Bun refuses to load it (PR #130). The retry starts from the container before Bun's attempt: starting from the refused exec, which always runs, kept every later step from being replayed.
 
 The store had 27 digests after one day of experiments, so pruning is needed before output keys can be on by default.
 
@@ -241,7 +245,6 @@ The store had 27 digests after one day of experiments, so pruning is needed befo
 - images with a non-root `USER`, where `cp -a` cannot set owners, so the runner falls back;
 - pruning the store;
 - Docker actions, which copy their workspace back by a separate path and are not covered;
-- which other tools write noise like Go's telemetry, which needs a survey of the target workloads (uv, npm).
 
 ## 8. Next
 
