@@ -45,11 +45,11 @@ Each decision with what it costs. The measurements behind them are in [STUDY.md]
 4. **GitHub-familiar by default.** The default image is `ubuntu:24.04` with what `ubuntu-latest` workflows assume, provisioned once per engine. Steps run as `runner` (uid 1001, passwordless `sudo`), as on GitHub. Step numbering, "Set up job" and post steps match GitHub's, and logs stream to GitHub live. `container:` jobs run as their image's user. *Cost:* every difference from GitHub found later is a bug to fix; `RUNNER_STEP_USER=root` exists for the cases where root is wanted.
 5. **JavaScript actions on Bun, with Node as the fallback.** Bun is the default runtime: lighter, and good enough for most actions. When Bun refuses to load an action's code, which happens before any of it runs, the runner runs it again with Node and says so in the log (`actions/setup-python` v7 needs this). `RUNNER_JS_RUNTIME=node` uses Node throughout. *Cost:* Bun's incompatibilities surface one action at a time.
 6. **Caching in three layers.**
-   - **The step cache** (Dagger) replays a step whose inputs are unchanged. Run-specific values (run id, actor, runner name, the event) are volatile, so they don't change the keys.
+   - **The step cache** (Dagger) replays a step whose inputs are unchanged. Run-specific values (run id, actor, runner name, the event) and the commit and refs are volatile, so they don't change the keys.
    - **Package and tool caches** are Dagger cache volumes per repository: npm, uv, Go, Cargo and others, plus `/opt/hostedtoolcache`. Pull requests from forks get their own.
    - **Dagger functions** cache their own calls.
 
-   A step that uses a secret always runs, once in every job: it may deploy or publish. With **output keys** (experimental, `RUNNER_OUTPUT_KEYS`), the steps after it are keyed on what it produced rather than on its having run, so they can still be replayed. *Cost:* the step cache lives as long as the engine process, so an engine restart starts it cold. A new commit misses every step, because every key includes the commit.
+   A step that uses a secret always runs, once in every job: it may deploy or publish. With **output keys** (experimental, `RUNNER_OUTPUT_KEYS`), the steps after it are keyed on what it produced rather than on its having run, so they can still be replayed. *Cost:* the step cache lives as long as the engine process, so an engine restart starts it cold. A new commit misses every step after the checkout, because each step starts from the previous one's container, which holds the checked-out files.
 7. **The engine sized for small machines.** The engine runs with a memory cap and `GOGC=400`, and its cache on disk is capped at 20 GB (`deploy/engine.json`). Without the cache cap, Dagger let it grow to most of a Raspberry Pi's SD card. The kernel's records of those files then filled the engine's memory, and every job re-read its tools from the card.
 
 ## 6. Job lifecycle
@@ -74,7 +74,7 @@ On SIGTERM, waiting runners stop and remove their registrations, and running job
 
 ## 8. Open questions
 
-- **Hits across commits.** Keying steps on their real inputs, not the whole commit. Experiment 2 estimated it would save about a third of check-step time.
+- **Hits across commits.** Keying steps on the files they read, not the whole checkout. Dagger keys files taken from a checkout on their content, so this can be cheap for them. It keys what earlier steps produced (a toolchain, `.venv`) on how they were made, so carrying that by content means copying it, which cost more than it saved for Python on the Pi. A prototype (`ZIG_RUNNER_INPUTS`) is on the `feat/declared-inputs` branch; see STUDY.md, experiment 5.
 - **The step cache across engine restarts.** Accept a cold start, avoid restarts, or keep the cache outside the engine's memory.
 - **Test selection for Python.** pytest has no equivalent of Go's test cache, so every test runs every time.
 - **Output keys by default.** They are being trialled on the Pi, with a per-job line in the runner's log showing how often they apply.
