@@ -60,13 +60,15 @@ pub fn request(
     opts: RequestOptions,
 ) !Response {
     // A kept-alive connection the server had closed while it sat idle (seen on completejob after a
-    // 16-minute step): no byte came back, so the request was never processed, and the connection is
-    // dropped. The pool can hold several such connections to the same host (six jobs finishing at
-    // once after minutes of quiet), so try again until a live or new connection answers.
+    // 16-minute step): no byte came back (HttpConnectionClosing), or the request could not even be
+    // written (WriteFailed, seen on log uploads to blob storage), so it was never processed, and the
+    // connection is dropped (see `requestOnce`). The pool can hold several such connections to the
+    // same host (six jobs finishing at once after minutes of quiet), so try again until a live or
+    // new connection answers.
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         return requestOnce(arena, io, method, url, payload, opts) catch |err| switch (err) {
-            error.HttpConnectionClosing => if (attempt < max_stale_retries) continue else err,
+            error.HttpConnectionClosing, error.WriteFailed => if (attempt < max_stale_retries) continue else err,
             else => err,
         };
     }
@@ -106,6 +108,12 @@ fn requestOnce(
         .extra_headers = headers,
     });
     defer req.deinit();
+    // A connection a request failed on is not given back to the pool: one that failed while writing
+    // (the server had closed it) would otherwise fail every later request to that host, which is how
+    // every log upload of a runner failed from one moment on.
+    errdefer if (req.connection) |conn| {
+        conn.closing = true;
+    };
 
     if (trace) std.debug.print("trace: connected\n", .{});
     if (payload) |p| {
