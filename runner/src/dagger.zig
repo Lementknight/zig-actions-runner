@@ -2599,7 +2599,7 @@ const Exec = struct {
                 else if (oidc != null)
                     "it can request OIDC tokens (id-token: write)"
                 else if (readsRunSpecific(resolved.run.script))
-                    "it reads run-specific values"
+                    "it reads run- or commit-specific values"
                 else
                     null;
                 if (reason) |r| resolved.run.always_run = try std.fmt.allocPrint(arena, "zig-runner runs this step every time: {s} (run {s})", .{ r, x.run_nonce });
@@ -4462,7 +4462,14 @@ const max_event_env = 100 * 1024;
 /// volatile: they reach every step but do not take part in exec cache keys.
 /// RUNNER_NAME belongs here too: a pool registers every job under a new name, so as an input it
 /// would make every job's keys new and no step would ever be reused.
-const volatile_env = [_][]const u8{ "GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "GITHUB_RUN_ATTEMPT", "GITHUB_ACTOR", "GITHUB_TRIGGERING_ACTOR", "RUNNER_NAME" };
+/// So do the commit and the refs: as inputs they made every step of a new commit miss, even steps
+/// before the checkout. A step whose script names one of these still runs every time
+/// (`readsRunSpecific`), and a step that reads the commit some other way still sees a new workspace
+/// (`.git` included) after a checkout, so its key changes with the commit anyway.
+const volatile_env = [_][]const u8{
+    "GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "GITHUB_RUN_ATTEMPT", "GITHUB_ACTOR",    "GITHUB_TRIGGERING_ACTOR", "RUNNER_NAME",
+    "GITHUB_SHA",    "GITHUB_REF",        "GITHUB_REF_NAME",    "GITHUB_REF_TYPE", "GITHUB_BASE_REF",         "GITHUB_HEAD_REF",
+};
 
 /// Whether a script names a variable whose value differs between runs while the cache key does not
 /// (the volatile ones and the event payload). Scripts the step runs from files are not looked into.
@@ -6587,8 +6594,9 @@ test "step caching: run-specific values are volatile, steps with secrets always 
         const build = fake.seen.items[1];
         const deploy = fake.seen.items[3];
         for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
-        // Content stays in the cache key either way.
-        try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"GITHUB_SHA\",value:\"abc\")") != null);
+        // The commit is volatile with step caching (a new commit is not by itself a new key); without
+        // it, it is an ordinary variable.
+        try std.testing.expect(std.mem.indexOf(u8, base, if (opt_out) "withEnvVariable(name:\"GITHUB_SHA\",value:\"abc\")" else "withVolatileVariable(name:\"GITHUB_SHA\",value:\"abc\")") != null);
         if (!opt_out) {
             try std.testing.expect(std.mem.indexOf(u8, base, "withVolatileVariable(name:\"GITHUB_RUN_ID\",value:\"123\")") != null);
             // A pool names every job's runner anew: as an input it would make every key new.
@@ -6847,6 +6855,14 @@ test "with step caching, each step's marker says whether it ran in this job or w
     try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused") == null);
     try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 2 stdout] cached") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 2 stdout] Reused from Dagger's cache") != null);
+}
+
+test "a script that names the commit or a ref runs every time; one that does not can be replayed" {
+    try std.testing.expect(readsRunSpecific("go build -ldflags \"-X main.commit=$GITHUB_SHA\" ./..."));
+    try std.testing.expect(readsRunSpecific("if [ \"$GITHUB_REF\" = refs/heads/main ]; then ./deploy.sh; fi"));
+    try std.testing.expect(readsRunSpecific("echo ${GITHUB_HEAD_REF}"));
+    try std.testing.expect(!readsRunSpecific("go test ./..."));
+    try std.testing.expect(isVolatile("GITHUB_SHA") and isVolatile("GITHUB_REF_NAME") and !isVolatile("GITHUB_REPOSITORY"));
 }
 
 test "a checkout gets the refs actions/checkout leaves" {
