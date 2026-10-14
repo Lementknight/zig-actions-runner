@@ -243,7 +243,9 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
             }
             try writeEnvCommand(w, arena, "env ", sc.env, sc.secret_env, sc.write_event, fc, action_name);
             try writeShellCommand(w, arena, sc.shell, path);
-            try w.writeAll(")\nrc=$?\n");
+            // The script file goes once it ran: otherwise every later step's filesystem holds it, and
+            // with it whatever the script embeds (a commit from `${{ github.sha }}`).
+            try w.print(")\nrc=$?\nrm -f {s}\n", .{path});
         },
         .checkout => |f| {
             // The tree is mounted by the query (`withDirectory`); the step reports it in the shape
