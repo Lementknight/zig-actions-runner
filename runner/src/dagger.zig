@@ -2679,11 +2679,14 @@ const Exec = struct {
         for (0..outputs_ignored.len) |i| @memcpy(closing[2 * i ..][0..2], " }");
         const pre_closing = try arena.alloc(u8, 2 * pre_braces);
         for (0..pre_braces) |i| @memcpy(pre_closing[2 * i ..][0..2], " }");
-        const older = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ {s}zig_base: id zig_fs: rootfs {{ {s}id{s} }}{s} }} }}", .{ std.json.fmt(before, .{}), pre, without.written(), closing, pre_closing }), &msg) catch {
+        const older = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ {s}zig_base: id zig_user: user zig_fs: rootfs {{ {s}id{s} }}{s} }} }}", .{ std.json.fmt(before, .{}), pre, without.written(), closing, pre_closing }), &msg) catch {
             debug(x, num, "Output keys: {s}", .{msg});
             return null;
         };
         const base = jsonFindString(older, "zig_base") orelse return null;
+        // The image's user ("" for its default, root): the copy runs as root, which can write
+        // anywhere and keep owners, and the next steps run as this user again.
+        const user = jsonFindString(older, "zig_user") orelse "";
         const older_id = (if (jsonFind(older, "zig_fs")) |f| jsonFindString(f, "id") else null) orelse return null;
         const changes = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ rootfs {{ {s}changes(from:{f}) {{ removedPaths layer {{ id digest }} }}{s} }} }} }}", .{ std.json.fmt(after, .{}), without.written(), std.json.fmt(older_id, .{}), closing }), &msg) catch {
             debug(x, num, "Output keys: {s}", .{msg});
@@ -2746,8 +2749,10 @@ const Exec = struct {
         try w.print("{{ loadContainerFromID(id:{f}) {{ ", .{std.json.fmt(base, .{})});
         try w.print("withMountedCache(path:\"" ++ outputs_store ++ "\",cache:{f}) {{ withMountedFile(path:\"" ++ outputs_busybox ++ "\",source:{f}) {{ ", .{ std.json.fmt(volume, .{}), std.json.fmt(busybox, .{}) });
         // Run now (exitCode), so a failure falls back here rather than failing the next step.
-        try w.print("withExec(args:{f}) {{ exitCode withoutMount(path:\"" ++ outputs_store ++ "\") {{ withoutMount(path:\"" ++ outputs_busybox ++ "\") {{ id", .{std.json.fmt([_][]const u8{ outputs_busybox, "sh", "-c", apply.written() }, .{})});
-        for (0..5 + 2) |_| try w.writeAll(" }");
+        try w.print("withUser(name:\"root\") {{ withExec(args:{f}) {{ exitCode ", .{std.json.fmt([_][]const u8{ outputs_busybox, "sh", "-c", apply.written() }, .{})});
+        if (user.len > 0) try w.print("withUser(name:{f}) {{ ", .{std.json.fmt(user, .{})}) else try w.writeAll("withoutUser { ");
+        try w.writeAll("withoutMount(path:\"" ++ outputs_store ++ "\") { withoutMount(path:\"" ++ outputs_busybox ++ "\") { id");
+        for (0..5 + 4) |_| try w.writeAll(" }");
         const next = gql(arena, x.transport, doc.written(), &msg) catch {
             debug(x, num, "Output keys: could not apply the step's changes: {s}", .{msg});
             return null;
@@ -6392,7 +6397,7 @@ test "output keys: the step after one that always runs starts from that step's o
         try exec(arena, "C1", 0, ""),
         "{\"data\":{\"bb\":{\"from\":{\"file\":{\"id\":\"BB\"}}},\"empty\":{\"id\":\"E\"}}}",
         "{\"data\":{\"cacheVolume\":{\"id\":\"VOL\"}}}",
-        "{\"data\":{\"loadContainerFromID\":{\"zig_base\":\"B0\",\"zig_fs\":{\"id\":\"R0\"}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"zig_base\":\"B0\",\"zig_user\":\"circleci\",\"zig_fs\":{\"id\":\"R0\"}}}}",
         "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{\"changes\":{\"removedPaths\":[\"tmp/it's gone\"],\"layer\":{\"id\":\"L\",\"digest\":\"sha256:0123abcd\"}}}}}}",
         "{\"data\":{\"container\":{\"withExec\":{\"exitCode\":0}}}}",
         "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"exitCode\":0,\"withoutMount\":{\"withoutMount\":{\"id\":\"N1\"}}}}}}",
@@ -6409,7 +6414,7 @@ test "output keys: the step after one that always runs starts from that step's o
     // The store, scoped like the package caches.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[4], "cacheVolume(key:\"zig-runner/o/r/repo/step-outputs\")") != null);
     // What the step changed: the container after it against the one before it.
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], "loadContainerFromID(id:\"C0\") { zig_base: id zig_fs: rootfs { withoutDirectory(path:\"/github/file_commands\") {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[5], "loadContainerFromID(id:\"C0\") { zig_base: id zig_user: user zig_fs: rootfs { withoutDirectory(path:\"/github/file_commands\") {") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[6], "loadContainerFromID(id:\"C1\") { rootfs { withoutDirectory(path:\"/github/file_commands\") { changes(from:\"R0\")") != null);
     // Stored under its digest, the layer mounted.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "withMountedDirectory(path:\"/in\",source:\"L\")") != null);
@@ -6427,6 +6432,9 @@ test "output keys: the step after one that always runs starts from that step's o
     try std.testing.expect(std.mem.indexOf(u8, apply, "rm -rf -- '/tmp/it'\\\\''s gone'") != null);
     try std.testing.expect(std.mem.indexOf(u8, apply, "cp -a /zig-runner-outputs/0123abcd/. /") != null);
     try std.testing.expect(std.mem.indexOf(u8, apply, "C1") == null);
+    // As root, which can write anywhere and keep owners; then as the image's user again.
+    const as_root = std.mem.indexOf(u8, apply, "withUser(name:\"root\") { withExec(").?;
+    try std.testing.expect(std.mem.indexOf(u8, apply, "exitCode withUser(name:\"circleci\") { withoutMount(").? > as_root);
     // The next step starts there.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[9], "loadContainerFromID(id:\"N1\")") != null);
 }
