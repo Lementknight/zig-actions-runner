@@ -292,13 +292,12 @@ On the fresh engine, the same workflow:
 ### 8.3 Found along the way
 
 - **Log uploads failed for two minutes,** all of a job's blobs within the same second. A request that failed was giving its dead connection back to the shared pool. Now a failed connection is dropped, and failed writes are retried (PR #137). Why the failures stopped by themselves is not known.
-- **The leftover network namespaces** suggest sessions that did not clean up. They are not investigated yet.
+- **The leftover network namespaces are not a leak.** Dagger keeps a warm pool of 128 network namespaces (`CNIPoolSize`, default 128 in `cmd/engine/config.go`), prefilled at engine start: 128 in 9.4 s on the Pi, 7.8 s of engine CPU. A restart cannot release the old pool's namespaces, because their mounts went away with the old container, hence the warnings; they do not pile up on disk. The pool could be shrunk (`cniPoolSize` in `engine.toml`, 16 is plenty for three runners), but that only saves those ~8 s per engine start, so it is left as it is.
 
 ## 9. Next
 
 - **Python with uv:** the same questions for `uv sync`, ruff and pytest. Pytest has no built-in equivalent of Go's test cache, so test selection there is a real gap to look into.
 - **Engine memory over days:** the 15-minute log, as the cache refills towards its 20 GB cap.
 - **Steps as a non-root user,** as on GitHub (cobra's permission test).
-- **The leftover network namespaces** after an engine restart.
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
 - **Breaking down the engine's cost:** Dagger (~720 ms per 10 trivial steps on the Mac), BuildKit alone (~300 ms) and raw overlayfs with namespaces (~35 ms). The BuildKit layer will be split into its parts: runc, snapshot metadata, cgroups, gRPC.
