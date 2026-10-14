@@ -3109,6 +3109,8 @@ const Exec = struct {
         try sw.print(outputs_busybox ++ " cp -a " ++ outputs_store ++ "/{s}/. /\n" ++
             outputs_busybox ++ " rm -rf " ++ workspace ++ "\n" ++
             outputs_busybox ++ " cp -a " ++ outputs_store ++ "/{s} " ++ workspace ++ "\n", .{ delta, files });
+        // The files keep the owners they had; the workspace itself is the store's directory, root's.
+        if (x.dir_owner) |o| try sw.print(outputs_busybox ++ " chown {s}:{s} " ++ workspace ++ "\n", .{ o, o });
         try w.print("withMountedCache(path:\"" ++ outputs_store ++ "\",cache:{f}) {{ withMountedFile(path:\"" ++ outputs_busybox ++ "\",source:{f}) {{ withUser(name:\"root\") {{ withExec(args:{f}) {{ exitCode ", .{
             std.json.fmt(stored.volume, .{}),
             std.json.fmt(stored.busybox, .{}),
@@ -7169,7 +7171,7 @@ test "declared inputs: a step runs on its declared files, keyed on content, with
     var buf: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .step_user = .runner, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
     try std.testing.expect(res.succeeded);
     const seen = fake.seen.items;
     try std.testing.expectEqual(@as(usize, 13), seen.len);
@@ -7189,6 +7191,8 @@ test "declared inputs: a step runs on its declared files, keyed on content, with
     try std.testing.expect(std.mem.indexOf(u8, cp, "withEnvVariable(name:\"GITHUB_REF\",value:\"refs/heads/main\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, cp, "cp -a /zig-runner-outputs/dddd/. /") != null);
     try std.testing.expect(std.mem.indexOf(u8, cp, "cp -a /zig-runner-outputs/ffff /github/workspace") != null);
+    // The step's user can write the workspace (the copy made it root's).
+    try std.testing.expect(std.mem.indexOf(u8, cp, "chown runner:runner /github/workspace") != null);
     // The step runs there; what it changed goes into the job's container, which the next step uses.
     try std.testing.expect(std.mem.indexOf(u8, seen[8], "loadContainerFromID(id:\"CP\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[9], "zig_real: loadContainerFromID(id:\"C0\")") != null);
