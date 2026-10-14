@@ -40,6 +40,7 @@ Start the engine once, with a socket on the host and a restart policy:
 docker run -d --name dagger-engine-runners --restart unless-stopped --privileged \
   -e GOGC=400 \
   -v dagger-engine-runners:/var/lib/dagger -v /run/dagger:/run/dagger \
+  -v "$PWD/deploy/engine.json:/etc/dagger/engine.json:ro" \
   registry.dagger.io/engine:v0.21.10 --addr unix:///run/dagger/engine.sock
 ```
 
@@ -74,6 +75,10 @@ Measured with release builds on Linux ([SPEC §7](SPEC.md)):
 - **Busy:** 10 concurrent jobs peak at 44 MB, about 1.5 MB per running job.
 
 The engine's CPU is the cost to manage. `GOGC=400` on the engine (in `deploy/compose.yaml` and above) makes its garbage collector run a quarter as often: 2 collections per 10 jobs instead of 10, about 200 MB more memory, 6% less engine CPU per job on a Mac and 13% on a Raspberry Pi 5. On a Raspberry Pi 5 with 8 GB (engine capped at 3 CPUs and 4 GB), real Node builds against a Postgres service took about 60 s each two at a time and about 3 minutes each six at a time, with the engine at its CPU cap from two jobs on: three runners is a good balance there.
+
+Cap the engine's cache on disk. [`deploy/engine.json`](../deploy/engine.json) sets `"gc": {"maxUsedSpace": "20GB"}`; without it, Dagger lets the cache grow to about three quarters of the disk before it collects anything. On a Raspberry Pi 5 with a 117 GB SD card and the engine capped at 4 GB of memory, the cache grew to 67 GB in 17,000 snapshots. The kernel's inode cache for those files (1.4 GB) was charged to the engine and crowded out its page cache: first runs re-read Go's toolchain from the card at 25-30% iowait, and the diff after an always-run step took 13-21 s instead of under a second. Size the cap to what the jobs reuse (a few GB per project's images and caches), not to the disk.
+
+The engine keeps its index of cached results in memory, so restarting it (an upgrade, a reboot) makes the next jobs run without step-cache hits.
 
 The runner itself is rarely the limit. What jobs need is CPU, memory and disk in the engine (their containers, images and caches), so set `RUNNER_COUNT` by what the machine can run at once.
 

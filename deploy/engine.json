@@ -1,0 +1,5 @@
+{
+  "gc": {
+    "maxUsedSpace": "20GB"
+  }
+}
