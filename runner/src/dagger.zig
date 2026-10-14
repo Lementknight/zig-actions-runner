@@ -4423,8 +4423,12 @@ fn awaitLiveOrReplay(io: std.Io, sh: *Shared, step: u32, stdout: []const u8, std
     while (waited < live_grace_ms and !sh.ended[idx].load(.acquire)) : (waited += 10) {
         io.sleep(.fromMilliseconds(10), .awake) catch {};
     }
-    if (sh.live_lines[idx].load(.monotonic) > 0 or sh.ended[idx].load(.acquire)) return false;
-    {
+    if (sh.live_lines[idx].load(.monotonic) > 0) return false;
+    // The step ran (its end marker arrived) but none of its lines did: they came after the marker,
+    // as a program's stderr can when it fails at once (Bun refusing an action's bundle, on Linux),
+    // and so belonged to no step. Show the result's output, which has them, as the step's own.
+    const cached = !sh.ended[idx].load(.acquire);
+    if (cached) {
         sh.mu.lockUncancelable(sh.io);
         defer sh.mu.unlock(sh.io);
         if (idx < sh.replayed_steps.len) sh.replayed_steps[idx] = true;
@@ -4441,7 +4445,7 @@ fn awaitLiveOrReplay(io: std.Io, sh: *Shared, step: u32, stdout: []const u8, std
         }
     }
     sh.flush();
-    return true;
+    return cached;
 }
 
 /// Logs why a step could not run and marks it failed (the job too, unless continue-on-error).
@@ -6273,6 +6277,24 @@ test "a step is noted as reused only if none of its live lines ever arrived" {
     try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused from Dagger's cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, got, "step 2") == null);
     try std.testing.expect(std.mem.indexOf(u8, got, "step 3") == null);
+}
+
+test "a step that ran but streamed no lines shows its result's output, not as reused" {
+    var buf: [1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var live = [_]std.atomic.Value(u32){ .init(0), .init(0) };
+    // Step 1 ended live (its end marker arrived); step 2 did not: it was cached.
+    var ended = [_]std.atomic.Value(bool){ .init(true), .init(false) };
+    var replayed = [_]bool{ false, false };
+    var sh: Shared = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed };
+    try std.testing.expect(!awaitLiveOrReplay(std.testing.io, &sh, 1, "", "error: Cannot use import statement\n"));
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[job 0 step 1 stdout] error: Cannot use import statement") != null);
+    try std.testing.expect(!replayed[0]);
+    try std.testing.expect(awaitLiveOrReplay(std.testing.io, &sh, 2, "from cache\n", ""));
+    try std.testing.expect(replayed[1]);
 }
 
 test "a checkout gets the refs actions/checkout leaves" {
