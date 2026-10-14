@@ -241,8 +241,9 @@ The store had 27 digests after one day of experiments, so it needs pruning. It i
 3. **The engine is short of memory on the Pi, with or without this change.** It sits at its 4 GB cap and has hit it tens of thousands of times. 1.4 GB of that is reclaimable kernel slab (inode and directory caches), so first runs re-read Go's toolchain and caches from the SD card, at 25–30% iowait. That is the next cost to understand. Pass B is fast because it barely touches the disk.
 4. **One hypothesis was wrong.** I thought stripping the ignored paths before the diff forced a full filesystem walk; the Mac showed no difference.
 
+**Images with a non-root user.** The copy into the next step ran as the image's user, so in an image with a non-root `USER` it failed and output keys fell back. It now runs as root, then restores the image's user (PR #134). With `cgr.dev/chainguard/git:latest-dev` (uid 65532) on the Pi, the next step still ran as 65532. A file the always-run step wrote kept its owner, and a re-run replayed the check.
+
 **Still open before this can be on by default:**
-- images with a non-root `USER`, where `cp -a` cannot set owners, so the runner falls back;
 - Docker actions, which copy their workspace back by a separate path and are not covered;
 
 ## 8. Next
