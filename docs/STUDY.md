@@ -245,7 +245,9 @@ The store had 27 digests after one day of experiments, so it needs pruning. It i
 
 **Docker actions.** A Docker action runs in its own image, and only the workspace comes back. That copy was keyed on the action's run, so every later step still ran. The returned workspace is now stored by its digest and copied into the container from before the action (PR #135). On the Pi, a `docker://alpine` step's changes to the workspace (a deletion, a new file, an empty directory) reached the next step. A re-run produced the same digest and replayed the check.
 
-**Still open before this can be on by default:**
+**Seeing how often they apply.** A fallback used to show only with step debug. The runner's own log now has a line per job, for example `job 115925527829: output keys: 1 of 1 always-run steps applied`, with the last reason when any fell back (PR #136).
+
+**Still open before this can be on by default:** none of the prototype's known gaps remain. What's left is to run it on the target workloads for a while, with the per-job line showing how often it applies, and to measure the cost of the store on the Pi over days rather than single runs.
 
 ## 8. Next
 
