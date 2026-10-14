@@ -1,6 +1,7 @@
 {
   "name": "api",
   "private": true,
+  "license": "MIT",
   "version": "0.0.0",
   "type": "module",
   "description": "Read-only HTTP API over the runner's runs, jobs, steps and log lines (docs/SPEC.md §5.3)",

@@ -1,5 +1,6 @@
 //! A copy of Zig 0.17.0's `std.crypto.tls.Client` (lib/std/crypto/tls/Client.zig, MIT license,
-//! Copyright (c) Zig contributors) with ONE functional change: it answers a TLS 1.3 CertificateRequest.
+//! Copyright (c) Zig contributors; the license is in LICENSE-zig next to this file) with ONE
+//! functional change: it answers a TLS 1.3 CertificateRequest.
 //!
 //! Why: Tiger Data (and any Postgres server configured with a CA file) sends a CertificateRequest
 //! during the handshake to ask for an optional client certificate. std's client treats it as an
