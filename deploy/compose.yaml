@@ -20,6 +20,9 @@ services:
     volumes:
       - engine-state:/var/lib/dagger
       - engine-socket:/run/dagger
+      # Caps the engine's cache on disk (docs/DEPLOY.md "Sizing"): Dagger's default lets it grow
+      # to about three quarters of the disk.
+      - ./engine.json:/etc/dagger/engine.json:ro
     restart: unless-stopped
 
   runner:
