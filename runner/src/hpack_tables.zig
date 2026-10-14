@@ -1,4 +1,5 @@
-//! HPACK tables (RFC 7541 Appendix A and B), generated from Go's golang.org/x/net/http2/hpack.
+//! HPACK tables, generated from RFC 7541 by tools/gen_hpack_tables.py: the Huffman code
+//! (Appendix B, symbols 0-255) and the static table (Appendix A).
 
 pub const huffman_codes = [256]u32{
     0x1ff8,    0x7fffd8,  0xfffffe2,  0xfffffe3, 0xfffffe4, 0xfffffe5,  0xfffffe6,  0xfffffe7,

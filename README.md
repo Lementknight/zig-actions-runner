@@ -16,6 +16,10 @@ docker compose -f deploy/compose.yaml up -d --build
 
 Then select the runners in a workflow with `runs-on: [self-hosted, zig]`.
 
+## License
+
+[MIT](LICENSE). Where third-party code and protocols come from is in [THIRD_PARTY.md](THIRD_PARTY.md).
+
 ## Git hooks
 
 `.githooks/` has hooks that catch Zig problems before CI does. Enable them once per clone:
