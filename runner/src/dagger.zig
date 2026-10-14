@@ -1048,6 +1048,11 @@ const Evaluator = struct {
         if (ev.github == .object and !hasKey(ev.github, "job") and job.github.job.len > 0) {
             ev.github = try withEntries(arena, ev.github, &.{.{ .key = "job", .value = .{ .string = job.github.job } }});
         }
+        // Nor is `github.workspace` (GITHUB_WORKSPACE), which actions use as an input default
+        // (setup-uv's `working-directory`).
+        if (ev.github == .object and !hasKey(ev.github, "workspace")) {
+            ev.github = try withEntries(arena, ev.github, &.{.{ .key = "workspace", .value = .{ .string = workspace } }});
+        }
         for (job.env) |in| {
             const sc = try ev.scope(&.{});
             const val = ev.render(in.value, sc) catch continue; // an env value that cannot be evaluated stays unset
@@ -6138,6 +6143,20 @@ test "step caching: run-specific values are volatile, steps with secrets always 
         const note = std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused from Dagger's cache") orelse return error.TestUnexpectedResult;
         try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] built").? < note);
     }
+}
+
+test "github.workspace is the job's workspace, as actions' input defaults expect" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const steps = [_]job_mod.Step{testStep("true")};
+    var job = testJob(&steps);
+    job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"}]}}
+    , .{});
+    var ev = try Evaluator.init(arena, &job);
+    try std.testing.expectEqualStrings("/github/workspace", ev.githubString("workspace"));
+    try std.testing.expectEqualStrings("/github/workspace", try ev.render(.{ .expr = "github.workspace" }, try ev.scope(&.{})));
 }
 
 test "output keys: the step after one that always runs starts from that step's output, by digest" {
