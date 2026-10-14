@@ -13,6 +13,10 @@ services:
     # The engine runs each step in its own container, which needs privileges.
     privileged: true
     command: ["--addr", "unix:///run/dagger/engine.sock"]
+    environment:
+      # The engine is a Go program: collecting garbage a quarter as often costs about 200 MB more
+      # memory and saves 6-13% of its CPU per job (measured; docs/DEPLOY.md "Sizing").
+      GOGC: "400"
     volumes:
       - engine-state:/var/lib/dagger
       - engine-socket:/run/dagger
