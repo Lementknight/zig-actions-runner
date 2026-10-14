@@ -300,7 +300,7 @@ On the fresh engine, the same workflow:
 
 **Question.** Experiment 2 found that a new commit misses every step after the checkout, and estimated that keying steps on their real inputs would save about a third of check-step time. Can the runner do that on Dagger, and what does it save in practice?
 
-**Design.** Two parts. The first is merged (PR #145); the second is a prototype on the branch `feat/declared-inputs`:
+**Design.** Two parts. The first is PR #145; the second is a prototype on the branch `feat/declared-inputs`:
 
 - **The commit and refs are volatile,** as run ids already were. Removing `GITHUB_SHA` from the key costs nothing in correctness: the checkout already keys every later step on the files it produced. A script that names one of these variables always runs, as for run ids. Experiment 2's worry, a step that reads the commit indirectly (`git describe`), is handled the same way: `.git` is in the workspace, so the checkout still keys it.
 - **Declared inputs.** A `run:` step may list what it reads in `ZIG_RUNNER_INPUTS` (workspace globs, plus `$GITHUB_SHA` and the like if it needs them). It then runs in a container built from content: the job's base, what earlier steps changed outside the workspace and the variables they set, and only the declared files as the workspace, each part stored by digest. What it changes is copied back into the job's container. This reuses experiment 3's content store.
@@ -357,7 +357,7 @@ Why copy at all? A probe on the Mac mounted a directory into a step that printed
 
 **Findings.**
 
-1. **The commit and refs are volatile** (merged). That is pure gain.
+1. **The commit and refs are volatile** (PR #145). That is pure gain.
 2. **Declared inputs replay correctly but do not pay on Dagger as built.** For Go, its own caches do most of the work; for Python, copying the environment costs more than replaying saves. The prototype stays on its branch.
 3. **The next design would use the content keys Dagger already has:** declared files filtered from the checkout, with no store, and the store only for files an earlier step changed. For environments like `.venv`, a cache volume named by the lockfile's digest (as `actions/cache` is used) costs nothing to mount, but trades enforced correctness for a convention.
 4. **Enforcement makes declarations safe to get wrong, but not free:** a project's maintainers have to find every file a step reads, and the first attempt here missed two.
