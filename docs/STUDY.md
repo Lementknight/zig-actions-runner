@@ -232,7 +232,7 @@ With all of this, one fresh run and one re-run of click, flask and Express on th
 
 It also found that Bun cannot load `actions/setup-python` v7, whose bundle mixes ES `import` with CommonJS `exports`; Node runs it. The runner now retries an action with Node when Bun refuses to load it (PR #130). The retry starts from the container before Bun's attempt: starting from the refused exec, which always runs, kept every later step from being replayed.
 
-The store had 27 digests after one day of experiments, so pruning is needed before output keys can be on by default.
+The store had 27 digests after one day of experiments, so it needs pruning. It is now pruned by age since last use (PR #133). The store step runs whenever an always-run step finishes, and is never replayed. It marks the output it finds or stores as used, and removes outputs not produced for 7 days. Pruning can only cause misses, never wrong results: a replayed step does not read the store, and a copy that finds nothing falls back to the step's own container. On the Pi, four backdated outputs were removed by the next job, and everything else stayed.
 
 ### 7.5 Findings
 
@@ -243,7 +243,6 @@ The store had 27 digests after one day of experiments, so pruning is needed befo
 
 **Still open before this can be on by default:**
 - images with a non-root `USER`, where `cp -a` cannot set owners, so the runner falls back;
-- pruning the store;
 - Docker actions, which copy their workspace back by a separate path and are not covered;
 
 ## 8. Next
