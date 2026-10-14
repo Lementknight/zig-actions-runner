@@ -300,7 +300,7 @@ On the fresh engine, the same workflow:
 
 **Question.** Experiment 2 found that a new commit misses every step after the checkout, and estimated that keying steps on their real inputs would save about a third of check-step time. Can the runner do that on Dagger, and what does it save in practice?
 
-**Design (PR #145).** Two parts:
+**Design.** Two parts. The first is merged (PR #145); the second is a prototype on the branch `feat/declared-inputs`:
 
 - **The commit and refs are volatile,** as run ids already were. Removing `GITHUB_SHA` from the key costs nothing in correctness: the checkout already keys every later step on the files it produced. A script that names one of these variables always runs, as for run ids. Experiment 2's worry, a step that reads the commit indirectly (`git describe`), is handled the same way: `.git` is in the workspace, so the checkout still keys it.
 - **Declared inputs.** A `run:` step may list what it reads in `ZIG_RUNNER_INPUTS` (workspace globs, plus `$GITHUB_SHA` and the like if it needs them). It then runs in a container built from content: the job's base, what earlier steps changed outside the workspace and the variables they set, and only the declared files as the workspace, each part stored by digest. What it changes is copied back into the job's container. This reuses experiment 3's content store.
@@ -318,21 +318,55 @@ The trade-off is in who is trusted to be right. Inferring inputs (tracing what a
 | 24c4ee6 | 40 s | **replayed** 2 s | ran 2 s | ran 2 s | 26 s |
 | 490d779 | 29 s | **replayed** 1 s | ran 2 s | ran 3 s | 15 s |
 
-**Results.**
+**Go results.**
 
 - **The keys are right.** Each declared step replayed exactly when its declared files were unchanged and ran when they changed; none fell back. The earlier steps' changes (`setup-go`'s toolchain) had the same digest on every commit, which is what makes any of this possible.
-- **The savings here are small, and that is a finding.** A replayed declared step takes 1–2 s on the Pi, mostly building its container, which is what gofmt and a warm `go vet` take to run. `go mod download`'s 41–60 s runs were a cold module cache (the first job) and new module versions (f34e517), exactly the cases where it cannot replay; with a warm cache it takes about a second either way. Go's own caches, kept between jobs in cache volumes, already capture most of what finer keys would save. That agrees with experiment 2, where the tools' caches made the estimate a third rather than half.
-- **The time goes where nothing is declared:** `go test` was 10–116 s, most of every job. Declaring it (everything but docs and CI configuration) would replay it on documentation commits; on the others Go's test cache already reruns only affected packages.
+- **The savings are small.** A replayed declared step takes 1–2 s on the Pi, mostly building its container, which is what gofmt and a warm `go vet` take to run. `go mod download`'s 41–60 s runs were a cold module cache (the first job) and new module versions (f34e517), exactly the cases where it cannot replay; with a warm cache it takes about a second either way. Go's own caches, kept between jobs in cache volumes, already capture most of what finer keys would save.
+
+### 9.1 Python: flask
+
+Twelve consecutive commits of pallets/flask, oldest first: `setup-uv`, the checkout, then `uv sync`, ruff, mypy and pytest, each declared. Two commits change only the changelog, two others repeat an earlier commit's files, and the rest change code. A control ran the same jobs without declarations.
+
+Getting the declarations right took two tries, and both mistakes failed loudly rather than replaying: flit, flask's build backend, needs `LICENSE.txt`, and ruff is installed in `.venv`. The first try also found a bug: the checkpoint left the workspace owned by root, so `uv sync` could not create `.venv` as `runner` (fixed on the branch).
+
+| Step | Control | Declared, ran | Declared, replayed |
+|---|---|---|---|
+| uv sync | 21–35 s | 54–74 s | 13–19 s |
+| ruff | 0–1 s | 31–75 s | 4–6 s |
+| mypy | 6–12 s | 19–28 s | 3–5 s |
+| pytest | 4–5 s | 32–50 s | 3–5 s |
+| Job | 43–69 s | 161–237 s | 39–49 s |
+| Twelve jobs | **702 s** | | **1,514 s** declared |
+
+Every replay was correct, but declaring made the series about twice as slow. Each declared step's container is built by copying what earlier steps produced (`.venv`, hundreds of MB) out of the store, and its result back in. On the Pi's SD card that costs 30–75 s. A job where everything replayed was barely faster than the control. `uv sync` also ran on every code commit, because an editable install of the project reads `src`.
+
+### 9.2 What Dagger keys on content
+
+Why copy at all? A probe on the Mac mounted a directory into a step that printed a random value, in two sessions, with two queries per session as the runner does, and checked whether the second session replayed the first's value:
+
+| Directory mounted | Content | Next step |
+|---|---|---|
+| A step's output, the content changed (control) | differs | ran |
+| A step's output, the step itself differs each time (a nonce) | same | **ran** |
+| A git checkout filtered to `go.mod go.sum`, two commits | same | **replayed** |
+| The whole git checkout, two commits (control) | differs | ran |
+
+**Dagger keys files from a git checkout on their content, and a step's output on how it was made.** So the workspace half of the checkpoint did not need the store: filtering the checkout itself would be keyed on content for free, as long as no earlier step changed the declared files. The other half, what earlier steps produced, does need it, because the steps that produce toolchains and environments (`setup-go`, `setup-uv`) take the token and always run. That half is the cost in 9.1.
+
+**A method note.** The first three rounds of this probe were invalid. In bash, `$RANDOM` inside a pipeline or `$(...)` is evaluated in a subshell, and a subshell of a shell that never used `$RANDOM` gets the same value every time. So the "different" trials sent identical commands, and every replay looked like content keying. The control caught it: a trial whose content had to differ replayed too. Values are now generated in the parent shell and printed.
 
 **Findings.**
 
-1. **Content keys across commits work on Dagger,** with the same store as output keys.
-2. **Declare expensive steps whose tool has no cache of its own.** For Go, its caches do most of the work, and declaring cheap steps costs as much as it saves. The case to measure next is Python, where pytest has no test cache: a declared test step would be the main saving.
-3. **Enforcement makes declarations safe to get wrong, but not free.** This run did not test a step that reads an undeclared file (go-task's vet reads only Go files); a project with `//go:embed` of other files must declare them.
+1. **The commit and refs are volatile** (merged). That is pure gain.
+2. **Declared inputs replay correctly but do not pay on Dagger as built.** For Go, its own caches do most of the work; for Python, copying the environment costs more than replaying saves. The prototype stays on its branch.
+3. **The next design would use the content keys Dagger already has:** declared files filtered from the checkout, with no store, and the store only for files an earlier step changed. For environments like `.venv`, a cache volume named by the lockfile's digest (as `actions/cache` is used) costs nothing to mount, but trades enforced correctness for a convention.
+4. **Enforcement makes declarations safe to get wrong, but not free:** a project's maintainers have to find every file a step reads, and the first attempt here missed two.
+5. **Dagger is the limit only for step outputs.** Driving BuildKit directly is not justified by this: the cheaper design above stays within Dagger.
 
 ## 10. Next
 
-- **Python with uv:** the same questions for `uv sync`, ruff and pytest. Pytest has no built-in equivalent of Go's test cache, so test selection there is a real gap to look into, and declared inputs are the first thing to try.
+- **Python with uv:** the same questions for `uv sync`, ruff and pytest. Pytest has no built-in equivalent of Go's test cache, so test selection there is a real gap to look into.
+- **Declared inputs without the copy:** the checkout-filtered design in 9.2, measured on the same Go and Python series.
 - **Inferring inputs** instead of declaring them, from a language's manifest or by tracing reads, and what it would cost to be wrong.
 - **Engine memory over days:** the 15-minute log, as the cache refills towards its 20 GB cap.
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
