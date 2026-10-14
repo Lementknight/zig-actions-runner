@@ -243,8 +243,9 @@ The store had 27 digests after one day of experiments, so it needs pruning. It i
 
 **Images with a non-root user.** The copy into the next step ran as the image's user, so in an image with a non-root `USER` it failed and output keys fell back. It now runs as root, then restores the image's user (PR #134). With `cgr.dev/chainguard/git:latest-dev` (uid 65532) on the Pi, the next step still ran as 65532. A file the always-run step wrote kept its owner, and a re-run replayed the check.
 
+**Docker actions.** A Docker action runs in its own image, and only the workspace comes back. That copy was keyed on the action's run, so every later step still ran. The returned workspace is now stored by its digest and copied into the container from before the action (PR #135). On the Pi, a `docker://alpine` step's changes to the workspace (a deletion, a new file, an empty directory) reached the next step. A re-run produced the same digest and replayed the check.
+
 **Still open before this can be on by default:**
-- Docker actions, which copy their workspace back by a separate path and are not covered;
 
 ## 8. Next
 
