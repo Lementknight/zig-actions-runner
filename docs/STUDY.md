@@ -146,29 +146,83 @@ The choice of path turned out to matter. The first version mounted the volumes a
 4. **Cache paths must not assume the default image.** Fixed for container jobs by pointing each tool's variable at its volume, which made jobs about 3 times faster and halved engine CPU. **A cache's path can be part of another cache's key:** Go's build cache is keyed partly on where module sources live, so every image should use the same module cache path.
 5. **Method notes.** Two early analyses were wrong and are corrected here. A "second pass" pushed a new commit, which changes `GITHUB_SHA`, so it could not hit by construction; GitHub's re-run is the right way to repeat a run. And a parsing slip counted a trailing newline as a replayed step.
 
-## 7. Experiment 3 (in progress): output-addressed keys on Dagger
+## 7. Experiment 3: output-addressed keys on Dagger
 
 **Question.** Can the steps after an always-run step keep their cache keys when that step produces the same files as before, without leaving Dagger?
 
 **Why it is hard.** In an input-addressed cache, "always run S" also means "always run everything after S": each step's key includes its parent's key, and S's key changes every run. The ways out are to make fewer steps always run, or to key later steps on S's *output*.
 
-**Probes (Mac, Dagger v0.21.10, alpine; a nonce in S's script forces it to run, as the runner does):**
+### 7.1 Probes (Mac, Dagger v0.21.10)
+
+A nonce in S's script forces it to run, as the runner does.
 
 | Parent of the next step T | T in runs 2 and 3 |
 |---|---|
 | S itself (today) | re-runs |
 | the base plus S's `diff`, copied | re-runs: Dagger keys the copy on the diff's recipe, which includes S |
-| the base plus S's `changes` applied with `withPatch(patch:)`, the patch passed as a literal | **cached** (1.2 s instead of 4.1 s), binary files included |
+| the base plus S's `changes`, applied as a literal patch (`withPatch`) | cached |
+| the base plus an exec that copies S's changes from a cache volume, the content digest in its arguments | **cached** |
 
-Dagger keys every value on how it was made, so the only way to get content into a key is to pass the content in as an argument. A patch does that: it costs one round trip through the runner per always-run step, and nothing later (IDs are 29-byte session handles whatever their arguments).
+Dagger keys every value on how it was made. To get content into a key, the content, or its digest, has to be passed as an argument.
 
-**Cost of the worst common case,** a `checkout` of go-task/task: the source is a 2.7 MB patch, made in about 0.4 s. Diffing the whole root filesystem instead of only the workspace adds 47 KB. A `setup-*` step's patch is small, since the tool cache is a volume and not in the diff.
+A patch carries the content through the runner. The runner runs many jobs in one process (the goroutine model), so that costs memory per job in proportion to the output: about 2.7 MB of patch for a checkout of go-task/task, held several times over. A patch also loses empty directories, owners and permission bits.
 
-**Known gaps of a git patch:** empty directories, owners, timestamps, and special files are not carried. Very large outputs (a built binary) would pass through the runner's memory, so a size cap with a fallback to today's behaviour is needed.
+The **content store** passes only the digest. `Directory.digest` hashes content, not the recipe:
+
+| What S changed | Digest changes? |
+|---|---|
+| Same content, different run | no |
+| Same content, new modification time | no |
+| One byte, `chmod`, `chown`, an extra empty directory | yes |
+
+### 7.2 Design
+
+For a step that always runs and succeeds (`RUNNER_OUTPUT_KEYS`, off by default):
+
+1. Diff the container after the step against the one before it. The "before" container includes what the runner mounted for the step: the variables earlier steps set, the action's code and the JavaScript runtime. Their recipes do not change from run to run.
+2. Store the changes in a per-repository cache volume at their digest. When two jobs store the same digest at once, `mv -T` lets the first writer win.
+3. The next step starts from the "before" container plus one exec, `cp -a /store/<digest>/. /`, which also removes deleted paths. Its arguments, the digest and the removed paths, are what its key depends on.
+
+The runner holds only the digest, so memory per job does not grow with a step's output. That fits the goroutine model.
+
+### 7.3 What the Pi found
+
+1. **Two bugs the unit test could not see.** The argument is named `from`, not `older`. Busybox only accepts an applet as its first argument when its own name starts with `busybox`. The unit test checks query text against a fake session, so a real engine's schema has to be checked separately.
+2. **Outputs that change every run without mattering.** `@actions/core` writes a random delimiter into the file-command files, and every `go` command rewrites Go's telemetry counters (`~/.config/go/telemetry`). Both made `setup-go`'s digest new every run. They are now neither keyed nor carried to the next step. This is the classic reproducible-builds problem: real output mixed with noise, which a content-addressed cache has to separate.
+3. **The runner's own mounts counted as output.** The 169 MB JavaScript runtime and the action's 9 MB of code were stored as if `setup-go` had written them. Hashing and copying them on the SD card is what made the first run slow.
+4. **A post step gains nothing from output keys.** Only other posts follow it, and they always run. Output-keying it cost 8–14 s per job, so posts are now skipped.
+
+### 7.4 Results
+
+Experiment 2's `setup-go` workflow (go-task/task at 6 commits), on the Pi. The first runs are back to back, flag off then on.
+
+| | Job time | Engine CPU per job |
+|---|---|---|
+| First run, flag off | 31–66 s | 19–30 s |
+| First run, flag on | 33–76 s | 20–29 s |
+| Re-run, input keys (experiment 2) | 22–27 s | 17–26 s |
+| **Re-run, flag on** | **4–6 s** (first job 18 s) | **0.7–1.6 s** (first job 4.4 s) |
+
+In the re-run, `setup-go` runs, as a step with the token must, produces the same digest, and the six steps after it are replayed. A first run costs about the same as without output keys. The exception is the first job to store a new digest, which takes about 10 s more.
+
+### 7.5 Findings
+
+1. **Output-addressed keys work on Dagger** without a new engine, through a content store and a digest in an exec's arguments. They lift experiment 2's main limit: one secret-using step no longer forces every later step to run.
+2. **Measure overhead with a back-to-back control.** The first comparison against experiment 2's numbers from earlier in the day overstated the cost by about 2 times. Most of the slowdown was the Pi's state at the time, not the change.
+3. **The engine is short of memory on the Pi, with or without this change.** It sits at its 4 GB cap and has hit it tens of thousands of times. 1.4 GB of that is reclaimable kernel slab (inode and directory caches), so first runs re-read Go's toolchain and caches from the SD card, at 25–30% iowait. That is the next cost to understand. Pass B is fast because it barely touches the disk.
+4. **One hypothesis was wrong.** I thought stripping the ignored paths before the diff forced a full filesystem walk; the Mac showed no difference.
+
+**Still open before this can be on by default:**
+- deletions and empty directories, covered by the design but not yet by a Pi run;
+- images with a non-root `USER`, where `cp -a` cannot set owners, so the runner falls back;
+- pruning the store;
+- Docker actions, which copy their workspace back by a separate path and are not covered;
+- which other tools write noise like Go's telemetry, which needs a survey of the target workloads (uv, npm).
 
 ## 8. Next
 
 - **The overhead floor:** the small Go projects (chi, cobra) and an empty job, to measure what the runner adds when the tests take almost nothing.
 - **Python with uv:** the same questions for `uv sync`, ruff and pytest. Pytest has no built-in equivalent of Go's test cache, so test selection there is a real gap to look into.
-- **The secret rule:** prototype the patch approach of experiment 3 in the runner, and measure what it saves on real workflows on the Pi.
+- **Engine memory on the Pi:** why kernel slab fills the engine's cgroup, and whether first runs can stop re-reading the toolchain from the SD card.
+- **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
 - **Breaking down the engine's cost:** Dagger (~720 ms per 10 trivial steps on the Mac), BuildKit alone (~300 ms) and raw overlayfs with namespaces (~35 ms). The BuildKit layer will be split into its parts: runc, snapshot metadata, cgroups, gRPC.
