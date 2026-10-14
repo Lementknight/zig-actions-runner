@@ -1,0 +1,7 @@
+# GitHub accounts whose explicit approval a pull request needs when it changes LICENSE: the
+# contributors whose code the license covers. The license-consent workflow reads this file from the
+# base branch, so a pull request cannot change who must approve it. A PR's author does not approve
+# their own PR (opening it is their consent).
+Lementknight
+philgutowski
+rafayet-git

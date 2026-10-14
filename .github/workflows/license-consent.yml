@@ -1,0 +1,61 @@
+name: license-consent
+
+# A pull request that changes LICENSE needs the explicit approval of every contributor listed in
+# .github/license-approvers (read from the base branch), given on the pull request's latest commit.
+# Other pull requests pass at once. A ruleset on main makes this check required.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  consent:
+    name: License consent
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check approvals
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          set -euo pipefail
+          if ! gh api --paginate "repos/$REPO/pulls/$PR/files" --jq '.[].filename' | grep -qx LICENSE; then
+            echo "This pull request does not change LICENSE."
+            exit 0
+          fi
+          approvers=$(gh api "repos/$REPO/contents/.github/license-approvers?ref=$BASE_SHA" --jq .content \
+            | base64 -d | sed 's/#.*//' | tr -d ' \r' | grep -v '^$' || true)
+          if [ -z "$approvers" ]; then
+            echo "::error::.github/license-approvers on the base branch lists no one."
+            exit 1
+          fi
+          # Each reviewer's latest review that is not a plain comment, with the commit it was given on.
+          reviews=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" \
+            --jq '.[] | select(.state != "COMMENTED") | "\(.user.login) \(.state) \(.commit_id)"')
+          missing=()
+          for who in $approvers; do
+            if [ "$who" = "$AUTHOR" ]; then
+              echo "$who: the author of this pull request"
+              continue
+            fi
+            last=$(awk -v u="$who" '$1 == u { s = $2 " " $3 } END { print s }' <<<"$reviews")
+            if [ "$last" = "APPROVED $HEAD_SHA" ]; then
+              echo "$who: approved the latest commit"
+            else
+              echo "$who: no approval of the latest commit (${last:-no review})"
+              missing+=("$who")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::This pull request changes LICENSE and needs the approval of: ${missing[*]}"
+            exit 1
+          fi
