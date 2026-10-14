@@ -4008,7 +4008,9 @@ const max_event_env = 100 * 1024;
 
 /// Default variables that identify the run rather than its inputs. With step caching they are
 /// volatile: they reach every step but do not take part in exec cache keys.
-const volatile_env = [_][]const u8{ "GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "GITHUB_RUN_ATTEMPT", "GITHUB_ACTOR", "GITHUB_TRIGGERING_ACTOR" };
+/// RUNNER_NAME belongs here too: a pool registers every job under a new name, so as an input it
+/// would make every job's keys new and no step would ever be reused.
+const volatile_env = [_][]const u8{ "GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "GITHUB_RUN_ATTEMPT", "GITHUB_ACTOR", "GITHUB_TRIGGERING_ACTOR", "RUNNER_NAME" };
 
 /// Whether a script names a variable whose value differs between runs while the cache key does not
 /// (the volatile ones and the event payload). Scripts the step runs from files are not looked into.
@@ -5907,7 +5909,7 @@ test "step caching: run-specific values are volatile, steps with secrets always 
         var buf: [4096]u8 = undefined;
         var w: std.Io.Writer = .fixed(&buf);
         var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
-        const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+        const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .runner_name = "zig-pi-1a2b3c4d", .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
         try std.testing.expect(res.succeeded);
         const base = fake.seen.items[0];
         const build = fake.seen.items[1];
@@ -5917,6 +5919,8 @@ test "step caching: run-specific values are volatile, steps with secrets always 
         try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"GITHUB_SHA\",value:\"abc\")") != null);
         if (!opt_out) {
             try std.testing.expect(std.mem.indexOf(u8, base, "withVolatileVariable(name:\"GITHUB_RUN_ID\",value:\"123\")") != null);
+            // A pool names every job's runner anew: as an input it would make every key new.
+            try std.testing.expect(std.mem.indexOf(u8, base, "withVolatileVariable(name:\"RUNNER_NAME\",value:\"zig-pi-1a2b3c4d\")") != null);
             try std.testing.expect(std.mem.indexOf(u8, base, "withVolatileVariable(name:\"ZIG_RUNNER_EVENT\",value:") != null);
             try std.testing.expect(std.mem.indexOf(u8, base, "withNewFile") == null);
             // Each step writes the event file from the volatile variable and hides the variable.
