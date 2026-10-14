@@ -23,6 +23,9 @@ pub const Scope = union(enum) {
 const pg = @import("pg.zig");
 
 pub const JsRuntime = enum { bun, node };
+/// Who steps run as in the default image: `runner` (uid 1001, passwordless sudo), as on GitHub's
+/// hosted runners, or root.
+pub const StepUser = enum { runner, root };
 /// How jobs reach the Dagger engine: directly (`engine.zig`), or through a `dagger run` child.
 pub const EngineMode = enum { direct, cli };
 
@@ -59,6 +62,8 @@ pub const Config = struct {
     /// Reuse a step's result from an earlier run when its inputs are unchanged (steps that use secrets
     /// always run). A workflow can opt out with `ZIG_RUNNER_STEP_CACHE: false` in its env.
     step_cache: bool = true,
+    /// Who steps run as in the default image (`RUNNER_STEP_USER`).
+    step_user: StepUser = .runner,
     /// Experimental: key the steps after one that always runs on what it produced rather than on
     /// the step itself (see `dagger.Options.output_keys`).
     output_keys: bool = false,
@@ -77,7 +82,7 @@ pub const Config = struct {
     /// Register one runner, print the shape of its config, delete it, exit.
     inspect: bool = false,
 
-    pub const Error = error{ MissingGhToken, MissingGhScope, InvalidScope, InvalidNumber, InvalidJsRuntime, InvalidEngine, InvalidBool, UnknownFlag, MissingFlagValue };
+    pub const Error = error{ MissingGhToken, MissingGhScope, InvalidScope, InvalidNumber, InvalidJsRuntime, InvalidStepUser, InvalidEngine, InvalidBool, UnknownFlag, MissingFlagValue };
 
     /// Values are borrowed from `environ` / `args`, which must outlive the Config.
     pub fn load(environ: *const std.process.Environ.Map, args: []const [:0]const u8) Error!Config {
@@ -103,6 +108,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_DAGGER_NESTING")) |v| c.dagger_nesting = try boolean(v);
         if (environ.get("RUNNER_PACKAGE_CACHES")) |v| c.package_caches = try boolean(v);
         if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
+        if (environ.get("RUNNER_STEP_USER")) |v| c.step_user = try stepUser(v);
         if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_DAYS")) |v| c.output_keys_days = try count(v);
         if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
@@ -155,6 +161,7 @@ pub const Config = struct {
             else if (std.mem.eql(u8, key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
             else if (std.mem.eql(u8, key, "package-caches")) c.package_caches = try boolean(val) //
             else if (std.mem.eql(u8, key, "step-cache")) c.step_cache = try boolean(val) //
+            else if (std.mem.eql(u8, key, "step-user")) c.step_user = try stepUser(val) //
             else if (std.mem.eql(u8, key, "output-keys")) c.output_keys = try boolean(val) //
             else if (std.mem.eql(u8, key, "output-keys-days")) c.output_keys_days = try count(val) //
             else if (std.mem.eql(u8, key, "runners")) c.runners = try count(val) //
@@ -192,6 +199,10 @@ pub const Config = struct {
 
     fn engineMode(s: []const u8) error{InvalidEngine}!EngineMode {
         return std.meta.stringToEnum(EngineMode, s) orelse error.InvalidEngine;
+    }
+
+    fn stepUser(s: []const u8) error{InvalidStepUser}!StepUser {
+        return std.meta.stringToEnum(StepUser, s) orelse error.InvalidStepUser;
     }
 
     fn jsRuntime(s: []const u8) error{InvalidJsRuntime}!JsRuntime {
