@@ -457,7 +457,7 @@ pub const Result = struct {
     /// With output keys: how many always-run steps keyed the steps after them on their output, how
     /// many fell back, and why the last one did. For the runner's own log, so an operator sees how
     /// often they apply without turning on step debug.
-    output_keys: struct { applied: u32 = 0, fell_back: u32 = 0, last_reason: []const u8 = "" } = .{},
+    output_keys: struct { applied: u32 = 0, fell_back: u32 = 0, last_reason: []const u8 = "", ms: i64 = 0 } = .{},
 };
 
 /// A published service port: steps reach `localhost:<host>`, forwarded to the service's `container`.
@@ -2284,7 +2284,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         result.succeeded = false;
     }
     result.extra = x.extra.items;
-    result.output_keys = .{ .applied = x.outputs_applied, .fell_back = x.outputs_fell_back, .last_reason = x.outputs_last_reason };
+    result.output_keys = .{ .applied = x.outputs_applied, .fell_back = x.outputs_fell_back, .last_reason = x.outputs_last_reason, .ms = x.outputs_ms };
     result.next_log_step = x.next_log_step;
     result.summaries = x.summaries;
     try jobOutputs(arena, &ev, job, &result);
@@ -2397,6 +2397,8 @@ const Exec = struct {
     outputs_fell_back: u32 = 0,
     outputs_last_reason: []const u8 = "",
     outputs_reason: ?[]const u8 = null,
+    /// Milliseconds spent on output keys in this job (diff, digest, store, copy).
+    outputs_ms: i64 = 0,
     /// The event payload is in ZIG_RUNNER_EVENT; each step writes it to GITHUB_EVENT_PATH.
     event_from_env: bool,
     /// Workflow- or job-level env carries a secret, so every step uses secrets.
@@ -2636,7 +2638,8 @@ const Exec = struct {
         const out = try x.collect(num, data);
         if (x.output_keys != null and resolved == .run and resolved.run.always_run != null and out.code == 0) {
             const pre = try std.mem.concat(arena, u8, &.{ env_nodes, mount_doc.written() });
-            if (x.countOutputKeyed(try x.outputKeyed(num, before, pre, env_braces + mounts.len, x.container_id))) |id| x.container_id = id;
+            const started = std.Io.Clock.awake.now(x.io).toMilliseconds();
+            if (x.countOutputKeyed(num, started, try x.outputKeyed(num, before, pre, env_braces + mounts.len, x.container_id))) |id| x.container_id = id;
         }
         return out;
     }
@@ -2667,6 +2670,7 @@ const Exec = struct {
     fn outputKeyed(x: *Exec, num: u32, before: []const u8, pre: []const u8, pre_braces: usize, after: []const u8) !?[]const u8 {
         const arena = x.arena;
         var msg: []const u8 = "";
+        var t = std.Io.Clock.awake.now(x.io).toMilliseconds();
 
         // What the step changed in the container's filesystem (cache volumes and mounts are not part
         // of it), as a directory with its digest, and what it removed.
@@ -2685,10 +2689,12 @@ const Exec = struct {
         // anywhere and keep owners, and the next steps run as this user again.
         const user = jsonFindString(older, "zig_user") orelse "";
         const older_id = (if (jsonFind(older, "zig_fs")) |f| jsonFindString(f, "id") else null) orelse return null;
+        x.outputsPhase(num, "the container before the step", &t);
         const changes = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ rootfs {{ {s}changes(from:{f}) {{ removedPaths layer {{ id digest }} }}{s} }} }} }}", .{ std.json.fmt(after, .{}), without.written(), std.json.fmt(older_id, .{}), closing }), &msg) catch {
             x.outputsFallback(num, "{s}", .{msg});
             return null;
         };
+        x.outputsPhase(num, "the diff and its digest", &t);
         const layer = jsonFind(changes, "layer") orelse return null;
         const layer_id = jsonFindString(layer, "id") orelse return null;
         const digest_full = jsonFindString(layer, "digest") orelse return null;
@@ -2700,6 +2706,14 @@ const Exec = struct {
         return x.storeAndApply(num, base, user, layer_id, digest, .{ .changes = removed.items });
     }
 
+    /// With step debug: how long one phase of the output-key work took, timed from `t`, which is then
+    /// reset.
+    fn outputsPhase(x: *Exec, num: u32, name: []const u8, t: *i64) void {
+        const now = std.Io.Clock.awake.now(x.io).toMilliseconds();
+        if (x.sh.step_debug) x.sh.appendFmt(num, "##[debug]Output keys: {s} took {d} ms", .{ name, now - t.* });
+        t.* = now;
+    }
+
     /// Why output keys did not apply to step `num`: shown with step debug, and kept for the runner's
     /// own log line (see `Result.output_keys`).
     fn outputsFallback(x: *Exec, num: u32, comptime fmt: []const u8, args: anytype) void {
@@ -2708,9 +2722,12 @@ const Exec = struct {
         if (x.sh.step_debug) x.sh.appendFmt(num, "##[debug]Output keys: {s}", .{why});
     }
 
-    /// Counts one always-run step: `id`, the container keyed on its output, or null when it fell
-    /// back. Returns `id`.
-    fn countOutputKeyed(x: *Exec, id: ?[]const u8) ?[]const u8 {
+    /// Counts one always-run step (`started_ms`: when its output-key work began): `id`, the container
+    /// keyed on its output, or null when it fell back. Returns `id`.
+    fn countOutputKeyed(x: *Exec, num: u32, started_ms: i64, id: ?[]const u8) ?[]const u8 {
+        const took = std.Io.Clock.awake.now(x.io).toMilliseconds() - started_ms;
+        x.outputs_ms += took;
+        if (x.sh.step_debug) x.sh.appendFmt(num, "##[debug]Output keys took {d} ms", .{took});
         if (id != null) {
             x.outputs_applied += 1;
         } else {
@@ -2746,6 +2763,7 @@ const Exec = struct {
     /// container the next step starts from: `base` with the output copied in by digest, as `user`.
     fn storeAndApply(x: *Exec, num: u32, base: []const u8, user: []const u8, layer_id: []const u8, digest: []const u8, target: OutputTarget) !?[]const u8 {
         const arena = x.arena;
+        var t = std.Io.Clock.awake.now(x.io).toMilliseconds();
         const debug = struct {
             fn line(ex: *Exec, n: u32, comptime fmt: []const u8, args: anytype) void {
                 if (ex.sh.step_debug) ex.sh.appendFmt(n, "##[debug]" ++ fmt, args);
@@ -2791,6 +2809,7 @@ const Exec = struct {
             x.outputsFallback(num, "could not store the step's output: {s}", .{msg});
             return null;
         };
+        x.outputsPhase(num, "storing it", &t);
 
         // The next step's container: the digest and removed paths are the exec's arguments, so they
         // are what its key depends on.
@@ -2831,6 +2850,7 @@ const Exec = struct {
             x.outputsFallback(num, "could not copy the step's output into the next container: {s}", .{msg});
             return null;
         };
+        x.outputsPhase(num, "copying it into the next container", &t);
         const id = jsonFindString(next, "id") orelse return null;
         switch (target) {
             .changes => |removed| debug(x, num, "Output keys: the next steps start from this step's output, sha256:{s} ({d} removed paths)", .{ digest[0..@min(12, digest.len)], removed.len }),
@@ -3909,7 +3929,8 @@ const Exec = struct {
         // The action always runs (it has the job token); with output keys the next steps are keyed
         // on the workspace it left, not on its run (see `Options.output_keys`).
         if (x.output_keys != null and out.code == 0) {
-            if (x.countOutputKeyed(try x.outputKeyedWorkspace(num, ws_out))) |id| {
+            const started = std.Io.Clock.awake.now(x.io).toMilliseconds();
+            if (x.countOutputKeyed(num, started, try x.outputKeyedWorkspace(num, ws_out))) |id| {
                 x.container_id = id;
                 return out;
             }

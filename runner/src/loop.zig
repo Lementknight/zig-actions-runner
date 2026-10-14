@@ -489,6 +489,8 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
     const ok = result.output_keys;
     if (ok.applied + ok.fell_back > 0) {
         try c.err.print("job {d}: output keys: {d} of {d} always-run steps applied", .{ job.check_run_id, ok.applied, ok.applied + ok.fell_back });
+        const ms: u64 = @intCast(@max(ok.ms, 0));
+        try c.err.print(" in {d}.{d} s", .{ ms / 1000, ms % 1000 / 100 });
         if (ok.fell_back > 0) try c.err.print("; {d} fell back (last: {s})", .{ ok.fell_back, ok.last_reason });
         try c.err.writeAll("\n");
     }
