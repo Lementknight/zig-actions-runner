@@ -259,7 +259,9 @@ An empty job (one `true` step), and the small Go projects chi and cobra (`setup-
 
 - **The runner is cheap:** an empty job takes 2–4 s and 0.1 s of engine CPU.
 - **In a small Go job, almost all the time went to output keys' diff after `setup-go`: 13.5–21 s.** The action itself took 2 s. Timing each phase of the output-key work (PR #136) found this; the per-job total alone would not have.
-- **cobra fails on this runner but not on GitHub.** `TestFailGenFishCompletionFile` expects writing to a `0400` file to fail. Steps run as root here, and root ignores file permissions; GitHub runs them as the non-root user `runner`. Any test suite that checks permissions will differ the same way. Fixing it means running steps as a non-root user with `sudo`, as GitHub does: a design change of its own, not done yet.
+- **cobra fails on this runner but not on GitHub.** `TestFailGenFishCompletionFile` expects writing to a `0400` file to fail. Steps run as root here, and root ignores file permissions; GitHub runs them as the non-root user `runner`. Any test suite that checks permissions will differ the same way. Steps in the default image now run as `runner` (uid 1001, passwordless `sudo`), as on GitHub (PR #139), and cobra's suite passes. That needed provisioning the user and making `/github` its own, plus moving the package caches under its home, owned by it, in new volumes (root's hold files it cannot write). It also needed creating the caches' directories in advance: Dagger creates a cache mount's missing parent directories as root, which broke `setup-go`'s `mkdir ~/go/bin`.
+
+The same test found that **checked-out files had the time 1970-01-01 00:00:01**, which is what Dagger's `git` gives them. Building pallets/flask failed, because wheels are zips and cannot hold times before 1980. Checkouts now get a fixed time, 2000-01-01, which stays the same from run to run so cached steps still match (PR #139).
 
 ### 8.2 The engine's memory
 
@@ -298,6 +300,5 @@ On the fresh engine, the same workflow:
 
 - **Python with uv:** the same questions for `uv sync`, ruff and pytest. Pytest has no built-in equivalent of Go's test cache, so test selection there is a real gap to look into.
 - **Engine memory over days:** the 15-minute log, as the cache refills towards its 20 GB cap.
-- **Steps as a non-root user,** as on GitHub (cobra's permission test).
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
 - **Breaking down the engine's cost:** Dagger (~720 ms per 10 trivial steps on the Mac), BuildKit alone (~300 ms) and raw overlayfs with namespaces (~35 ms). The BuildKit layer will be split into its parts: runc, snapshot metadata, cgroups, gRPC.
