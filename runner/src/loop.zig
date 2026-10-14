@@ -701,7 +701,7 @@ pub fn shownSteps(arena: Allocator, ids: []const []const u8, job: job_mod.Job, r
     for (result.extra) |e| if (e.started_ms > 0 and e.started_ms < first_started) {
         first_started = e.started_ms;
     };
-    try out.append(arena, .{ .id = ids[0], .number = 0, .name = "Set up job", .log_step = 0, .conclusion = "succeeded", .started_ms = job_started_ms, .completed_ms = first_started });
+    try out.append(arena, .{ .id = ids[0], .number = 0, .name = "Set up job", .log_step = 0, .conclusion = if (result.set_up_failed) "failed" else "succeeded", .started_ms = job_started_ms, .completed_ms = first_started });
     for (result.extra) |e| if (e.kind == .initialize) try out.append(arena, extraShown(ids, e));
     for (result.extra) |e| if (e.kind == .pre) try out.append(arena, extraShown(ids, e));
     for (job.steps, result.steps, 1..) |step, r, n| try out.append(arena, .{
