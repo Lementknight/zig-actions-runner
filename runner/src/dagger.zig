@@ -868,6 +868,9 @@ fn isSha(s: []const u8) bool {
 /// The query that resolves a checkout to a Directory id, or null with a reason.
 /// `auth`: a Dagger secret holding the job's GITHUB_TOKEN, sent as GitHub expects a token over HTTPS
 /// (user `x-access-token`), so private repositories can be checked out, as actions/checkout does.
+/// The time checked-out files get: 2000-01-01 00:00 UTC (see `checkoutQuery`).
+const checkout_mtime: i64 = 946684800;
+
 pub fn checkoutQuery(arena: Allocator, job: job_mod.Job, co: job_mod.Checkout, auth: ?[]const u8) !union(enum) { doc: []const u8, err: []const u8 } {
     const repo = co.repository orelse job.github.repository;
     if (repo.len == 0) return .{ .err = "no repository to check out (the job has no github.repository)" };
@@ -892,7 +895,10 @@ pub fn checkoutQuery(arena: Allocator, job: job_mod.Job, co: job_mod.Checkout, a
         try w.writeAll("head");
     }
     // `depth` is always sent: Dagger's default is 1, and 0 is what fetches the full history.
-    try w.print(" {{ tree(depth:{d}{s}) {{ id }} }} }} }}", .{ co.fetch_depth, if (co.fetch_tags) ",includeTags:true" else "" });
+    // Dagger's git gives every file the time 1970-01-01 00:00:01. Tools reject that (Python wheels
+    // are zips, which cannot hold times before 1980: "ZIP does not support timestamps before 1980");
+    // a fixed later time keeps the tree the same from run to run, so cached steps still match.
+    try w.print(" {{ tree(depth:{d}{s}) {{ withTimestamps(timestamp:{d}) {{ id }} }} }} }} }}", .{ co.fetch_depth, if (co.fetch_tags) ",includeTags:true" else "", checkout_mtime });
     return .{ .doc = aw.written() };
 }
 
@@ -5029,11 +5035,11 @@ test "checkoutQuery picks commit, ref or head and honours fetch-depth" {
     defer a.deinit();
     const job = testJob(&.{});
     const own = (try checkoutQuery(a.allocator(), job, .{}, null)).doc;
-    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { commit(id:\"0123456789012345678901234567890123456789\") { tree(depth:1) { id } } } }", own);
+    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { commit(id:\"0123456789012345678901234567890123456789\") { tree(depth:1) { withTimestamps(timestamp:946684800) { id } } } } }", own);
     const by_ref = (try checkoutQuery(a.allocator(), job, .{ .ref = "refs/pull/7/merge", .fetch_depth = 0 }, null)).doc;
-    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { ref(name:\"refs/pull/7/merge\") { tree(depth:0) { id } } } }", by_ref);
+    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { ref(name:\"refs/pull/7/merge\") { tree(depth:0) { withTimestamps(timestamp:946684800) { id } } } } }", by_ref);
     const tags = (try checkoutQuery(a.allocator(), job, .{ .fetch_tags = true }, "SEC")).doc;
-    try std.testing.expect(std.mem.indexOf(u8, tags, "tree(depth:1,includeTags:true) { id }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tags, "tree(depth:1,includeTags:true) { withTimestamps(timestamp:946684800) { id }") != null);
     // With the job's GITHUB_TOKEN (a secret), as GitHub expects a token over HTTPS.
     try std.testing.expect(std.mem.indexOf(u8, tags, "git(url:\"https://github.com/o/r.git\",httpAuthUsername:\"x-access-token\",httpAuthToken:\"SEC\",keepGitDir:true)") != null);
     const other = (try checkoutQuery(a.allocator(), job, .{ .repository = "x/y", .fetch_depth = 3 }, null)).doc;
