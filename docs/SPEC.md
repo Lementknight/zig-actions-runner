@@ -1,25 +1,32 @@
 # Spec Sheet
 
-Status: draft v0.1 · Companion: [DESIGN.md](DESIGN.md)
+The reference for how the runner behaves. The why is in [DESIGN.md](DESIGN.md); running it is in [DEPLOY.md](DEPLOY.md).
 
 This is the contract between components. If you change anything here, tell the team and update this file in the same PR.
 
-## 1. Repo layout (proposed)
+## 1. Repo layout
 
 ```
-hackathon/
-  docs/                 DESIGN.md, SPEC.md
-  runner/               Zig runner
-    src/
-      main.zig          CLI entry
-      config.zig        env/flags
-      github/           jitconfig.zig, auth.zig, broker.zig
-      dagger.zig        pipeline driver
-      sink.zig          LogSink interface + postgres impl
-  api/                  TypeScript read API
-  web/                  frontend
-  db/migrations/        numbered .sql files
-  deploy/               Dockerfile, compose.yaml
+docs/                   DESIGN.md, SPEC.md, DEPLOY.md
+runner/                 the runner (Zig); Dockerfile, testdata/ (job messages for --exec-job)
+  src/
+    main.zig            entry point: the runner, --exec-job, --inspect, --db-check
+    config.zig          environment variables and flags
+    loop.zig            a runner's loop: register, poll, run a job, report, again
+    dagger.zig          a job's steps in the Dagger engine
+    engine.zig          Dagger's client protocol (with hpack.zig)
+    job.zig, action.zig, expr.zig, context.zig, yaml.zig, commands.zig
+                        the job message, actions, expressions, workflow commands
+    live.zig            live logs and step updates for GitHub
+    sink.zig, redact.zig, pgsink.zig, pg.zig, db.zig
+                        log sinks, secret redaction, the optional Postgres writer
+    github/             jitconfig, auth, broker, run service, results (logs), live feed, HTTP
+    vendor/             std's TLS client with one change (see §6)
+api/                    optional read API (TypeScript)
+web/                    optional frontend
+db/                     optional schema: migrations/, seed.sql
+deploy/                 compose.yaml, engine.json, zig-runner.service, runner.env.example
+.githooks/              pre-commit and pre-push checks (README.md)
 ```
 
 ## 2. Runner configuration
@@ -44,6 +51,9 @@ Environment variables (flags override):
 | `RUNNER_JS_RUNTIME` | no | `bun` (default) or `node` (flag `--js-runtime`): what runs JavaScript actions (see §6) |
 | `RUNNER_PACKAGE_CACHES` | no | `true` (default) or `false` (flag `--package-caches`): mount persistent Dagger cache volumes at package managers' cache directories in every job (see §6 "Package caches") |
 | `RUNNER_STEP_CACHE` | no | `true` (default) or `false` (flag `--step-cache`): reuse a step's result from an earlier run when its inputs are unchanged; steps that use secrets or read run-specific values always run (see §6 "Step caching"). A workflow or job opts out with `ZIG_RUNNER_STEP_CACHE: false` in its `env` |
+| `RUNNER_STEP_USER` | no | `runner` (default) or `root` (flag `--step-user`): who steps run as in the default image. `runner` is uid 1001 with home `/home/runner` and passwordless `sudo`, as on GitHub's hosted runners; `root` was the behaviour before. `container:` jobs run as their image's user either way (see §6 "Package caches") |
+| `RUNNER_OUTPUT_KEYS` | no | `false` (default) or `true` (flag `--output-keys`), experimental: with step caching, the steps after one that always runs (it uses secrets) are keyed on what it produced rather than on its having run, so they can still be replayed. What it changed is stored by content digest in a cache volume. The runner's log says per job how often this applied (`job <id>: output keys: N of M always-run steps applied in S s`) |
+| `RUNNER_OUTPUT_KEYS_DAYS` | no | Default `7` (flag `--output-keys-days`, 1 to 1024): stored outputs no step produced for this many days are removed |
 | `LOG_FLUSH_LINES` | no | Default `200` |
 | `LOG_FLUSH_MS` | no | Default `500` |
 | `RUNNER_COUNT` | no | Default `1` (flag `--runners`, 1 to 1024): how many runners this process runs, as concurrent tasks (`std.Io.Group`). Each registers under its own name and serves jobs one after another as described for `RUNNER_ONCE`; they share the configuration, the console and database log sinks (each line written whole) and one database connection (one query at a time), and each job still gets its own Dagger session. The process exits when every runner has stopped, with the most severe exit code. Verified live: `--runners 3` ran a three-job matrix at the same time (all three started within 3 s and finished in 18 s, against 45 s one after another); the process used about 31 MB idle and 47 MB at peak (Debug build), with 10 threads throughout, while the three `dagger run` children used about 65 MB each |
@@ -422,28 +432,25 @@ Log format (verified live: one workflow as a matrix on `ubuntu-latest` and on th
 - Steps (verified live next to `ubuntu-latest`: the same list, names and order, each with its log): GitHub lists only the workflow's steps; like its runner, this one adds "Set up job" (the lines above), a "Pre <step name>" step for each action's `pre` script, a "Post <step name>" step for each `post` script (last step first; "Post Run <action>" for one nested in a composite action), and "Complete job" ("Cleaning up orphan processes"; the job's processes end with its Dagger session). They get ids of their own (UUIDs made by the runner), are numbered in that order, reported in completejob's `stepResults`, and each has its log uploaded under its id (the results service accepts step ids GitHub did not list). Pre and post steps start with their output (a post with "Post job cleanup."), without the main step's input fold. A step for an action in a subdirectory is named with it (`Run owner/repo/dir@ref`).
 - Numbers and post steps as GitHub's (verified live next to `ubuntu-latest`: the same names, order and numbers): steps are numbered in order up to the last main step; when there are post steps or "Stop containers", one number is set aside after it for each step that could have a post (the job's steps and the pre steps) and one more, the post steps take the last of those (in reverse order of their steps), then "Stop containers" and "Complete job" follow (checkout, a script, github-script, and checkout's post: 1-4, 8, 9; four steps with a service: 1-6, 12, 13). The live view numbers them so from the start (GitHub keeps the live numbers). The built-in checkout has a "Post <step>" step, as actions/checkout does ("Post job cleanup."; it stores no credentials, so there is nothing to remove). Not yet like GitHub: the built-in checkout's output differs from the action's git commands.
 
-Supported v0 subset: `run`, `env`, `working-directory`, `shell` (bash, sh, or a custom bash or sh command with `{0}`), `name`, `continue-on-error`, `timeout-minutes` (step and job), `if:`, `${{ }}` expressions (see above), `uses: actions/checkout`, composite, JavaScript and Docker `uses:` actions (remote or local), `uses: docker://`. Anything else fails the step with a clear "unsupported" message in the log. Expressions are described below.
+Supported: `run`, `env`, `working-directory`, `shell` (bash, sh, or a custom bash or sh command with `{0}`), `name`, `continue-on-error`, `timeout-minutes` (step and job), `if:`, `${{ }}` expressions (see above), `uses: actions/checkout`, composite, JavaScript and Docker `uses:` actions (remote or local), `uses: docker://`. Anything else fails the step with a clear "unsupported" message in the log. Expressions are described below.
 
-## 7. Resource targets (to measure, not assumed)
+## 7. Resource use
 
-- Idle runner: target under 20 MB RSS, near-zero CPU while long-polling.
-- Binary: single static executable, no runtime dependencies.
-- Target 20+ idle runners on a 4 GB machine; to be validated in M7.
-
-Measured 2026-10-12 (Linux arm64 in Docker on macOS, `aarch64-linux-musl` static build, `--runners 20`, direct engine sessions over the engine's own TCP listener, a fresh engine):
+The original targets were under 20 MB per idle runner, near-zero CPU while long-polling, one static executable, and 20+ idle runners on a 4 GB machine. Measured 2026-10-12 (Linux arm64 in Docker on macOS, `aarch64-linux-musl` static build, `--runners 20`, direct engine sessions over the engine's own TCP listener, a fresh engine):
 - Binary: 12.8 MB ReleaseSafe (most of it debug info), 1.0 MB ReleaseSmall; static, no runtime dependencies.
 - 20 idle runners in one process: 29 MB RSS in total (about 1.4 MB per runner), flat over minutes of long polls, 62 threads (each waiting runner: its task, its poll and a stop watcher).
 - 10 concurrent jobs on those 20 runners (checkout, 15 s of streamed output, `actions/github-script` on Bun; all succeeded): the runner peaked at 44 MB (about 1.5 MB per running job) and returned to 31 MB; no other process ran outside the engine. The engine container, with the jobs' own containers, peaked at 376 MB on a cold cache.
 - So 20+ runners on a 4 GB machine is met by a wide margin for the runner itself; what a machine can run at once is bounded by the jobs' containers in the engine.
 - Found by measuring: every HTTP request used to build its own `std.http.Client`, which loads the CA bundle (and a 64 KB decompression window) into the memory a waiting runner only frees after its next job, so each idle runner grew by about 700 KB per poll (20 runners: 74 MB growing by about 14 MB a minute). One client for the process (`src/github/http.zig`) and per-request scratch memory fixed it.
 
-## 8. Definition of done (demo slice)
+## 8. Smoke test
 
-1. `runner` starts with the env vars above and registers a JIT runner.
-2. A push triggers a workflow with one `run: echo hello && sleep 2 && echo done` step.
-3. Output appears in the frontend within ~2 s of being produced.
-4. The job shows as succeeded in the GitHub UI.
-5. Re-running the identical job is measurably faster through Dagger caching.
+A quick check that a new deployment works end to end:
+
+1. The runner starts with the configuration above, and its runners appear in the repository's (or organization's) runner settings as idle.
+2. A push triggers a workflow with `runs-on: [self-hosted, zig]` and a step `run: echo hello && sleep 2 && echo done`.
+3. The step's output appears live in GitHub's log view, and the job succeeds.
+4. Re-running the job replays the step from Dagger's cache: its log ends with "Reused from Dagger's cache".
 
 ## 9. Conventions
 

@@ -1,10 +1,11 @@
 # Zig Actions Runner
 
-A lightweight, Zig-based alternative to the official GitHub Actions runner. Jobs run as Dagger pipelines, and logs are stored in Tiger Data and shown in a custom frontend.
+A lightweight, self-hosted GitHub Actions runner in Zig. One small process runs many runners, each job's steps run in a Dagger engine that caches them, and workflows written for GitHub's hosted runners run unchanged, with their logs in GitHub's UI. A Raspberry Pi is the reference machine.
 
-- [Design document](docs/DESIGN.md)
-- [Spec sheet](docs/SPEC.md)
-- [Deploying the runner](docs/DEPLOY.md): Docker Compose, systemd, or a plain binary
+- [Design](docs/DESIGN.md): goals, architecture and the decisions behind them
+- [Spec sheet](docs/SPEC.md): configuration, the GitHub protocol, what workflows can use
+- [Deploying the runner](docs/DEPLOY.md): Docker Compose, systemd, or a plain binary, and sizing
+- Optional: run state and logs in Postgres ([`db/`](db/README.md)), a read API ([`api/`](api/README.md)) and a frontend ([`web/`](web/README.md))
 
 Quick start, on a Linux machine with Docker:
 
