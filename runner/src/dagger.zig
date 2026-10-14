@@ -37,8 +37,8 @@ pub const workspace = "/github/workspace";
 pub const marker = "::zig-step::";
 
 /// What the default image (`ubuntu:24.04`) gets before a job: what workflows written for GitHub's
-/// `ubuntu-latest` most often assume without a setup action. `sudo` (steps run as root, but many call
-/// `sudo apt-get`), compilers and `make`, Python with pip and venv (and `python`), `psql` for a
+/// `ubuntu-latest` most often assume without a setup action. `sudo` (steps run as `runner_user`, as on
+/// GitHub, and many call `sudo apt-get`), compilers and `make`, Python with pip and venv (and `python`), `psql` for a
 /// Postgres service, archive and transfer tools, and what composite actions often use (`jq`,
 /// `curl`). Installed once per engine: Dagger caches this exec, so only the first job pays for it.
 pub const provision_packages = [_][]const u8{
@@ -49,6 +49,41 @@ pub const provision_packages = [_][]const u8{
     "postgresql-client", "netcat-openbsd", "procps",
 };
 pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends " ++ packageList() ++ " >/dev/null && rm -rf /var/lib/apt/lists/*";
+
+/// The user steps run as in the default image with `Options.step_user = .runner`, as on GitHub's
+/// hosted runners: uid 1001, home /home/runner, passwordless sudo, and /github (the workspace, file
+/// commands, the event) its own. Tests that expect file permissions to hold (writing a 0400 file
+/// fails) behave as on GitHub; root ignores them.
+const runner_user = "runner";
+const runner_home = "/home/runner";
+const provision_runner_script = provision_script ++
+    " && (id -u " ++ runner_user ++ " >/dev/null 2>&1 || useradd -m -u 1001 -s /bin/bash " ++ runner_user ++ ")" ++
+    " && printf '%s\\n' '" ++ runner_user ++ " ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/" ++ runner_user ++ " && chmod 0440 /etc/sudoers.d/" ++ runner_user ++
+    " && mkdir -p " ++ workspace ++ " " ++ docker_home ++ runnerCacheDirs() ++
+    " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " /github " ++ runner_home;
+
+/// The package caches' directories under the user's home, made in advance: Dagger creates a cache
+/// mount's missing parents as root (`/home/runner/go` for `/home/runner/go/pkg/mod`), and then the
+/// user could not create anything next to the mount (setup-go's `~/go/bin`).
+fn runnerCacheDirs() []const u8 {
+    comptime {
+        var out: []const u8 = "";
+        for (package_cache_dirs) |d| {
+            if (std.mem.startsWith(u8, d.path, "/root/")) out = out ++ " " ++ runner_home ++ d.path["/root".len..];
+        }
+        return out ++ " " ++ runner_home ++ "/.cache/yarn";
+    }
+}
+
+/// Where package cache `i` is mounted for steps that run as `runner_user`: its directory under the
+/// user's home instead of root's.
+fn runnerCachePath(arena: Allocator, i: usize) ![]const u8 {
+    const p = package_cache_dirs[i].path;
+    if (std.mem.startsWith(u8, p, "/root/")) return std.mem.concat(arena, u8, &.{ runner_home, p["/root".len..] });
+    // Yarn's cache is under /usr/local/share for root, in the home directory for anyone else.
+    if (std.mem.eql(u8, package_cache_dirs[i].name, "yarn")) return runner_home ++ "/.cache/yarn";
+    return p;
+}
 
 fn packageList() []const u8 {
     comptime {
@@ -741,6 +776,8 @@ pub const Options = struct {
     /// Reuse unchanged steps' results across runs (see `volatile_env`). The runner turns this on
     /// (`RUNNER_STEP_CACHE`, on by default).
     step_cache: bool = false,
+    /// Who steps run as in the default image (provisioned; see `runner_user`).
+    step_user: config.StepUser = .root,
     /// Experimental, with `step_cache`: a step that always runs (it uses secrets) no longer makes
     /// every later step run too. What it changed is stored by content digest in a cache volume (see
     /// `Exec.outputKeyed`), and the next step starts from the container before it plus a copy of
@@ -1906,6 +1943,8 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     // `container:` replaces the image every step runs in.
     const job_image: []const u8 = if (job.container) |jc| (ev.render(jc.image, try ev.scope(&.{})) catch "") else opts.image;
     if (job_image.len == 0) return fail(sh, results, try std.fmt.allocPrint(arena, "container: has no image: {s}", .{ev.diag}));
+    const provision = opts.provision and std.mem.eql(u8, job_image, default_image);
+    const as_runner = provision and opts.step_user == .runner;
     // Package managers' caches persist across jobs in Dagger cache volumes (see `package_cache_dirs`).
     const cache_ids: []const []const u8 = if (opts.package_caches and job.github.repository.len > 0) ids: {
         const scope = try packageCacheScope(arena, &ev, job.github.repository);
@@ -1920,7 +1959,10 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
                 try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/{s}/{s}", .{ job.github.repository, scope, d.name, job_image })
             else
                 try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/{s}", .{ job.github.repository, scope, d.name });
-            try std.json.Stringify.value(key, .{}, w);
+            // Volumes root filled hold files `runner_user` cannot write: steps that run as it get
+            // their own.
+            const user_key = if (as_runner) try std.mem.concat(arena, u8, &.{ key, "/", runner_user }) else key;
+            try std.json.Stringify.value(user_key, .{}, w);
             try w.writeAll(") { id }");
         }
         try w.writeAll(" }");
@@ -1975,18 +2017,22 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
                 extra_braces += 1;
             }
         }
-        const provision = opts.provision and std.mem.eql(u8, job_image, default_image);
         if (provision) {
             try w.writeAll("withExec(args:");
-            try std.json.Stringify.value([_][]const u8{ "sh", "-c", provision_script }, .{}, w);
+            try std.json.Stringify.value([_][]const u8{ "sh", "-c", if (as_runner) provision_runner_script else provision_script }, .{}, w);
             try w.writeAll(") { ");
+        }
+        if (as_runner) {
+            try w.writeAll("withUser(name:\"" ++ runner_user ++ "\") { withEnvVariable(name:\"HOME\",value:\"" ++ runner_home ++ "\") { ");
+            extra_braces += 2;
         }
         try w.print("withWorkdir(path:\"{s}\") {{ ", .{workspace});
         for (cache_ids, 0..) |id, i| {
             try w.writeAll("withMountedCache(path:");
-            try std.json.Stringify.value(package_cache_dirs[i].path, .{}, w);
+            try std.json.Stringify.value(if (as_runner) try runnerCachePath(arena, i) else package_cache_dirs[i].path, .{}, w);
             try w.writeAll(",cache:");
             try std.json.Stringify.value(id, .{}, w);
+            if (as_runner) try w.writeAll(",owner:\"" ++ runner_user ++ "\"");
             try w.writeAll(") { ");
         }
         // The event payload, as on GitHub (actions read it through GITHUB_EVENT_PATH). It differs on
@@ -2050,6 +2096,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         // in each of them would otherwise be replayed from the first one's result.
         .run_nonce = try std.fmt.allocPrint(arena, "{s}, job {s}", .{ try runNonce(arena, io, &ev), ran_marker }),
         .ran_marker = ran_marker,
+        .dir_owner = if (as_runner) runner_user else null,
         .execs = try zeroed(arena, u32, logSteps(job.steps.len)),
         .next_log_step = @intCast(job.steps.len + 1),
         .loaded = try nulls(arena, Exec.LoadResult, job.steps.len),
@@ -2202,7 +2249,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
                     continue;
                 }
                 resolved = .{ .checkout = f };
-                mount_buf[0] = .{ .dir = .{ .path = f.mount, .id = f.result.dir } };
+                mount_buf[0] = .{ .dir = .{ .path = f.mount, .id = f.result.dir, .owner = x.dir_owner } };
                 mounts = &mount_buf;
             },
             .uses, .docker => {
@@ -2338,7 +2385,8 @@ fn emptySlices(arena: Allocator, comptime T: type, n: usize) ![][]const T {
 
 /// A directory mounted into the container for one exec.
 const Mount = union(enum) {
-    dir: struct { path: []const u8, id: []const u8 },
+    /// `owner`: who owns the copy (`Exec.dir_owner`), so steps that do not run as root can write it.
+    dir: struct { path: []const u8, id: []const u8, owner: ?[]const u8 = null },
     file: struct { path: []const u8, id: []const u8, permissions: u32 },
     new_file: struct { path: []const u8, contents: []const u8, permissions: u32 },
 };
@@ -2408,6 +2456,9 @@ const Exec = struct {
     run_nonce: []const u8,
     /// This job's value of `ran_env`.
     ran_marker: []const u8,
+    /// Who owns what the runner copies into the job's container (checkouts, actions, the workspace a
+    /// Docker action leaves): `runner_user` when steps run as it, else root (null).
+    dir_owner: ?[]const u8 = null,
     /// The job token as a Dagger secret, for ACTIONS_ID_TOKEN_REQUEST_TOKEN (registered on first use).
     id_token_secret: ?[]const u8 = null,
     /// The job's GITHUB_TOKEN as a Dagger secret, for git fetches (see `gitAuth`).
@@ -2587,6 +2638,10 @@ const Exec = struct {
                     try std.json.Stringify.value(d.path, .{}, mw);
                     try mw.writeAll(",source:");
                     try std.json.Stringify.value(d.id, .{}, mw);
+                    if (d.owner) |o| {
+                        try mw.writeAll(",owner:");
+                        try std.json.Stringify.value(o, .{}, mw);
+                    }
                 },
                 .file => |f| {
                     try mw.writeAll("withFile(path:");
@@ -2835,6 +2890,12 @@ const Exec = struct {
                 try aw.print("/{s} ", .{digest});
                 try shellQuote(aw, dir);
                 try aw.writeAll("\n");
+                // As the copy back without output keys does (see `runContainer`).
+                if (x.dir_owner) |o| {
+                    try aw.print(outputs_busybox ++ " chown -R {s}:{s} ", .{ o, o });
+                    try shellQuote(aw, dir);
+                    try aw.writeAll("\n");
+                }
             },
         }
         var doc: std.Io.Writer.Allocating = .init(arena);
@@ -3088,7 +3149,7 @@ const Exec = struct {
 
             // The action's files are mounted once per job; its steps may change them, as on GitHub.
             const mounted = x.mounted_actions.contains(act.mount);
-            const m = [_]Mount{.{ .dir = .{ .path = act.mount, .id = act.dir } }};
+            const m = [_]Mount{.{ .dir = .{ .path = act.mount, .id = act.dir, .owner = x.dir_owner } }};
             const fc = x.next_fc;
             x.next_fc += 1;
             const out = try x.execScript(num, fc, .{ .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = plain.items } }, ctx_id, secret.items, if (mounted) &.{} else &m);
@@ -3139,7 +3200,7 @@ const Exec = struct {
         };
         const f = try fetchCheckout(arena, x.transport, x.job.*, co, x.gitAuth());
         if (f.result == .failed) return x.actionFailed(num, "{s}", .{f.result.failed});
-        const m = [_]Mount{.{ .dir = .{ .path = f.mount, .id = f.result.dir } }};
+        const m = [_]Mount{.{ .dir = .{ .path = f.mount, .id = f.result.dir, .owner = x.dir_owner } }};
         const fc = x.next_fc;
         x.next_fc += 1;
         const out = try x.execScript(num, fc, .{ .checkout = f }, ctx_id, &.{}, &m);
@@ -3366,7 +3427,7 @@ const Exec = struct {
             }
         }
         // Mounted once: a later phase sees what an earlier one left in the action's directory.
-        if (!x.mounted_actions.contains(act.mount)) try mounts.append(arena, .{ .dir = .{ .path = act.mount, .id = act.dir } });
+        if (!x.mounted_actions.contains(act.mount)) try mounts.append(arena, .{ .dir = .{ .path = act.mount, .id = act.dir, .owner = x.dir_owner } });
 
         // Inputs as INPUT_<NAME> (spaces become underscores, as in @actions/core), the action's
         // location, and the services actions/cache and artifact actions talk to.
@@ -3935,7 +3996,8 @@ const Exec = struct {
                 return out;
             }
         }
-        const back = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ withoutDirectory(path:\"" ++ workspace ++ "\") {{ withDirectory(path:\"" ++ workspace ++ "\",source:{f}) {{ id }} }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(ws_out, .{}) });
+        const owner: []const u8 = if (x.dir_owner) |o| try std.fmt.allocPrint(arena, ",owner:{f}", .{std.json.fmt(o, .{})}) else "";
+        const back = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ withoutDirectory(path:\"" ++ workspace ++ "\") {{ withDirectory(path:\"" ++ workspace ++ "\",source:{f}{s}) {{ id }} }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(ws_out, .{}), owner });
         const bdata = gql(arena, x.transport, back, &x.err_msg) catch return error.EngineFailed;
         x.container_id = jsonFindString(bdata, "id") orelse {
             x.err_msg = "Dagger returned no container";
@@ -6414,6 +6476,44 @@ test "package caches: one volume per tool, keyed by repository, separate for for
         try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "withMountedCache(path:\"/root/.config/go/telemetry\"") != null);
         try std.testing.expect(braceBalanced(fake.seen.items[1]));
     }
+}
+
+test "steps run as runner in the default image, as on GitHub, with their own package caches" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("go test ./...")};
+    const job = testJob(&steps);
+    var vols: std.Io.Writer.Allocating = .init(arena);
+    try vols.writer.writeAll("{\"data\":{");
+    for (package_cache_dirs, 0..) |_, i| try vols.writer.print("{s}\"c{d}\":{{\"id\":\"V{d}\"}}", .{ if (i == 0) "" else ",", i, i });
+    try vols.writer.writeAll("}}");
+    const answers = [_][]const u8{ vols.written(), base_answer, try exec(arena, "C1", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .package_caches = true, .step_user = .runner, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(res.succeeded);
+    const keys = fake.seen.items[0];
+    const base = fake.seen.items[1];
+    try std.testing.expect(braceBalanced(base));
+    // Volumes of their own: root's hold files the user cannot write.
+    try std.testing.expect(std.mem.indexOf(u8, keys, "cacheVolume(key:\"zig-runner/o/r/repo/npm/runner\")") != null);
+    // Provisioned with the user (uid 1001, passwordless sudo, /github its own), then run as it.
+    try std.testing.expect(std.mem.indexOf(u8, base, "useradd -m -u 1001 -s /bin/bash runner") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "runner ALL=(ALL) NOPASSWD:ALL") != null);
+    // The caches' directories exist and are its own before they are mounted (Dagger would make the
+    // parents of a mount as root).
+    try std.testing.expect(std.mem.indexOf(u8, base, " /home/runner/go/pkg/mod ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "chown -R runner:runner /github /home/runner") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "withUser(name:\"runner\") { withEnvVariable(name:\"HOME\",value:\"/home/runner\")") != null);
+    // Caches under its home, owned by it; the tool cache stays where actions look for it.
+    try std.testing.expect(std.mem.indexOf(u8, base, "withMountedCache(path:\"/home/runner/go/pkg/mod\",cache:\"V6\",owner:\"runner\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "withMountedCache(path:\"/home/runner/.cache/yarn\",cache:\"V3\",owner:\"runner\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "withMountedCache(path:\"/opt/hostedtoolcache\",cache:\"V0\",owner:\"runner\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "/root/") == null);
 }
 
 test "package caches in a container job: variables point the tools at the volumes, the image's own value winning" {

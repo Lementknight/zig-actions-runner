@@ -455,6 +455,7 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
             .nesting = c.cfg.dagger_nesting,
             .package_caches = c.cfg.package_caches,
             .step_cache = c.cfg.step_cache,
+            .step_user = c.cfg.step_user,
             .output_keys = c.cfg.output_keys,
             .output_keys_days = c.cfg.output_keys_days,
             .cancel = &cancel,
