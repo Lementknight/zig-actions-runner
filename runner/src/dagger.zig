@@ -743,6 +743,8 @@ pub const Options = struct {
     /// that content, so its key depends on what the step produced, not on the step having run. The
     /// runner turns this on with `RUNNER_OUTPUT_KEYS`.
     output_keys: bool = false,
+    /// Stored outputs not produced again for this many days are removed (`RUNNER_OUTPUT_KEYS_DAYS`).
+    output_keys_days: u32 = 7,
     /// Set by the runner when GitHub cancels the job.
     cancel: ?*Cancel = null,
     /// Talk to the Dagger engine directly (`engine.zig`) instead of through a `dagger run` child.
@@ -2037,6 +2039,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
             try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/step-outputs", .{ job.github.repository, try packageCacheScope(arena, &ev, job.github.repository) })
         else
             null,
+        .outputs_days = opts.output_keys_days,
         .event_from_env = step_cache and (try ev.eventJson()).len <= max_event_env,
         .job_secret_env = jobEnvHasSecret(job, ev.job_env.items),
         // Per job, not per run: a run's matrix jobs share its id and attempt, and a step that must run
@@ -2380,6 +2383,8 @@ const Exec = struct {
     /// (scoped like the package caches), and the volume once created.
     output_keys: ?[]const u8,
     outputs_volume: ?[]const u8 = null,
+    /// See `Options.output_keys_days`.
+    outputs_days: u32,
     /// The event payload is in ZIG_RUNNER_EVENT; each step writes it to GITHUB_EVENT_PATH.
     event_from_env: bool,
     /// Workflow- or job-level env carries a secret, so every step uses secrets.
@@ -2700,11 +2705,18 @@ const Exec = struct {
         var tmp_raw: [8]u8 = undefined;
         x.io.random(&tmp_raw);
         const tmp_name = std.fmt.bytesToHex(tmp_raw, .lower);
+        //
+        // The directory's time is when a step last produced it (this runs whenever one does, and is
+        // never replayed). Outputs not produced for `outputs_days` days go, and copies left half
+        // made for a day. Removing one is always safe: a replayed step does not read the store, and
+        // when the copy into a next step has to run and finds nothing, that falls back to the step's
+        // own container.
         const store_script = try std.fmt.allocPrint(arena,
-            \\d=/store/{s}; test -d "$d" && exit 0
+            \\/bin/busybox find /store -mindepth 1 -maxdepth 1 \( -name '*.tmp.*' -mtime +0 -o -mtime +{d} \) -exec /bin/busybox rm -rf {{}} +
+            \\d=/store/{s}; test -d "$d" && {{ /bin/busybox touch "$d"; exit 0; }}
             \\t="$d.tmp.{s}"; /bin/busybox rm -rf "$t"; /bin/busybox cp -a /in/. "$t" || exit 1
-            \\/bin/busybox mv -T "$t" "$d" 2>/dev/null || /bin/busybox rm -rf "$t"; test -d "$d"
-        , .{ digest, &tmp_name });
+            \\/bin/busybox mv -T "$t" "$d" 2>/dev/null || /bin/busybox rm -rf "$t"; test -d "$d" && /bin/busybox touch "$d"
+        , .{ x.outputs_days, digest, &tmp_name });
         _ = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ container {{ withFile(path:\"/bin/busybox\",source:{f},permissions:493) {{ withMountedCache(path:\"/store\",cache:{f}) {{ withMountedDirectory(path:\"/in\",source:{f}) {{ withExec(args:{f}) {{ exitCode }} }} }} }} }} }}", .{
             std.json.fmt(busybox, .{}),
             std.json.fmt(volume, .{}),
@@ -6402,6 +6414,10 @@ test "output keys: the step after one that always runs starts from that step's o
     // Stored under its digest, the layer mounted.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "withMountedDirectory(path:\"/in\",source:\"L\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "d=/store/0123abcd;") != null);
+    // A digest a step produced again is marked used; ones not produced for 7 days, and stale
+    // temporary copies, go.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "test -d \\\"$d\\\" && { /bin/busybox touch \\\"$d\\\"; exit 0; }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], "-mtime +0 -o -mtime +7 \\\\) -exec /bin/busybox rm -rf {} +") != null);
     // Matrix jobs share the run's nonce (123.1): the temporary name is the store's own.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[7], ".tmp.123") == null);
     // The next container: the one before the step (with what the runner added for it), the removed
