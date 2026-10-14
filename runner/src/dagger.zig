@@ -240,6 +240,8 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
 fn writeCombinedFileCommands(w: *std.Io.Writer, arena: Allocator, prefix: []const u8, fc: u32) !void {
     try w.writeAll("{ ");
     for (fc_kinds) |k| try w.print("printf '%s\\n' '" ++ fc_marker ++ "{s}'; {s}cat {s}; printf '\\n'; ", .{ k, prefix, try fcPath(arena, k, fc) });
+    // The job's marker (see `ran_env`): a result replayed from Dagger's cache has an earlier job's.
+    try w.writeAll("printf '%s\\n%s\\n' '" ++ fc_marker ++ "ran' \"${" ++ ran_env ++ "-}\"; ");
     try w.print("}} > {s}\n", .{try fcPath(arena, "all", fc)});
 }
 
@@ -349,6 +351,7 @@ fn writeEnvCommand(w: *std.Io.Writer, arena: Allocator, env_cmd: []const u8, env
     try w.writeAll(env_cmd);
     for (secret_env, 0..) |_, i| try w.print("-u {s} ", .{try secretAlias(arena, i)});
     if (write_event) try w.writeAll("-u " ++ event_env ++ " ");
+    try w.writeAll("-u " ++ ran_env ++ " ");
     for (env) |e| {
         const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
         try shellQuote(w, pair);
@@ -749,6 +752,8 @@ pub const Options = struct {
     /// Tests only: replaces `dagger run ...` (it must print "<port> <token>" first) and the HTTP transport.
     test_session_argv: ?[]const []const u8 = null,
     test_transport: ?Transport = null,
+    /// Tests: this job's `ran_env` value instead of a random one.
+    test_ran_marker: ?[]const u8 = null,
 };
 
 // --- the HTTP transport to the session ---
@@ -1922,6 +1927,11 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         break :ids ids;
     } else &.{};
 
+    const ran_marker = opts.test_ran_marker orelse ran: {
+        var raw: [12]u8 = undefined;
+        io.random(&raw);
+        break :ran try arena.dupe(u8, &std.fmt.bytesToHex(raw, .lower));
+    };
     const container_id: []const u8 = blk: {
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
@@ -1984,6 +1994,12 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         }
         try std.json.Stringify.value(event, .{}, w);
         try w.writeAll(") { ");
+        if (step_cache) {
+            try w.writeAll("withVolatileVariable(name:\"" ++ ran_env ++ "\",value:");
+            try std.json.Stringify.value(ran_marker, .{}, w);
+            try w.writeAll(") { ");
+            extra_braces += 1;
+        }
         const defaults = try ev.defaultEnv();
         for (defaults) |e| {
             // Run-specific values do not take part in exec cache keys, so unchanged steps are reused.
@@ -2024,6 +2040,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         .event_from_env = step_cache and (try ev.eventJson()).len <= max_event_env,
         .job_secret_env = jobEnvHasSecret(job, ev.job_env.items),
         .run_nonce = try runNonce(arena, io, &ev),
+        .ran_marker = ran_marker,
         .execs = try zeroed(arena, u32, logSteps(job.steps.len)),
         .next_log_step = @intCast(job.steps.len + 1),
         .loaded = try nulls(arena, Exec.LoadResult, job.steps.len),
@@ -2367,6 +2384,8 @@ const Exec = struct {
     job_secret_env: bool,
     /// Differs on every run (and attempt): makes steps that use secrets run every time.
     run_nonce: []const u8,
+    /// This job's value of `ran_env`.
+    ran_marker: []const u8,
     /// The job token as a Dagger secret, for ACTIONS_ID_TOKEN_REQUEST_TOKEN (registered on first use).
     id_token_secret: ?[]const u8 = null,
     /// The job's GITHUB_TOKEN as a Dagger secret, for git fetches (see `gitAuth`).
@@ -2741,7 +2760,10 @@ const Exec = struct {
         var code: i32 = if (jsonFind(data, "exitCode")) |c| (if (c == .integer) @intCast(c.integer) else 1) else 1;
 
         // A cached step prints no log lines. Wait briefly for a live stream, then replay the result.
-        _ = awaitLiveOrReplay(x.io, x.sh, num, jsonFindString(data, "stdout") orelse "", jsonFindString(data, "stderr") orelse "");
+        // Without step caching nothing is replayed from an earlier job: run-specific values are part
+        // of every key.
+        const ran: ?bool = if (!x.step_cache) true else if (fileCommand(data, "fc_ran")) |m| std.mem.eql(u8, std.mem.trim(u8, m, " \n"), x.ran_marker) else null;
+        _ = awaitLiveOrReplay(x.io, x.sh, num, jsonFindString(data, "stdout") orelse "", jsonFindString(data, "stderr") orelse "", ran);
 
         // File commands: outputs for `steps.<id>.outputs`, env and PATH for the steps that follow.
         var outputs: []const job_mod.EnvVar = &.{};
@@ -3753,6 +3775,12 @@ const Exec = struct {
         try std.json.Stringify.value(try ev.eventJson(), .{}, w);
         try w.writeAll(") { ");
         braces += 1;
+        if (x.step_cache) {
+            try w.writeAll("withVolatileVariable(name:\"" ++ ran_env ++ "\",value:");
+            try std.json.Stringify.value(x.ran_marker, .{}, w);
+            try w.writeAll(") { ");
+            braces += 1;
+        }
         for (secret.items, 0..) |sr, i| {
             try w.writeAll("withSecretVariable(name:");
             try std.json.Stringify.value(try secretAlias(arena, i), .{}, w);
@@ -4228,6 +4256,11 @@ const event_dir = "/github/workflow";
 const event_path = event_dir ++ "/event.json";
 /// The volatile variable that carries the event payload when step caching is on.
 const event_env = "ZIG_RUNNER_EVENT";
+/// A value new for every job, in a volatile variable (not part of exec cache keys). Each step writes
+/// it with its file commands, so the runner knows for certain whether a step ran in this job or its
+/// result was replayed from Dagger's cache, instead of guessing from whether its log lines arrived in
+/// time.
+const ran_env = "ZIG_RUNNER_RAN";
 /// Linux limits one environment string to 128 KiB; larger payloads are written as a file instead.
 const max_event_env = 100 * 1024;
 
@@ -4492,7 +4525,9 @@ test "file commands come back from one combined file" {
 
 /// Gives the reader a moment to deliver this step's lines; if none show up the step was served from
 /// cache, so its recorded stdout and stderr are logged instead.
-fn awaitLiveOrReplay(io: std.Io, sh: *Shared, step: u32, stdout: []const u8, stderr: []const u8) bool {
+/// `ran`: whether the step ran in this job, when its marker says so (see `ran_env`); null when there
+/// is none, and then a step counts as cached if neither its lines nor its end marker arrived in time.
+fn awaitLiveOrReplay(io: std.Io, sh: *Shared, step: u32, stdout: []const u8, stderr: []const u8, ran: ?bool) bool {
     const idx = step - 1;
     var waited: u32 = 0;
     while (waited < live_grace_ms and !sh.ended[idx].load(.acquire)) : (waited += 10) {
@@ -4502,7 +4537,7 @@ fn awaitLiveOrReplay(io: std.Io, sh: *Shared, step: u32, stdout: []const u8, std
     // The step ran (its end marker arrived) but none of its lines did: they came after the marker,
     // as a program's stderr can when it fails at once (Bun refusing an action's bundle, on Linux),
     // and so belonged to no step. Show the result's output, which has them, as the step's own.
-    const cached = !sh.ended[idx].load(.acquire);
+    const cached = if (ran) |r| !r else !sh.ended[idx].load(.acquire);
     if (cached) {
         sh.mu.lockUncancelable(sh.io);
         defer sh.mu.unlock(sh.io);
@@ -4743,7 +4778,7 @@ test "script quotes, applies env, shell and working directory, and propagates th
         .working_directory = "sub dir",
         .env = &.{.{ .name = "X", .value = "a b" }},
     } }, "build");
-    try std.testing.expect(std.mem.indexOf(u8, w, "cd 'sub dir' && env 'X=a b' 'GITHUB_OUTPUT=/github/file_commands/output_2'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, "cd 'sub dir' && env -u ZIG_RUNNER_RAN 'X=a b' 'GITHUB_OUTPUT=/github/file_commands/output_2'") != null);
     // The script is written to a file that the shell runs, as GitHub does.
     try std.testing.expect(std.mem.indexOf(u8, w, "printf '%s' 'echo '\\''hi'\\'' && echo $X' > /tmp/zig-runner-step-2.sh\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, w, "'GITHUB_ACTION=build' 'sh' '-e' '/tmp/zig-runner-step-2.sh' )") != null);
@@ -4776,7 +4811,7 @@ test "secret variables reach the script through aliases, whatever their names" {
         .secret_env = &.{ "INPUT_GITHUB-TOKEN", "TOKEN" },
     } }, "a");
     // Aliases are unset before the assignments; the real names come after the plain env.
-    try std.testing.expect(std.mem.indexOf(u8, w, "env -u ZIG_SECRET_0 -u ZIG_SECRET_1 'PLAIN=p' 'INPUT_GITHUB-TOKEN='\"$ZIG_SECRET_0\" 'TOKEN='\"$ZIG_SECRET_1\" ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w, "env -u ZIG_SECRET_0 -u ZIG_SECRET_1 -u ZIG_RUNNER_RAN 'PLAIN=p' 'INPUT_GITHUB-TOKEN='\"$ZIG_SECRET_0\" 'TOKEN='\"$ZIG_SECRET_1\" ") != null);
 }
 
 test "the checkout log names the ref as the checkout leaves it" {
@@ -6293,10 +6328,17 @@ test "step caching: run-specific values are volatile, steps with secrets always 
             try std.testing.expect(std.mem.indexOf(u8, base, "withVolatileVariable") == null);
             try std.testing.expect(std.mem.indexOf(u8, deploy, "runs this step every time") == null);
         }
-        // The note follows the replayed output, at the end of the job.
         const got = w.buffered();
-        const note = std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused from Dagger's cache") orelse return error.TestUnexpectedResult;
-        try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] built").? < note);
+        try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] built") != null);
+        if (opt_out) {
+            // Without step caching nothing is replayed from an earlier job: the output is the step's
+            // own, though no line of it streamed.
+            try std.testing.expect(std.mem.indexOf(u8, got, "Reused from Dagger's cache") == null);
+        } else {
+            // The note follows the replayed output, at the end of the job.
+            const note = std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused from Dagger's cache") orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] built").? < note);
+        }
     }
 }
 
@@ -6441,11 +6483,48 @@ test "a step that ran but streamed no lines shows its result's output, not as re
     var ended = [_]std.atomic.Value(bool){ .init(true), .init(false) };
     var replayed = [_]bool{ false, false };
     var sh: Shared = .{ .io = std.testing.io, .arena = a.allocator(), .log = &log, .sink_job_id = 0, .live_lines = &live, .ended = &ended, .replayed_steps = &replayed };
-    try std.testing.expect(!awaitLiveOrReplay(std.testing.io, &sh, 1, "", "error: Cannot use import statement\n"));
+    try std.testing.expect(!awaitLiveOrReplay(std.testing.io, &sh, 1, "", "error: Cannot use import statement\n", null));
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "[job 0 step 1 stdout] error: Cannot use import statement") != null);
     try std.testing.expect(!replayed[0]);
-    try std.testing.expect(awaitLiveOrReplay(std.testing.io, &sh, 2, "from cache\n", ""));
+    try std.testing.expect(awaitLiveOrReplay(std.testing.io, &sh, 2, "from cache\n", "", null));
     try std.testing.expect(replayed[1]);
+}
+
+test "with step caching, each step's marker says whether it ran in this job or was replayed" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{ testStep("fast"), testStep("cached") };
+    const job = testJob(&steps);
+    const answer = struct {
+        fn f(ar: Allocator, id: []const u8, out: []const u8, ran_value: []const u8) ![]const u8 {
+            return std.fmt.allocPrint(ar, "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":{{\"id\":\"{s}\",\"exitCode\":0,\"stdout\":\"{s}\",\"stderr\":\"\",\"fc_all\":{{\"contents\":\"::zig-file-command::ran\\n{s}\\n\"}}}}}}}}}}", .{ id, out, ran_value });
+        }
+    }.f;
+    const answers = [_][]const u8{
+        base_answer,
+        // Ran in this job, though none of its lines streamed (they came late).
+        try answer(arena, "C1", "fast\\n", "m-this-job"),
+        // Replayed: an earlier job's marker.
+        try answer(arena, "C2", "cached\\n", "m-earlier-job"),
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .test_ran_marker = "m-this-job", .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(res.succeeded);
+    // The marker is volatile: not part of any step's cache key.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "withVolatileVariable(name:\"ZIG_RUNNER_RAN\",value:\"m-this-job\")") != null);
+    // Each step writes it with its file commands, and its own program does not see it.
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "::zig-file-command::ran' \\\"${ZIG_RUNNER_RAN-}\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "-u ZIG_RUNNER_RAN ") != null);
+    const got = w.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] fast") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 1 stdout] Reused") == null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 2 stdout] cached") != null);
+    try std.testing.expect(std.mem.indexOf(u8, got, "[job 0 step 2 stdout] Reused from Dagger's cache") != null);
 }
 
 test "a checkout gets the refs actions/checkout leaves" {
