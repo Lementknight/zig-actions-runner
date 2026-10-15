@@ -74,7 +74,7 @@ On SIGTERM, waiting runners stop and remove their registrations, and running job
 
 ## 8. Open questions
 
-- **Hits across commits.** Keying steps on the files they read, not the whole checkout. Dagger keys files taken from a checkout on their content, so this can be cheap for them. It keys what earlier steps produced (a toolchain, `.venv`) on how they were made, so carrying that by content means copying it, which cost more than it saved for Python on the Pi. A prototype (`ZIG_RUNNER_INPUTS`) is on the `feat/declared-inputs` branch; see STUDY.md, experiment 5.
+- **Hits across commits.** Tried and set aside (STUDY.md, experiment 5). A `run:` step could declare the files it reads, and the runner would key it on those instead of the whole checkout. Every replay decision was right, but both workloads ran faster without it: the tools' own caches already make the declarable steps cheap, the expensive steps (`go test`, pytest) are the ones a project cannot easily declare, and handing each step its inputs costs more than replaying them saves on a Raspberry Pi. The prototype is on `feat/declared-inputs-v2`. What is still open is the cost of handing a step its inputs at all, which decides whether any finer keying can pay.
 - **Test selection for Python.** pytest has no equivalent of Go's test cache, so every test runs every time.
 - **Output keys by default.** They are being trialled on the Pi, with a per-job line in the runner's log showing how often they apply.
 
