@@ -468,6 +468,22 @@ Two designs were tried and discarded before the one that worked, both for reason
 4. **It can move the install target into the cache, where one exists** (10.1): uv's environment now lives there by default, which made a warm `uv sync` faster than a GitHub-hosted runner's, and the symlink kept every way a workflow reaches `.venv` working. Where the target must stay in the workspace, as pnpm's `node_modules` must, only the workflow can avoid the cost.
 5. **Two designs failed first, for one reason:** on Dagger, being on the container's filesystem means being in the cache key, and persisting means being a mount, which means another device. Any fix has to live on one side of that line.
 
+### 10.2 Against a hosted runner's own cache
+
+Experiment 6 compared the volumes against a hosted runner with **no** caching configured, which is not what a real workflow does. Repeated with `actions/setup-go`'s cache on, building hugo (192 packages, a 1.1 GB module cache):
+
+| Toolchain, `go mod download`, `go build ./...` | This runner | GitHub-hosted |
+|---|---|---|
+| first run on a new branch | **9 s** (0.2 + 8.7) | 151 s (16.0 + 134.8; "Cache is not found") |
+| second run, same branch, its cache hits | 9 s | 30 s (26 s restoring 438 MB, then 0.0 + 3.7) |
+| first run ever, nothing cached anywhere | 231 s (35.8 + 195.3) | 151 s |
+
+**Two structural differences, not tuning.** GitHub's cache is scoped to a branch, so a new branch starts from a miss and pays the full build; the volumes are scoped to a repository, so a new branch is warm at once. And when its cache does hit, a hosted runner downloads and extracts an archive (26 s for 438 MB) where this runner mounts a volume (0.2 s). The hosted runner only wins on the first run on a machine, where the network and the CPU decide it.
+
+**A workflow should leave `setup-*`'s caching off here, and this is the measurement that says so.** With `cache: true`, `setup-go`'s post step tried to upload **2.7 GB at 2 MB/s**, about 22 minutes of a home connection, and it was cancelled at 82%. The archive is that big because one volume holds every Go project built for that repository, and the cache action tars all of it; the hosted runner's archive for the same job was 460 MB. The upload also counts against the repository's 10 GB cache quota and evicts other entries.
+
+**A method note.** The first attempt at the restored-cache row read "Cache is not found" because the ubuntu-only job was pushed to a *different* branch from the one that saved the archive. Branch scoping is the thing being measured, so it had to be the same branch.
+
 ## 11. Experiment 7: is the engine the per-step cost?
 
 **Question.** With architecture open to change, would an executor of our own (overlayfs and namespaces directly, as the study's earlier Mac probes suggested) make jobs faster than Dagger does? The answer has to be a number, not a preference.
