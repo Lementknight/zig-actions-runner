@@ -66,6 +66,9 @@ pub const Checkout = struct {
     fetch_depth: u32 = 1,
     /// `fetch-tags`: also fetch the repository's tags.
     fetch_tags: bool = false,
+    /// `submodules`: false (actions/checkout's default) leaves each submodule's directory empty.
+    /// Dagger's git always fetches them, recursively, so `true` gives nested ones too.
+    submodules: bool = false,
 };
 
 pub const Step = struct {
@@ -463,8 +466,7 @@ pub fn checkoutFromInputs(arena: Allocator, kv: []const EnvVar) Allocator.Error!
             co.fetch_tags = parseBool(e.value) orelse
                 return .{ .unsupported = try std.fmt.allocPrint(arena, "actions/checkout fetch-tags '{s}' is not true or false", .{e.value}) };
         } else if (std.mem.eql(u8, e.name, "submodules")) {
-            // Dagger's git always checks submodules out, recursively; see SPEC §6.
-            if (parseBool(e.value) == null and !std.ascii.eqlIgnoreCase(e.value, "recursive"))
+            co.submodules = if (e.value.len == 0) false else if (std.ascii.eqlIgnoreCase(e.value, "recursive")) true else parseBool(e.value) orelse
                 return .{ .unsupported = try std.fmt.allocPrint(arena, "actions/checkout submodules '{s}' is not true, false or recursive", .{e.value}) };
         } else if (inList(&ignored_checkout_inputs, e.name)) {
             continue;
@@ -868,10 +870,14 @@ test "parse job fixture" {
     try std.testing.expectEqualStrings("cache", cache.name);
     try std.testing.expectEqualStrings("v4", cache.ref);
     try std.testing.expectEqualStrings("", cache.path);
-    // submodules are always there (Dagger fetches them recursively), so any valid value is accepted
-    _ = (try checkoutFromInputs(a.allocator(), try litEnv(a.allocator(), job.steps[5].action.checkout))).ok;
-    for ([_][]const u8{ "true", "false", "recursive", "Recursive", "" }) |v| {
-        _ = (try checkoutFromInputs(a.allocator(), &.{.{ .name = "submodules", .value = v }})).ok;
+    // submodules: true and recursive fetch them (Dagger's git always does, recursively); false and
+    // the default leave their directories empty, as actions/checkout does
+    try std.testing.expect((try checkoutFromInputs(a.allocator(), try litEnv(a.allocator(), job.steps[5].action.checkout))).ok.submodules);
+    for ([_][]const u8{ "true", "recursive", "Recursive" }) |v| {
+        try std.testing.expect((try checkoutFromInputs(a.allocator(), &.{.{ .name = "submodules", .value = v }})).ok.submodules);
+    }
+    for ([_][]const u8{ "false", "" }) |v| {
+        try std.testing.expect(!(try checkoutFromInputs(a.allocator(), &.{.{ .name = "submodules", .value = v }})).ok.submodules);
     }
     const bad_sub = try checkoutFromInputs(a.allocator(), &.{.{ .name = "submodules", .value = "yes" }});
     try std.testing.expect(std.mem.indexOf(u8, bad_sub.unsupported, "not true, false or recursive") != null);

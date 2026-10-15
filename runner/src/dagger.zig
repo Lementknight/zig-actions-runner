@@ -923,8 +923,45 @@ pub fn checkoutQuery(arena: Allocator, job: job_mod.Job, co: job_mod.Checkout, a
     // Dagger's git gives every file the time 1970-01-01 00:00:01. Tools reject that (Python wheels
     // are zips, which cannot hold times before 1980: "ZIP does not support timestamps before 1980");
     // a fixed later time keeps the tree the same from run to run, so cached steps still match.
-    try w.print(" {{ tree(depth:{d}{s}) {{ withTimestamps(timestamp:{d}) {{ id }} }} }} }} }}", .{ co.fetch_depth, if (co.fetch_tags) ",includeTags:true" else "", checkout_mtime });
+    // Without `submodules`, the root's entries say whether there are any to empty (see `fetchCheckout`).
+    try w.print(" {{ tree(depth:{d}{s}) {{ withTimestamps(timestamp:{d}) {{ id{s} }} }} }} }} }}", .{ co.fetch_depth, if (co.fetch_tags) ",includeTags:true" else "", checkout_mtime, if (co.submodules) "" else " entries" });
     return .{ .doc = aw.written() };
+}
+
+/// The tree with each submodule's directory emptied, as actions/checkout leaves them without
+/// `submodules` (Dagger's git always checks them out). The paths come from `.gitmodules`.
+fn withoutSubmodules(arena: Allocator, t: Transport, dir: []const u8, msg: *[]const u8) !?[]const u8 {
+    const read = try std.fmt.allocPrint(arena, "{{ loadDirectoryFromID(id:{f}) {{ file(path:\".gitmodules\") {{ contents }} }} }}", .{std.json.fmt(dir, .{})});
+    const data = gql(arena, t, read, msg) catch return null;
+    const paths = try gitmodulePaths(arena, jsonFindString(data, "contents") orelse "");
+    if (paths.len == 0) return dir;
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    try w.print("{{ loadDirectoryFromID(id:{f}) {{ ", .{std.json.fmt(dir, .{})});
+    for (paths) |p| try w.print("withoutDirectory(path:{f}) {{ withNewDirectory(path:{f}) {{ ", .{ std.json.fmt(p, .{}), std.json.fmt(p, .{}) });
+    // The new directories get the checkout's fixed time, as every other file has.
+    try w.print("withTimestamps(timestamp:{d}) {{ id }}", .{checkout_mtime});
+    for (0..paths.len * 2 + 2) |_| try w.writeAll(" }");
+    const out = gql(arena, t, aw.written(), msg) catch return null;
+    return jsonFindString(out, "id") orelse {
+        msg.* = "Dagger returned no tree";
+        return null;
+    };
+}
+
+/// The `path = ...` of each submodule in a `.gitmodules` file.
+fn gitmodulePaths(arena: Allocator, text: []const u8) ![]const []const u8 {
+    var out: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, line[0..eq], " \t"), "path")) continue;
+        const p = std.mem.trim(u8, std.mem.trim(u8, line[eq + 1 ..], " \t"), "\"/");
+        if (p.len == 0 or std.mem.indexOf(u8, p, "..") != null) continue;
+        try out.append(arena, p);
+    }
+    return out.items;
 }
 
 /// The checkout step's log up to the commit: actions/checkout's folds ("Fetching the repository",
@@ -1074,7 +1111,11 @@ fn fetchCheckout(arena: Allocator, t: Transport, job: job_mod.Job, co: job_mod.C
     var msg: []const u8 = "";
     if (gql(arena, t, doc, &msg)) |data| {
         if (jsonFindString(data, "id")) |id| {
-            f.result = .{ .dir = id };
+            const has_modules = if (jsonFind(data, "entries")) |es| (es == .array and for (es.array.items) |e| (if (e == .string and std.mem.eql(u8, e.string, ".gitmodules")) break true) else false) else false;
+            f.result = .{ .dir = if (!co.submodules and has_modules) try withoutSubmodules(arena, t, id, &msg) orelse {
+                f.result = .{ .failed = try std.fmt.allocPrint(arena, "could not leave {s}'s submodules out: {s}", .{ repo, msg }) };
+                return f;
+            } else id };
             return f;
         }
         msg = "Dagger returned no tree";
@@ -5144,16 +5185,35 @@ test "the checkout log names the ref as the checkout leaves it" {
     }
 }
 
+test "the submodules to leave empty come from .gitmodules" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const paths = try gitmodulePaths(a.allocator(),
+        \\[submodule "themes/PaperMod"]
+        \\    path = themes/PaperMod
+        \\    url = https://github.com/adityatelange/hugo-PaperMod.git
+        \\
+        \\[submodule "public"]
+        \\    path=public/
+        \\    url = https://github.com/lementknight/lementknight.github.io.git
+        \\[submodule "escape"]
+        \\    path = ../outside
+    );
+    try std.testing.expectEqual(@as(usize, 2), paths.len);
+    try std.testing.expectEqualStrings("themes/PaperMod", paths[0]);
+    try std.testing.expectEqualStrings("public", paths[1]);
+}
+
 test "checkoutQuery picks commit, ref or head and honours fetch-depth" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const job = testJob(&.{});
     const own = (try checkoutQuery(a.allocator(), job, .{}, null)).doc;
-    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { commit(id:\"0123456789012345678901234567890123456789\") { tree(depth:1) { withTimestamps(timestamp:946684800) { id } } } } }", own);
+    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { commit(id:\"0123456789012345678901234567890123456789\") { tree(depth:1) { withTimestamps(timestamp:946684800) { id entries } } } } }", own);
     const by_ref = (try checkoutQuery(a.allocator(), job, .{ .ref = "refs/pull/7/merge", .fetch_depth = 0 }, null)).doc;
-    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { ref(name:\"refs/pull/7/merge\") { tree(depth:0) { withTimestamps(timestamp:946684800) { id } } } } }", by_ref);
+    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { ref(name:\"refs/pull/7/merge\") { tree(depth:0) { withTimestamps(timestamp:946684800) { id entries } } } } }", by_ref);
     const tags = (try checkoutQuery(a.allocator(), job, .{ .fetch_tags = true }, "SEC")).doc;
-    try std.testing.expect(std.mem.indexOf(u8, tags, "tree(depth:1,includeTags:true) { withTimestamps(timestamp:946684800) { id }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tags, "tree(depth:1,includeTags:true) { withTimestamps(timestamp:946684800) { id entries }") != null);
     // With the job's GITHUB_TOKEN (a secret), as GitHub expects a token over HTTPS.
     try std.testing.expect(std.mem.indexOf(u8, tags, "git(url:\"https://github.com/o/r.git\",httpAuthUsername:\"x-access-token\",httpAuthToken:\"SEC\",keepGitDir:true)") != null);
     const other = (try checkoutQuery(a.allocator(), job, .{ .repository = "x/y", .fetch_depth = 3 }, null)).doc;
