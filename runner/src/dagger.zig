@@ -33,7 +33,28 @@ const engine = @import("engine.zig");
 const Allocator = std.mem.Allocator;
 
 pub const default_image = "ubuntu:24.04";
-pub const workspace = "/github/workspace";
+/// Where a Docker action sees the job's workspace, as on GitHub.
+const docker_workspace = "/github/workspace";
+/// GitHub's runner works under /home/runner/work; a `container:` job sees it as /__w.
+const work_root = "/home/runner/work";
+const container_work_root = "/__w";
+
+/// The job's workspace, where GitHub's runner puts it: `<work>/<repo>/<repo>` (checked next to
+/// `ubuntu-latest`). Scripts and tools that record absolute paths then see the same ones.
+fn jobWorkspace(arena: Allocator, job: job_mod.Job) ![]const u8 {
+    const repo = job.github.repository;
+    const name = if (std.mem.lastIndexOfScalar(u8, repo, '/')) |i| repo[i + 1 ..] else if (repo.len > 0) repo else "workspace";
+    return std.fmt.allocPrint(arena, "{s}/{s}/{s}", .{ jobWorkRoot(job), name, name });
+}
+
+/// RUNNER_TEMP: `<work>/_temp`, as on GitHub.
+fn jobTemp(arena: Allocator, job: job_mod.Job) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s}/_temp", .{jobWorkRoot(job)});
+}
+
+fn jobWorkRoot(job: job_mod.Job) []const u8 {
+    return if (job.container != null) container_work_root else work_root;
+}
 pub const marker = "::zig-step::";
 
 /// What the default image (`ubuntu:24.04`) gets before a job: what workflows written for GitHub's
@@ -59,7 +80,7 @@ const runner_home = "/home/runner";
 const provision_runner_script = provision_script ++
     " && (id -u " ++ runner_user ++ " >/dev/null 2>&1 || useradd -m -u 1001 -s /bin/bash " ++ runner_user ++ ")" ++
     " && printf '%s\\n' '" ++ runner_user ++ " ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/" ++ runner_user ++ " && chmod 0440 /etc/sudoers.d/" ++ runner_user ++
-    " && mkdir -p " ++ workspace ++ " " ++ docker_home ++ runnerCacheDirs() ++
+    " && mkdir -p " ++ work_root ++ " " ++ docker_home ++ runnerCacheDirs() ++
     " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " /github " ++ runner_home;
 
 /// The package caches' directories under the user's home, made in advance: Dagger creates a cache
@@ -1022,10 +1043,11 @@ fn writeGitAuth(w: *std.Io.Writer, auth: ?[]const u8) !void {
 
 fn fetchCheckout(arena: Allocator, t: Transport, job: job_mod.Job, co: job_mod.Checkout, auth: ?[]const u8) !Fetched {
     const repo = co.repository orelse job.github.repository;
+    const ws = try jobWorkspace(arena, job);
     const mount = if (co.path) |pth|
-        try std.fmt.allocPrint(arena, "{s}/{s}", .{ workspace, std.mem.trim(u8, pth, "/") })
+        try std.fmt.allocPrint(arena, "{s}/{s}", .{ ws, std.mem.trim(u8, pth, "/") })
     else
-        workspace;
+        ws;
     const want = co.ref orelse (if (co.repository == null) job.github.sha else "HEAD");
     const label = if (isSha(want)) want[0..7] else want;
     // The workflow's own commit is named by the ref that triggered the run, as actions/checkout does.
@@ -1097,11 +1119,16 @@ const Evaluator = struct {
     runner_name: []const u8 = "zig-runner",
     /// Step debug is on (ACTIONS_STEP_DEBUG): steps get RUNNER_DEBUG=1, as on GitHub.
     runner_debug: bool = false,
+    /// GITHUB_WORKSPACE and RUNNER_TEMP (see `jobWorkspace`).
+    workspace: []const u8 = "",
+    temp: []const u8 = "",
 
     fn init(arena: Allocator, job: *const job_mod.Job) !Evaluator {
         var ev: Evaluator = .{
             .arena = arena,
             .job = job,
+            .workspace = try jobWorkspace(arena, job.*),
+            .temp = try jobTemp(arena, job.*),
             .github = try context.named(arena, job.context_data, "github"),
             .inputs = try context.named(arena, job.context_data, "inputs"),
             .matrix = try context.named(arena, job.context_data, "matrix"),
@@ -1125,7 +1152,7 @@ const Evaluator = struct {
         // Nor is `github.workspace` (GITHUB_WORKSPACE), which actions use as an input default
         // (setup-uv's `working-directory`).
         if (ev.github == .object and !hasKey(ev.github, "workspace")) {
-            ev.github = try withEntries(arena, ev.github, &.{.{ .key = "workspace", .value = .{ .string = workspace } }});
+            ev.github = try withEntries(arena, ev.github, &.{.{ .key = "workspace", .value = .{ .string = ev.workspace } }});
         }
         for (job.env) |in| {
             const sc = try ev.scope(&.{});
@@ -1166,12 +1193,14 @@ const Evaluator = struct {
         const job_fields = try arena.alloc(expr.Value.Entry, if (ev.services != null) 2 else 1);
         job_fields[0] = .{ .key = "status", .value = .{ .string = if (ev.cancelled) "cancelled" else if (ev.job_failed) "failure" else "success" } };
         if (ev.services) |v| job_fields[1] = .{ .key = "services", .value = v };
-        const runner_fields = try arena.alloc(expr.Value.Entry, 5);
+        const runner_fields = try arena.alloc(expr.Value.Entry, if (ev.runner_debug) 7 else 6);
         runner_fields[0] = .{ .key = "os", .value = .{ .string = "Linux" } };
         runner_fields[1] = .{ .key = "arch", .value = .{ .string = broker.arch } };
         runner_fields[2] = .{ .key = "name", .value = .{ .string = ev.runner_name } };
-        runner_fields[3] = .{ .key = "temp", .value = .{ .string = "/tmp" } };
+        runner_fields[3] = .{ .key = "temp", .value = .{ .string = ev.temp } };
         runner_fields[4] = .{ .key = "tool_cache", .value = .{ .string = "/opt/hostedtoolcache" } };
+        runner_fields[5] = .{ .key = "environment", .value = .{ .string = "self-hosted" } };
+        if (ev.runner_debug) runner_fields[6] = .{ .key = "debug", .value = .{ .string = "1" } };
 
         const secret_entries = try arena.alloc(expr.Value.Entry, ev.job.secret_vars.len);
         for (ev.job.secret_vars, secret_entries) |sv, *o| o.* = .{ .key = sv.name, .value = .{ .string = sv.value } };
@@ -1273,13 +1302,13 @@ const Evaluator = struct {
         const fixed = [_]job_mod.EnvVar{
             .{ .name = "CI", .value = "true" },
             .{ .name = "GITHUB_ACTIONS", .value = "true" },
-            .{ .name = "GITHUB_WORKSPACE", .value = workspace },
+            .{ .name = "GITHUB_WORKSPACE", .value = ev.workspace },
             .{ .name = "RUNNER_OS", .value = "Linux" },
             .{ .name = "RUNNER_ARCH", .value = broker.arch },
             .{ .name = "RUNNER_NAME", .value = ev.runner_name },
-            .{ .name = "RUNNER_TEMP", .value = "/tmp" },
+            .{ .name = "RUNNER_TEMP", .value = ev.temp },
             .{ .name = "RUNNER_TOOL_CACHE", .value = "/opt/hostedtoolcache" },
-            .{ .name = "RUNNER_WORKSPACE", .value = std.fs.path.dirnamePosix(workspace) orelse "/" },
+            .{ .name = "RUNNER_WORKSPACE", .value = std.fs.path.dirnamePosix(ev.workspace) orelse "/" },
             .{ .name = "RUNNER_ENVIRONMENT", .value = "self-hosted" },
             .{ .name = "GITHUB_EVENT_PATH", .value = event_path },
             // Set in every step, empty outside an action's own steps (which set them), as on GitHub.
@@ -1416,6 +1445,8 @@ const Shared = struct {
     replayed_steps: []bool = &.{},
     /// `ACTIONS_STEP_DEBUG`: show `::debug::` lines.
     step_debug: bool = false,
+    /// The job's workspace (see `jobWorkspace`): annotations name files relative to it.
+    workspace: []const u8 = "",
     /// `::error`/`::warning`/`::notice` lines and the runner's own errors, sent with completejob so
     /// GitHub shows them on the run (guarded by `mu`).
     annotations: std.ArrayList(Annotation) = .empty,
@@ -1503,7 +1534,7 @@ const Shared = struct {
         }
         if (same >= max_annotations) return;
         var copy = an;
-        if (an.file) |f| copy.file = if (std.mem.startsWith(u8, f, workspace ++ "/")) f[workspace.len + 1 ..] else f;
+        if (an.file) |f| copy.file = if (std.mem.startsWith(u8, f, sh.workspace) and std.mem.startsWith(u8, f[sh.workspace.len..], "/")) f[sh.workspace.len + 1 ..] else f;
         // Its line in the log: the annotation's own line was logged just before this.
         if (an.file == null and an.line == null and step < sh.line_counts.len and sh.line_counts[step] > 0)
             copy.line = std.fmt.allocPrint(sh.arena, "{d}", .{sh.line_counts[step] - countLines(an.message) + 1}) catch null;
@@ -1735,6 +1766,7 @@ pub fn run(
         .service_logs = service_logs,
         .service_dropped = service_dropped,
         .step_debug = stepDebug(arena, job),
+        .workspace = try jobWorkspace(arena, job),
     };
 
     if (opts.engine) |ep| if (opts.test_transport == null) return runDirect(arena, io, opts, job, &sh, results, ep);
@@ -2074,11 +2106,19 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
             try std.json.Stringify.value([_][]const u8{ "sh", "-c", if (as_runner) provision_runner_script else provision_script }, .{}, w);
             try w.writeAll(") { ");
         }
+        if (provision) {
+            // The job's workspace and RUNNER_TEMP, the user's (cached per repository).
+            const mk = try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}", .{ ev.workspace, ev.temp, if (as_runner) " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root else "" });
+            try w.writeAll("withExec(args:");
+            try std.json.Stringify.value([_][]const u8{ "sh", "-c", mk }, .{}, w);
+            try w.writeAll(") { ");
+            extra_braces += 1;
+        }
         if (as_runner) {
             try w.writeAll("withUser(name:\"" ++ runner_user ++ "\") { withEnvVariable(name:\"HOME\",value:\"" ++ runner_home ++ "\") { ");
             extra_braces += 2;
         }
-        try w.print("withWorkdir(path:\"{s}\") {{ ", .{workspace});
+        try w.print("withWorkdir(path:\"{s}\") {{ ", .{ev.workspace});
         for (cache_ids, 0..) |id, i| {
             try w.writeAll("withMountedCache(path:");
             try std.json.Stringify.value(if (as_runner) try runnerCachePath(arena, i) else package_cache_dirs[i].path, .{}, w);
@@ -2867,7 +2907,7 @@ const Exec = struct {
         };
         const digest_full = jsonFindString(data, "digest") orelse return null;
         const digest = if (std.mem.indexOfScalar(u8, digest_full, ':')) |c| digest_full[c + 1 ..] else digest_full;
-        return x.storeAndApply(num, x.container_id, jsonFindString(data, "user") orelse "", ws_out, digest, .{ .replace_dir = workspace });
+        return x.storeAndApply(num, x.container_id, jsonFindString(data, "user") orelse "", ws_out, digest, .{ .replace_dir = x.ev.workspace });
     }
 
     /// Where `storeAndApply` puts a stored output in the next step's container: over the whole
@@ -3589,6 +3629,7 @@ const Exec = struct {
     /// which the exec does not change.
     fn hashFiles(ptr: *anyopaque, arena: Allocator, args: []const []const u8) Allocator.Error!expr.HashFiles.Result {
         const x: *Exec = @ptrCast(@alignCast(ptr));
+        const ws = x.ev.workspace;
         const Pattern = struct { glob: []const u8, exclude: bool };
         var patterns: std.ArrayList(Pattern) = .empty;
         var any_include = false;
@@ -3599,8 +3640,8 @@ const Exec = struct {
                 if (p.len == 0 or p[0] == '#') continue;
                 const exclude = p[0] == '!';
                 if (exclude) p = std.mem.trimStart(u8, p[1..], " ");
-                if (std.mem.startsWith(u8, p, workspace ++ "/")) p = p[workspace.len + 1 ..] //
-                else if (std.mem.eql(u8, p, workspace)) p = "**" //
+                if (std.mem.startsWith(u8, p, ws) and std.mem.startsWith(u8, p[ws.len..], "/")) p = p[ws.len + 1 ..] //
+                else if (std.mem.eql(u8, p, ws)) p = "**" //
                 else if (p.len > 0 and p[0] == '/') continue; // outside the workspace: GitHub ignores those files
                 while (std.mem.startsWith(u8, p, "./")) p = p[2..];
                 p = std.mem.trimEnd(u8, p, "/");
@@ -3616,7 +3657,7 @@ const Exec = struct {
         const w = &doc.writer;
         w.writeAll("{ loadContainerFromID(id:") catch return error.OutOfMemory;
         std.json.Stringify.value(x.container_id, .{}, w) catch return error.OutOfMemory;
-        w.writeAll(") { directory(path:\"" ++ workspace ++ "\") {") catch return error.OutOfMemory;
+        w.print(") {{ directory(path:{f}) {{", .{std.json.fmt(ws, .{})}) catch return error.OutOfMemory;
         for (patterns.items, 0..) |p, i| {
             w.print(" p{d}: glob(pattern:", .{i}) catch return error.OutOfMemory;
             std.json.Stringify.value(p.glob, .{}, w) catch return error.OutOfMemory;
@@ -3667,7 +3708,8 @@ const Exec = struct {
         w2.writeAll(") { withNewFile(path:\"" ++ hash_list_path ++ "\",contents:") catch return error.OutOfMemory;
         std.json.Stringify.value(list, .{}, w2) catch return error.OutOfMemory;
         w2.writeAll(") { withExec(args:") catch return error.OutOfMemory;
-        std.json.Stringify.value([_][]const u8{ "sh", "-c", "cd " ++ workspace ++ " && tr '\\n' '\\0' < " ++ hash_list_path ++ " | xargs -0 sha256sum --" }, .{}, w2) catch return error.OutOfMemory;
+        const hash_cmd = std.fmt.allocPrint(arena, "cd {s} && tr '\\n' '\\0' < " ++ hash_list_path ++ " | xargs -0 sha256sum --", .{ws}) catch return error.OutOfMemory;
+        std.json.Stringify.value([_][]const u8{ "sh", "-c", hash_cmd }, .{}, w2) catch return error.OutOfMemory;
         w2.writeAll(",expect:ANY) { exitCode stdout stderr } } } }") catch return error.OutOfMemory;
         const hdata = gql(arena, x.transport, doc.written(), &msg) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -3944,7 +3986,7 @@ const Exec = struct {
         }
 
         const ws_in = blk: {
-            const doc = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ directory(path:\"" ++ workspace ++ "\") {{ id }} }} }}", .{std.json.fmt(x.container_id, .{})});
+            const doc = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ directory(path:{f}) {{ id }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(x.ev.workspace, .{}) });
             const data = gql(arena, x.transport, doc, &x.err_msg) catch return error.EngineFailed;
             break :blk jsonFindString(data, "id") orelse {
                 x.err_msg = "Dagger returned no workspace directory";
@@ -3982,14 +4024,14 @@ const Exec = struct {
         const w = &doc.writer;
         try w.writeAll("{ loadContainerFromID(id:");
         try std.json.Stringify.value(img.id, .{}, w);
-        try w.writeAll(") { withWorkdir(path:\"" ++ workspace ++ "\") { withFile(path:\"" ++ busybox_path ++ "\",permissions:493,source:");
+        try w.writeAll(") { withWorkdir(path:\"" ++ docker_workspace ++ "\") { withFile(path:\"" ++ busybox_path ++ "\",permissions:493,source:");
         try std.json.Stringify.value(busybox, .{}, w);
         try w.writeAll(") { ");
         var braces: usize = 4;
         // The workspace, /github/home, and where file commands and the event go, owned by the image's
         // user, which may not be root (GitHub's own example action runs as one).
         const dirs = [_][2][]const u8{
-            .{ workspace, ws_in },
+            .{ docker_workspace, ws_in },
             .{ docker_home, x.docker_home orelse x.empty_dir },
             .{ fc_dir, x.empty_dir },
             .{ event_dir, x.empty_dir },
@@ -4010,7 +4052,8 @@ const Exec = struct {
             try w.writeAll(if (x.step_cache and isVolatile(e.name)) "withVolatileVariable(name:" else "withEnvVariable(name:");
             try std.json.Stringify.value(e.name, .{}, w);
             try w.writeAll(",value:");
-            try std.json.Stringify.value(e.value, .{}, w);
+            // GitHub mounts the workspace at /github/workspace in a Docker action, and says so.
+            try std.json.Stringify.value(if (std.mem.eql(u8, e.name, "GITHUB_WORKSPACE")) docker_workspace else e.value, .{}, w);
             try w.writeAll(") { ");
             braces += 1;
         }
@@ -4038,7 +4081,7 @@ const Exec = struct {
         try std.json.Stringify.value([_][]const u8{ busybox_path, "sh", "-c", script }, .{}, w);
         try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
         try w.print(" fc_all: file(path:\"{s}\") {{ contents }}", .{try fcPath(arena, "all", fc)});
-        try w.writeAll(" ws: directory(path:\"" ++ workspace ++ "\") { id } home: directory(path:\"" ++ docker_home ++ "\") { id } }");
+        try w.writeAll(" ws: directory(path:\"" ++ docker_workspace ++ "\") { id } home: directory(path:\"" ++ docker_home ++ "\") { id } }");
         for (0..braces) |_| try w.writeAll(" }");
 
         x.beginExec(num);
@@ -4062,7 +4105,7 @@ const Exec = struct {
             }
         }
         const owner: []const u8 = if (x.dir_owner) |o| try std.fmt.allocPrint(arena, ",owner:{f}", .{std.json.fmt(o, .{})}) else "";
-        const back = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ withoutDirectory(path:\"" ++ workspace ++ "\") {{ withDirectory(path:\"" ++ workspace ++ "\",source:{f}{s}) {{ id }} }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(ws_out, .{}), owner });
+        const back = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ withoutDirectory(path:{f}) {{ withDirectory(path:{f},source:{f}{s}) {{ id }} }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(x.ev.workspace, .{}), std.json.fmt(x.ev.workspace, .{}), std.json.fmt(ws_out, .{}), owner });
         const bdata = gql(arena, x.transport, back, &x.err_msg) catch return error.EngineFailed;
         x.container_id = jsonFindString(bdata, "id") orelse {
             x.err_msg = "Dagger returned no container";
@@ -4476,7 +4519,7 @@ const Exec = struct {
     /// action's files are already there.
     fn loadLocal(x: *Exec, u: job_mod.Uses) !LoadResult {
         const arena = x.arena;
-        const abs = if (u.path.len > 0) try std.fmt.allocPrint(arena, workspace ++ "/{s}", .{u.path}) else workspace;
+        const abs = if (u.path.len > 0) try std.fmt.allocPrint(arena, "{s}/{s}", .{ x.ev.workspace, u.path }) else x.ev.workspace;
         const label = try std.fmt.allocPrint(arena, "./{s}", .{u.path});
         const missing = try std.fmt.allocPrint(arena, "Can't find 'action.yml' or 'action.yaml' under '{s}'. Did you forget to run actions/checkout before running your local action?", .{abs});
         const doc = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ directory(path:{f}) {{ id entries }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(abs, .{}) });
@@ -5271,7 +5314,7 @@ test "run mounts a fetched checkout, and a failed fetch fails only that step" {
     var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
     _ = try run(arena, std.testing.io, &env, .{ .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
     for (fake.seen.items) |d| try std.testing.expect(braceBalanced(d));
-    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withDirectory(path:\"/github/workspace\",source:\"TREE1\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[2], "withDirectory(path:\"/home/runner/work/r/r\",source:\"TREE1\")") != null);
     // actions/checkout's folds, with what the built-in checkout did, and the commit last (from git).
     const co_script = fake.seen.items[2];
     for ([_][]const u8{
@@ -5282,9 +5325,9 @@ test "run mounts a fetched checkout, and a failed fetch fails only that step" {
         "Depth: 1",
         "Tags: not fetched",
         "##[group]Checking out the ref",
-        "Into /github/workspace",
+        "Into /home/runner/work/r/r",
         "Switched to a new branch ",
-        "/github/workspace",
+        "/home/runner/work/r/r",
         " log -1 --format=%H",
     }) |want| if (std.mem.indexOf(u8, co_script, want) == null) {
         std.debug.print("missing: {s}\n", .{want});
@@ -5920,8 +5963,8 @@ test "output keys: after a Docker action, the next steps start from the workspac
     // action's own run is not part of it.
     const apply = seen[9];
     try std.testing.expect(std.mem.startsWith(u8, apply, "{ loadContainerFromID(id:\"C0\") {"));
-    try std.testing.expect(std.mem.indexOf(u8, apply, "rm -rf '/github/workspace'\\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, apply, "cp -a /zig-runner-outputs/abcd12 '/github/workspace'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, apply, "rm -rf '/home/runner/work/r/r'\\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, apply, "cp -a /zig-runner-outputs/abcd12 '/home/runner/work/r/r'") != null);
     try std.testing.expect(std.mem.indexOf(u8, apply, "WS1") == null);
 }
 
@@ -5999,7 +6042,7 @@ test "Docker actions: built or pulled, the workspace copied in and back, args, e
     try std.testing.expect(std.mem.indexOf(u8, seen[3], "empty: directory { id }") != null);
     // Built with the Dockerfile's directory as the context.
     try std.testing.expect(std.mem.indexOf(u8, seen[4], "loadDirectoryFromID(id:\"D1\") { directory(path:\"sub/docker\") { dockerBuild(dockerfile:\"Dockerfile\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[5], "loadContainerFromID(id:\"C0\") { directory(path:\"/github/workspace\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[5], "loadContainerFromID(id:\"C0\") { directory(path:\"/home/runner/work/r/r\")") != null);
     const run1 = seen[7];
     try std.testing.expect(std.mem.indexOf(u8, run1, "loadContainerFromID(id:\"IMG\") { withWorkdir(path:\"/github/workspace\")") != null);
     // The image's user owns what it writes: the workspace, /github/home, file commands, the event.
@@ -6019,7 +6062,7 @@ test "Docker actions: built or pulled, the workspace copied in and back, args, e
     try std.testing.expect(std.mem.indexOf(u8, run1, "withEnvVariable(name:\"GITHUB_WORKSPACE\",value:\"/github/workspace\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, run1, "ws: directory(path:\"/github/workspace\") { id } home: directory(path:\"/github/home\") { id }") != null);
     // The workspace it left replaces the job's.
-    try std.testing.expect(std.mem.indexOf(u8, seen[8], "withoutDirectory(path:\"/github/workspace\") { withDirectory(path:\"/github/workspace\",source:\"WS1\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[8], "withoutDirectory(path:\"/home/runner/work/r/r\") { withDirectory(path:\"/home/runner/work/r/r\",source:\"WS1\")") != null);
     // docker://: the entrypoint input, args split like a command line, the step's env; /github/home is shared.
     try std.testing.expect(std.mem.indexOf(u8, seen[9], "from(address:\"alpine:3.22\") { id entrypoint defaultArgs user }") != null);
     const run2 = seen[12];
@@ -6072,7 +6115,7 @@ test "hashFiles globs the workspace, honours exclusions, and hashes the files' d
     const seen = fake.seen.items;
     try std.testing.expectEqual(@as(usize, 5), seen.len);
     for (seen) |d| try std.testing.expect(braceBalanced(d));
-    try std.testing.expect(std.mem.indexOf(u8, seen[1], "loadContainerFromID(id:\"C0\") { directory(path:\"/github/workspace\") { p0: glob(pattern:\"**/package-lock.json\") d0: glob(pattern:\"**/package-lock.json/**\") p1: glob(pattern:\"node_modules/**\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[1], "loadContainerFromID(id:\"C0\") { directory(path:\"/home/runner/work/r/r\") { p0: glob(pattern:\"**/package-lock.json\") d0: glob(pattern:\"**/package-lock.json/**\") p1: glob(pattern:\"node_modules/**\")") != null);
     // node_modules is excluded; the rest is hashed in path order, in the job's container.
     try std.testing.expect(std.mem.indexOf(u8, seen[2], "loadContainerFromID(id:\"C0\") { withNewFile(path:\"/tmp/zig-runner-hashfiles\",contents:\"a/package-lock.json\\npackage-lock.json\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[2], "xargs -0 sha256sum --") != null);
@@ -6115,7 +6158,7 @@ test "a local action is read from the workspace when its step runs, and is not m
         "{\"data\":{\"loadContainerFromID\":{\"directory\":{\"id\":\"LD\",\"entries\":[\"action.yml\"]}}}}",
         try fileAnswer(arena, action_yml),
         try exec(arena, "C2", 0, ""),
-        "{\"errors\":[{\"message\":\"lstat /github/workspace/nope: no such file or directory\"}]}",
+        "{\"errors\":[{\"message\":\"lstat /home/runner/work/r/r/nope: no such file or directory\"}]}",
     };
     var fake: FakeSession = .{ .answers = &answers, .arena = arena };
     var buf: [8192]u8 = undefined;
@@ -6126,16 +6169,16 @@ test "a local action is read from the workspace when its step runs, and is not m
     try std.testing.expectEqual(@as(usize, 6), seen.len);
     for (seen) |d| try std.testing.expect(braceBalanced(d));
     // Read after the earlier step, from the container that step left; nothing is fetched up front.
-    try std.testing.expect(std.mem.indexOf(u8, seen[2], "loadContainerFromID(id:\"C1\") { directory(path:\"/github/workspace/.github/actions/greet\") { id entries } }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[2], "loadContainerFromID(id:\"C1\") { directory(path:\"/home/runner/work/r/r/.github/actions/greet\") { id entries } }") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[3], "loadDirectoryFromID(id:\"LD\") { file(path:\"action.yml\")") != null);
     const run1 = seen[4];
     try std.testing.expect(std.mem.indexOf(u8, run1, "withDirectory") == null);
     try std.testing.expect(std.mem.indexOf(u8, run1, "hi you from $GITHUB_ACTION_PATH ()") != null);
-    try std.testing.expect(std.mem.indexOf(u8, run1, "'GITHUB_ACTION_PATH=/github/workspace/.github/actions/greet'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run1, "'GITHUB_ACTION_PATH=/home/runner/work/r/r/.github/actions/greet'") != null);
     try std.testing.expect(std.mem.indexOf(u8, run1, "'GITHUB_ACTION_REPOSITORY='") != null);
     try std.testing.expectEqual(Outcome.success, res.steps[1].outcome);
     try std.testing.expectEqual(Outcome.failure, res.steps[2].outcome);
-    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Can't find 'action.yml' or 'action.yaml' under '/github/workspace/nope'. Did you forget to run actions/checkout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "Can't find 'action.yml' or 'action.yaml' under '/home/runner/work/r/r/nope'. Did you forget to run actions/checkout") != null);
 }
 
 test "a composite action's uses: steps: nested actions, the built-in checkout, outputs, and the nesting limit" {
@@ -6209,7 +6252,7 @@ test "a composite action's uses: steps: nested actions, the built-in checkout, o
     try std.testing.expect(std.mem.indexOf(u8, seen[5], "withDirectory(path:\"/github/_actions/o/inner/v1\",source:\"D2\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[5], "echo \\\"text=hello zig\\\"") != null);
     // actions/checkout is the built-in checkout, at its path.
-    try std.testing.expect(std.mem.indexOf(u8, seen[7], "withDirectory(path:\"/github/workspace/sub\",source:\"TREE1\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[7], "withDirectory(path:\"/home/runner/work/r/r/sub\",source:\"TREE1\")") != null);
     // Its outputs reach the outer action's steps and outputs, and the job's next step.
     try std.testing.expect(std.mem.indexOf(u8, seen[8], "inner said hello zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[9], "echo hello zig") != null);
@@ -6251,6 +6294,19 @@ test "steps see the name the runner registered under" {
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "echo zig-1a2b3c4d") != null);
 }
 
+test "the workspace is where GitHub's runner puts it, /__w in a container job" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var job = testJob(&.{});
+    job.github.repository = "Lementknight/zig-actions-runner";
+    try std.testing.expectEqualStrings("/home/runner/work/zig-actions-runner/zig-actions-runner", try jobWorkspace(arena, job));
+    try std.testing.expectEqualStrings("/home/runner/work/_temp", try jobTemp(arena, job));
+    job.container = .{ .name = "", .image = .{ .lit = "golang:1.26" } };
+    try std.testing.expectEqualStrings("/__w/zig-actions-runner/zig-actions-runner", try jobWorkspace(arena, job));
+    try std.testing.expectEqualStrings("/__w/_temp", try jobTemp(arena, job));
+}
+
 test "the variables GitHub's runner sets: empty ones too, numbers and booleans as text" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -6271,7 +6327,7 @@ test "the variables GitHub's runner sets: empty ones too, numbers and booleans a
         .{ "GITHUB_REF_PROTECTED", "false" },
         .{ "GITHUB_WORKFLOW_SHA", "0123abc" },
         .{ "RUNNER_ENVIRONMENT", "self-hosted" },
-        .{ "RUNNER_WORKSPACE", "/github" },
+        .{ "RUNNER_WORKSPACE", "/home/runner/work/r" },
         .{ "RUNNER_DEBUG", "1" },
         .{ "GITHUB_ACTION_REPOSITORY", "" },
     }) |want| {
@@ -6775,8 +6831,8 @@ test "github.workspace is the job's workspace, as actions' input defaults expect
         \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"}]}}
     , .{});
     var ev = try Evaluator.init(arena, &job);
-    try std.testing.expectEqualStrings("/github/workspace", ev.githubString("workspace"));
-    try std.testing.expectEqualStrings("/github/workspace", try ev.render(.{ .expr = "github.workspace" }, try ev.scope(&.{})));
+    try std.testing.expectEqualStrings("/home/runner/work/r/r", ev.githubString("workspace"));
+    try std.testing.expectEqualStrings("/home/runner/work/r/r", try ev.render(.{ .expr = "github.workspace" }, try ev.scope(&.{})));
 }
 
 test "output keys: the step after one that always runs starts from that step's output, by digest" {
