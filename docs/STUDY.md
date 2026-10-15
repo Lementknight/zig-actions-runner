@@ -24,8 +24,19 @@ What the runner adds to a job beyond the job's own commands is the cost being de
 | medium | [go-task/task](https://github.com/go-task/task) (MIT) | 19 | which tests a change affects, across packages |
 | large | [caddyserver/caddy](https://github.com/caddyserver/caddy) (Apache-2.0) | 30 | how costs grow with project size |
 | Python | [pallets/click](https://github.com/pallets/click), [pallets/flask](https://github.com/pallets/flask) (BSD-3) | — | uv, ruff and pytest |
+| Rust, small | [BurntSushi/ripgrep](https://github.com/BurntSushi/ripgrep) (MIT/Unlicense) | — | a compiled language: what the step cache saves when nothing changed |
+| Rust, large | [clap-rs/clap](https://github.com/clap-rs/clap) (MIT/Apache-2.0) | — | how a job's cost grows with the artefacts it leaves: ~1 GB of `target/`, ~925 MB of registry cache |
 
-Each project is pinned to a commit, and all Go projects build with Go 1.26 (the newest any of them asks for is 1.26.4).
+Each project is pinned to a commit or tag, and all Go projects build with Go 1.26 (the newest any of them asks for is 1.26.4). The Rust projects use `dtolnay/rust-toolchain@stable`, which works unchanged on this runner.
+
+Rust was added last and is where the step cache shows best, because compiling is the cost:
+
+| | Pi, first run | Pi, re-run | GitHub-hosted |
+|---|---|---|---|
+| ripgrep: fetch, debug build, test | 90 s (1.6 + 30.1 + 22.9 s) | **5 s**, 3 of 3 steps replayed | 36 s, then 34 s again |
+| clap: fetch, debug build, test | 229 s (37.8 s fetch, 134.4 s test) | — | 85 s |
+
+The Pi is about 2.5 times slower than a hosted runner at compiling, and about seven times faster than one on a re-run, since a hosted runner has nothing to replay. clap also shows what a Rust job leaves behind: a 996 MB `target/` in the workspace and 925 MB in the registry cache volume for one project, which is the scale the engine's 20 GB cache cap has to hold (§8.2).
 
 ## 3. Measurement
 
