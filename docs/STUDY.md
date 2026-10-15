@@ -472,16 +472,26 @@ The dimension latency could not settle. 100 trivial steps through Dagger, then 1
 
 **The retained state is the price of the step cache, not of Dagger.** The raw loop keeps nothing because it deletes each mount; it also cannot replay anything. Any executor that replays steps has to keep each step's result, and two snapshots, twelve inodes and 131 KB a step is a modest way to keep it.
 
-**The memory is the exception, and it is the one real argument for an executor of our own.** The engine's anonymous heap grew about 2.6 MB for every trivial cached step and had not come back 25 minutes later, idle. Dagger keeps its index of cached results in memory, which is also why an engine restart empties the step cache (§8.2). That is what puts the engine at its 4 GB cap after a few thousand steps, and it is what turned 1 s of work into 17 s. An executor that kept its cache index on disk would avoid both at once.
+**The memory looked like the exception, and then did not.** The first reading was +279 MB for 100 steps, with nothing returned after 25 minutes idle, which suggested an index growing about 2.6 MB a step. Watching it across six more batches showed otherwise:
 
-**What is not yet separated:** how much of that 263 MB is live index and how much is Go garbage. The engine runs with `GOGC=400`, so it collects when the heap reaches five times the live set, and nothing here forced a collection. The live share could be a fifth of it. Until that is measured, "the engine's memory grows with the number of cached steps" is the claim the numbers support, not a figure per step.
+| | Heap | Snapshots |
+|---|---|---|
+| start (a collection had run since the first reading: 959 → 706 MB) | 706 MB | 2,960 |
+| +100 steps | 876 MB | 3,164 |
+| +200 steps | **882 MB** | 3,368 |
+| +300 steps | 1,045 MB | 3,572 |
+
+Between 100 and 200 steps the heap moved 6 MB while 200 snapshots were added, and the earlier 959 MB had already fallen to 706 MB on its own. So most of the growth is **Go garbage, not a live index**: the heap oscillates up to about five times the live set, which is what `GOGC=400` asks for, and the live set looks like a couple of hundred megabytes.
+
+**That removes the architecture argument and leaves a setting.** `GOGC=400` was this project's own choice, for 6% less engine CPU on a Mac and 13% on a Pi (DEPLOY.md "Sizing"). The price is that the engine's heap runs to about 1 GB of a 4 GB cap before collecting, and page cache is what gets squeezed — the same page cache whose absence turned 1 s of output-key work into 17 s (§8.2). On a machine with 8 GB shared with other services, that trade looks wrong, and testing it costs one engine restart rather than a new executor.
 
 **Findings.**
 
 1. **Per-step overhead does not justify leaving Dagger:** 43 ms a step against the floor, about 1% of a real job on the reference machine.
 2. **Nor does the job floor:** it is the GitHub protocol, not the engine.
 3. **What did cost real time this week was elsewhere:** the cache volumes' filesystem split (28.6 s a Python job, now 0.5 s, experiment 6) and the engine's memory pressure (the same work taking 1 s or 17 s, experiment 4). Both were found by measuring workloads, not layers.
-4. **The architecture question turns on memory, not latency** (11.1). Keeping a step's result costs little on disk, but Dagger holds its cache index in memory, and that grows with every cached step until the engine sits at its cap. An executor of our own with an on-disk index would fix both that and the cold step cache after a restart. How much of the growth is live index rather than Go garbage is the next thing to measure, and it decides how large the prize is.
+4. **Nor does memory, once garbage is separated from live data** (11.1). Keeping a step's result costs about two snapshots, twelve inodes and 131 KB on disk; the heap growth that looked like an index is mostly Go garbage under `GOGC=400`, a setting of ours. The engine's memory pressure is therefore a tuning question, not an architecture one.
+5. **So the architecture stays.** Nothing measured — per-step latency, the job floor, retained state or memory — supports replacing Dagger. What the measurements do point at is `GOGC`: trading back some of the CPU it saves to leave the engine more page cache (§8.2's pathology). That is the next experiment, and it costs one engine restart.
 
 ## 12. Next
 
@@ -490,4 +500,4 @@ The dimension latency could not settle. 100 trivial steps through Dagger, then 1
 - **The cost of handing a step its inputs:** experiment 5's overhead, measured on its own rather than as a feature's by-product, and on a machine with an SSD as well as the Pi. It decides whether any form of finer keying can pay here.
 - **Engine memory over days:** the 15-minute log under ordinary jobs, to decide whether the cache cap should be lower (8.2).
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
-- **How much of the engine's heap is live cache index** rather than Go garbage (11.1): it sizes the prize for an executor of our own, which is now the only measured argument for one.
+- **`GOGC` against page cache** (11.1): the engine saves 6–13% CPU at `GOGC=400` but runs its heap to about 1 GB before collecting. Whether a lower value stops the memory pressure that turned 1 s of work into 17 s, and what it costs in CPU, is the open question.
