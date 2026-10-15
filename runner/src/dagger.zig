@@ -182,6 +182,9 @@ pub fn evalCondition(cond: []const u8, job_failed: bool) ?bool {
 pub const Fetched = struct {
     /// Dagger Directory id of the fetched tree, or why it could not be fetched.
     result: union(enum) { dir: []const u8, failed: []const u8 },
+    /// The same tree before its files get the checkout's fixed time: Dagger keys it, and what is
+    /// filtered from it, on content, which `withTimestamps` would undo (see `Exec.chain_tree`).
+    raw: ?[]const u8 = null,
     repo: []const u8,
     /// What was checked out, for the log (a short sha or the requested ref).
     ref_label: []const u8,
@@ -924,13 +927,13 @@ pub fn checkoutQuery(arena: Allocator, job: job_mod.Job, co: job_mod.Checkout, a
     // are zips, which cannot hold times before 1980: "ZIP does not support timestamps before 1980");
     // a fixed later time keeps the tree the same from run to run, so cached steps still match.
     // Without `submodules`, the root's entries say whether there are any to empty (see `fetchCheckout`).
-    try w.print(" {{ tree(depth:{d}{s}) {{ withTimestamps(timestamp:{d}) {{ id{s} }} }} }} }} }}", .{ co.fetch_depth, if (co.fetch_tags) ",includeTags:true" else "", checkout_mtime, if (co.submodules) "" else " entries" });
+    try w.print(" {{ tree(depth:{d}{s}) {{ zig_raw: id withTimestamps(timestamp:{d}) {{ id{s} }} }} }} }} }}", .{ co.fetch_depth, if (co.fetch_tags) ",includeTags:true" else "", checkout_mtime, if (co.submodules) "" else " entries" });
     return .{ .doc = aw.written() };
 }
 
 /// The tree with each submodule's directory emptied, as actions/checkout leaves them without
 /// `submodules` (Dagger's git always checks them out). The paths come from `.gitmodules`.
-fn withoutSubmodules(arena: Allocator, t: Transport, dir: []const u8, msg: *[]const u8) !?[]const u8 {
+fn withoutSubmodules(arena: Allocator, t: Transport, dir: []const u8, stamp: bool, msg: *[]const u8) !?[]const u8 {
     const read = try std.fmt.allocPrint(arena, "{{ loadDirectoryFromID(id:{f}) {{ file(path:\".gitmodules\") {{ contents }} }} }}", .{std.json.fmt(dir, .{})});
     const data = gql(arena, t, read, msg) catch return null;
     const paths = try gitmodulePaths(arena, jsonFindString(data, "contents") orelse "");
@@ -940,7 +943,7 @@ fn withoutSubmodules(arena: Allocator, t: Transport, dir: []const u8, msg: *[]co
     try w.print("{{ loadDirectoryFromID(id:{f}) {{ ", .{std.json.fmt(dir, .{})});
     for (paths) |p| try w.print("withoutDirectory(path:{f}) {{ withNewDirectory(path:{f}) {{ ", .{ std.json.fmt(p, .{}), std.json.fmt(p, .{}) });
     // The new directories get the checkout's fixed time, as every other file has.
-    try w.print("withTimestamps(timestamp:{d}) {{ id }}", .{checkout_mtime});
+    if (stamp) try w.print("withTimestamps(timestamp:{d}) {{ id }}", .{checkout_mtime}) else try w.writeAll("id");
     for (0..paths.len * 2 + 2) |_| try w.writeAll(" }");
     const out = gql(arena, t, aw.written(), msg) catch return null;
     return jsonFindString(out, "id") orelse {
@@ -1112,10 +1115,18 @@ fn fetchCheckout(arena: Allocator, t: Transport, job: job_mod.Job, co: job_mod.C
     if (gql(arena, t, doc, &msg)) |data| {
         if (jsonFindString(data, "id")) |id| {
             const has_modules = if (jsonFind(data, "entries")) |es| (es == .array and for (es.array.items) |e| (if (e == .string and std.mem.eql(u8, e.string, ".gitmodules")) break true) else false) else false;
-            f.result = .{ .dir = if (!co.submodules and has_modules) try withoutSubmodules(arena, t, id, &msg) orelse {
-                f.result = .{ .failed = try std.fmt.allocPrint(arena, "could not leave {s}'s submodules out: {s}", .{ repo, msg }) };
-                return f;
-            } else id };
+            const raw = jsonFindString(data, "zig_raw");
+            if (!co.submodules and has_modules) {
+                const dir = try withoutSubmodules(arena, t, id, true, &msg) orelse {
+                    f.result = .{ .failed = try std.fmt.allocPrint(arena, "could not leave {s}'s submodules out: {s}", .{ repo, msg }) };
+                    return f;
+                };
+                f.result = .{ .dir = dir };
+                f.raw = if (raw) |r| try withoutSubmodules(arena, t, r, false, &msg) else null;
+            } else {
+                f.result = .{ .dir = id };
+                f.raw = raw;
+            }
             return f;
         }
         msg = "Dagger returned no tree";
@@ -2406,7 +2417,8 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
                     continue;
                 }
                 resolved = .{ .checkout = f };
-                x.chain_ws = if (co.path == null) f.result.dir else null;
+                x.chain_tree = if (co.path == null) f.raw else null;
+                x.chain_layers.clearRetainingCapacity();
                 mount_buf[0] = .{ .dir = .{ .path = f.mount, .id = f.result.dir, .owner = x.dir_owner } };
                 mounts = &mount_buf;
             },
@@ -2414,7 +2426,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
                 res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
                 if (opts.observer) |o| o.started(num, res.name, res.started_ms);
                 watch.begin(if (timeout_ms > 0) res.started_ms + timeout_ms else 0);
-                x.chain_ws = null;
+                x.chain_tree = null;
                 const ran = switch (step.action) {
                     .uses => |u| x.runAction(num, u, sc1, plain_step_env.items, secret_step_env.items, false),
                     .docker => |d| x.runImageStep(num, d, sc1, plain_step_env.items, secret_step_env.items),
@@ -2603,12 +2615,14 @@ const Exec = struct {
     /// `inputsCheckpoint`), and its filesystem without `checkpoint_ignored`, once read.
     base_container: []const u8,
     base_fs: ?[]const u8 = null,
-    /// The workspace as a Dagger directory whose recipe does not depend on the run: the root
-    /// checkout's tree plus what each declared-input step since changed in it. A declared step
-    /// takes its files from it with `withDirectory`, which neither copies them nor keys the step
-    /// on the commit. Null when no root checkout has run, or when a step that might change the
-    /// workspace without being followed here (an action, an undeclared `run:` step) ran after it.
-    chain_ws: ?[]const u8 = null,
+    /// The workspace as Dagger directories whose recipes do not depend on the run: the root
+    /// checkout's tree (unstamped: Dagger keys it on content) and what each declared-input step
+    /// since changed in it (`chain_layers`). A declared step's files are built from them and added
+    /// with `withDirectory`, which neither copies them nor keys the step on the commit. Null when
+    /// no root checkout has run, or when a step that might change the workspace without being
+    /// followed here (an action, an undeclared `run:` step) ran after it.
+    chain_tree: ?[]const u8 = null,
+    chain_layers: std.ArrayList(ChainLayer) = .empty,
     /// `ZIG_RUNNER_INPUTS` of the `run:` step about to run (see `inputsCheckpoint`).
     declared_inputs: ?[]const u8 = null,
     /// See `Options.output_keys_days`.
@@ -2892,7 +2906,7 @@ const Exec = struct {
             x.declared_inputs = null;
             return x.execScript(num, fc, resolved_in, action_name, secret_env_in, mounts);
         }
-        if (resolved != .checkout) x.chain_ws = null;
+        if (resolved != .checkout) x.chain_tree = null;
         if (x.output_keys and resolved == .run and resolved.run.always_run != null and out.code == 0) {
             const pre = try std.mem.concat(arena, u8, &.{ env_nodes, mount_doc.written() });
             const started = std.Io.Clock.awake.now(x.io).toMilliseconds();
@@ -3012,6 +3026,35 @@ const Exec = struct {
     /// workspace (only the declared files of it are given), the runner's per-step files, and what
     /// the runner mounts for actions (a `run:` step needs neither; the JavaScript runtime alone is
     /// 169 MB to hash).
+    /// What a declared step changed in the workspace: its files (a layer's workspace directory, or
+    /// null when it added or changed none) and the paths it removed, relative to the workspace.
+    const ChainLayer = struct { dir: ?[]const u8, removed: []const []const u8 };
+
+    /// The declared files, from `chain_tree` and `chain_layers`: filtered from the tree, given the
+    /// checkout's fixed time (after the filter, so the key stays the content's), then each layer
+    /// and its removals, filtered again. A query field selecting `{ id }`.
+    fn chainFiles(x: *Exec, globs: []const []const u8) ![]const u8 {
+        const arena = x.arena;
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const w = &aw.writer;
+        const g = std.json.fmt(globs, .{});
+        try w.print("zig_chain: loadDirectoryFromID(id:{f}) {{ filter(include:{f}) {{ withTimestamps(timestamp:{d}) {{ ", .{ std.json.fmt(x.chain_tree.?, .{}), g, checkout_mtime });
+        var braces: usize = 3;
+        for (x.chain_layers.items) |l| {
+            if (l.dir) |d| {
+                try w.print("withDirectory(path:\".\",source:{f}) {{ ", .{std.json.fmt(d, .{})});
+                braces += 1;
+            }
+            for (l.removed) |p| {
+                try w.print("{s}(path:{f}) {{ ", .{ if (std.mem.endsWith(u8, p, "/")) "withoutDirectory" else "withoutFile", std.json.fmt(std.mem.trimEnd(u8, p, "/"), .{}) });
+                braces += 1;
+            }
+        }
+        try w.print("filter(include:{f}) {{ id }}", .{g});
+        for (0..braces) |_| try w.writeAll(" }");
+        return aw.written();
+    }
+
     fn checkpointIgnored(x: *const Exec) [5][]const u8 {
         return .{ x.ev.workspace, fc_dir, event_dir, "/github/_actions", "/github/_runtime" };
     }
@@ -3058,9 +3101,9 @@ const Exec = struct {
         // What earlier steps changed outside the workspace, the variables now set, and the declared
         // files of the workspace.
         // From the chain, the declared files are a directory whose recipe is the same whatever the
-        // commit (see `chain_ws`); otherwise they are taken from the job's container and stored.
-        const files_src = if (x.chain_ws) |c|
-            try std.fmt.allocPrint(arena, "zig_chain: loadDirectoryFromID(id:{f}) {{ filter(include:{f}) {{ id }} }}", .{ std.json.fmt(c, .{}), std.json.fmt(globs.items, .{}) })
+        // commit (see `chain_tree`); otherwise they are taken from the job's container and stored.
+        const files_src = if (x.chain_tree != null)
+            try x.chainFiles(globs.items)
         else
             try std.fmt.allocPrint(arena, "zig_ws: loadContainerFromID(id:{f}) {{ directory(path:{f}) {{ filter(include:{f}) {{ id digest }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(x.ev.workspace, .{}), std.json.fmt(globs.items, .{}) });
         const data = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ zig_base: loadContainerFromID(id:{f}) {{ envVariables {{ name value }} }} zig_now: loadContainerFromID(id:{f}) {{ envVariables {{ name value }} rootfs {{ {s}changes(from:{f}) {{ removedPaths layer {{ id digest }} }}{s} }} }} {s} }}", .{
@@ -3078,10 +3121,12 @@ const Exec = struct {
         const layer = jsonFind(now, "layer") orelse return null;
         const delta_id = jsonFindString(layer, "id") orelse return null;
         const delta = digestHex(jsonFindString(layer, "digest") orelse return null);
-        const from_chain = x.chain_ws != null;
-        const filtered = jsonFind(jsonFind(data, if (from_chain) "zig_chain" else "zig_ws") orelse return null, "filter") orelse return null;
-        const files_id = jsonFindString(filtered, "id") orelse return null;
-        const files = if (from_chain) "" else digestHex(jsonFindString(filtered, "digest") orelse return null);
+        const from_chain = x.chain_tree != null;
+        const files_id = (if (from_chain)
+            (if (jsonFind(data, "zig_chain")) |c| jsonFindString(c, "id") else null)
+        else if (jsonFind(data, "zig_ws")) |ws| (if (jsonFind(ws, "filter")) |f| jsonFindString(f, "id") else null) else null) orelse return null;
+        const filtered = if (from_chain) null else (jsonFind(jsonFind(data, "zig_ws") orelse return null, "filter") orelse return null);
+        const files = if (filtered) |f| digestHex(jsonFindString(f, "digest") orelse return null) else "";
         var removed: std.ArrayList([]const u8) = .empty;
         if (jsonFind(now, "removedPaths")) |r| if (r == .array) for (r.array.items) |p| {
             if (p == .string) try removed.append(arena, p.string);
@@ -3164,7 +3209,7 @@ const Exec = struct {
     /// After a declared-input step: what it changed in its checkpoint (`checkpoint` to `after`), added
     /// to the job's container (`real_before`, with the variables earlier steps set, `env_nodes`) as a
     /// layer, with the paths it removed taken out, which the next step starts from. Nothing is
-    /// copied. What it changed in the workspace extends `chain_ws`. Null when that failed.
+    /// copied. What it changed in the workspace extends `chain_layers`. Null when that failed.
     fn declaredOutput(x: *Exec, num: u32, checkpoint: []const u8, after: []const u8, real_before: []const u8, env_nodes: []const u8, env_braces: usize) !?[]const u8 {
         const arena = x.arena;
         var msg: []const u8 = "";
@@ -3199,33 +3244,22 @@ const Exec = struct {
         }
         try w.writeAll("id");
         for (0..braces) |_| try w.writeAll(" }");
-        // The chain: the workspace as the step left it, from the same layer.
-        if (x.chain_ws) |c| {
-            try w.print(" zig_chain: loadDirectoryFromID(id:{f}) {{ ", .{std.json.fmt(c, .{})});
-            var cb: usize = 1;
-            if (touched_ws) {
-                try w.print("withDirectory(path:\".\",source:{f}) {{ ", .{std.json.fmt(try x.layerDir(layer_id, ws_rel) orelse return null, .{})});
-                cb += 1;
-            }
-            const prefix = try std.fmt.allocPrint(arena, "{s}/", .{ws_rel});
-            for (removed.items) |p| {
-                const rel = std.mem.trimStart(u8, p, "/");
-                if (!std.mem.startsWith(u8, rel, prefix)) continue;
-                const in_ws = std.mem.trimEnd(u8, rel[prefix.len..], "/");
-                if (in_ws.len == 0) continue;
-                try w.print("{s}(path:{f}) {{ ", .{ if (std.mem.endsWith(u8, rel, "/")) "withoutDirectory" else "withoutFile", std.json.fmt(in_ws, .{}) });
-                cb += 1;
-            }
-            try w.writeAll("id");
-            for (0..cb) |_| try w.writeAll(" }");
-        }
         try w.writeAll(" }");
         const applied = gql(arena, x.transport, doc.written(), &msg) catch {
             x.outputsFallback(num, "could not add the step's changes to the job's container: {s}", .{msg});
             return null;
         };
         const job_id = (if (jsonFind(applied, "zig_job")) |j| jsonFindString(j, "id") else null) orelse return null;
-        if (x.chain_ws != null) x.chain_ws = (if (jsonFind(applied, "zig_chain")) |j| jsonFindString(j, "id") else null) orelse return null;
+        // The chain: what the step changed in the workspace, from the same layer.
+        if (x.chain_tree != null) {
+            const prefix = try std.fmt.allocPrint(arena, "{s}/", .{ws_rel});
+            var in_ws: std.ArrayList([]const u8) = .empty;
+            for (removed.items) |p| {
+                const rel = std.mem.trimStart(u8, p, "/");
+                if (std.mem.startsWith(u8, rel, prefix) and rel.len > prefix.len) try in_ws.append(arena, rel[prefix.len..]);
+            }
+            try x.chain_layers.append(arena, .{ .dir = if (touched_ws) (try x.layerDir(layer_id, ws_rel) orelse return null) else null, .removed = in_ws.items });
+        }
         if (x.sh.step_debug) x.sh.appendFmt(num, "##[debug]Declared inputs: the step's changes ({d} removed paths) were added to the job's container as a layer", .{removed.items.len});
         return job_id;
     }
@@ -5525,11 +5559,11 @@ test "checkoutQuery picks commit, ref or head and honours fetch-depth" {
     defer a.deinit();
     const job = testJob(&.{});
     const own = (try checkoutQuery(a.allocator(), job, .{}, null)).doc;
-    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { commit(id:\"0123456789012345678901234567890123456789\") { tree(depth:1) { withTimestamps(timestamp:946684800) { id entries } } } } }", own);
+    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { commit(id:\"0123456789012345678901234567890123456789\") { tree(depth:1) { zig_raw: id withTimestamps(timestamp:946684800) { id entries } } } } }", own);
     const by_ref = (try checkoutQuery(a.allocator(), job, .{ .ref = "refs/pull/7/merge", .fetch_depth = 0 }, null)).doc;
-    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { ref(name:\"refs/pull/7/merge\") { tree(depth:0) { withTimestamps(timestamp:946684800) { id entries } } } } }", by_ref);
+    try std.testing.expectEqualStrings("{ git(url:\"https://github.com/o/r.git\",keepGitDir:true) { ref(name:\"refs/pull/7/merge\") { tree(depth:0) { zig_raw: id withTimestamps(timestamp:946684800) { id entries } } } } }", by_ref);
     const tags = (try checkoutQuery(a.allocator(), job, .{ .fetch_tags = true }, "SEC")).doc;
-    try std.testing.expect(std.mem.indexOf(u8, tags, "tree(depth:1,includeTags:true) { withTimestamps(timestamp:946684800) { id entries }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tags, "tree(depth:1,includeTags:true) { zig_raw: id withTimestamps(timestamp:946684800) { id entries }") != null);
     // With the job's GITHUB_TOKEN (a secret), as GitHub expects a token over HTTPS.
     try std.testing.expect(std.mem.indexOf(u8, tags, "git(url:\"https://github.com/o/r.git\",httpAuthUsername:\"x-access-token\",httpAuthToken:\"SEC\",keepGitDir:true)") != null);
     const other = (try checkoutQuery(a.allocator(), job, .{ .repository = "x/y", .fetch_depth = 3 }, null)).doc;
@@ -7232,11 +7266,11 @@ test "declared inputs after a checkout: files come from the checkout and declare
     const env_now = "\"zig_base\":{\"envVariables\":[]},\"zig_now\":{\"envVariables\":[],\"rootfs\":{\"changes\":{\"removedPaths\":[],\"layer\":{\"id\":\"DL\",\"digest\":\"sha256:dddd\"}}}}";
     const answers = [_][]const u8{
         base_answer,
-        "{\"data\":{\"git\":{\"commit\":{\"tree\":{\"withTimestamps\":{\"id\":\"TREE1\",\"entries\":[\"src\",\"pyproject.toml\"]}}}}}}",
+        "{\"data\":{\"git\":{\"commit\":{\"tree\":{\"zig_raw\":\"RAW1\",\"withTimestamps\":{\"id\":\"TREE1\",\"entries\":[\"src\",\"pyproject.toml\"]}}}}}}",
         try exec(arena, "C1", 0, ""),
         // uv sync
         "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{\"id\":\"BF\"}}}}",
-        "{\"data\":{" ++ env_now ++ ",\"zig_chain\":{\"filter\":{\"id\":\"FA\"}}}}",
+        "{\"data\":{" ++ env_now ++ ",\"zig_chain\":{\"filter\":{\"withTimestamps\":{\"filter\":{\"id\":\"FA\"}}}}}}",
         "{\"data\":{\"bb\":{\"from\":{\"file\":{\"id\":\"BB\"}}},\"empty\":{\"id\":\"E\"}}}",
         "{\"data\":{\"cacheVolume\":{\"id\":\"VOL\"}}}",
         "{\"data\":{\"container\":{\"withExec\":{\"exitCode\":0}}}}",
@@ -7244,16 +7278,16 @@ test "declared inputs after a checkout: files come from the checkout and declare
         try exec(arena, "CA", 0, ""),
         "{\"data\":{\"zig_cp\":{\"rootfs\":{\"id\":\"CPFA\"}}}}",
         "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{\"changes\":{\"removedPaths\":[\"home/runner/work/r/r/old.lock\"],\"layer\":{\"id\":\"OLA\",\"zig_ws\":true}}}}}}",
+        "{\"data\":{\"zig_job\":{\"id\":\"JA\"}}}",
         "{\"data\":{\"loadDirectoryFromID\":{\"directory\":{\"id\":\"WSA\"}}}}",
-        "{\"data\":{\"zig_job\":{\"id\":\"JA\"},\"zig_chain\":{\"id\":\"CHA\"}}}",
         // ruff
-        "{\"data\":{" ++ env_now ++ ",\"zig_chain\":{\"filter\":{\"id\":\"FB\"}}}}",
+        "{\"data\":{" ++ env_now ++ ",\"zig_chain\":{\"filter\":{\"withTimestamps\":{\"withDirectory\":{\"withoutFile\":{\"filter\":{\"id\":\"FB\"}}}}}}}}",
         "{\"data\":{\"container\":{\"withExec\":{\"exitCode\":0}}}}",
         "{\"data\":{\"loadContainerFromID\":{\"x\":{\"id\":\"CPB\"}}}}",
         try exec(arena, "CB", 0, ""),
         "{\"data\":{\"zig_cp\":{\"rootfs\":{\"id\":\"CPFB\"}}}}",
         "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{\"changes\":{\"removedPaths\":[],\"layer\":{\"id\":\"OLB\",\"zig_ws\":false}}}}}}",
-        "{\"data\":{\"zig_job\":{\"id\":\"JB\"},\"zig_chain\":{\"id\":\"CHB\"}}}",
+        "{\"data\":{\"zig_job\":{\"id\":\"JB\"}}}",
     };
     var fake: FakeSession = .{ .answers = &answers, .arena = arena };
     var buf: [8192]u8 = undefined;
@@ -7264,20 +7298,19 @@ test "declared inputs after a checkout: files come from the checkout and declare
     const seen = fake.seen.items;
     try std.testing.expectEqual(answers.len, seen.len);
     for (seen) |d| try std.testing.expect(braceBalanced(d));
-    // uv sync: its files from the checkout's tree, added as a layer, owned by the step user.
-    try std.testing.expect(std.mem.indexOf(u8, seen[4], "zig_chain: loadDirectoryFromID(id:\"TREE1\") { filter(include:[\"pyproject.toml\"])") != null);
+    // uv sync: its files filtered from the unstamped tree, then given the checkout's time (so the
+    // key is the content's), added as a layer, owned by the step user.
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "zig_chain: loadDirectoryFromID(id:\"RAW1\") { filter(include:[\"pyproject.toml\"]) { withTimestamps(timestamp:946684800) { filter(include:[\"pyproject.toml\"]) { id }") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[8], "withDirectory(path:\"/home/runner/work/r/r\",source:\"FA\",owner:\"runner\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[8], "cp -a /zig-runner-outputs/dddd/. /") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[8], "rm -rf /home/runner/work/r/r") == null);
-    // Its changes: a layer on the job's container, and on the chain, with the file it removed.
-    try std.testing.expect(std.mem.indexOf(u8, seen[13], "withDirectory(path:\"/\",source:\"OLA\") { withoutFile(path:\"/home/runner/work/r/r/old.lock\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[13], "zig_chain: loadDirectoryFromID(id:\"TREE1\") { withDirectory(path:\".\",source:\"WSA\") { withoutFile(path:\"old.lock\")") != null);
-    // ruff: its files from the chain as uv sync left it.
-    try std.testing.expect(std.mem.indexOf(u8, seen[14], "zig_chain: loadDirectoryFromID(id:\"CHA\") { filter(include:[\"src\",\".venv\"])") != null);
+    // Its changes: a layer on the job's container, with the file it removed.
+    try std.testing.expect(std.mem.indexOf(u8, seen[12], "withDirectory(path:\"/\",source:\"OLA\") { withoutFile(path:\"/home/runner/work/r/r/old.lock\")") != null);
+    // ruff: its files from the tree and uv sync's layer, with the file it removed, filtered again.
+    try std.testing.expect(std.mem.indexOf(u8, seen[14], "zig_chain: loadDirectoryFromID(id:\"RAW1\") { filter(include:[\"src\",\".venv\"]) { withTimestamps(timestamp:946684800) { withDirectory(path:\".\",source:\"WSA\") { withoutFile(path:\"old.lock\") { filter(include:[\"src\",\".venv\"]) { id }") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[16], "withDirectory(path:\"/home/runner/work/r/r\",source:\"FB\",owner:\"runner\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[17], "loadContainerFromID(id:\"CPB\")") != null);
-    // It changed nothing in the workspace: the chain only reloads.
-    try std.testing.expect(std.mem.indexOf(u8, seen[20], "zig_chain: loadDirectoryFromID(id:\"CHA\") { id }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[20], "zig_chain") == null);
 }
 
 test "declared inputs without a checkout before: the declared files are stored and copied in, keyed on content" {
