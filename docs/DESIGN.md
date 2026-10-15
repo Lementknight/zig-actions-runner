@@ -75,7 +75,8 @@ On SIGTERM, waiting runners stop and remove their registrations, and running job
 ## 8. Open questions
 
 - **Hits across commits.** Tried and set aside (STUDY.md, experiment 5). A `run:` step could declare the files it reads, and the runner would key it on those instead of the whole checkout. Every replay decision was right, but both workloads ran faster without it: the tools' own caches already make the declarable steps cheap, the expensive steps (`go test`, pytest) are the ones a project cannot easily declare, and handing each step its inputs costs more than replaying them saves on a Raspberry Pi. The prototype is on `feat/declared-inputs-v2`. What is still open is the cost of handing a step its inputs at all, which decides whether any finer keying can pay.
-- **Test selection for Python.** pytest has no equivalent of Go's test cache, so every test runs every time.
+- **Test selection for Python,** on a project whose tests are slow enough to need it. flask's are not: experiment 6 found its job's time to be `uv sync`, not its 493 tests, which run in under 3 s.
+- **What a step costs in memory and inodes.** Experiment 7 found Dagger's per-step latency to be about 1% of a real job, so a different executor cannot win there; the engine's memory pressure (experiment 4) is the open dimension.
 - **Output keys by default.** They are being trialled on the Pi, with a per-job line in the runner's log showing how often they apply.
 
 ## 9. History
