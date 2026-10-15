@@ -2406,6 +2406,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
                     continue;
                 }
                 resolved = .{ .checkout = f };
+                x.chain_ws = if (co.path == null) f.result.dir else null;
                 mount_buf[0] = .{ .dir = .{ .path = f.mount, .id = f.result.dir, .owner = x.dir_owner } };
                 mounts = &mount_buf;
             },
@@ -2413,6 +2414,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
                 res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
                 if (opts.observer) |o| o.started(num, res.name, res.started_ms);
                 watch.begin(if (timeout_ms > 0) res.started_ms + timeout_ms else 0);
+                x.chain_ws = null;
                 const ran = switch (step.action) {
                     .uses => |u| x.runAction(num, u, sc1, plain_step_env.items, secret_step_env.items, false),
                     .docker => |d| x.runImageStep(num, d, sc1, plain_step_env.items, secret_step_env.items),
@@ -2601,6 +2603,12 @@ const Exec = struct {
     /// `inputsCheckpoint`), and its filesystem without `checkpoint_ignored`, once read.
     base_container: []const u8,
     base_fs: ?[]const u8 = null,
+    /// The workspace as a Dagger directory whose recipe does not depend on the run: the root
+    /// checkout's tree plus what each declared-input step since changed in it. A declared step
+    /// takes its files from it with `withDirectory`, which neither copies them nor keys the step
+    /// on the commit. Null when no root checkout has run, or when a step that might change the
+    /// workspace without being followed here (an action, an undeclared `run:` step) ran after it.
+    chain_ws: ?[]const u8 = null,
     /// `ZIG_RUNNER_INPUTS` of the `run:` step about to run (see `inputsCheckpoint`).
     declared_inputs: ?[]const u8 = null,
     /// See `Options.output_keys_days`.
@@ -2884,6 +2892,7 @@ const Exec = struct {
             x.declared_inputs = null;
             return x.execScript(num, fc, resolved_in, action_name, secret_env_in, mounts);
         }
+        if (resolved != .checkout) x.chain_ws = null;
         if (x.output_keys and resolved == .run and resolved.run.always_run != null and out.code == 0) {
             const pre = try std.mem.concat(arena, u8, &.{ env_nodes, mount_doc.written() });
             const started = std.Io.Clock.awake.now(x.io).toMilliseconds();
@@ -3003,7 +3012,9 @@ const Exec = struct {
     /// workspace (only the declared files of it are given), the runner's per-step files, and what
     /// the runner mounts for actions (a `run:` step needs neither; the JavaScript runtime alone is
     /// 169 MB to hash).
-    const checkpoint_ignored = [_][]const u8{ workspace, fc_dir, event_dir, "/github/_actions", "/github/_runtime" };
+    fn checkpointIgnored(x: *const Exec) [5][]const u8 {
+        return .{ x.ev.workspace, fc_dir, event_dir, "/github/_actions", "/github/_runtime" };
+    }
 
     /// `withoutDirectory` for each of `paths`, and the braces that close them.
     fn withoutDirs(arena: Allocator, paths: []const []const u8) !struct { open: []const u8, close: []const u8 } {
@@ -3035,7 +3046,8 @@ const Exec = struct {
             return null;
         }
         var msg: []const u8 = "";
-        const ign = try withoutDirs(arena, &checkpoint_ignored);
+        const ignored = x.checkpointIgnored();
+        const ign = try withoutDirs(arena, &ignored);
         if (x.base_fs == null) {
             const data = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ rootfs {{ {s}id{s} }} }} }}", .{ std.json.fmt(x.base_container, .{}), ign.open, ign.close }), &msg) catch {
                 x.outputsFallback(num, "{s}", .{msg});
@@ -3045,13 +3057,19 @@ const Exec = struct {
         }
         // What earlier steps changed outside the workspace, the variables now set, and the declared
         // files of the workspace.
-        const data = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ zig_base: loadContainerFromID(id:{f}) {{ envVariables {{ name value }} }} zig_now: loadContainerFromID(id:{f}) {{ envVariables {{ name value }} rootfs {{ {s}changes(from:{f}) {{ removedPaths layer {{ id digest }} }}{s} }} directory(path:\"" ++ workspace ++ "\") {{ filter(include:{f}) {{ id digest }} }} }} }}", .{
+        // From the chain, the declared files are a directory whose recipe is the same whatever the
+        // commit (see `chain_ws`); otherwise they are taken from the job's container and stored.
+        const files_src = if (x.chain_ws) |c|
+            try std.fmt.allocPrint(arena, "zig_chain: loadDirectoryFromID(id:{f}) {{ filter(include:{f}) {{ id }} }}", .{ std.json.fmt(c, .{}), std.json.fmt(globs.items, .{}) })
+        else
+            try std.fmt.allocPrint(arena, "zig_ws: loadContainerFromID(id:{f}) {{ directory(path:{f}) {{ filter(include:{f}) {{ id digest }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(x.ev.workspace, .{}), std.json.fmt(globs.items, .{}) });
+        const data = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ zig_base: loadContainerFromID(id:{f}) {{ envVariables {{ name value }} }} zig_now: loadContainerFromID(id:{f}) {{ envVariables {{ name value }} rootfs {{ {s}changes(from:{f}) {{ removedPaths layer {{ id digest }} }}{s} }} }} {s} }}", .{
             std.json.fmt(x.base_container, .{}),
             std.json.fmt(x.container_id, .{}),
             ign.open,
             std.json.fmt(x.base_fs.?, .{}),
             ign.close,
-            std.json.fmt(globs.items, .{}),
+            files_src,
         }), &msg) catch {
             x.outputsFallback(num, "{s}", .{msg});
             return null;
@@ -3060,15 +3078,16 @@ const Exec = struct {
         const layer = jsonFind(now, "layer") orelse return null;
         const delta_id = jsonFindString(layer, "id") orelse return null;
         const delta = digestHex(jsonFindString(layer, "digest") orelse return null);
-        const filtered = jsonFind(now, "filter") orelse return null;
+        const from_chain = x.chain_ws != null;
+        const filtered = jsonFind(jsonFind(data, if (from_chain) "zig_chain" else "zig_ws") orelse return null, "filter") orelse return null;
         const files_id = jsonFindString(filtered, "id") orelse return null;
-        const files = digestHex(jsonFindString(filtered, "digest") orelse return null);
+        const files = if (from_chain) "" else digestHex(jsonFindString(filtered, "digest") orelse return null);
         var removed: std.ArrayList([]const u8) = .empty;
         if (jsonFind(now, "removedPaths")) |r| if (r == .array) for (r.array.items) |p| {
             if (p == .string) try removed.append(arena, p.string);
         };
         const stored = (try x.storeLayer(num, delta_id, delta)) orelse return null;
-        _ = (try x.storeLayer(num, files_id, files)) orelse return null;
+        if (!from_chain) _ = (try x.storeLayer(num, files_id, files)) orelse return null;
 
         // The checkpoint: the base, the variables earlier steps set (those the base does not have),
         // the commit and refs hidden unless declared, and the two stored layers copied in.
@@ -3106,59 +3125,116 @@ const Exec = struct {
             }
             try sw.writeAll("\n");
         }
-        try sw.print(outputs_busybox ++ " cp -a " ++ outputs_store ++ "/{s}/. /\n" ++
-            outputs_busybox ++ " rm -rf " ++ workspace ++ "\n" ++
-            outputs_busybox ++ " cp -a " ++ outputs_store ++ "/{s} " ++ workspace ++ "\n", .{ delta, files });
-        // The files keep the owners they had; the workspace itself is the store's directory, root's.
-        if (x.dir_owner) |o| try sw.print(outputs_busybox ++ " chown {s}:{s} " ++ workspace ++ "\n", .{ o, o });
+        try sw.print(outputs_busybox ++ " cp -a " ++ outputs_store ++ "/{s}/. /\n", .{delta});
+        if (!from_chain) {
+            try sw.print(outputs_busybox ++ " rm -rf {s}\n" ++ outputs_busybox ++ " cp -a " ++ outputs_store ++ "/{s} {s}\n", .{ x.ev.workspace, files, x.ev.workspace });
+            // The files keep the owners they had; the workspace itself is the store's directory, root's.
+            if (x.dir_owner) |o| try sw.print(outputs_busybox ++ " chown {s}:{s} {s}\n", .{ o, o, x.ev.workspace });
+        }
         try w.print("withMountedCache(path:\"" ++ outputs_store ++ "\",cache:{f}) {{ withMountedFile(path:\"" ++ outputs_busybox ++ "\",source:{f}) {{ withUser(name:\"root\") {{ withExec(args:{f}) {{ exitCode ", .{
             std.json.fmt(stored.volume, .{}),
             std.json.fmt(stored.busybox, .{}),
             std.json.fmt([_][]const u8{ outputs_busybox, "sh", "-c", script.written() }, .{}),
         });
         if (x.dir_owner) |o| try w.print("withUser(name:{f}) {{ ", .{std.json.fmt(o, .{})}) else try w.writeAll("withoutUser { ");
-        try w.writeAll("withoutMount(path:\"" ++ outputs_store ++ "\") { withoutMount(path:\"" ++ outputs_busybox ++ "\") { id");
+        try w.writeAll("withoutMount(path:\"" ++ outputs_store ++ "\") { withoutMount(path:\"" ++ outputs_busybox ++ "\") { ");
+        if (from_chain) {
+            // Added as a layer, not copied (a cp of 240 MB took 20 s on a Raspberry Pi; this, 0.2 s).
+            try w.print("withDirectory(path:{f},source:{f}", .{ std.json.fmt(x.ev.workspace, .{}), std.json.fmt(files_id, .{}) });
+            if (x.dir_owner) |o| try w.print(",owner:{f}", .{std.json.fmt(o, .{})});
+            try w.writeAll(") { ");
+            braces += 1;
+        }
+        try w.writeAll("id");
         for (0..braces + 7) |_| try w.writeAll(" }");
         const built = gql(arena, x.transport, doc.written(), &msg) catch {
             x.outputsFallback(num, "could not build the step's container from its inputs: {s}", .{msg});
             return null;
         };
         const id = jsonFindString(built, "id") orelse return null;
-        if (x.sh.step_debug) x.sh.appendFmt(num, "##[debug]Declared inputs: the step runs on {d} pattern(s) of the workspace, sha256:{s}; earlier steps' changes sha256:{s}", .{ globs.items.len, files[0..@min(12, files.len)], delta[0..@min(12, delta.len)] });
+        if (x.sh.step_debug) {
+            if (from_chain)
+                x.sh.appendFmt(num, "##[debug]Declared inputs: the step runs on {d} pattern(s) of the workspace, from the checkout and the declared steps since; earlier steps' changes sha256:{s}", .{ globs.items.len, delta[0..@min(12, delta.len)] })
+            else
+                x.sh.appendFmt(num, "##[debug]Declared inputs: the step runs on {d} pattern(s) of the workspace, sha256:{s} (stored: a step other than a declared one ran since the checkout); earlier steps' changes sha256:{s}", .{ globs.items.len, files[0..@min(12, files.len)], delta[0..@min(12, delta.len)] });
+        }
         return id;
     }
 
-    /// After a declared-input step: what it changed in its checkpoint (`checkpoint` to `after`),
-    /// stored by digest and copied into the job's container (`real_before`, with the variables
-    /// earlier steps set, `env_nodes`), which the next step starts from. Null when that failed.
+    /// After a declared-input step: what it changed in its checkpoint (`checkpoint` to `after`), added
+    /// to the job's container (`real_before`, with the variables earlier steps set, `env_nodes`) as a
+    /// layer, with the paths it removed taken out, which the next step starts from. Nothing is
+    /// copied. What it changed in the workspace extends `chain_ws`. Null when that failed.
     fn declaredOutput(x: *Exec, num: u32, checkpoint: []const u8, after: []const u8, real_before: []const u8, env_nodes: []const u8, env_braces: usize) !?[]const u8 {
         const arena = x.arena;
         var msg: []const u8 = "";
         const ign = try withoutDirs(arena, &.{ fc_dir, event_dir });
-        const env_close = try arena.alloc(u8, 2 * env_braces);
-        for (0..env_braces) |i| @memcpy(env_close[2 * i ..][0..2], " }");
-        const data = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ zig_cp: loadContainerFromID(id:{f}) {{ rootfs {{ {s}id{s} }} }} zig_real: loadContainerFromID(id:{f}) {{ {s}zig_base: id zig_user: user{s} }} }}", .{
-            std.json.fmt(checkpoint, .{}), ign.open, ign.close, std.json.fmt(real_before, .{}), env_nodes, env_close,
-        }), &msg) catch {
+        const ws_rel = std.mem.trimStart(u8, x.ev.workspace, "/");
+        const data = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ zig_cp: loadContainerFromID(id:{f}) {{ rootfs {{ {s}id{s} }} }} }}", .{ std.json.fmt(checkpoint, .{}), ign.open, ign.close }), &msg) catch {
             x.outputsFallback(num, "{s}", .{msg});
             return null;
         };
-        const cp_fs = (if (jsonFind(data, "zig_cp")) |c| jsonFindString(c, "id") else null) orelse return null;
-        const real = jsonFind(data, "zig_real") orelse return null;
-        const base = jsonFindString(real, "zig_base") orelse return null;
-        const user = jsonFindString(real, "zig_user") orelse "";
-        const changes = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ rootfs {{ {s}changes(from:{f}) {{ removedPaths layer {{ id digest }} }}{s} }} }} }}", .{ std.json.fmt(after, .{}), ign.open, std.json.fmt(cp_fs, .{}), ign.close }), &msg) catch {
+        const cp_fs = jsonFindString(data, "id") orelse return null;
+        const changes = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ rootfs {{ {s}changes(from:{f}) {{ removedPaths layer {{ id zig_ws: exists(path:{f}) }} }}{s} }} }} }}", .{ std.json.fmt(after, .{}), ign.open, std.json.fmt(cp_fs, .{}), std.json.fmt(ws_rel, .{}), ign.close }), &msg) catch {
             x.outputsFallback(num, "{s}", .{msg});
             return null;
         };
         const layer = jsonFind(changes, "layer") orelse return null;
         const layer_id = jsonFindString(layer, "id") orelse return null;
-        const digest = digestHex(jsonFindString(layer, "digest") orelse return null);
+        const touched_ws = if (jsonFind(layer, "zig_ws")) |b| b == .bool and b.bool else false;
         var removed: std.ArrayList([]const u8) = .empty;
         if (jsonFind(changes, "removedPaths")) |r| if (r == .array) for (r.array.items) |p| {
             if (p == .string) try removed.append(arena, p.string);
         };
-        return x.storeAndApply(num, base, user, layer_id, digest, .{ .changes = removed.items });
+
+        // The job's container: the variables earlier steps set, the layer, the removals.
+        var doc: std.Io.Writer.Allocating = .init(arena);
+        const w = &doc.writer;
+        try w.print("{{ zig_job: loadContainerFromID(id:{f}) {{ {s}withDirectory(path:\"/\",source:{f}) {{ ", .{ std.json.fmt(real_before, .{}), env_nodes, std.json.fmt(layer_id, .{}) });
+        var braces: usize = env_braces + 2;
+        for (removed.items) |p| {
+            const abs = try std.fmt.allocPrint(arena, "/{s}", .{std.mem.trim(u8, p, "/")});
+            try w.print("{s}(path:{f}) {{ ", .{ if (std.mem.endsWith(u8, p, "/")) "withoutDirectory" else "withoutFile", std.json.fmt(abs, .{}) });
+            braces += 1;
+        }
+        try w.writeAll("id");
+        for (0..braces) |_| try w.writeAll(" }");
+        // The chain: the workspace as the step left it, from the same layer.
+        if (x.chain_ws) |c| {
+            try w.print(" zig_chain: loadDirectoryFromID(id:{f}) {{ ", .{std.json.fmt(c, .{})});
+            var cb: usize = 1;
+            if (touched_ws) {
+                try w.print("withDirectory(path:\".\",source:{f}) {{ ", .{std.json.fmt(try x.layerDir(layer_id, ws_rel) orelse return null, .{})});
+                cb += 1;
+            }
+            const prefix = try std.fmt.allocPrint(arena, "{s}/", .{ws_rel});
+            for (removed.items) |p| {
+                const rel = std.mem.trimStart(u8, p, "/");
+                if (!std.mem.startsWith(u8, rel, prefix)) continue;
+                const in_ws = std.mem.trimEnd(u8, rel[prefix.len..], "/");
+                if (in_ws.len == 0) continue;
+                try w.print("{s}(path:{f}) {{ ", .{ if (std.mem.endsWith(u8, rel, "/")) "withoutDirectory" else "withoutFile", std.json.fmt(in_ws, .{}) });
+                cb += 1;
+            }
+            try w.writeAll("id");
+            for (0..cb) |_| try w.writeAll(" }");
+        }
+        try w.writeAll(" }");
+        const applied = gql(arena, x.transport, doc.written(), &msg) catch {
+            x.outputsFallback(num, "could not add the step's changes to the job's container: {s}", .{msg});
+            return null;
+        };
+        const job_id = (if (jsonFind(applied, "zig_job")) |j| jsonFindString(j, "id") else null) orelse return null;
+        if (x.chain_ws != null) x.chain_ws = (if (jsonFind(applied, "zig_chain")) |j| jsonFindString(j, "id") else null) orelse return null;
+        if (x.sh.step_debug) x.sh.appendFmt(num, "##[debug]Declared inputs: the step's changes ({d} removed paths) were added to the job's container as a layer", .{removed.items.len});
+        return job_id;
+    }
+
+    /// `layer`'s subdirectory `rel`, as a directory id.
+    fn layerDir(x: *Exec, layer: []const u8, rel: []const u8) !?[]const u8 {
+        var msg: []const u8 = "";
+        const data = gql(x.arena, x.transport, try std.fmt.allocPrint(x.arena, "{{ loadDirectoryFromID(id:{f}) {{ directory(path:{f}) {{ id }} }} }}", .{ std.json.fmt(layer, .{}), std.json.fmt(rel, .{}) }), &msg) catch return null;
+        return jsonFindString(data, "id");
     }
 
     /// Where `storeAndApply` puts a stored output in the next step's container: over the whole
@@ -7140,7 +7216,71 @@ test "github.workspace is the job's workspace, as actions' input defaults expect
     try std.testing.expectEqualStrings("/home/runner/work/r/r", try ev.render(.{ .expr = "github.workspace" }, try ev.scope(&.{})));
 }
 
-test "declared inputs: a step runs on its declared files, keyed on content, without the commit unless declared" {
+test "declared inputs after a checkout: files come from the checkout and declared steps as layers, not copies" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var env: std.process.Environ.Map = .init(arena);
+    var co = testStep("x");
+    co.name = "Run actions/checkout@v4";
+    co.action = .{ .checkout = &.{} };
+    var sync = testStep("uv sync");
+    sync.env = &.{.{ .name = "ZIG_RUNNER_INPUTS", .value = .{ .lit = "pyproject.toml" } }};
+    var lint = testStep("ruff check");
+    lint.env = &.{.{ .name = "ZIG_RUNNER_INPUTS", .value = .{ .lit = "src .venv" } }};
+    const steps = [_]job_mod.Step{ co, sync, lint };
+    const env_now = "\"zig_base\":{\"envVariables\":[]},\"zig_now\":{\"envVariables\":[],\"rootfs\":{\"changes\":{\"removedPaths\":[],\"layer\":{\"id\":\"DL\",\"digest\":\"sha256:dddd\"}}}}";
+    const answers = [_][]const u8{
+        base_answer,
+        "{\"data\":{\"git\":{\"commit\":{\"tree\":{\"withTimestamps\":{\"id\":\"TREE1\",\"entries\":[\"src\",\"pyproject.toml\"]}}}}}}",
+        try exec(arena, "C1", 0, ""),
+        // uv sync
+        "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{\"id\":\"BF\"}}}}",
+        "{\"data\":{" ++ env_now ++ ",\"zig_chain\":{\"filter\":{\"id\":\"FA\"}}}}",
+        "{\"data\":{\"bb\":{\"from\":{\"file\":{\"id\":\"BB\"}}},\"empty\":{\"id\":\"E\"}}}",
+        "{\"data\":{\"cacheVolume\":{\"id\":\"VOL\"}}}",
+        "{\"data\":{\"container\":{\"withExec\":{\"exitCode\":0}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"x\":{\"id\":\"CPA\"}}}}",
+        try exec(arena, "CA", 0, ""),
+        "{\"data\":{\"zig_cp\":{\"rootfs\":{\"id\":\"CPFA\"}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{\"changes\":{\"removedPaths\":[\"home/runner/work/r/r/old.lock\"],\"layer\":{\"id\":\"OLA\",\"zig_ws\":true}}}}}}",
+        "{\"data\":{\"loadDirectoryFromID\":{\"directory\":{\"id\":\"WSA\"}}}}",
+        "{\"data\":{\"zig_job\":{\"id\":\"JA\"},\"zig_chain\":{\"id\":\"CHA\"}}}",
+        // ruff
+        "{\"data\":{" ++ env_now ++ ",\"zig_chain\":{\"filter\":{\"id\":\"FB\"}}}}",
+        "{\"data\":{\"container\":{\"withExec\":{\"exitCode\":0}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"x\":{\"id\":\"CPB\"}}}}",
+        try exec(arena, "CB", 0, ""),
+        "{\"data\":{\"zig_cp\":{\"rootfs\":{\"id\":\"CPFB\"}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{\"changes\":{\"removedPaths\":[],\"layer\":{\"id\":\"OLB\",\"zig_ws\":false}}}}}}",
+        "{\"data\":{\"zig_job\":{\"id\":\"JB\"},\"zig_chain\":{\"id\":\"CHB\"}}}",
+    };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [8192]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .step_user = .runner, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
+    try std.testing.expect(res.succeeded);
+    const seen = fake.seen.items;
+    try std.testing.expectEqual(answers.len, seen.len);
+    for (seen) |d| try std.testing.expect(braceBalanced(d));
+    // uv sync: its files from the checkout's tree, added as a layer, owned by the step user.
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "zig_chain: loadDirectoryFromID(id:\"TREE1\") { filter(include:[\"pyproject.toml\"])") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[8], "withDirectory(path:\"/home/runner/work/r/r\",source:\"FA\",owner:\"runner\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[8], "cp -a /zig-runner-outputs/dddd/. /") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[8], "rm -rf /home/runner/work/r/r") == null);
+    // Its changes: a layer on the job's container, and on the chain, with the file it removed.
+    try std.testing.expect(std.mem.indexOf(u8, seen[13], "withDirectory(path:\"/\",source:\"OLA\") { withoutFile(path:\"/home/runner/work/r/r/old.lock\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[13], "zig_chain: loadDirectoryFromID(id:\"TREE1\") { withDirectory(path:\".\",source:\"WSA\") { withoutFile(path:\"old.lock\")") != null);
+    // ruff: its files from the chain as uv sync left it.
+    try std.testing.expect(std.mem.indexOf(u8, seen[14], "zig_chain: loadDirectoryFromID(id:\"CHA\") { filter(include:[\"src\",\".venv\"])") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[16], "withDirectory(path:\"/home/runner/work/r/r\",source:\"FB\",owner:\"runner\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[17], "loadContainerFromID(id:\"CPB\")") != null);
+    // It changed nothing in the workspace: the chain only reloads.
+    try std.testing.expect(std.mem.indexOf(u8, seen[20], "zig_chain: loadDirectoryFromID(id:\"CHA\") { id }") != null);
+}
+
+test "declared inputs without a checkout before: the declared files are stored and copied in, keyed on content" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const arena = a.allocator();
@@ -7155,17 +7295,16 @@ test "declared inputs: a step runs on its declared files, keyed on content, with
     const answers = [_][]const u8{
         base_answer,
         "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{\"id\":\"BF\"}}}}",
-        "{\"data\":{\"zig_base\":{\"envVariables\":[{\"name\":\"PATH\",\"value\":\"/usr/bin\"}]},\"zig_now\":{\"envVariables\":[{\"name\":\"PATH\",\"value\":\"/usr/bin\"},{\"name\":\"GOFLAGS\",\"value\":\"-mod=mod\"}],\"rootfs\":{\"changes\":{\"removedPaths\":[],\"layer\":{\"id\":\"DL\",\"digest\":\"sha256:dddd\"}}},\"directory\":{\"filter\":{\"id\":\"FL\",\"digest\":\"sha256:ffff\"}}}}}",
+        "{\"data\":{\"zig_base\":{\"envVariables\":[{\"name\":\"PATH\",\"value\":\"/usr/bin\"}]},\"zig_now\":{\"envVariables\":[{\"name\":\"PATH\",\"value\":\"/usr/bin\"},{\"name\":\"GOFLAGS\",\"value\":\"-mod=mod\"}],\"rootfs\":{\"changes\":{\"removedPaths\":[],\"layer\":{\"id\":\"DL\",\"digest\":\"sha256:dddd\"}}}},\"zig_ws\":{\"directory\":{\"filter\":{\"id\":\"FL\",\"digest\":\"sha256:ffff\"}}}}}",
         "{\"data\":{\"bb\":{\"from\":{\"file\":{\"id\":\"BB\"}}},\"empty\":{\"id\":\"E\"}}}",
         "{\"data\":{\"cacheVolume\":{\"id\":\"VOL\"}}}",
         "{\"data\":{\"container\":{\"withExec\":{\"exitCode\":0}}}}",
         "{\"data\":{\"container\":{\"withExec\":{\"exitCode\":0}}}}",
         "{\"data\":{\"loadContainerFromID\":{\"x\":{\"id\":\"CP\"}}}}",
         try exec(arena, "C1", 0, ""),
-        "{\"data\":{\"zig_cp\":{\"rootfs\":{\"id\":\"CPF\"}},\"zig_real\":{\"zig_base\":\"RB\",\"zig_user\":\"\"}}}",
-        "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{\"changes\":{\"removedPaths\":[],\"layer\":{\"id\":\"OL\",\"digest\":\"sha256:0000\"}}}}}}",
-        "{\"data\":{\"container\":{\"withExec\":{\"exitCode\":0}}}}",
-        "{\"data\":{\"loadContainerFromID\":{\"withExec\":{\"exitCode\":0,\"withoutMount\":{\"withoutMount\":{\"id\":\"N1\"}}}}}}",
+        "{\"data\":{\"zig_cp\":{\"rootfs\":{\"id\":\"CPF\"}}}}",
+        "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{\"changes\":{\"removedPaths\":[\"tmp/gone\"],\"layer\":{\"id\":\"OL\",\"zig_ws\":true}}}}}}",
+        "{\"data\":{\"zig_job\":{\"id\":\"N1\"}}}",
     };
     var fake: FakeSession = .{ .answers = &answers, .arena = arena };
     var buf: [8192]u8 = undefined;
@@ -7174,10 +7313,10 @@ test "declared inputs: a step runs on its declared files, keyed on content, with
     const res = try run(arena, std.testing.io, &env, .{ .step_cache = true, .step_user = .runner, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
     try std.testing.expect(res.succeeded);
     const seen = fake.seen.items;
-    try std.testing.expectEqual(@as(usize, 13), seen.len);
+    try std.testing.expectEqual(@as(usize, 12), seen.len);
     for (seen) |d| try std.testing.expect(braceBalanced(d));
     // Earlier steps' changes outside the workspace, against the base; and only the declared files.
-    try std.testing.expect(std.mem.indexOf(u8, seen[1], "loadContainerFromID(id:\"C0\") { rootfs { withoutDirectory(path:\"/github/workspace\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[1], "loadContainerFromID(id:\"C0\") { rootfs { withoutDirectory(path:\"/home/runner/work/r/r\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[2], "changes(from:\"BF\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[2], "filter(include:[\"go.mod\",\"go.sum\"])") != null);
     // The checkpoint: from the base, with the variable an earlier step set, the commit hidden, the
@@ -7190,14 +7329,17 @@ test "declared inputs: a step runs on its declared files, keyed on content, with
     try std.testing.expect(std.mem.indexOf(u8, cp, "withEnvVariable(name:\"GITHUB_SHA\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, cp, "withEnvVariable(name:\"GITHUB_REF\",value:\"refs/heads/main\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, cp, "cp -a /zig-runner-outputs/dddd/. /") != null);
-    try std.testing.expect(std.mem.indexOf(u8, cp, "cp -a /zig-runner-outputs/ffff /github/workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cp, "cp -a /zig-runner-outputs/ffff /home/runner/work/r/r") != null);
     // The step's user can write the workspace (the copy made it root's).
-    try std.testing.expect(std.mem.indexOf(u8, cp, "chown runner:runner /github/workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cp, "chown runner:runner /home/runner/work/r/r") != null);
     // The step runs there; what it changed goes into the job's container, which the next step uses.
     try std.testing.expect(std.mem.indexOf(u8, seen[8], "loadContainerFromID(id:\"CP\")") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[9], "zig_real: loadContainerFromID(id:\"C0\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[9], "zig_cp: loadContainerFromID(id:\"CP\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[10], "changes(from:\"CPF\")") != null);
-    try std.testing.expect(std.mem.startsWith(u8, seen[12], "{ loadContainerFromID(id:\"RB\") {"));
+    // Its changes are added to the job's container as a layer, not copied, with what it removed.
+    try std.testing.expect(std.mem.startsWith(u8, seen[11], "{ zig_job: loadContainerFromID(id:\"C0\") {"));
+    try std.testing.expect(std.mem.indexOf(u8, seen[11], "withDirectory(path:\"/\",source:\"OL\") { withoutFile(path:\"/tmp/gone\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[11], "zig_chain") == null);
 }
 
 test "output keys: the step after one that always runs starts from that step's output, by digest" {
