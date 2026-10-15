@@ -49,7 +49,7 @@ Each decision with what it costs. The measurements behind them are in [STUDY.md]
    - **Package and tool caches** are Dagger cache volumes per repository: npm, uv, Go, Cargo and others, plus `/opt/hostedtoolcache`. Pull requests from forks get their own.
    - **Dagger functions** cache their own calls.
 
-   A step that uses a secret always runs, once in every job: it may deploy or publish. With **output keys** (experimental, `RUNNER_OUTPUT_KEYS`), the steps after it are keyed on what it produced rather than on its having run, so they can still be replayed. *Cost:* the step cache lives as long as the engine process, so an engine restart starts it cold. A new commit misses every step after the checkout, because each step starts from the previous one's container, which holds the checked-out files.
+   A step that uses a secret always runs, once in every job: it may deploy or publish. With **output keys** (experimental, `RUNNER_OUTPUT_KEYS`), the steps after it are keyed on what it produced rather than on its having run, so they can still be replayed. *Cost:* the step cache lives as long as the engine process, so an engine restart starts it cold. Restarts are rare and deliberate (the deploy files keep image updaters away), and the package and tool caches survive them, so a cold step cache is accepted rather than kept outside the engine. A new commit misses every step after the checkout, because each step starts from the previous one's container, which holds the checked-out files.
 7. **The engine sized for small machines.** The engine runs with a memory cap and `GOGC=400`, and its cache on disk is capped at 20 GB (`deploy/engine.json`). Without the cache cap, Dagger let it grow to most of a Raspberry Pi's SD card. The kernel's records of those files then filled the engine's memory, and every job re-read its tools from the card.
 
 ## 6. Job lifecycle
@@ -75,7 +75,6 @@ On SIGTERM, waiting runners stop and remove their registrations, and running job
 ## 8. Open questions
 
 - **Hits across commits.** Keying steps on the files they read, not the whole checkout. Dagger keys files taken from a checkout on their content, so this can be cheap for them. It keys what earlier steps produced (a toolchain, `.venv`) on how they were made, so carrying that by content means copying it, which cost more than it saved for Python on the Pi. A prototype (`ZIG_RUNNER_INPUTS`) is on the `feat/declared-inputs` branch; see STUDY.md, experiment 5.
-- **The step cache across engine restarts.** Accept a cold start, avoid restarts, or keep the cache outside the engine's memory.
 - **Test selection for Python.** pytest has no equivalent of Go's test cache, so every test runs every time.
 - **Output keys by default.** They are being trialled on the Pi, with a per-job line in the runner's log showing how often they apply.
 
