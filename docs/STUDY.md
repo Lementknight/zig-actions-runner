@@ -23,7 +23,9 @@ What the runner adds to a job beyond the job's own commands is the cost being de
 | small | [go-chi/chi](https://github.com/go-chi/chi) (MIT), [spf13/cobra](https://github.com/spf13/cobra) (Apache-2.0) | 2 each | the runner's own overhead: tests are short, so most of the time left is the runner's |
 | medium | [go-task/task](https://github.com/go-task/task) (MIT) | 19 | which tests a change affects, across packages |
 | large | [caddyserver/caddy](https://github.com/caddyserver/caddy) (Apache-2.0) | 30 | how costs grow with project size |
+| Go, larger | [gohugoio/hugo](https://github.com/gohugoio/hugo) (Apache-2.0) | 192 | what the package cache volumes save on a big build |
 | Python | [pallets/click](https://github.com/pallets/click), [pallets/flask](https://github.com/pallets/flask) (BSD-3) | — | uv, ruff and pytest |
+| Python, larger | [sqlalchemy/sqlalchemy](https://github.com/sqlalchemy/sqlalchemy) (MIT) | 9,300 tests | a suite long enough for test selection to matter |
 | Rust, small | [BurntSushi/ripgrep](https://github.com/BurntSushi/ripgrep) (MIT/Unlicense) | — | a compiled language: what the step cache saves when nothing changed |
 | Rust, large | [clap-rs/clap](https://github.com/clap-rs/clap) (MIT/Apache-2.0) | — | how a job's cost grows with the artefacts it leaves: ~1 GB of `target/`, ~925 MB of registry cache |
 
@@ -37,6 +39,21 @@ Rust was added last and is where the step cache shows best, because compiling is
 | clap: fetch, debug build, test | 229 s (37.8 s fetch, 134.4 s test) | — | 85 s |
 
 The Pi is about 2.5 times slower than a hosted runner at compiling, and about seven times faster than one on a re-run, since a hosted runner has nothing to replay. clap also shows what a Rust job leaves behind: a 996 MB `target/` in the workspace and 925 MB in the registry cache volume for one project, which is the scale the engine's 20 GB cache cap has to hold (§8.2).
+
+The larger Go and Python projects were added for two questions the smaller ones could not answer:
+
+| | First run on the Pi | Again, with the volumes warm | GitHub-hosted |
+|---|---|---|---|
+| hugo, 192 packages: `go mod download` | 35.8 s | **0.2 s** | 7.0 s |
+| hugo: `go build ./...` | 195.3 s | **8.7 s** | 132.1 s |
+| hugo: `go vet ./...` | — | 109.0 s | — |
+| sqlalchemy: install, editable with test deps | 21.0 s | — | 28.2 s |
+| sqlalchemy: 9,300 tests (`test/base test/sql`) | 81.2 s | — | 42.7 s |
+
+- **The package cache volumes are worth most on a big build.** hugo's module download went 35.8 s → 0.2 s and its build 195 s → 8.7 s once the Go module and build caches were warm, which is the whole point of keeping them per repository. The module cache alone is 1.1 GB for this one project.
+- **Installing is now faster here than on a hosted runner** (21.0 s against 28.2 s): the environment lives in uv's cache volume so uv hardlinks into it (experiment 6), and the registry is warm, while the hosted runner downloads from PyPI each time.
+- **Tests dominate a large Python job, where they did not in a small one:** 81 s of sqlalchemy's 205 s, against 3 s for flask's whole suite. That is the workload the test-selection question needs.
+- **hugo's own test suite is not usable as a workload:** `go test ./...` fails on a hosted runner as well as here (`TestNPMGlobalInstalls` and others want npm and more tooling installed), and takes over 40 minutes on the Pi. The study measures its build and `vet` instead.
 
 ## 3. Measurement
 
