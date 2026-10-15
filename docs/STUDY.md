@@ -313,49 +313,26 @@ Garbage collection held the disk at the cap and cut the snapshots by five times,
 
 **Question.** Experiment 2 found that a new commit misses every step after the checkout, and estimated that keying steps on their real inputs would save about a third of check-step time. Can the runner do that on Dagger, and what does it save in practice?
 
-**Design.** Two parts. The first is PR #145; the second is a prototype on the branch `feat/declared-inputs`:
+**Design.** Two parts. The first is PR #145; the second is a prototype on the branch `feat/declared-inputs-v2`, three versions of it:
 
 - **The commit and refs are volatile,** as run ids already were. Removing `GITHUB_SHA` from the key costs nothing in correctness: the checkout already keys every later step on the files it produced. A script that names one of these variables always runs, as for run ids. Experiment 2's worry, a step that reads the commit indirectly (`git describe`), is handled the same way: `.git` is in the workspace, so the checkout still keys it.
-- **Declared inputs.** A `run:` step may list what it reads in `ZIG_RUNNER_INPUTS` (workspace globs, plus `$GITHUB_SHA` and the like if it needs them). It then runs in a container built from content: the job's base, what earlier steps changed outside the workspace and the variables they set, and only the declared files as the workspace, each part stored by digest. What it changes is copied back into the job's container. This reuses experiment 3's content store.
+- **Declared inputs.** A `run:` step may list what it reads in `ZIG_RUNNER_INPUTS` (workspace globs, plus `$GITHUB_SHA` and the like if it needs them). It then runs in a container built from content: the job's base, what earlier steps changed outside the workspace and the variables they set, and only the declared files as the workspace. What it changes is put back into the job's container, which the next step starts from.
 
-The trade-off is in who is trusted to be right. Inferring inputs (tracing what a step reads) needs no declaration but can miss reads and replay a wrong result. A declaration can also be wrong, but here it is enforced: an undeclared file is not in the container, so the step fails instead of replaying a wrong result. The cost of that safety is that the declaration must be complete, which a project's maintainers can do once per step.
+The trade-off is in who is trusted to be right. Inferring inputs (tracing what a step reads) needs no declaration but can miss reads and replay a wrong result. A declaration can also be wrong, but here it is enforced: an undeclared file is not in the container, so the step fails instead of replaying a wrong result. The cost of that safety is that the declaration must be complete.
 
-**Workload.** Experiment 2's first six go-task commits, one job each, with `setup-go`, the checkout, and three declared steps: `go mod download` (`go.mod go.sum`), gofmt (`**/*.go`), and `go vet` (both); `go test` is undeclared.
+**Workloads.** Experiment 2's first six go-task commits (`setup-go`, checkout, `go mod download` declared on `go.mod go.sum`, gofmt on `**/*.go`, `go vet` on both; `go test` undeclared), and twelve consecutive commits of pallets/flask (`setup-uv`, checkout, `uv sync`, ruff, mypy, pytest, all declared). Each series ran one job at a time, and each was measured against a control: the same workflow with the declarations removed.
 
-| Commit | Job | go mod download | gofmt | go vet | go test |
-|---|---|---|---|---|---|
-| 2ecc2d2 (cold) | 211 s | ran 60 s | ran 2 s | ran 11 s | 116 s |
-| 4ac7726 | 49 s | **replayed** 1 s | ran 2 s | ran 3 s | 24 s |
-| 2ec5ffa | 23 s | **replayed** 2 s | **replayed** 1 s | **replayed** 1 s | 10 s |
-| f34e517 (new module versions) | 117 s | ran 41 s | **replayed** 1 s | ran 3 s | 62 s |
-| 24c4ee6 | 40 s | **replayed** 2 s | ran 2 s | ran 2 s | 26 s |
-| 490d779 | 29 s | **replayed** 1 s | ran 2 s | ran 3 s | 15 s |
+### 9.1 The replay decisions are right
 
-**Go results.**
+Across all four runs of the two series, every declared step replayed exactly when its declared files were unchanged and ran when they changed, and none fell back. On flask's four commits that left the declared inputs alone (two changelog-only, two repeating an earlier commit's files), all four steps replayed every time.
 
-- **The keys are right.** Each declared step replayed exactly when its declared files were unchanged and ran when they changed; none fell back. The earlier steps' changes (`setup-go`'s toolchain) had the same digest on every commit, which is what makes any of this possible.
-- **The savings are small.** A replayed declared step takes 1–2 s on the Pi, mostly building its container, which is what gofmt and a warm `go vet` take to run. `go mod download`'s 41–60 s runs were a cold module cache (the first job) and new module versions (f34e517), exactly the cases where it cannot replay; with a warm cache it takes about a second either way. Go's own caches, kept between jobs in cache volumes, already capture most of what finer keys would save.
+Enforcement was tested by getting declarations wrong twice, and both failed loudly rather than replaying something wrong: flit, flask's build backend, reads `LICENSE.txt` and the version out of `src`, and ruff is installed in `.venv`. A project's maintainers have to find every file a step reads, and the first attempt here missed two.
 
-### 9.1 Python: flask
-
-Twelve consecutive commits of pallets/flask, oldest first: `setup-uv`, the checkout, then `uv sync`, ruff, mypy and pytest, each declared. Two commits change only the changelog, two others repeat an earlier commit's files, and the rest change code. A control ran the same jobs without declarations.
-
-Getting the declarations right took two tries, and both mistakes failed loudly rather than replaying: flit, flask's build backend, needs `LICENSE.txt`, and ruff is installed in `.venv`. The first try also found a bug: the checkpoint left the workspace owned by root, so `uv sync` could not create `.venv` as `runner` (fixed on the branch).
-
-| Step | Control | Declared, ran | Declared, replayed |
-|---|---|---|---|
-| uv sync | 21–35 s | 54–74 s | 13–19 s |
-| ruff | 0–1 s | 31–75 s | 4–6 s |
-| mypy | 6–12 s | 19–28 s | 3–5 s |
-| pytest | 4–5 s | 32–50 s | 3–5 s |
-| Job | 43–69 s | 161–237 s | 39–49 s |
-| Twelve jobs | **702 s** | | **1,514 s** declared |
-
-Every replay was correct, but declaring made the series about twice as slow. Each declared step's container is built by copying what earlier steps produced (`.venv`, hundreds of MB) out of the store, and its result back in. On the Pi's SD card that costs 30–75 s. A job where everything replayed was barely faster than the control. `uv sync` also ran on every code commit, because an editable install of the project reads `src`.
+The first flask run also found a bug of the runner's own: the checkpoint left the workspace owned by root, so `uv sync` could not create `.venv` as the step user. The Go series had not caught it, because none of its steps write to the workspace.
 
 ### 9.2 What Dagger keys on content
 
-Why copy at all? A probe on the Mac mounted a directory into a step that printed a random value, in two sessions, with two queries per session as the runner does, and checked whether the second session replayed the first's value:
+Why the cost moved around so much is explained by what Dagger puts in a cache key. A probe mounted a directory into a step that printed a random value, in two sessions, with two queries per session as the runner does, and checked whether the second session replayed the first's value:
 
 | Directory mounted | Content | Next step |
 |---|---|---|
@@ -364,23 +341,54 @@ Why copy at all? A probe on the Mac mounted a directory into a step that printed
 | A git checkout filtered to `go.mod go.sum`, two commits | same | **replayed** |
 | The whole git checkout, two commits (control) | differs | ran |
 
-**Dagger keys files from a git checkout on their content, and a step's output on how it was made.** So the workspace half of the checkpoint did not need the store: filtering the checkout itself would be keyed on content for free, as long as no earlier step changed the declared files. The other half, what earlier steps produced, does need it, because the steps that produce toolchains and environments (`setup-go`, `setup-uv`) take the token and always run. That half is the cost in 9.1.
+**Dagger keys files from a git checkout on their content, and a step's output on how it was made.** So the workspace half of a declared step's container can be free, while the half that earlier steps produced cannot.
 
-**A method note.** The first three rounds of this probe were invalid. In bash, `$RANDOM` inside a pipeline or `$(...)` is evaluated in a subshell, and a subshell of a shell that never used `$RANDOM` gets the same value every time. So the "different" trials sent identical commands, and every replay looked like content keying. The control caught it: a trial whose content had to differ replayed too. Values are now generated in the parent shell and printed.
+Two more measurements decided the design, both on the Pi, where the SD card makes costs visible (the same probes on the Mac showed no differences at all):
+
+| Giving a step a 200–240 MB directory of ~20,000 files | Time |
+|---|---|
+| `cp -a` from a mount (what v1 did) | 20 s |
+| `withDirectory`, no owner | 1–2 s |
+| `withDirectory` with `owner:` (so the step user can write it) | **21 s**, then 1–2 s while the source is unchanged |
+| `withMountedDirectory` | 1–2 s |
+
+**Three method notes.** The first three rounds of the content probe were invalid: in bash, `$RANDOM` inside a pipeline or `$(...)` is evaluated in a subshell, and a subshell of a shell that never used `$RANDOM` gets the same value every time, so the "different" trials sent identical commands and every replay looked like content keying. The control caught it. Second, the `owner` probe had to run on the Pi: on the Mac every variant took 1–2 s, which would have been read as "owner is free". Third, that probe reused one source directory across its rounds, so it measured a cached ownership pass and understated what a *new* directory costs; the real runs showed that.
+
+### 9.3 Three versions, and what each cost
+
+| | flask, 12 commits | go-task, warm commits |
+|---|---|---|
+| **Control** (no declarations) | **575 s** | **258 s** |
+| v1: the store, `cp` in and out | 1,514 s | — |
+| v2: layers instead of copies | 1,376 s | — |
+| v3: the ownership pass only where needed | **734 s** | **476 s** |
+
+- **v1** stored every part by digest and copied it in with `cp -a`, and copied the step's output back the same way. Building a declared step's container took 25–65 s and applying its output 2–28 s, almost all of it moving `.venv`.
+- **v2** passed those parts as Dagger directories instead. Building a container fell to 1–3 s and applying an output to under 2 s. Its first run replayed nothing at all, though: the checkout gets a fixed modification time so that Python wheels can be built (§8.1), and `withTimestamps` makes the result keyed on how it was built rather than on its content. Filtering the declared files first and setting the time afterwards keeps the content key.
+- **v3** split the workspace by where its files come from. The checkout's files are root's and need `owner:`, but a filter of a git tree is content-keyed, so that pass is cached while those files are unchanged. An earlier declared step's output needs no pass at all: that step ran as the step user, so its files already belong to them. In v2 all the declared patterns went into one directory, so a change to `src` re-owned the whole 200 MB `.venv` on every commit.
+
+### 9.4 Why it still does not pay
+
+v3 is the best version and still loses on both workloads. The per-commit figures say why.
+
+**flask.** A commit that leaves the declared inputs alone saves about 22 s; one that changes them costs about 31 s. So the feature needs about **three commits in five** to leave the expensive step's inputs alone. This sample had one in three. And `uv sync` must declare `src`, because flit reads the version from `src/flask/__init__.py`, so almost every commit re-runs it, and the three steps after it each take in its new `.venv`.
+
+**go-task.** With the tool caches warm, the control's `go mod download` is 1 s on every commit: the step the feature was meant to rescue is already free. `go vet` is the one real win, 2 s replayed against 8–24 s. But `go test`, which declares nothing, cost 27–65 s against the control's 18–27 s. Its container is now a stack of the declared steps' layers, and materialising that stack costs more than the control's simple chain. **The overhead is not confined to declared steps: it falls on the steps after them too.**
 
 **Findings.**
 
-1. **The commit and refs are volatile** (PR #145). That is pure gain.
-2. **Declared inputs replay correctly but do not pay on Dagger as built.** For Go, its own caches do most of the work; for Python, copying the environment costs more than replaying saves. The prototype stays on its branch.
-3. **The next design would use the content keys Dagger already has:** declared files filtered from the checkout, with no store, and the store only for files an earlier step changed. For environments like `.venv`, a cache volume named by the lockfile's digest (as `actions/cache` is used) costs nothing to mount, but trades enforced correctness for a convention.
-4. **Enforcement makes declarations safe to get wrong, but not free:** a project's maintainers have to find every file a step reads, and the first attempt here missed two.
-5. **Dagger is the limit only for step outputs.** Driving BuildKit directly is not justified by this: the cheaper design above stays within Dagger.
+1. **The commit and refs are volatile** (PR #145). That is pure gain, and it is the half of this experiment worth keeping.
+2. **Declared inputs work and do not pay, on this machine with this engine.** Every replay decision was right, and v3 is half v1's cost, but both workloads ran faster without declarations. Experiment 2's estimate of a third saved was computed from step times alone; it did not account for what it costs to hand a container its inputs.
+3. **The two reasons are structural.** The tools' own caches (Go's module and build caches, uv's cache) already make the declarable steps cheap, and the genuinely expensive steps (`go test`, pytest) are the ones a project cannot easily declare. Declaring more steps makes the stack deeper, which the steps after them pay for.
+4. **Where it would pay:** a step that is slow, has no cache of its own, and reads a small, rarely-changing set of files. That is a narrower case than this experiment assumed.
+5. **It is not Dagger's fault alone.** Dagger does key checkout-derived files on content, which is what made v3 possible. What it does not offer is content keys for a step's output, and no copy-free way to re-own files. Driving BuildKit directly is not justified by this: the cheap paths were all reachable from Dagger's API.
+
+The prototype stays on `feat/declared-inputs-v2` with its tests, in case the cost profile changes (an SSD machine, or an engine that keys step outputs on content).
 
 ## 10. Next
 
-- **Python with uv:** the same questions for `uv sync`, ruff and pytest. Pytest has no built-in equivalent of Go's test cache, so test selection there is a real gap to look into.
-- **Declared inputs without the copy:** the checkout-filtered design in 9.2, measured on the same Go and Python series.
-- **Inferring inputs** instead of declaring them, from a language's manifest or by tracing reads, and what it would cost to be wrong.
+- **Test selection for Python:** experiment 5 found pytest to be most of a flask job's time, and it is the step a project can least easily declare. Pytest has no equivalent of Go's test cache, so every test runs every time; what a runner could do about that is the open question.
+- **The cost of handing a step its inputs:** experiment 5's overhead, measured on its own rather than as a feature's by-product, and on a machine with an SSD as well as the Pi. It decides whether any form of finer keying can pay here.
 - **Engine memory over days:** the 15-minute log under ordinary jobs, to decide whether the cache cap should be lower (8.2).
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
 - **Breaking down the engine's cost:** Dagger (~720 ms per 10 trivial steps on the Mac), BuildKit alone (~300 ms) and raw overlayfs with namespaces (~35 ms). The BuildKit layer will be split into its parts: runc, snapshot metadata, cgroups, gRPC.
