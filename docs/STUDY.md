@@ -485,13 +485,30 @@ Between 100 and 200 steps the heap moved 6 MB while 200 snapshots were added, an
 
 **That removes the architecture argument and leaves a setting.** `GOGC=400` was this project's own choice, for 6% less engine CPU on a Mac and 13% on a Pi (DEPLOY.md "Sizing"). The price is that the engine's heap runs to about 1 GB of a 4 GB cap before collecting, and page cache is what gets squeezed — the same page cache whose absence turned 1 s of output-key work into 17 s (§8.2). On a machine with 8 GB shared with other services, that trade looks wrong, and testing it costs one engine restart rather than a new executor.
 
+### 11.2 `GOGC`, tested
+
+Three arms on the Pi, each a fresh engine (so an empty step cache) and the same flask job: a cold run, then warm re-runs of the same commit. The first pass suggested warm jobs got faster as `GOGC` fell (31 s, 21 s, 17 s). Repeating the two ends three times each showed that was noise:
+
+| | `GOGC=400` (the default here) | `GOGC=100` (Go's default) |
+|---|---|---|
+| cold run | 125 s | 133 s |
+| warm runs | 19 / 9 / 7 s | 19 / 7 / 7 s |
+| engine CPU, cold then warm | 45 / 13 / 4 / 3 s | 46 / 14 / 4 / 3 s |
+| heap held | ~350 MB | **~125 MB** |
+| page cache | 1,915 MB | 1,970 MB |
+
+**`GOGC=400` buys nothing measurable here and costs about 225 MB of a 4 GB cap.** Job time and engine CPU are the same within noise across both arms. The 6% and 13% CPU savings that chose `GOGC=400` (DEPLOY.md "Sizing") were measured on a different workload, real Node builds with more steps; they may still hold there, so the documented default should not change on this evidence alone.
+
+**What these arms cannot test.** Each starts from a fresh engine, so the step cache is empty and the engine never approaches its memory cap: `memory.events max` stayed at 0 in every arm. The pathology this was meant to address (§8.2: the cap hit 154,000 times, the same work taking 1 s or 17 s) needs thousands of cached results and days of churn to reappear. So this says `GOGC=100` is free in the short run, not that it prevents the pathology. The Pi is left at `GOGC=100` to find out, with the per-job cost and saving lines still being logged.
+
 **Findings.**
 
 1. **Per-step overhead does not justify leaving Dagger:** 43 ms a step against the floor, about 1% of a real job on the reference machine.
 2. **Nor does the job floor:** it is the GitHub protocol, not the engine.
 3. **What did cost real time this week was elsewhere:** the cache volumes' filesystem split (28.6 s a Python job, now 0.5 s, experiment 6) and the engine's memory pressure (the same work taking 1 s or 17 s, experiment 4). Both were found by measuring workloads, not layers.
 4. **Nor does memory, once garbage is separated from live data** (11.1). Keeping a step's result costs about two snapshots, twelve inodes and 131 KB on disk; the heap growth that looked like an index is mostly Go garbage under `GOGC=400`, a setting of ours. The engine's memory pressure is therefore a tuning question, not an architecture one.
-5. **So the architecture stays.** Nothing measured — per-step latency, the job floor, retained state or memory — supports replacing Dagger. What the measurements do point at is `GOGC`: trading back some of the CPU it saves to leave the engine more page cache (§8.2's pathology). That is the next experiment, and it costs one engine restart.
+5. **So the architecture stays.** Nothing measured — per-step latency, the job floor, retained state or memory — supports replacing Dagger.
+6. **`GOGC=400` looks like the wrong trade on this machine** (11.2), though not for the reason expected: not because a lower value is faster, but because it is free. The same job time and CPU, 225 MB less heap. Whether that headroom prevents §8.2's pathology needs a loaded engine and days, which the Pi is now accumulating at `GOGC=100`.
 
 ## 12. Next
 
@@ -500,4 +517,4 @@ Between 100 and 200 steps the heap moved 6 MB while 200 snapshots were added, an
 - **The cost of handing a step its inputs:** experiment 5's overhead, measured on its own rather than as a feature's by-product, and on a machine with an SSD as well as the Pi. It decides whether any form of finer keying can pay here.
 - **Engine memory over days:** the 15-minute log under ordinary jobs, to decide whether the cache cap should be lower (8.2).
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
-- **`GOGC` against page cache** (11.1): the engine saves 6–13% CPU at `GOGC=400` but runs its heap to about 1 GB before collecting. Whether a lower value stops the memory pressure that turned 1 s of work into 17 s, and what it costs in CPU, is the open question.
+- **Whether `GOGC=100`'s headroom prevents the memory pathology** (11.2), which needs a loaded engine and days rather than fresh arms; and whether `GOGC=400`'s documented CPU saving still holds on a step-heavy workload, which is where it was first measured.
