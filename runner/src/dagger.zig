@@ -3030,30 +3030,29 @@ const Exec = struct {
     /// null when it added or changed none) and the paths it removed, relative to the workspace.
     const ChainLayer = struct { dir: ?[]const u8, removed: []const []const u8 };
 
-    /// The declared files, from `chain_tree` and `chain_layers`: filtered from the tree, given the
-    /// checkout's fixed time (after the filter, so the key stays the content's), then each layer
-    /// and its removals, filtered again. A query field selecting `{ id }`.
+    /// The declared files, from `chain_tree` and `chain_layers`, as query fields: the checkout's
+    /// tree filtered to them (`zig_t`), and each declared step's workspace layer filtered to them
+    /// (`zig_l<i>`). They go into the step's container separately (see `inputsCheckpoint`): the
+    /// tree's files are root's and need `owner:`, which costs a pass over them (21 s for 200 MB on
+    /// a Raspberry Pi) but is cached while their content is unchanged, since a filter of a git tree
+    /// is keyed on content; a layer's files already belong to the step user, so it needs no pass.
     fn chainFiles(x: *Exec, globs: []const []const u8) ![]const u8 {
         const arena = x.arena;
         var aw: std.Io.Writer.Allocating = .init(arena);
         const w = &aw.writer;
         const g = std.json.fmt(globs, .{});
-        try w.print("zig_chain: loadDirectoryFromID(id:{f}) {{ filter(include:{f}) {{ withTimestamps(timestamp:{d}) {{ ", .{ std.json.fmt(x.chain_tree.?, .{}), g, checkout_mtime });
-        var braces: usize = 3;
-        for (x.chain_layers.items) |l| {
-            if (l.dir) |d| {
-                try w.print("withDirectory(path:\".\",source:{f}) {{ ", .{std.json.fmt(d, .{})});
-                braces += 1;
-            }
-            for (l.removed) |p| {
-                try w.print("{s}(path:{f}) {{ ", .{ if (std.mem.endsWith(u8, p, "/")) "withoutDirectory" else "withoutFile", std.json.fmt(std.mem.trimEnd(u8, p, "/"), .{}) });
-                braces += 1;
-            }
+        // Filter first, then set the time: `withTimestamps` would make the result keyed on how it
+        // was built instead of on its content.
+        try w.print("zig_t: loadDirectoryFromID(id:{f}) {{ filter(include:{f}) {{ withTimestamps(timestamp:{d}) {{ id }} }} }}", .{ std.json.fmt(x.chain_tree.?, .{}), g, checkout_mtime });
+        for (x.chain_layers.items, 0..) |l, i| {
+            const d = l.dir orelse continue;
+            try w.print(" zig_l{d}: loadDirectoryFromID(id:{f}) {{ filter(include:{f}) {{ id }} }}", .{ i, std.json.fmt(d, .{}), g });
         }
-        try w.print("filter(include:{f}) {{ id }}", .{g});
-        for (0..braces) |_| try w.writeAll(" }");
         return aw.written();
     }
+
+    /// One part of a declared step's workspace: a directory and whether its files need `owner:`.
+    const WorkspacePart = struct { id: []const u8, owned: bool, removed: []const []const u8 = &.{} };
 
     fn checkpointIgnored(x: *const Exec) [5][]const u8 {
         return .{ x.ev.workspace, fc_dir, event_dir, "/github/_actions", "/github/_runtime" };
@@ -3122,10 +3121,21 @@ const Exec = struct {
         const delta_id = jsonFindString(layer, "id") orelse return null;
         const delta = digestHex(jsonFindString(layer, "digest") orelse return null);
         const from_chain = x.chain_tree != null;
-        const files_id = (if (from_chain)
-            (if (jsonFind(data, "zig_chain")) |c| jsonFindString(c, "id") else null)
-        else if (jsonFind(data, "zig_ws")) |ws| (if (jsonFind(ws, "filter")) |f| jsonFindString(f, "id") else null) else null) orelse return null;
+        var parts: std.ArrayList(WorkspacePart) = .empty;
+        if (from_chain) {
+            try parts.append(arena, .{ .id = (if (jsonFind(data, "zig_t")) |t| jsonFindString(t, "id") else null) orelse return null, .owned = true });
+            for (x.chain_layers.items, 0..) |l, i| {
+                if (l.dir == null) {
+                    // It only removed files; they go after the part before it.
+                    if (parts.items.len > 0) parts.items[parts.items.len - 1].removed = l.removed;
+                    continue;
+                }
+                const f = jsonFind(data, try std.fmt.allocPrint(arena, "zig_l{d}", .{i})) orelse return null;
+                try parts.append(arena, .{ .id = jsonFindString(f, "id") orelse return null, .owned = false, .removed = l.removed });
+            }
+        }
         const filtered = if (from_chain) null else (jsonFind(jsonFind(data, "zig_ws") orelse return null, "filter") orelse return null);
+        const files_id = if (filtered) |f| (jsonFindString(f, "id") orelse return null) else "";
         const files = if (filtered) |f| digestHex(jsonFindString(f, "digest") orelse return null) else "";
         var removed: std.ArrayList([]const u8) = .empty;
         if (jsonFind(now, "removedPaths")) |r| if (r == .array) for (r.array.items) |p| {
@@ -3183,12 +3193,17 @@ const Exec = struct {
         });
         if (x.dir_owner) |o| try w.print("withUser(name:{f}) {{ ", .{std.json.fmt(o, .{})}) else try w.writeAll("withoutUser { ");
         try w.writeAll("withoutMount(path:\"" ++ outputs_store ++ "\") { withoutMount(path:\"" ++ outputs_busybox ++ "\") { ");
-        if (from_chain) {
-            // Added as a layer, not copied (a cp of 240 MB took 20 s on a Raspberry Pi; this, 0.2 s).
-            try w.print("withDirectory(path:{f},source:{f}", .{ std.json.fmt(x.ev.workspace, .{}), std.json.fmt(files_id, .{}) });
-            if (x.dir_owner) |o| try w.print(",owner:{f}", .{std.json.fmt(o, .{})});
+        // Added as layers, not copied (a cp of 240 MB took 20 s on a Raspberry Pi; this, 0.2 s).
+        for (parts.items) |part| {
+            try w.print("withDirectory(path:{f},source:{f}", .{ std.json.fmt(x.ev.workspace, .{}), std.json.fmt(part.id, .{}) });
+            if (part.owned) if (x.dir_owner) |o| try w.print(",owner:{f}", .{std.json.fmt(o, .{})});
             try w.writeAll(") { ");
             braces += 1;
+            for (part.removed) |rel| {
+                const abs = try std.fmt.allocPrint(arena, "{s}/{s}", .{ x.ev.workspace, std.mem.trimEnd(u8, rel, "/") });
+                try w.print("{s}(path:{f}) {{ ", .{ if (std.mem.endsWith(u8, rel, "/")) "withoutDirectory" else "withoutFile", std.json.fmt(abs, .{}) });
+                braces += 1;
+            }
         }
         try w.writeAll("id");
         for (0..braces + 7) |_| try w.writeAll(" }");
@@ -3199,7 +3214,7 @@ const Exec = struct {
         const id = jsonFindString(built, "id") orelse return null;
         if (x.sh.step_debug) {
             if (from_chain)
-                x.sh.appendFmt(num, "##[debug]Declared inputs: the step runs on {d} pattern(s) of the workspace, from the checkout and the declared steps since; earlier steps' changes sha256:{s}", .{ globs.items.len, delta[0..@min(12, delta.len)] })
+                x.sh.appendFmt(num, "##[debug]Declared inputs: the step runs on {d} pattern(s) of the workspace, from the checkout and {d} declared step(s) since; earlier steps' changes sha256:{s}", .{ globs.items.len, parts.items.len - 1, delta[0..@min(12, delta.len)] })
             else
                 x.sh.appendFmt(num, "##[debug]Declared inputs: the step runs on {d} pattern(s) of the workspace, sha256:{s} (stored: a step other than a declared one ran since the checkout); earlier steps' changes sha256:{s}", .{ globs.items.len, files[0..@min(12, files.len)], delta[0..@min(12, delta.len)] });
         }
@@ -7270,7 +7285,7 @@ test "declared inputs after a checkout: files come from the checkout and declare
         try exec(arena, "C1", 0, ""),
         // uv sync
         "{\"data\":{\"loadContainerFromID\":{\"rootfs\":{\"id\":\"BF\"}}}}",
-        "{\"data\":{" ++ env_now ++ ",\"zig_chain\":{\"filter\":{\"withTimestamps\":{\"filter\":{\"id\":\"FA\"}}}}}}",
+        "{\"data\":{" ++ env_now ++ ",\"zig_t\":{\"filter\":{\"withTimestamps\":{\"id\":\"FA\"}}}}}",
         "{\"data\":{\"bb\":{\"from\":{\"file\":{\"id\":\"BB\"}}},\"empty\":{\"id\":\"E\"}}}",
         "{\"data\":{\"cacheVolume\":{\"id\":\"VOL\"}}}",
         "{\"data\":{\"container\":{\"withExec\":{\"exitCode\":0}}}}",
@@ -7281,7 +7296,7 @@ test "declared inputs after a checkout: files come from the checkout and declare
         "{\"data\":{\"zig_job\":{\"id\":\"JA\"}}}",
         "{\"data\":{\"loadDirectoryFromID\":{\"directory\":{\"id\":\"WSA\"}}}}",
         // ruff
-        "{\"data\":{" ++ env_now ++ ",\"zig_chain\":{\"filter\":{\"withTimestamps\":{\"withDirectory\":{\"withoutFile\":{\"filter\":{\"id\":\"FB\"}}}}}}}}",
+        "{\"data\":{" ++ env_now ++ ",\"zig_t\":{\"filter\":{\"withTimestamps\":{\"id\":\"FB\"}}},\"zig_l0\":{\"filter\":{\"id\":\"LB\"}}}}",
         "{\"data\":{\"container\":{\"withExec\":{\"exitCode\":0}}}}",
         "{\"data\":{\"loadContainerFromID\":{\"x\":{\"id\":\"CPB\"}}}}",
         try exec(arena, "CB", 0, ""),
@@ -7300,15 +7315,17 @@ test "declared inputs after a checkout: files come from the checkout and declare
     for (seen) |d| try std.testing.expect(braceBalanced(d));
     // uv sync: its files filtered from the unstamped tree, then given the checkout's time (so the
     // key is the content's), added as a layer, owned by the step user.
-    try std.testing.expect(std.mem.indexOf(u8, seen[4], "zig_chain: loadDirectoryFromID(id:\"RAW1\") { filter(include:[\"pyproject.toml\"]) { withTimestamps(timestamp:946684800) { filter(include:[\"pyproject.toml\"]) { id }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[4], "zig_t: loadDirectoryFromID(id:\"RAW1\") { filter(include:[\"pyproject.toml\"]) { withTimestamps(timestamp:946684800) { id }") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[8], "withDirectory(path:\"/home/runner/work/r/r\",source:\"FA\",owner:\"runner\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[8], "cp -a /zig-runner-outputs/dddd/. /") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[8], "rm -rf /home/runner/work/r/r") == null);
     // Its changes: a layer on the job's container, with the file it removed.
     try std.testing.expect(std.mem.indexOf(u8, seen[12], "withDirectory(path:\"/\",source:\"OLA\") { withoutFile(path:\"/home/runner/work/r/r/old.lock\")") != null);
-    // ruff: its files from the tree and uv sync's layer, with the file it removed, filtered again.
-    try std.testing.expect(std.mem.indexOf(u8, seen[14], "zig_chain: loadDirectoryFromID(id:\"RAW1\") { filter(include:[\"src\",\".venv\"]) { withTimestamps(timestamp:946684800) { withDirectory(path:\".\",source:\"WSA\") { withoutFile(path:\"old.lock\") { filter(include:[\"src\",\".venv\"]) { id }") != null);
-    try std.testing.expect(std.mem.indexOf(u8, seen[16], "withDirectory(path:\"/home/runner/work/r/r\",source:\"FB\",owner:\"runner\")") != null);
+    // ruff: the tree's files, and uv sync's layer filtered to the same patterns.
+    try std.testing.expect(std.mem.indexOf(u8, seen[14], "zig_t: loadDirectoryFromID(id:\"RAW1\") { filter(include:[\"src\",\".venv\"]) { withTimestamps(timestamp:946684800) { id }") != null);
+    try std.testing.expect(std.mem.indexOf(u8, seen[14], "zig_l0: loadDirectoryFromID(id:\"WSA\") { filter(include:[\"src\",\".venv\"]) { id }") != null);
+    // The tree's files need the ownership pass; uv sync's layer already belongs to the step user.
+    try std.testing.expect(std.mem.indexOf(u8, seen[16], "withDirectory(path:\"/home/runner/work/r/r\",source:\"FB\",owner:\"runner\") { withDirectory(path:\"/home/runner/work/r/r\",source:\"LB\") { withoutFile(path:\"/home/runner/work/r/r/old.lock\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[17], "loadContainerFromID(id:\"CPB\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, seen[20], "zig_chain") == null);
 }
