@@ -458,12 +458,30 @@ The BuildKit row is **not comparable** and is kept only to be honest about what 
 
 **Where the fixed cost actually is.** An empty job through the runner takes 2–4 s (experiment 4) while an engine session costs 0.6 s and an empty job spends 0.1 s of engine CPU. So most of a job's floor is the GitHub protocol — registering, claiming, reporting, uploading logs — and not the engine at all. A different executor would not move it.
 
+### 11.1 What a step costs in memory and inodes
+
+The dimension latency could not settle. 100 trivial steps through Dagger, then 100 raw overlay steps, with the engine's cgroup, the host's inodes and the engine's snapshot count read either side:
+
+| Per 100 steps | Dagger | Raw overlay |
+|---|---|---|
+| engine memory | **+279 MB** (anon 696 → 959 MB) | none |
+| engine snapshots kept | **+202** (about 2 a step) | none |
+| filesystem inodes | +1,206 (about 12 a step) | none |
+| disk | +13 MB (about 131 KB a step) | +80 KB total |
+| kernel `ext4_inode_cache` | unchanged at 957 MB | unchanged |
+
+**The retained state is the price of the step cache, not of Dagger.** The raw loop keeps nothing because it deletes each mount; it also cannot replay anything. Any executor that replays steps has to keep each step's result, and two snapshots, twelve inodes and 131 KB a step is a modest way to keep it.
+
+**The memory is the exception, and it is the one real argument for an executor of our own.** The engine's anonymous heap grew about 2.6 MB for every trivial cached step and had not come back 25 minutes later, idle. Dagger keeps its index of cached results in memory, which is also why an engine restart empties the step cache (§8.2). That is what puts the engine at its 4 GB cap after a few thousand steps, and it is what turned 1 s of work into 17 s. An executor that kept its cache index on disk would avoid both at once.
+
+**What is not yet separated:** how much of that 263 MB is live index and how much is Go garbage. The engine runs with `GOGC=400`, so it collects when the heap reaches five times the live set, and nothing here forced a collection. The live share could be a fifth of it. Until that is measured, "the engine's memory grows with the number of cached steps" is the claim the numbers support, not a figure per step.
+
 **Findings.**
 
 1. **Per-step overhead does not justify leaving Dagger:** 43 ms a step against the floor, about 1% of a real job on the reference machine.
 2. **Nor does the job floor:** it is the GitHub protocol, not the engine.
 3. **What did cost real time this week was elsewhere:** the cache volumes' filesystem split (28.6 s a Python job, now 0.5 s, experiment 6) and the engine's memory pressure (the same work taking 1 s or 17 s, experiment 4). Both were found by measuring workloads, not layers.
-4. **One decision-relevant thing is still unmeasured:** what each step costs in *memory and inodes*, not milliseconds. BuildKit's snapshot metadata is the suspect behind experiment 4's pathology, and it is the one dimension where an executor of our own might still win. That, not latency, is where the architecture question should be settled.
+4. **The architecture question turns on memory, not latency** (11.1). Keeping a step's result costs little on disk, but Dagger holds its cache index in memory, and that grows with every cached step until the engine sits at its cap. An executor of our own with an on-disk index would fix both that and the cold step cache after a restart. How much of the growth is live index rather than Go garbage is the next thing to measure, and it decides how large the prize is.
 
 ## 12. Next
 
@@ -472,4 +490,4 @@ The BuildKit row is **not comparable** and is kept only to be honest about what 
 - **The cost of handing a step its inputs:** experiment 5's overhead, measured on its own rather than as a feature's by-product, and on a machine with an SSD as well as the Pi. It decides whether any form of finer keying can pay here.
 - **Engine memory over days:** the 15-minute log under ordinary jobs, to decide whether the cache cap should be lower (8.2).
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
-- **What a step costs in memory and inodes** at each level (experiment 7, finding 4): the dimension on which an executor of our own might still beat Dagger, since latency is not it.
+- **How much of the engine's heap is live cache index** rather than Go garbage (11.1): it sizes the prize for an executor of our own, which is now the only measured argument for one.
