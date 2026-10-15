@@ -1095,6 +1095,8 @@ const Evaluator = struct {
     hash_files: ?expr.HashFiles = null,
     /// `runner.name` and RUNNER_NAME: the name the runner registered under.
     runner_name: []const u8 = "zig-runner",
+    /// Step debug is on (ACTIONS_STEP_DEBUG): steps get RUNNER_DEBUG=1, as on GitHub.
+    runner_debug: bool = false,
 
     fn init(arena: Allocator, job: *const job_mod.Job) !Evaluator {
         var ev: Evaluator = .{
@@ -1238,6 +1240,17 @@ const Evaluator = struct {
     }
 
     /// A string from the `github` context ("" when absent).
+    /// A `github` context value as GitHub's runner puts it in the environment: strings as they
+    /// are, numbers and booleans as text; null when the context has no such key.
+    fn githubText(ev: *const Evaluator, key: []const u8) !?[]const u8 {
+        if (ev.github != .object) return null;
+        for (ev.github.object) |e| if (std.ascii.eqlIgnoreCase(e.key, key)) return switch (e.value) {
+            .string, .number, .boolean => try expr.toStr(ev.arena, e.value),
+            else => null,
+        };
+        return null;
+    }
+
     fn githubString(ev: *const Evaluator, key: []const u8) []const u8 {
         if (ev.github != .object) return "";
         for (ev.github.object) |e| if (std.ascii.eqlIgnoreCase(e.key, key)) return switch (e.value) {
@@ -1266,9 +1279,15 @@ const Evaluator = struct {
             .{ .name = "RUNNER_NAME", .value = ev.runner_name },
             .{ .name = "RUNNER_TEMP", .value = "/tmp" },
             .{ .name = "RUNNER_TOOL_CACHE", .value = "/opt/hostedtoolcache" },
+            .{ .name = "RUNNER_WORKSPACE", .value = std.fs.path.dirnamePosix(workspace) orelse "/" },
+            .{ .name = "RUNNER_ENVIRONMENT", .value = "self-hosted" },
             .{ .name = "GITHUB_EVENT_PATH", .value = event_path },
+            // Set in every step, empty outside an action's own steps (which set them), as on GitHub.
+            .{ .name = "GITHUB_ACTION_REPOSITORY", .value = "" },
+            .{ .name = "GITHUB_ACTION_REF", .value = "" },
         };
         try out.appendSlice(ev.arena, &fixed);
+        if (ev.runner_debug) try out.append(ev.arena, .{ .name = "RUNNER_DEBUG", .value = "1" });
         const from_github = [_][2][]const u8{
             .{ "GITHUB_REPOSITORY", "repository" },
             .{ "GITHUB_REPOSITORY_OWNER", "repository_owner" },
@@ -1289,10 +1308,18 @@ const Evaluator = struct {
             .{ "GITHUB_SERVER_URL", "server_url" },
             .{ "GITHUB_API_URL", "api_url" },
             .{ "GITHUB_GRAPHQL_URL", "graphql_url" },
+            .{ "GITHUB_ACTOR_ID", "actor_id" },
+            .{ "GITHUB_REPOSITORY_ID", "repository_id" },
+            .{ "GITHUB_REPOSITORY_OWNER_ID", "repository_owner_id" },
+            .{ "GITHUB_WORKFLOW_REF", "workflow_ref" },
+            .{ "GITHUB_WORKFLOW_SHA", "workflow_sha" },
+            .{ "GITHUB_REF_PROTECTED", "ref_protected" },
+            .{ "GITHUB_RETENTION_DAYS", "retention_days" },
         };
+        // Every key the context has, even an empty one (GITHUB_BASE_REF and GITHUB_HEAD_REF on a
+        // push): a script under `set -u` reads them on GitHub.
         for (from_github) |m| {
-            const v = ev.githubString(m[1]);
-            if (v.len > 0) try out.append(ev.arena, .{ .name = m[0], .value = v });
+            if (try ev.githubText(m[1])) |v| try out.append(ev.arena, .{ .name = m[0], .value = v });
         }
         return out.items;
     }
@@ -1959,6 +1986,7 @@ const SpanDemux = struct {
 fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *Shared, results: []StepResult, transport: Transport) !Result {
     var ev = try Evaluator.init(arena, &job);
     ev.runner_name = opts.runner_name;
+    ev.runner_debug = sh.step_debug;
     var secret_counter: u32 = 0;
     var err_msg: []const u8 = "";
     // Services hold state a cached step would not have changed (a migration replayed from cache
@@ -3471,7 +3499,6 @@ const Exec = struct {
         // location, and the services actions/cache and artifact actions talk to.
         var env: std.ArrayList(job_mod.EnvVar) = .empty;
         try env.appendSlice(arena, try inputEnv(arena, inputs));
-        try env.append(arena, .{ .name = "GITHUB_ACTION_PATH", .value = act.path });
         try env.append(arena, .{ .name = "GITHUB_ACTION_REPOSITORY", .value = act.repository });
         try env.append(arena, .{ .name = "GITHUB_ACTION_REF", .value = act.ref });
         try x.runtimeEnv(&env, state);
@@ -4497,8 +4524,10 @@ const max_event_env = 100 * 1024;
 /// (`readsRunSpecific`), and a step that reads the commit some other way still sees a new workspace
 /// (`.git` included) after a checkout, so its key changes with the commit anyway.
 const volatile_env = [_][]const u8{
-    "GITHUB_RUN_ID", "GITHUB_RUN_NUMBER", "GITHUB_RUN_ATTEMPT", "GITHUB_ACTOR",    "GITHUB_TRIGGERING_ACTOR", "RUNNER_NAME",
-    "GITHUB_SHA",    "GITHUB_REF",        "GITHUB_REF_NAME",    "GITHUB_REF_TYPE", "GITHUB_BASE_REF",         "GITHUB_HEAD_REF",
+    "GITHUB_RUN_ID",   "GITHUB_RUN_NUMBER",   "GITHUB_RUN_ATTEMPT",  "GITHUB_ACTOR",         "GITHUB_TRIGGERING_ACTOR", "RUNNER_NAME",
+    "GITHUB_SHA",      "GITHUB_REF",          "GITHUB_REF_NAME",     "GITHUB_REF_TYPE",      "GITHUB_BASE_REF",         "GITHUB_HEAD_REF",
+    // Follow the actor, the commit and the branch, as the variables above do.
+    "GITHUB_ACTOR_ID", "GITHUB_WORKFLOW_REF", "GITHUB_WORKFLOW_SHA", "GITHUB_REF_PROTECTED",
 };
 
 /// Whether a script names a variable whose value differs between runs while the cache key does not
@@ -6220,6 +6249,39 @@ test "steps see the name the runner registered under" {
     _ = try run(arena, std.testing.io, &env, .{ .runner_name = "zig-1a2b3c4d", .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, testJob(&steps), &log);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[0], "withEnvVariable(name:\"RUNNER_NAME\",value:\"zig-1a2b3c4d\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "echo zig-1a2b3c4d") != null);
+}
+
+test "the variables GitHub's runner sets: empty ones too, numbers and booleans as text" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    var job = testJob(&.{});
+    job.context_data = try std.json.parseFromSliceLeaky(std.json.Value, arena,
+        \\{"github":{"t":2,"d":[{"k":"repository","v":"o/r"},{"k":"base_ref","v":""},{"k":"head_ref","v":""},
+        \\ {"k":"repository_id","v":123},{"k":"ref_protected","v":false},{"k":"workflow_sha","v":"0123abc"}]}}
+    , .{});
+    var ev = try Evaluator.init(arena, &job);
+    ev.runner_debug = true;
+    const env = try ev.defaultEnv();
+    const Want = struct { []const u8, []const u8 };
+    for ([_]Want{
+        .{ "GITHUB_BASE_REF", "" },
+        .{ "GITHUB_HEAD_REF", "" },
+        .{ "GITHUB_REPOSITORY_ID", "123" },
+        .{ "GITHUB_REF_PROTECTED", "false" },
+        .{ "GITHUB_WORKFLOW_SHA", "0123abc" },
+        .{ "RUNNER_ENVIRONMENT", "self-hosted" },
+        .{ "RUNNER_WORKSPACE", "/github" },
+        .{ "RUNNER_DEBUG", "1" },
+        .{ "GITHUB_ACTION_REPOSITORY", "" },
+    }) |want| {
+        const got = for (env) |e| (if (std.mem.eql(u8, e.name, want[0])) break e.value) else return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(want[1], got);
+    }
+    // Keys the context does not have are not set.
+    for (env) |e| try std.testing.expect(!std.mem.eql(u8, e.name, "GITHUB_ACTOR_ID"));
+    // The workflow's commit and ref follow the commit and branch: not part of step cache keys.
+    try std.testing.expect(isVolatile("GITHUB_WORKFLOW_SHA") and isVolatile("GITHUB_WORKFLOW_REF"));
 }
 
 test "an action that cannot be resolved: GitHub's message" {
