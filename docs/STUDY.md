@@ -291,6 +291,19 @@ On the fresh engine, the same workflow:
 
 **The fix:** cap the cache at 20 GB (`deploy/engine.json`, PR #138); the engine reports the policy as active. A logger on the Pi records the engine's memory every 15 minutes, to check whether slab stays small as the cache fills up to the cap.
 
+**The cap bounds the disk, not the memory.** The logger caught the cache filling up: experiment 5's two flask runs, which stored and copied a `.venv` per job, took it from 10 GB to the cap in about half an hour.
+
+| Time | Cache on disk | Snapshots | Slab (inode cache) | Memory cap hit |
+|---|---|---|---|---|
+| after the Go runs | ~10 GB | 4,676 | 288 MB | 87 times |
+| declared flask run | 21.4 GB (at the cap) | 9,130 | 989 MB | 19,053 |
+| control flask run | 21.4 GB | 3,436 | 1,208 MB | 33,494 |
+| idle afterwards | ~21 GB | 1,551 | 1,182 MB | 44,371 |
+
+Garbage collection held the disk at the cap and cut the snapshots by five times, but the kernel's records of the files it had touched stayed at 1.2 GB, charged to the engine. Within each flask run, output keys' work after `setup-uv` grew from about 1 s to 10–17 s; on the Go runs before, it held at about 1 s. So the 67 GB day was the same effect at a larger scale, and the cap makes it smaller, not absent. Whether ordinary jobs (not experiments that write hundreds of MB each) also push the engine to its memory cap is what the next days of logging will show; if they do, a lower cap (about 12 GB) is the next step, not a larger memory cap on a machine that hosts other services.
+
+**What a restart costs.** Recreating the engine's container between two runs of an always-run probe job (PR #148): the step cache was gone, and every cache volume survived. A marker written into the npm cache before was still there after, as were the Go and uv toolchains, Go's 1,055 module directories and uv's cache. So after a restart a workflow's first run replays no steps but still finds its downloads and toolchains. Restarts on the Pi are rare and deliberate: Watchtower checked the engine nightly but never replaced it (its pinned tag never changed), unattended upgrades neither reboot nor touch Docker, and the deploy files now keep image updaters away from the engine (WUD would otherwise move it to the next Dagger release). A cold step cache after a restart is accepted rather than kept outside the engine.
+
 ### 8.3 Found along the way
 
 - **Log uploads failed for two minutes,** all of a job's blobs within the same second. A request that failed was giving its dead connection back to the shared pool. Now a failed connection is dropped, and failed writes are retried (PR #137). Why the failures stopped by themselves is not known.
@@ -368,6 +381,6 @@ Why copy at all? A probe on the Mac mounted a directory into a step that printed
 - **Python with uv:** the same questions for `uv sync`, ruff and pytest. Pytest has no built-in equivalent of Go's test cache, so test selection there is a real gap to look into.
 - **Declared inputs without the copy:** the checkout-filtered design in 9.2, measured on the same Go and Python series.
 - **Inferring inputs** instead of declaring them, from a language's manifest or by tracing reads, and what it would cost to be wrong.
-- **Engine memory over days:** the 15-minute log, as the cache refills towards its 20 GB cap.
+- **Engine memory over days:** the 15-minute log under ordinary jobs, to decide whether the cache cap should be lower (8.2).
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
 - **Breaking down the engine's cost:** Dagger (~720 ms per 10 trivial steps on the Mac), BuildKit alone (~300 ms) and raw overlayfs with namespaces (~35 ms). The BuildKit layer will be split into its parts: runc, snapshot metadata, cgroups, gRPC.
