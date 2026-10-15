@@ -24,6 +24,11 @@ services:
       # to about three quarters of the disk.
       - ./engine.json:/etc/dagger/engine.json:ro
     restart: unless-stopped
+    # The runner speaks one engine version's protocol, and restarting the engine empties its step
+    # cache: keep image updaters away (WUD would also move it to the next Dagger release).
+    labels:
+      wud.watch: "false"
+      com.centurylinklabs.watchtower.enable: "false"
 
   runner:
     build: ../runner
