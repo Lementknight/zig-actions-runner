@@ -400,6 +400,8 @@ The prototype stays on `feat/declared-inputs-v2` with its tests, in case the cos
 
 A hardlink from any volume to the workspace is refused ("Invalid cross-device link"), and so is one from one volume to another. `/tmp` and the workspace are the same filesystem, so links between *those* work. On a GitHub-hosted runner everything is one disk, so the question never arises.
 
+Two mounts of the *same* volume are also separate devices: a link between them is refused although each sees what the other writes. So the only hardlink-reachable place from a cache is inside that same cache, which is what the fix below rests on.
+
 **What it costs.** Six variants of the same `uv sync` in one job (flask, 84 packages, a 214 MB `.venv`), and the same for pnpm and npm (68 MB of dependencies):
 
 | Warm install | Pi, from the volume | Pi, from a copy on the workspace's filesystem | GitHub |
@@ -410,12 +412,33 @@ A hardlink from any volume to the workspace is refused ("Invalid cross-device li
 
 Copying uv's cache onto the workspace's filesystem first takes 4.4 s, so "copy, then install with hardlinks" is 4.6 s against 27 s. Naming the fallback explicitly (`UV_LINK_MODE=copy`) costs the same 25.4 s, which confirms the warning describes what already happens. Even on GitHub's SSD, forcing copy mode costs 5.6 s against 0.1 s.
 
+### 10.1 The fix, and what it did not cost
+
+Two designs were tried and discarded before the one that worked, both for reasons worth recording:
+
+- **Persist caches as content the runner tracks** (read `container.directory(path).id` at the end of a job, add it with `withDirectory` at the start of the next). Hardlinks would work, since the cache would be on the container's own filesystem. But a cache's content would then be part of every step's cache key, and caches churn on almost every run, so step replay — worth about 20 times on a re-run (experiment 2) — would be lost. The two properties are mutually exclusive on Dagger: on the container's filesystem means in the key; persistent means a mount, and a mount means another device.
+- **Mount one volume twice,** once for the cache and once for the install target. The probe above refused that link.
+
+**What works is to put the install target inside the cache.** uv allows it (`UV_PROJECT_ENVIRONMENT`), so the runner now keeps uv's project environment in uv's own cache volume, one per ref, with the workspace's `.venv` a symlink to it, made before the checkout (which merges the repository over it and leaves it). Measured on the Pi against `ubuntu-latest`:
+
+| | This runner | GitHub |
+|---|---|---|
+| `uv sync`, new ref | 9.2 s (was 28.6 s) | 1.3 s |
+| `uv sync`, re-run | **0.5 s** | 0.8 s |
+| fallback warnings | none (was 2) | none |
+| `uv run`, `.venv/bin/python`, `activate`, `.venv/bin/pytest` | all work, 134 tests pass | same |
+
+**The fidelity cost did not materialise.** Relocating the environment was expected to break `.venv/bin/...` and `source .venv/bin/activate`; through the symlink both work, as does pytest run from it. A warm sync is now faster than a GitHub-hosted runner's. The real costs are that environments accumulate in the volume, one per ref, until it is pruned, and that `RUNNER_UV_ENV_IN_CACHE=false` exists for anyone it surprises.
+
+**pnpm cannot be fixed this way.** `node_modules` has to be in the workspace for imports to resolve, so there is nowhere hardlink-reachable to put it. It still pays 16.6 s against 1.4 s, and only its workflow can avoid that, by copying the store under `RUNNER_TEMP`.
+
 **Findings.**
 
 1. **The cache volumes make hardlink-based installers slow,** by a factor of 135 for uv and 12 for pnpm on the Pi. It is the runner's design doing it, not the tools.
 2. **npm, Go and Cargo are unaffected:** they copy from their caches anyway, and a bulk copy of the same 68 MB takes 1.5 s. The penalty is not "copying is slow" but that uv and pnpm copy file by file, with verification, down a path they do not expect to take.
-3. **The runner cannot fix this inside Dagger.** Staging the cache into the container at job start needs an exec that reads the volume. Dagger keys an exec on its recipe, not on a mounted volume's content, so that exec would either be cached and serve a stale copy for ever, or carry a per-job value and change every step's cache key after it. Putting the install target inside the volume does work (same device), but it moves a project's `.venv` out of its workspace, which the "workflows run unchanged" goal rules out as a default.
-4. **A workflow can take the fast path itself,** and this is worth documenting (SPEC §6): copy the tool's cache to a path under `RUNNER_TEMP`, which shares the workspace's filesystem, and point the tool at the copy. For flask that is 27 s → 4.6 s.
+3. **The runner cannot stage a cache into the job.** That needs an exec that reads the volume, and Dagger keys an exec on its recipe, not on a mounted volume's content, so the exec would either be cached and serve a stale copy for ever, or carry a per-job value and change every step's cache key after it.
+4. **It can move the install target into the cache, where one exists** (10.1): uv's environment now lives there by default, which made a warm `uv sync` faster than a GitHub-hosted runner's, and the symlink kept every way a workflow reaches `.venv` working. Where the target must stay in the workspace, as pnpm's `node_modules` must, only the workflow can avoid the cost.
+5. **Two designs failed first, for one reason:** on Dagger, being on the container's filesystem means being in the cache key, and persisting means being a mount, which means another device. Any fix has to live on one side of that line.
 
 ## 11. Next
 
