@@ -2106,9 +2106,14 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
             try std.json.Stringify.value([_][]const u8{ "sh", "-c", if (as_runner) provision_runner_script else provision_script }, .{}, w);
             try w.writeAll(") { ");
         }
-        if (provision) {
-            // The job's workspace and RUNNER_TEMP, the user's (cached per repository).
-            const mk = try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}", .{ ev.workspace, ev.temp, if (as_runner) " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root else "" });
+        {
+            // The job's workspace and RUNNER_TEMP, the step user's in the default image (cached per
+            // repository). A job container's user may be unable to make them; its steps then report
+            // that themselves.
+            const mk = if (provision)
+                try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}", .{ ev.workspace, ev.temp, if (as_runner) " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root else "" })
+            else
+                try std.fmt.allocPrint(arena, "mkdir -p {s} {s} 2>/dev/null || true", .{ ev.workspace, ev.temp });
             try w.writeAll("withExec(args:");
             try std.json.Stringify.value([_][]const u8{ "sh", "-c", mk }, .{}, w);
             try w.writeAll(") { ");
