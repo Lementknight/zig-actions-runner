@@ -385,9 +385,42 @@ v3 is the best version and still loses on both workloads. The per-commit figures
 
 The prototype stays on `feat/declared-inputs-v2` with its tests, in case the cost profile changes (an SSD machine, or an engine that keys step outputs on content).
 
-## 10. Next
+## 10. Experiment 6: the cache volumes and installers that hardlink
 
-- **Where a Python job's time actually goes.** Not the tests: in experiment 5's control, flask's pytest step was 4–5 s of a 40–57 s job (493 tests run in under 3 s), while `uv sync` was 19–33 s on every commit, with a warm uv cache. uv reports why: "Failed to hardlink files; falling back to full copy", because its cache is a Dagger volume and so a different filesystem from the workspace where `.venv` is built. How much of that step is the copy, and whether a runner can avoid it, is the open question. Test selection matters only for a suite slow enough to need it, which flask is not; that needs a different workload.
+**Question.** Experiment 5 found `uv sync` to be 19–33 s of a 40–57 s flask job, on every commit, with a warm uv cache. uv says why: "Failed to hardlink files; falling back to full copy." Is that the runner's doing, and what does it cost?
+
+**The cause.** Each package cache is its own Dagger cache volume, and each volume is its own filesystem. Probed inside a job on the Pi, by `stat` and by trying the link:
+
+| Path | Device |
+|---|---|
+| the uv cache volume | 99 |
+| the pip cache volume | 77 |
+| the npm cache volume | 162 |
+| `/tmp` **and the workspace** | 173 |
+
+A hardlink from any volume to the workspace is refused ("Invalid cross-device link"), and so is one from one volume to another. `/tmp` and the workspace are the same filesystem, so links between *those* work. On a GitHub-hosted runner everything is one disk, so the question never arises.
+
+**What it costs.** Six variants of the same `uv sync` in one job (flask, 84 packages, a 214 MB `.venv`), and the same for pnpm and npm (68 MB of dependencies):
+
+| Warm install | Pi, from the volume | Pi, from a copy on the workspace's filesystem | GitHub |
+|---|---|---|---|
+| uv | **27.0 s** | **0.2 s** | 0.1 s |
+| pnpm | **16.6 s** | 1.4 s | 1.3 s |
+| npm | 1.5 s | — | 1.4 s |
+
+Copying uv's cache onto the workspace's filesystem first takes 4.4 s, so "copy, then install with hardlinks" is 4.6 s against 27 s. Naming the fallback explicitly (`UV_LINK_MODE=copy`) costs the same 25.4 s, which confirms the warning describes what already happens. Even on GitHub's SSD, forcing copy mode costs 5.6 s against 0.1 s.
+
+**Findings.**
+
+1. **The cache volumes make hardlink-based installers slow,** by a factor of 135 for uv and 12 for pnpm on the Pi. It is the runner's design doing it, not the tools.
+2. **npm, Go and Cargo are unaffected:** they copy from their caches anyway, and a bulk copy of the same 68 MB takes 1.5 s. The penalty is not "copying is slow" but that uv and pnpm copy file by file, with verification, down a path they do not expect to take.
+3. **The runner cannot fix this inside Dagger.** Staging the cache into the container at job start needs an exec that reads the volume. Dagger keys an exec on its recipe, not on a mounted volume's content, so that exec would either be cached and serve a stale copy for ever, or carry a per-job value and change every step's cache key after it. Putting the install target inside the volume does work (same device), but it moves a project's `.venv` out of its workspace, which the "workflows run unchanged" goal rules out as a default.
+4. **A workflow can take the fast path itself,** and this is worth documenting (SPEC §6): copy the tool's cache to a path under `RUNNER_TEMP`, which shares the workspace's filesystem, and point the tool at the copy. For flask that is 27 s → 4.6 s.
+
+## 11. Next
+
+- **Test selection for Python,** on a workload that needs it. flask does not: its 493 tests run in under 3 s, and experiment 6 found its job's time to be `uv sync`. A project with slow tests is needed before this question means anything.
+- **Whether the staging recipe (experiment 6) can be made the default** without an exec that reads a volume, which Dagger will not key on content.
 - **The cost of handing a step its inputs:** experiment 5's overhead, measured on its own rather than as a feature's by-product, and on a machine with an SSD as well as the Pi. It decides whether any form of finer keying can pay here.
 - **Engine memory over days:** the 15-minute log under ordinary jobs, to decide whether the cache cap should be lower (8.2).
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
