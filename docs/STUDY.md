@@ -440,11 +440,36 @@ Two designs were tried and discarded before the one that worked, both for reason
 4. **It can move the install target into the cache, where one exists** (10.1): uv's environment now lives there by default, which made a warm `uv sync` faster than a GitHub-hosted runner's, and the symlink kept every way a workflow reaches `.venv` working. Where the target must stay in the workspace, as pnpm's `node_modules` must, only the workflow can avoid the cost.
 5. **Two designs failed first, for one reason:** on Dagger, being on the container's filesystem means being in the cache key, and persisting means being a mount, which means another device. Any fix has to live on one side of that line.
 
-## 11. Next
+## 11. Experiment 7: is the engine the per-step cost?
+
+**Question.** With architecture open to change, would an executor of our own (overlayfs and namespaces directly, as the study's earlier Mac probes suggested) make jobs faster than Dagger does? The answer has to be a number, not a preference.
+
+**Method.** On the Pi, three levels, each with a fresh nonce per measurement so nothing is replayed, and the per-step cost taken as the slope between a 1-step and a 21-step run rather than a total (which would fold in startup):
+
+| Level | Per step | Fixed cost |
+|---|---|---|
+| Raw overlayfs: mount, namespace, exec, unmount, on the SD card | **17.1 ms** | — |
+| **Dagger** (`withExec` chain in one session) | **60–62 ms** | 0.53–0.63 s per session |
+| BuildKit through the Dockerfile frontend (`buildctl --no-cache`) | 207–534 ms | — |
+
+**Dagger is not the slow layer.** Its per-step cost is about 3.5 times a hand-rolled floor, and the gap is 43 ms a step: on a ten-step job, 0.6 s against 0.17 s. Against jobs that take 40–60 s on this machine, that is about 1%. An executor of our own cannot win back more than that on per-step overhead, which is the ground the rewrite case was standing on.
+
+The BuildKit row is **not comparable** and is kept only to be honest about what was run: a Dockerfile `RUN` commits a layer per instruction, while Dagger's `withExec` chain does not, so that row measures more work per step rather than a lower layer doing the same work. Reproducing the study's earlier Mac figures (Dagger ~72 ms a step, BuildKit ~30 ms) would need BuildKit driven through LLB with the same semantics as Dagger's chain.
+
+**Where the fixed cost actually is.** An empty job through the runner takes 2–4 s (experiment 4) while an engine session costs 0.6 s and an empty job spends 0.1 s of engine CPU. So most of a job's floor is the GitHub protocol — registering, claiming, reporting, uploading logs — and not the engine at all. A different executor would not move it.
+
+**Findings.**
+
+1. **Per-step overhead does not justify leaving Dagger:** 43 ms a step against the floor, about 1% of a real job on the reference machine.
+2. **Nor does the job floor:** it is the GitHub protocol, not the engine.
+3. **What did cost real time this week was elsewhere:** the cache volumes' filesystem split (28.6 s a Python job, now 0.5 s, experiment 6) and the engine's memory pressure (the same work taking 1 s or 17 s, experiment 4). Both were found by measuring workloads, not layers.
+4. **One decision-relevant thing is still unmeasured:** what each step costs in *memory and inodes*, not milliseconds. BuildKit's snapshot metadata is the suspect behind experiment 4's pathology, and it is the one dimension where an executor of our own might still win. That, not latency, is where the architecture question should be settled.
+
+## 12. Next
 
 - **Test selection for Python,** on a workload that needs it. flask does not: its 493 tests run in under 3 s, and experiment 6 found its job's time to be `uv sync`. A project with slow tests is needed before this question means anything.
 - **Whether the staging recipe (experiment 6) can be made the default** without an exec that reads a volume, which Dagger will not key on content.
 - **The cost of handing a step its inputs:** experiment 5's overhead, measured on its own rather than as a feature's by-product, and on a machine with an SSD as well as the Pi. It decides whether any form of finer keying can pay here.
 - **Engine memory over days:** the 15-minute log under ordinary jobs, to decide whether the cache cap should be lower (8.2).
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
-- **Breaking down the engine's cost:** Dagger (~720 ms per 10 trivial steps on the Mac), BuildKit alone (~300 ms) and raw overlayfs with namespaces (~35 ms). The BuildKit layer will be split into its parts: runc, snapshot metadata, cgroups, gRPC.
+- **What a step costs in memory and inodes** at each level (experiment 7, finding 4): the dimension on which an executor of our own might still beat Dagger, since latency is not it.
