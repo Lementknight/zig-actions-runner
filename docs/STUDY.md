@@ -379,7 +379,7 @@ v3 is the best version and still loses on both workloads. The per-commit figures
 
 1. **The commit and refs are volatile** (PR #145). That is pure gain, and it is the half of this experiment worth keeping.
 2. **Declared inputs work and do not pay, on this machine with this engine.** Every replay decision was right, and v3 is half v1's cost, but both workloads ran faster without declarations. Experiment 2's estimate of a third saved was computed from step times alone; it did not account for what it costs to hand a container its inputs.
-3. **The two reasons are structural.** The tools' own caches (Go's module and build caches, uv's cache) already make the declarable steps cheap, and the genuinely expensive steps (`go test`, pytest) are the ones a project cannot easily declare. Declaring more steps makes the stack deeper, which the steps after them pay for.
+3. **The two reasons are structural.** The tools' own caches (Go's module and build caches, uv's cache) already make the declarable steps cheap, and the step that dominates each workload is the one a project cannot easily declare or cache (`go test` for Go; for flask, `uv sync`, which must declare `src`). Declaring more steps makes the stack deeper, which the steps after them pay for.
 4. **Where it would pay:** a step that is slow, has no cache of its own, and reads a small, rarely-changing set of files. That is a narrower case than this experiment assumed.
 5. **It is not Dagger's fault alone.** Dagger does key checkout-derived files on content, which is what made v3 possible. What it does not offer is content keys for a step's output, and no copy-free way to re-own files. Driving BuildKit directly is not justified by this: the cheap paths were all reachable from Dagger's API.
 
@@ -387,7 +387,7 @@ The prototype stays on `feat/declared-inputs-v2` with its tests, in case the cos
 
 ## 10. Next
 
-- **Test selection for Python:** experiment 5 found pytest to be most of a flask job's time, and it is the step a project can least easily declare. Pytest has no equivalent of Go's test cache, so every test runs every time; what a runner could do about that is the open question.
+- **Where a Python job's time actually goes.** Not the tests: in experiment 5's control, flask's pytest step was 4–5 s of a 40–57 s job (493 tests run in under 3 s), while `uv sync` was 19–33 s on every commit, with a warm uv cache. uv reports why: "Failed to hardlink files; falling back to full copy", because its cache is a Dagger volume and so a different filesystem from the workspace where `.venv` is built. How much of that step is the copy, and whether a runner can avoid it, is the open question. Test selection matters only for a suite slow enough to need it, which flask is not; that needs a different workload.
 - **The cost of handing a step its inputs:** experiment 5's overhead, measured on its own rather than as a feature's by-product, and on a machine with an SSD as well as the Pi. It decides whether any form of finer keying can pay here.
 - **Engine memory over days:** the 15-minute log under ordinary jobs, to decide whether the cache cap should be lower (8.2).
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
