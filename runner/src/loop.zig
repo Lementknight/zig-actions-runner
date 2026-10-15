@@ -493,6 +493,15 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
         r.jobFinished(job, c.name, if (result.cancelled) "cancelled" else if (result.succeeded) "success" else "failure", job_started_ms, std.Io.Clock.real.now(c.io).toMilliseconds());
         if (r.failures > 0) try c.err.print("run state: {d} database write(s) failed (last: {s})\n", .{ r.failures, r.last_error });
     }
+    // How many steps the engine served from cache, as the step logs say (`dagger.reused_note`):
+    // what step caching saved this job, next to what output keys cost it.
+    if (c.cfg.step_cache and job.steps.len > 0) {
+        var replayed: usize = 0;
+        for (log.collect.lines.items) |l| {
+            if (l.step >= 1 and l.step <= job.steps.len and std.mem.eql(u8, l.text, dagger.reused_note)) replayed += 1;
+        }
+        try c.err.print("job {d}: {d} of {d} steps replayed from the cache\n", .{ job.check_run_id, replayed, job.steps.len });
+    }
     const ok = result.output_keys;
     if (ok.applied + ok.fell_back > 0) {
         try c.err.print("job {d}: output keys: {d} of {d} always-run steps applied", .{ job.check_run_id, ok.applied, ok.applied + ok.fell_back });

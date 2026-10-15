@@ -4922,6 +4922,10 @@ fn fail(sh: *Shared, results: []StepResult, msg: []const u8) !Result {
     return .{ .steps = results, .engine_error = msg, .succeeded = false };
 }
 
+/// The note a replayed step's log ends with. The runner counts it per job (see `loop.zig`), so a
+/// step cached by the engine is visible in the runner's own log, not only in the step's.
+pub const reused_note = "Reused from Dagger's cache: this step's inputs were unchanged since an earlier run, so the output above was recorded then.";
+
 /// Says which steps Dagger served from cache. Decided once the session has ended and the log stream is
 /// fully read, not when a step's output is replayed: the live stream can lag behind a step that did
 /// run, and its lines then arrive (and are dropped as duplicates) after the replay. Only a step none
@@ -4929,7 +4933,7 @@ fn fail(sh: *Shared, results: []StepResult, msg: []const u8) !Result {
 fn noteReusedSteps(sh: *Shared) void {
     for (sh.replayed_steps, 0..) |replayed, idx| {
         if (!replayed or sh.live_lines[idx].load(.monotonic) > 0 or sh.ended[idx].load(.acquire)) continue;
-        sh.append(@intCast(idx + 1), "Reused from Dagger's cache: this step's inputs were unchanged since an earlier run, so the output above was recorded then.");
+        sh.append(@intCast(idx + 1), reused_note);
     }
 }
 
