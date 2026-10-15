@@ -106,6 +106,19 @@ fn runnerCachePath(arena: Allocator, i: usize) ![]const u8 {
     return p;
 }
 
+/// Where uv's project environment goes with `uv_env_in_cache`: inside its own cache volume, the only
+/// place a hardlink from that cache can reach (every mount is its own device, even two of one
+/// volume). Keyed by the ref, so jobs on different branches do not reconcile one environment to
+/// their own lockfiles in turn, and concurrent jobs on one branch want the same state anyway.
+fn uvEnvPath(arena: Allocator, cache_path: []const u8, ref: []const u8) ![]const u8 {
+    var key: std.ArrayList(u8) = .empty;
+    for (if (ref.len > 0) ref else "default") |c| {
+        try key.append(arena, if (std.ascii.isAlphanumeric(c) or c == '.' or c == '-' or c == '_') c else '-');
+    }
+    const trimmed = std.mem.trim(u8, key.items, "-");
+    return std.fmt.allocPrint(arena, "{s}/zig-runner-envs/{s}", .{ cache_path, if (trimmed.len > 0) trimmed else "default" });
+}
+
 fn packageList() []const u8 {
     comptime {
         var out: []const u8 = "";
@@ -809,6 +822,8 @@ pub const Options = struct {
     /// that content, so its key depends on what the step produced, not on the step having run. The
     /// runner turns this on with `RUNNER_OUTPUT_KEYS`.
     output_keys: bool = false,
+    /// `Config.uv_env_in_cache`: uv's project environment goes inside its cache volume.
+    uv_env_in_cache: bool = true,
     /// Stored outputs not produced again for this many days are removed (`RUNNER_OUTPUT_KEYS_DAYS`).
     output_keys_days: u32 = 7,
     /// Set by the runner when GitHub cancels the job.
@@ -2070,6 +2085,13 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     if (job_image.len == 0) return fail(sh, results, try std.fmt.allocPrint(arena, "container: has no image: {s}", .{ev.diag}));
     const provision = opts.provision and std.mem.eql(u8, job_image, default_image);
     const as_runner = provision and opts.step_user == .runner;
+    // uv's project environment, inside its cache volume so uv can hardlink into it (see `uvEnvPath`).
+    const uv_env: ?[]const u8 = blk: {
+        if (!opts.uv_env_in_cache or !opts.package_caches or job.github.repository.len == 0) break :blk null;
+        const i = for (package_cache_dirs, 0..) |d, n| (if (std.mem.eql(u8, d.name, "uv")) break n) else break :blk null;
+        const path = if (job.container != null) package_cache_dirs[i].path else if (as_runner) try runnerCachePath(arena, i) else package_cache_dirs[i].path;
+        break :blk try uvEnvPath(arena, path, job.github.ref);
+    };
     // Package managers' caches persist across jobs in Dagger cache volumes (see `package_cache_dirs`).
     const cache_ids: []const []const u8 = if (opts.package_caches and job.github.repository.len > 0) ids: {
         const scope = try packageCacheScope(arena, &ev, job.github.repository);
@@ -2151,10 +2173,14 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
             // The job's workspace and RUNNER_TEMP, the step user's in the default image (cached per
             // repository). A job container's user may be unable to make them; its steps then report
             // that themselves.
+            // With `uv_env_in_cache`, `.venv` in the workspace is a symlink to the environment in the
+            // cache, so `uv run`, `.venv/bin/...` and `activate` all keep working. The link is made
+            // here, before the checkout, which merges the repository over it and leaves it.
+            const link = if (uv_env) |e| try std.fmt.allocPrint(arena, " && ln -sfn {s} {s}/.venv", .{ e, ev.workspace }) else "";
             const mk = if (provision)
-                try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}", .{ ev.workspace, ev.temp, if (as_runner) " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root else "" })
+                try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}{s}", .{ ev.workspace, ev.temp, link, if (as_runner) " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root else "" })
             else
-                try std.fmt.allocPrint(arena, "mkdir -p {s} {s} 2>/dev/null || true", .{ ev.workspace, ev.temp });
+                try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s} 2>/dev/null || true", .{ ev.workspace, ev.temp, link });
             try w.writeAll("withExec(args:");
             try std.json.Stringify.value([_][]const u8{ "sh", "-c", mk }, .{}, w);
             try w.writeAll(") { ");
@@ -2187,6 +2213,12 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         if (step_cache) {
             try w.writeAll("withVolatileVariable(name:\"" ++ ran_env ++ "\",value:");
             try std.json.Stringify.value(ran_marker, .{}, w);
+            try w.writeAll(") { ");
+            extra_braces += 1;
+        }
+        if (uv_env) |e| {
+            try w.writeAll("withEnvVariable(name:\"UV_PROJECT_ENVIRONMENT\",value:");
+            try std.json.Stringify.value(e, .{}, w);
             try w.writeAll(") { ");
             extra_braces += 1;
         }
@@ -6710,6 +6742,41 @@ test "what a step writes to GITHUB_STEP_SUMMARY is kept for upload" {
     try std.testing.expectEqualStrings("", res.summaries[1]);
     // The query reads the file back.
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "fc_all: file(path:") != null);
+}
+
+test "uv's environment goes in its cache, with a .venv symlink to it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    // Keyed by the ref, with anything else in a path turned into a dash.
+    try std.testing.expectEqualStrings("/home/runner/.cache/uv/zig-runner-envs/refs-heads-main", try uvEnvPath(arena, "/home/runner/.cache/uv", "refs/heads/main"));
+    try std.testing.expectEqualStrings("/c/zig-runner-envs/refs-pull-7-merge", try uvEnvPath(arena, "/c", "refs/pull/7/merge"));
+    try std.testing.expectEqualStrings("/c/zig-runner-envs/default", try uvEnvPath(arena, "/c", ""));
+
+    var env: std.process.Environ.Map = .init(arena);
+    const steps = [_]job_mod.Step{testStep("uv sync")};
+    var job = testJob(&steps);
+    job.github.ref = "refs/heads/main";
+    const vols = "{\"data\":{\"c0\":{\"id\":\"V\"},\"c1\":{\"id\":\"V\"},\"c2\":{\"id\":\"V\"},\"c3\":{\"id\":\"V\"},\"c4\":{\"id\":\"V\"},\"c5\":{\"id\":\"V\"},\"c6\":{\"id\":\"V\"},\"c7\":{\"id\":\"V\"},\"c8\":{\"id\":\"V\"},\"c9\":{\"id\":\"V\"},\"c10\":{\"id\":\"V\"},\"c11\":{\"id\":\"V\"},\"c12\":{\"id\":\"V\"},\"c13\":{\"id\":\"V\"},\"c14\":{\"id\":\"V\"},\"c15\":{\"id\":\"V\"},\"c16\":{\"id\":\"V\"}}}";
+    const answers = [_][]const u8{ vols, base_answer, try exec(arena, "C1", 0, "") };
+    var fake: FakeSession = .{ .answers = &answers, .arena = arena };
+    var buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    var log: sink.LogSink = .{ .stdout = .{ .writer = &w } };
+    const res = try run(arena, std.testing.io, &env, .{ .step_user = .runner, .package_caches = true, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake.transport() }, job, &log);
+    try std.testing.expect(res.succeeded);
+    const base = fake.seen.items[1];
+    const path = "/home/runner/.cache/uv/zig-runner-envs/refs-heads-main";
+    try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"UV_PROJECT_ENVIRONMENT\",value:\"" ++ path ++ "\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, base, "ln -sfn " ++ path ++ " /home/runner/work/r/r/.venv") != null);
+
+    // Off: no variable, no link.
+    var fake2: FakeSession = .{ .answers = &answers, .arena = arena };
+    var w2: std.Io.Writer = .fixed(&buf);
+    var log2: sink.LogSink = .{ .stdout = .{ .writer = &w2 } };
+    _ = try run(arena, std.testing.io, &env, .{ .step_user = .runner, .package_caches = true, .uv_env_in_cache = false, .test_session_argv = &.{ "sh", "-c", fake_child }, .test_transport = fake2.transport() }, job, &log2);
+    try std.testing.expect(std.mem.indexOf(u8, fake2.seen.items[1], "UV_PROJECT_ENVIRONMENT") == null);
+    try std.testing.expect(std.mem.indexOf(u8, fake2.seen.items[1], "ln -sfn") == null);
 }
 
 test "package caches: one volume per tool, keyed by repository, separate for fork pull requests" {
