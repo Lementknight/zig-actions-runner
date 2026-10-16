@@ -49,6 +49,7 @@ jobs:
       - name: Probe the cache
         working-directory: runner
         run: |
+          grep -m1 "model name" /proc/cpuinfo; nproc
           echo "--- restored global cache ---"
           du -sh ~/.cache/zig 2>/dev/null || echo "absent"
           du -sh ~/.cache/zig/* 2>/dev/null | sort -h | tail -5
