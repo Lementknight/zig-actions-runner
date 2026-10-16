@@ -277,6 +277,26 @@ The store had 27 digests after one day of experiments, so it needs pruning. It i
 
 **Still open before this can be on by default:** none of the prototype's known gaps remain. What's left is to run it on the target workloads for a while, with the per-job line showing how often it applies, and to measure the cost of the store on the Pi over days rather than single runs.
 
+### 7.6 The trial on the Pi: what they cost and what they saved
+
+Output keys ran for a trial on the Pi from 2026-10-14, with a line per job for what they cost and (from 2026-10-15) one for how many steps the engine replayed.
+
+**189 jobs.** They applied to every always-run step in 187 of them. Two fell back, both "could not reach the Dagger session: QueryAborted", both while the runner was being stopped to deploy a new binary; each job then ran the ordinary way and succeeded.
+
+| Cost per job | |
+|---|---|
+| median | **4.6 s** |
+| 75th percentile | 8.6 s |
+| 90th percentile | 20.3 s |
+| worst | 91 s |
+| over 30 s | 9 jobs |
+
+**The cost follows the size of the job's filesystem, not of what the step changed.** The phases on a hugo checkout: 14.7 s to build the container before the step, 10.4 s to diff it, and 0.4 s to store and copy what `setup-go` actually changed. A small checkout spends about 1 s on the same two walks. The two worst jobs in the trial, 78 s and 84 s, were hugo's. The same walks took 1.2 s on a later hugo job with a fresh engine, so page-cache health matters as much as size (§8.2).
+
+**What they saved, from 42 jobs with both lines:** 29 steps replayed out of 166, two jobs replayed every step, and 34 of 42 replayed none. That sample is unkind to the feature — nearly every job was a fresh commit pushed by these experiments, which is the worst case — but it does show the saving is conditional while the cost is paid in every job.
+
+**So they stay off by default,** and they now stop themselves: when a job spends more than `RUNNER_OUTPUT_KEYS_MAX_MS` (10 s) on them, the runner says so once and later jobs for that repository skip them. Verified on the Pi with the limit set to 0.5 s: the first job logged "1.4 s is over the 0.5 s limit, so ...'s later jobs skip them", and the next job had no output-key work at all and still replayed steps. Nothing cheap tells the runner a workspace is large in advance — Dagger's `Directory` has no size — so the limit is what it measures.
+
 ## 8. Experiment 4: the overhead floor and the engine's memory on the Pi
 
 **Questions.** What does the runner itself cost on a job that does almost nothing? And why do first runs on the Pi spend 25–30% of their time waiting on the SD card?
