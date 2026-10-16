@@ -169,9 +169,11 @@ data _∈_ {A : Set} (x : A) : List A → Set where
   here  : {xs : List A} → x ∈ (x ∷ xs)
   there : {y : A} {xs : List A} → x ∈ xs → x ∈ (y ∷ xs)
 
+-- Constructors named apart from the list's: overloading them compiles on some
+-- Agda versions and not others, which is not a thing to find out in CI.
 data All {A : Set} (P : A → Set) : List A → Set where
-  []  : All P []
-  _∷_ : {x : A} {xs : List A} → P x → All P xs → All P (x ∷ xs)
+  all[] : All P []
+  all∷  : {x : A} {xs : List A} → P x → All P xs → All P (x ∷ xs)
 
 any : {A : Set} → (A → Bool) → List A → Bool
 any p []       = false

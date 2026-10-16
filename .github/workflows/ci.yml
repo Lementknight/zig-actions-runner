@@ -9,6 +9,8 @@ on:
 
 env:
   ZIG_VERSION: "0.17.0"
+  # The Agda the proofs are checked with, here and in the hooks (proofs/check.sh reads it from here).
+  AGDA_VERSION: "2.7.0"
 
 jobs:
   unit:
@@ -43,18 +45,22 @@ jobs:
 
   proofs:
     name: Agda proofs of the step cache
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: setup-agda's prebuilt binaries are built per image, and 22.04 is the newest
+    # the pinned version has, so this is the image whose binary is used rather than built.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      # Ubuntu's own Agda, not a third-party action: the proofs use no standard library, so a plain
-      # type-checker is all they need. The version is in the log, since a failure here is as likely
-      # to be a difference between Agda releases as a broken proof.
-      - name: Install Agda
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends agda
-          agda --version
+      # Pinned by commit, not by tag, so the action cannot change under us; the tag is v2.5.0.
+      # Ubuntu's apt Agda was 2.6.3, two and a half years behind the one installed locally, and the
+      # proofs type-checked on one and not the other. One named version on both ends instead:
+      # AGDA_VERSION above, and proofs/check.sh prefers the same one.
+      - name: Install Agda ${{ env.AGDA_VERSION }}
+        uses: wenkokke/setup-agda@52f1e708494c8717630b3e1378383b01a56a379c
+        with:
+          agda-version: ${{ env.AGDA_VERSION }}
+          # The proofs use no library, so do not fetch or configure one.
+          agda-stdlib-version: none
 
       # Every module is --safe, so a clean run is the whole claim; see proofs/README.md.
       - name: Check the proofs
