@@ -72,6 +72,11 @@ pub const Config = struct {
     /// cannot be replayed with an earlier run's value. On by default, and a deliberate divergence
     /// from GitHub's runner: see SPEC "Where this runner differs from GitHub's".
     enforce_volatile: bool = true,
+    /// Where a job's log is spooled while it runs, so the copy the upload reads is not held in
+    /// memory for the length of the job (see `sink.Spool` and docs/RELATED.md, "Streaming a step's
+    /// output"). Empty keeps the lines in memory, as before. A directory the runner cannot write to
+    /// is reported once and then ignored, because logging must never fail a job.
+    log_spool_dir: []const u8 = "/tmp",
     /// Put uv's project environment inside its cache volume, so uv can hardlink into it instead of
     /// copying every file (28.6 s against 0.2 s on a Raspberry Pi; see SPEC Â§6 "Package caches").
     /// The workspace gets a `.venv` symlink to it, so paths into `.venv` still work.
@@ -125,6 +130,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_STEP_USER")) |v| c.step_user = try stepUser(v);
         if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
         if (environ.get("RUNNER_ENFORCE_VOLATILE")) |v| c.enforce_volatile = try boolean(v);
+        if (environ.get("RUNNER_LOG_SPOOL_DIR")) |v| c.log_spool_dir = v;
         if (environ.get("RUNNER_UV_ENV_IN_CACHE")) |v| c.uv_env_in_cache = try boolean(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_MAX_MS")) |v| c.output_keys_max_ms = try millis(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_DAYS")) |v| c.output_keys_days = try count(v);
@@ -181,6 +187,7 @@ pub const Config = struct {
             else if (std.mem.eql(u8, key, "step-user")) c.step_user = try stepUser(val) //
             else if (std.mem.eql(u8, key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
             else if (std.mem.eql(u8, key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
+            else if (std.mem.eql(u8, key, "log-spool-dir")) c.log_spool_dir = val //
             else if (std.mem.eql(u8, key, "enforce-volatile")) c.enforce_volatile = try boolean(val) //
             else if (std.mem.eql(u8, key, "output-keys")) c.output_keys = try boolean(val) //
             else if (std.mem.eql(u8, key, "output-keys-days")) c.output_keys_days = try count(val) //

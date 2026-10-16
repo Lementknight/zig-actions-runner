@@ -104,6 +104,68 @@ steps from a cache can *hide* flakiness by construction — a replayed flaky tes
 that interacts with P1 in MEASURE.md. And the workflow corpora in those papers are a better source of
 realistic test workloads than the six projects chosen by hand in STUDY.md §2.
 
+## Streaming a step's output
+
+A different subsystem, with its own prior art: how a runner gets a step's log off the machine while
+the step is still running, without losing the end of it. Ours keeps a job's lines in memory (64 MB
+cap), batches them to GitHub's WebSocket feed every 500 ms with a per-step `startLine`, and uploads
+blobs when the job ends. Two of the bugs in STUDY.md came from that shape — a dead connection handed
+back to a shared pool, and a step's output arriving after its end marker — and the shape is also why
+a crashed or redeployed runner loses a job's log entirely.
+
+Five systems, five patterns worth stealing from:
+
+- **Buildkite's agent cuts the log into numbered chunks and retries them one at a time.** Its API
+  type is `Chunk{Data, Sequence, Offset, Size}`, gzipped, `POST jobs/:id/chunks?sequence=&offset=&size=`
+  ([api/chunks.go](https://github.com/buildkite/agent/blob/main/api/chunks.go)); the streamer takes
+  `Concurrency`, `MaxChunkSizeBytes` and `MaxSizeBytes` and counts the chunks it failed to send
+  ([agent package](https://pkg.go.dev/github.com/buildkite/agent/v3/agent)), which is exported as
+  `buildkite_agent_logs_chunk_uploads_errored_total`
+  ([monitoring](https://buildkite.com/docs/agent/v3/monitoring)). It can spool the job log to a file
+  (`--enable-job-log-tmpfile`), emit logs as OpenTelemetry records, and takes a grace period to
+  finish uploading after the job process exits (`--cancel-cleanup-timeout`)
+  ([cli-start](https://buildkite.com/docs/agent/v3/cli-start)). *One failure costs one chunk.*
+
+- **GitLab's runner lets the server own the offset.** It PATCHes `/api/v4/jobs/:id/trace` with a
+  `Content-Range` ([MR 906](https://gitlab.com/gitlab-org/gitlab-runner/-/merge_requests/906)), and
+  when the server already holds bytes it answers **416 with its length** so the client can skip
+  ahead. The cautionary half is [issue #4548](https://gitlab.com/gitlab-org/gitlab-runner/-/issues/4548):
+  `range mismatch … job-log=0-16359 sent-log=19720-23513`, where a buffer that does not begin at
+  those bytes diverges quietly. *Ask where to resume; make a mismatch loud.*
+
+- **Airflow treats the local file as the source of truth.** `FileTaskHandler` writes
+  `dag_id=…/run_id=…/task_id=…/attempt=N.log` under `base_log_folder`; because "most task handlers
+  send logs upon completion", a small HTTP server (8793 on workers, 8794 on the triggerer) serves
+  them live until then, and `remote_logging` ships them afterwards, with `delete_local_logs` to clean
+  up. Blob handlers **interleave by timestamp** when a log's pieces end up in several places
+  ([logging tasks](https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/logging-tasks.html)).
+  *The network is a view of a durable spool, not the only copy.*
+
+- **Dagger makes a log an event on a span.** `dagger.io/dagger/telemetry` converts OTLP
+  `ResourceSpans` to and from SDK spans and exposes configured span, log and metric exporters, with
+  span options (`Encapsulate`, `Internal`, `Boundary`) deciding how the progress UI nests them
+  ([telemetry package](https://pkg.go.dev/dagger.io/dagger/telemetry)); OTel log records carry
+  `trace_id` and `span_id` ([logs spec](https://opentelemetry.io/docs/specs/otel/logs/)).
+  *Attribution comes from identifiers, never from arrival time* — which this runner already relies on
+  (`SpanDemux` routes a line to a step by span) and which is why its "was this step replayed?" guess
+  had to be replaced by a marker the step writes.
+
+- **Concourse keeps the log as a durable event table.** Build events live in Postgres — `build_events`
+  plus a `pipeline_build_events_<id>` table per pipeline — and are served to `fly` and the UI
+  ([#2104](https://github.com/concourse/concourse/issues/2104)); the SSE `id` is the resume cursor
+  ([log-tailing patterns](https://www.server-sent-events.com/real-time-application-patterns/log-tailing-and-ci-output-streaming/)).
+  The price is visible: multi-GB tables and ~50 GiB of Postgres reported even with retention set
+  ([#6892](https://github.com/concourse/concourse/issues/6892)). *Replayable from a cursor, paid for
+  in storage.*
+
+What they agree on, and this runner did not: **the unit of a log is a numbered record in an
+append-only stream, written somewhere durable before it is sent, and shipped with retries that are
+idempotent because the number says where they belong.** Nobody streams from a buffer that only exists
+in the sender's memory. The first two steps towards that here are a per-step sequence number assigned
+when a line is logged rather than when it is sent, and a spool file per job in place of the
+in-memory buffer; chunked, resumable upload is the third and needs to know what GitHub's results
+service accepts.
+
 ## What this implies, shortest form
 
 1. **Trace, do not declare,** if "hits across commits" is ever re-opened (Riker, Rattle).
