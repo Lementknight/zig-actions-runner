@@ -47,10 +47,12 @@ negative control as well: medians 6.204 s and 6.224 s, CI [−0.284, +0.437], `n
 spread (sd 0.29) asked for three repetitions an arm, not the nineteen a warm-up round's provisioning
 made it look like before `dimension` learned to exclude warm-ups.
 
-**All three are transcriptions, not measurements**, and they are here for one reason: the harness has
-to agree with answers that are already known before it is trusted with answers that are not. They
-carry no environment capture, no windows and no tokens, because the runs that produced them recorded
-none — which is itself the finding.
+## The transcriptions, and why they are here
+
+The three `E7.6*`/`E7.7-gogc-steps` files are **transcriptions, not measurements**, and they exist
+for one reason: the harness had to agree with answers that were already known before it was trusted
+with answers that were not. They carry no environment capture, no windows and no tokens, because the
+runs that produced them recorded none — which is itself the finding.
 
 What the harness says about them:
 
