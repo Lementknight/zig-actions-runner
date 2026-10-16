@@ -9,7 +9,7 @@ measured, on what, against what, how many times, and how to run it again — and
 one be marked unverified and not used to justify a change. This is that register, built by reading
 STUDY.md against §3.2 after the fact.
 
-**62 claims: 17 verified, 32 under-powered, 8 unverified, 2 superseded, 2 proved, 1 withdrawn.** The
+**62 claims: 18 verified, 32 under-powered, 7 unverified, 2 superseded, 2 proved, 1 withdrawn.** The
 one-line summary: *little here is wrong, and little is measured to the standard MEASURE.md sets.* The
 large effects — 135× on uv's install, 20× on a re-run, 37× on a warm Go job — are far beyond any
 plausible noise and can be relied on in direction and order of magnitude. The small ones cannot, and
@@ -154,7 +154,7 @@ independently by arithmetic. The samples are in [measurements/](../measurements/
 | E7.4 | 100 steps keep ~202 snapshots, ~1,206 inodes and 13 MB of disk (about 2, 12 and 131 KB a step) | 100 trivial steps · Pi | 2 × 1 batch | under-powered |
 | E7.5 | the +279 MB per 100 steps was mostly Go garbage, not a live index; the live set is a couple of hundred MB | 6 more batches of 100 · Pi | 1 × 6 | **verified** — the repeat is the evidence, and it overturned the first reading |
 | E7.6 | `GOGC=400` buys nothing measurable on a four-long-step job and costs ~225 MB of heap | flask, fresh engine per arm · Pi | 2 × (1 cold + 3 warm) | **verified** as a null result — repeated, and correctly reported as "no effect found" rather than a trend |
-| E7.7 | `GOGC=400` saves roughly 15–20% of engine CPU once a job has many steps (6 s against 7 s over 40 steps) | 40 trivial steps · Pi | 2 × 3 rounds | **unverified** as quantified — 15–20% is a 1 s difference on a counter read either side, with no interval, after two attempts that were wrong by 3× (18 s, 22 s). The *direction* is supported by both attempts; the size is not, and it is what DEPLOY.md's "Sizing" cites |
+| E7.7 | `GOGC=400` saves ~15% of engine CPU on a step-heavy job (0.90 s of 5.93 s) | 40 trivial steps, each carrying the trial's token · Pi | 2 × 3, interleaved, engine recreated per trial | **verified** — median 5.926 s against 6.825 s, difference +0.899 s, 95% CI [0.751, 1.456] (12.7% to 24.6%); re-run: `measurements/e7.7/` |
 | E7.8 | nothing measured — latency, floor, retained state or memory — supports replacing Dagger | E7.1–E7.6 | — | under-powered — a conclusion from the above, no stronger than E7.1 |
 
 ## §12 Experiment 8 — test selection for Python
@@ -168,8 +168,8 @@ independently by arithmetic. The samples are in [measurements/](../measurements/
 
 ## What this says to do next
 
-1. **Stop citing the eight unverified claims** until they are re-checked: W.5, E2.7, E3.4, E5.4, E5.6, E6.4, E7.7, E8.3. Two are load-bearing in documents outside the study — E6.4 in [SPEC.md](SPEC.md) §6 ("faster than GitHub's") and E7.7 in [DEPLOY.md](DEPLOY.md) ("Sizing") — and should be softened there until then.
-2. **E7.7 first**, because it is the only unverified claim that currently decides a deployed setting. It needs the dimensioning experiment of §3.2(5): the variability of a 40-step job's engine CPU, then enough rounds for a 15% difference, interleaved.
+1. **Stop citing the seven unverified claims** until they are re-checked: W.5, E2.7, E3.4, E5.4, E5.6, E6.4, E8.3. One is load-bearing outside the study — E6.4 in [SPEC.md](SPEC.md) §6 ("faster than GitHub's") — and is softened where it is cited. **E7.7 has been re-checked and holds**: it was the first claim through the harness, and the measurement is in `measurements/E7.7-gogc-measured.jsonl`.
+2. ~~**E7.7 first**, because it is the only unverified claim that currently decides a deployed setting.~~ **Done.** The pilot put a 40-step job's engine CPU at 6.2 s with sd 0.29, so dimensioning asked for three repetitions rather than the nineteen a warm-up round's provisioning made it look like; three interleaved rounds an arm, each recreating the engine, settled it in 13 minutes.
 3. **Then E6.4 and W.5**, the two "faster than a hosted runner" claims. Both are single samples with margins under 30%, across machines we do not control, and both are quotable in a way that invites being quoted.
 4. **The harness before the rest.** Four commands in this repository cover a handful of the 62 claims; re-checking any of the others means writing the measurement again from the prose. That is MEASURE.md stage 2, and E7.6 and E3.5 are what to validate it against, their answers being known.
 5. **Nothing here asks for a design change.** No verdict moved a conclusion: the two decisions resting on unverified numbers (`GOGC=400`, and "faster than a hosted runner" in the docs) are a setting and a sentence, not an architecture. The findings carrying real weight — E6.1's filesystem split, E2.2's secret rule, E5.5's declared-inputs cost — are proved, verified, or very large.
