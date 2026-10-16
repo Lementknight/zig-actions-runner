@@ -46,6 +46,40 @@ pub const Context = struct {
     name: []const u8,
     /// Where run state is written (SPEC §5.2); null when the runner has no database.
     store: ?*db.Store = null,
+    /// Shared by the pool: repositories whose output-key work ran over the limit.
+    slow_outputs: ?*SlowOutputs = null,
+};
+
+/// Output keys cost two walks of the job's filesystem whatever the step changed, so they are cheap
+/// on a small checkout and not on a large one (25 s against 1 s, STUDY.md §3.6). When a job spends
+/// more than `Config.output_keys_max_ms` on them, this remembers the repository and later jobs skip
+/// them, until the runner restarts. Shared by every runner in the pool.
+pub const SlowOutputs = struct {
+    mu: std.Io.Mutex = .init,
+    io: std.Io,
+    gpa: Allocator,
+    /// Repository to the milliseconds that put it here.
+    repos: std.StringHashMapUnmanaged(i64) = .empty,
+
+    /// The milliseconds a job spent, when this repository is already known to be slow.
+    pub fn spent(so: *SlowOutputs, repo: []const u8) ?i64 {
+        so.mu.lockUncancelable(so.io);
+        defer so.mu.unlock(so.io);
+        return so.repos.get(repo);
+    }
+
+    /// Remembers a repository whose job went over. True the first time, so the caller logs it once.
+    pub fn record(so: *SlowOutputs, repo: []const u8, ms: i64) bool {
+        so.mu.lockUncancelable(so.io);
+        defer so.mu.unlock(so.io);
+        if (so.repos.contains(repo)) return false;
+        const key = so.gpa.dupe(u8, repo) catch return false;
+        so.repos.put(so.gpa, key, ms) catch {
+            so.gpa.free(key);
+            return false;
+        };
+        return true;
+    }
 };
 
 fn say(c: Context, comptime fmt: []const u8, args: anytype) !void {
@@ -72,9 +106,13 @@ pub const Cycle = union(enum) {
 /// once every runner has stopped: the most severe exit code among them.
 pub fn pool(c: Context, n: u32) !Exit {
     const slots = try c.arena.alloc(Slot, n);
+    // One per process, so what one runner learns about a repository the others use too.
+    const slow = try c.arena.create(SlowOutputs);
+    slow.* = .{ .io = c.io, .gpa = c.gpa };
     var group: std.Io.Group = .init;
     for (slots) |*s| {
         s.* = .{ .c = c };
+        s.c.slow_outputs = slow;
         group.concurrent(c.io, Slot.main, .{s}) catch |e| {
             try c.err.print("could not start {d} runners: {s}\n", .{ n, @errorName(e) });
             group.cancel(c.io);
@@ -456,7 +494,8 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
             .package_caches = c.cfg.package_caches,
             .step_cache = c.cfg.step_cache,
             .step_user = c.cfg.step_user,
-            .output_keys = c.cfg.output_keys,
+            // Skipped for a repository whose jobs spend too long on them (see `SlowOutputs`).
+            .output_keys = c.cfg.output_keys and (if (c.slow_outputs) |so| so.spent(job.github.repository) == null else true),
             .output_keys_days = c.cfg.output_keys_days,
             .cancel = &cancel,
             .observer = observer: {
@@ -509,6 +548,12 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
         try c.err.print(" in {d}.{d} s", .{ ms / 1000, ms % 1000 / 100 });
         if (ok.fell_back > 0) try c.err.print("; {d} fell back (last: {s})", .{ ok.fell_back, ok.last_reason });
         try c.err.writeAll("\n");
+        // Over the limit: the rest of this repository's jobs do without them (see `SlowOutputs`).
+        const cap = c.cfg.output_keys_max_ms;
+        if (cap > 0 and ok.ms > cap and job.github.repository.len > 0) if (c.slow_outputs) |so| {
+            if (so.record(job.github.repository, ok.ms))
+                try c.err.print("job {d}: output keys: {d}.{d} s is over the {d}.{d} s limit, so {s}'s later jobs skip them (RUNNER_OUTPUT_KEYS_MAX_MS)\n", .{ job.check_run_id, ms / 1000, ms % 1000 / 100, cap / 1000, cap % 1000 / 100, job.github.repository });
+        };
     }
     const shown = try shownSteps(c.arena, live.ids, job, result, job_started_ms, .{ .log_step = complete_step, .started_ms = complete_started, .completed_ms = std.Io.Clock.real.now(c.io).toMilliseconds() });
     try uploadLogs(c, job, shown, log.collect.lines.items, result.summaries, log.currentSecrets());
@@ -940,6 +985,23 @@ test "backoffSecs doubles from 5s up to 5 minutes" {
     try std.testing.expectEqual(@as(u32, 160), backoffSecs(6));
     try std.testing.expectEqual(@as(u32, 300), backoffSecs(7));
     try std.testing.expectEqual(@as(u32, 300), backoffSecs(1000));
+}
+
+test "a repository whose output keys run over the limit is remembered once" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    var so: SlowOutputs = .{ .io = std.testing.io, .gpa = std.testing.allocator };
+    defer {
+        var it = so.repos.keyIterator();
+        while (it.next()) |k| std.testing.allocator.free(k.*);
+        so.repos.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(so.spent("o/r") == null);
+    try std.testing.expect(so.record("o/r", 25_600)); // the first job over the limit says so
+    try std.testing.expect(!so.record("o/r", 30_000)); // later ones stay quiet
+    try std.testing.expectEqual(@as(?i64, 25_600), so.spent("o/r"));
+    // Another repository is unaffected: the cost follows the checkout's size, not the runner's.
+    try std.testing.expect(so.spent("o/small") == null);
 }
 
 test "the steps GitHub shows: Set up job, pre, the job's steps, post, Complete job, numbered in order" {
