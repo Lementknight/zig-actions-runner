@@ -21,6 +21,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The first `zig build` of this job takes 80-100 s, and it is not the thing it builds: with
+      # every cache cold, compiling the tool alone (`zig build-exe`) is 4 s against 59 s through
+      # `zig build`, so the cost is compiling the build runner — build.zig against std — for the
+      # host. Whichever step runs `zig build` first pays it; the next one takes seconds.
+      #
+      # Caching it does not work, and this is the record of four attempts so it is not tried a
+      # fifth time: restoring ~/.cache/zig (61 MB, complete), then also the Zig installation, then
+      # also runner/.zig-cache (121 MB in all, restored in 3 s) each left the compile at 1m18-1m38,
+      # with the global cache growing afterwards — Zig rejects the restored manifests and redoes the
+      # work. It is not the runner's CPU either: two runs on the same model, both cache hits, both
+      # recompiled. Whatever identifies that compilation survives neither a tar restore nor a fresh
+      # checkout, which makes it a Zig question rather than a workflow one.
       - name: Install Zig
         run: |
           arch=$(uname -m)
@@ -89,6 +101,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The first `zig build` of this job takes 80-100 s, and it is not the thing it builds: with
+      # every cache cold, compiling the tool alone (`zig build-exe`) is 4 s against 59 s through
+      # `zig build`, so the cost is compiling the build runner — build.zig against std — for the
+      # host. Whichever step runs `zig build` first pays it; the next one takes seconds.
+      #
+      # Caching it does not work, and this is the record of four attempts so it is not tried a
+      # fifth time: restoring ~/.cache/zig (61 MB, complete), then also the Zig installation, then
+      # also runner/.zig-cache (121 MB in all, restored in 3 s) each left the compile at 1m18-1m38,
+      # with the global cache growing afterwards — Zig rejects the restored manifests and redoes the
+      # work. It is not the runner's CPU either: two runs on the same model, both cache hits, both
+      # recompiled. Whatever identifies that compilation survives neither a tar restore nor a fresh
+      # checkout, which makes it a Zig question rather than a workflow one.
       - name: Install Zig
         run: |
           arch=$(uname -m)
