@@ -2,7 +2,7 @@
 
 Status: in progress · Reference machine: Raspberry Pi 5 (4 cores, 8 GB, SD card) · Companion: [DESIGN.md](DESIGN.md), [SPEC.md](SPEC.md)
 
-How a claim here must be produced, and what the caching algorithms must prove rather than measure, is in [MEASURE.md](MEASURE.md); claims made before it are being re-checked against it.
+How a claim here must be produced, and what the caching algorithms must prove rather than measure, is in [MEASURE.md](MEASURE.md). Every claim below is registered in [CLAIMS.md](CLAIMS.md) with what it rests on and a verdict; the eight the register marks **unverified** are marked here too, and may not be used to justify a change until they are re-checked.
 
 This study decides how the runner should execute steps. Today every step runs through Dagger; the alternatives are BuildKit directly, or an executor of our own in Zig. Rather than pick by intuition, each part of the problem is measured on its own, and each design choice is written down with what it gains and what it gives up.
 
@@ -53,7 +53,7 @@ The larger Go and Python projects were added for two questions the smaller ones 
 | sqlalchemy: 9,300 tests (`test/base test/sql`) | 81.2 s | — | 42.7 s |
 
 - **The package cache volumes are worth most on a big build.** hugo's module download went 35.8 s → 0.2 s and its build 195 s → 8.7 s once the Go module and build caches were warm, which is the whole point of keeping them per repository. The module cache alone is 1.1 GB for this one project.
-- **Installing is now faster here than on a hosted runner** (21.0 s against 28.2 s): the environment lives in uv's cache volume so uv hardlinks into it (experiment 6), and the registry is warm, while the hosted runner downloads from PyPI each time.
+- **Installing took less time here than on a hosted runner** (21.0 s against 28.2 s; one sample each, so *unverified* — CLAIMS.md W.5): the environment lives in uv's cache volume so uv hardlinks into it (experiment 6), and the registry is warm, while the hosted runner downloads from PyPI each time.
 - **Tests dominate a large Python job, where they did not in a small one:** 81 s of sqlalchemy's 205 s, against 3 s for flask's whole suite. That is the workload the test-selection question needs.
 - **hugo's own test suite is not usable as a workload:** `go test ./...` fails on a hosted runner as well as here (`TestNPMGlobalInstalls` and others want npm and more tooling installed), and takes over 40 minutes on the Pi. The study measures its build and `vet` instead.
 
@@ -164,7 +164,7 @@ The persistent cache volumes are mounted at the default image's paths (`/root/go
 | before | 60–74 s | 35–45 s | 33–44 s |
 | after, warm | 16–24 s | 0–1 s | 18–26 s |
 
-The choice of path turned out to matter. The first version mounted the volumes at a new directory (`/var/cache/zig-runner/...`). Go keys compiled packages partly on their source directory, so moving the module cache invalidated every compiled dependency. The first job's `go vet` took 96 s (313 s of engine CPU), and the first job on a commit with new module versions took 122 s. Keeping the default image's paths, so that every image puts modules in the same place, halved that warm-up (150 s and 60 s) by sharing what earlier default-image jobs had compiled. The other half probably comes from a different Go patch version between the image and setup-go; I haven't verified it.
+The choice of path turned out to matter. The first version mounted the volumes at a new directory (`/var/cache/zig-runner/...`). Go keys compiled packages partly on their source directory, so moving the module cache invalidated every compiled dependency. The first job's `go vet` took 96 s (313 s of engine CPU), and the first job on a commit with new module versions took 122 s. Keeping the default image's paths, so that every image puts modules in the same place, halved that warm-up (150 s and 60 s) by sharing what earlier default-image jobs had compiled. The other half probably comes from a different Go patch version between the image and setup-go; that is *unverified* (CLAIMS.md E2.7).
 
 ### Findings
 
@@ -233,7 +233,7 @@ Experiment 2's `setup-go` workflow (go-task/task at 6 commits), on the Pi. The f
 | Re-run, input keys (experiment 2) | 22–27 s | 17–26 s |
 | **Re-run, flag on** | **4–6 s** (first job 18 s) | **0.7–1.6 s** (first job 4.4 s) |
 
-In the re-run, `setup-go` runs, as a step with the token must, produces the same digest, and the six steps after it are replayed. A first run costs about the same as without output keys. The exception is the first job to store a new digest, which takes about 10 s more.
+In the re-run, `setup-go` runs, as a step with the token must, produces the same digest, and the six steps after it are replayed. A first run costs about the same as without output keys — *unverified* at this precision: the two ranges overlap on one sample per commit (CLAIMS.md E3.4). The exception is the first job to store a new digest, which takes about 10 s more.
 
 **Concurrent jobs.** In a run of the same matrix three legs at a time, an always-run step wrote the run's commit SHA, so every leg produced the same new digest. All six jobs succeeded. The store ended up with one directory for the digest, containing only what the step wrote, and no leftover temporary directories. The legs started in the same second, but this does not prove their store calls overlapped: a leg that arrives late finds the directory and skips. It does show the concurrent path is safe.
 
@@ -402,7 +402,7 @@ Two more measurements decided the design, both on the Pi, where the SD card make
 | `withDirectory` with `owner:` (so the step user can write it) | **21 s**, then 1–2 s while the source is unchanged |
 | `withMountedDirectory` | 1–2 s |
 
-**Three method notes.** The first three rounds of the content probe were invalid: in bash, `$RANDOM` inside a pipeline or `$(...)` is evaluated in a subshell, and a subshell of a shell that never used `$RANDOM` gets the same value every time, so the "different" trials sent identical commands and every replay looked like content keying. The control caught it. Second, the `owner` probe had to run on the Pi: on the Mac every variant took 1–2 s, which would have been read as "owner is free". Third, that probe reused one source directory across its rounds, so it measured a cached ownership pass and understated what a *new* directory costs; the real runs showed that.
+**Three method notes.** The first three rounds of the content probe were invalid: in bash, `$RANDOM` inside a pipeline or `$(...)` is evaluated in a subshell, and a subshell of a shell that never used `$RANDOM` gets the same value every time, so the "different" trials sent identical commands and every replay looked like content keying. The control caught it. Second, the `owner` probe had to run on the Pi: on the Mac every variant took 1–2 s, which would have been read as "owner is free". Third, that probe reused one source directory across its rounds, so it measured a cached ownership pass and understated what a *new* directory costs; the real runs showed that, so the 21 s figure is *unverified* as the cost of a new directory (CLAIMS.md E5.4).
 
 ### 9.3 Three versions, and what each cost
 
@@ -421,7 +421,7 @@ Two more measurements decided the design, both on the Pi, where the SD card make
 
 v3 is the best version and still loses on both workloads. The per-commit figures say why.
 
-**flask.** A commit that leaves the declared inputs alone saves about 22 s; one that changes them costs about 31 s. So the feature needs about **three commits in five** to leave the expensive step's inputs alone. This sample had one in three. And `uv sync` must declare `src`, because flit reads the version from `src/flask/__init__.py`, so almost every commit re-runs it, and the three steps after it each take in its new `.venv`.
+**flask.** A commit that leaves the declared inputs alone saves about 22 s; one that changes them costs about 31 s. So the feature needs about **three commits in five** to leave the expensive step's inputs alone (*unverified*: an estimate from single samples — CLAIMS.md E5.6). This sample had one in three. And `uv sync` must declare `src`, because flit reads the version from `src/flask/__init__.py`, so almost every commit re-runs it, and the three steps after it each take in its new `.venv`.
 
 **go-task.** With the tool caches warm, the control's `go mod download` is 1 s on every commit: the step the feature was meant to rescue is already free. `go vet` is the one real win, 2 s replayed against 8–24 s. But `go test`, which declares nothing, cost 27–65 s against the control's 18–27 s. Its container is now a stack of the declared steps' layers, and materialising that stack costs more than the control's simple chain. **The overhead is not confined to declared steps: it falls on the steps after them too.**
 
@@ -478,7 +478,7 @@ Two designs were tried and discarded before the one that worked, both for reason
 | fallback warnings | none (was 2) | none |
 | `uv run`, `.venv/bin/python`, `activate`, `.venv/bin/pytest` | all work, 134 tests pass | same |
 
-**The fidelity cost did not materialise.** Relocating the environment was expected to break `.venv/bin/...` and `source .venv/bin/activate`; through the symlink both work, as does pytest run from it. A warm sync is now faster than a GitHub-hosted runner's. The real costs are that environments accumulate in the volume, one per ref, until it is pruned, and that `RUNNER_UV_ENV_IN_CACHE=false` exists for anyone it surprises.
+**The fidelity cost did not materialise.** (That a warm sync beats a hosted runner's 0.8 s is *unverified*: a 0.3 s margin, one sample each — CLAIMS.md E6.4.) Relocating the environment was expected to break `.venv/bin/...` and `source .venv/bin/activate`; through the symlink both work, as does pytest run from it. A warm sync is now in the same range as a hosted runner's, where it had been fifty times slower. The real costs are that environments accumulate in the volume, one per ref, until it is pruned, and that `RUNNER_UV_ENV_IN_CACHE=false` exists for anyone it surprises.
 
 **pnpm cannot be fixed this way.** `node_modules` has to be in the workspace for imports to resolve, so there is nowhere hardlink-reachable to put it. It still pays 16.6 s against 1.4 s, and only its workflow can avoid that, by copying the store under `RUNNER_TEMP`.
 
@@ -570,7 +570,7 @@ Three arms on the Pi, each a fresh engine (so an empty step cache) and the same 
 | `GOGC=400` | **6 s** (a first attempt measured 18 s) |
 | `GOGC=100` | **7 s** (a first attempt measured 22 s) |
 
-So `GOGC=400` does save roughly 15–20% of the engine's CPU once a job has many steps, which is what it was chosen for, and the default stands. Reading it cost two attempts: the first sampled CPU after a short job had already finished, and the second matched a stale run on its first round, shifting every reading by one. Both attempts agree on the direction and the rough size, which is what the decision needed.
+So `GOGC=400` does save engine CPU once a job has many steps, which is what it was chosen for, and the default stands. The **size** is *unverified* — 15–20% is a 1 s difference read off a counter, with no interval, after two attempts that were wrong by three times (CLAIMS.md E7.7 says what would settle it). Reading it cost two attempts: the first sampled CPU after a short job had already finished, and the second matched a stale run on its first round, shifting every reading by one. Both attempts agree on the direction and the rough size, which is what the decision needed.
 
 **What it is paying for that.** About 225 MB of heap held, out of a 4 GB cap, on a machine with 8 GB shared with other services. That is the trade: CPU on step-heavy jobs against headroom for page cache (§8.2's pathology). The Pi runs the documented `GOGC=400`.
 
@@ -601,7 +601,7 @@ So `GOGC=400` does save roughly 15–20% of the engine's CPU once a job has many
 
 **Selection is a bad trade here, and the reason is the tracing.** Running tests under testmon costs about four times what running them plainly does, so the moment a change touches something widely used — 79% of the suite for one core module — selection costs 4.5 times the full run it was meant to replace. It wins only when almost nothing is affected, and that is precisely the case the step cache already handles for nothing: a re-run replays the whole step (experiment 2, and §2's ripgrep row, "3 of 3 steps replayed"). Tool-level selection pays four times over to discover what the runner already knew.
 
-**One row is inconclusive.** Changing a leaf module selected the same 62 tests as changing nothing, which means either testmon missed it or the function the edit landed in is covered by no test. Without checking which, it cannot be read as evidence that testmon is wrong, so it is not.
+**One row is inconclusive** (*unverified*, CLAIMS.md E8.3)**.** Changing a leaf module selected the same 62 tests as changing nothing, which means either testmon missed it or the function the edit landed in is covered by no test. Without checking which, it cannot be read as evidence that testmon is wrong, so it is not.
 
 **Findings.**
 
@@ -615,4 +615,6 @@ So `GOGC=400` does save roughly 15–20% of the engine's CPU once a job has many
 - **The cost of handing a step its inputs:** experiment 5's overhead, measured on its own rather than as a feature's by-product, and on a machine with an SSD as well as the Pi. It decides whether any form of finer keying can pay here.
 - **Engine memory over days:** the 15-minute log under ordinary jobs, to decide whether the cache cap should be lower (8.2).
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
-- **Whether `GOGC=100`'s headroom would prevent the memory pathology** (11.2), which needs a loaded engine and days rather than fresh arms. Its CPU cost is now known (15–20% on step-heavy jobs), so this is the other half of that trade.
+- **Whether `GOGC=100`'s headroom would prevent the memory pathology** (11.2), which needs a loaded engine and days rather than fresh arms. Its CPU cost on step-heavy jobs is the other half of that trade, and is the first thing the harness should measure properly (CLAIMS.md E7.7).
+- **The harness** ([MEASURE.md](MEASURE.md) stage 2), because 62 claims are registered in [CLAIMS.md](CLAIMS.md) and four commands in this repository can reproduce any of them. Build it against E7.6 and E3.5, whose answers are known.
+- **Re-check the eight unverified claims** (stage 4), in the order CLAIMS.md gives: E7.7 first, since it is the only one deciding a deployed setting.

@@ -65,6 +65,8 @@ quantity, the workload and its pinned commit, the machine, the arms compared, th
 level, the statistic reported, and the command that reproduces it. A claim with no entry is marked
 **unverified** in the text, and may not be used to justify a change.
 
+The register is [CLAIMS.md](CLAIMS.md), and a new claim belongs in it before it is cited anywhere.
+
 ### 3.2 The protocol
 
 1. **Say what would refute it, first.** Write the expected direction and the smallest effect worth
@@ -143,9 +145,11 @@ proofs/README.md, "three things this turned up".
 
 ## 5. Staging
 
-1. **The registry and the re-run commands** for the claims already in STUDY.md, marking those whose
-   evidence does not meet §3.2 as unverified. This is paperwork, and it is where the value is: it
-   says which of today's numbers can be relied on.
+1. ~~**The registry and the re-run commands** for the claims already in STUDY.md, marking those whose
+   evidence does not meet §3.2 as unverified.~~ **Done:** [CLAIMS.md](CLAIMS.md). 62 claims, of which
+   17 are verified, 32 are usable but under-powered, 8 are unverified and may not be used to justify
+   a change, and 2 were superseded. It also found that four commands in this repository can reproduce
+   any of them, which is the case for stage 2.
 2. **The harness** (§3.3), with the environment capture and JSON samples, replacing the one-off shell
    scripts. Built against the `GOGC` and output-keys experiments, whose answers are known, so a
    harness that disagrees with them is wrong.
