@@ -453,6 +453,25 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
     var collect: sink.LogSink = .{ .collect = .{ .arena = c.arena, .io = c.io, .inner = c.log } };
     collect.setSecrets(try std.mem.concat(c.arena, []const u8, &.{ c.secrets, job.secrets }));
     const log = &collect;
+    // On disk while the job runs, rather than in memory until it ends: a job's log is then bounded
+    // by the spool and survives the process (see `sink.Spool`). Best effort — a directory the runner
+    // cannot write to is said once and the lines stay in memory, because logging must not fail a job.
+    var spool: sink.Spool = undefined;
+    var spool_path: ?[]const u8 = null;
+    if (c.cfg.log_spool_dir.len > 0) spooled: {
+        const path = std.fmt.allocPrint(c.arena, "{s}/zig-runner-job-{d}.log", .{ c.cfg.log_spool_dir, job.check_run_id }) catch break :spooled;
+        const file = std.Io.Dir.cwd().createFile(c.io, path, .{ .read = true }) catch |e| {
+            try c.err.print("job {d}: no log spool in {s} ({s}); the job's log is kept in memory\n", .{ job.check_run_id, c.cfg.log_spool_dir, @errorName(e) });
+            break :spooled;
+        };
+        spool = .{ .file = file, .io = c.io };
+        collect.collect.spool = &spool;
+        spool_path = path;
+    }
+    defer if (spool_path) |path| {
+        spool.file.close(c.io);
+        std.Io.Dir.cwd().deleteFile(c.io, path) catch {};
+    };
     // The job, live in GitHub's UI: its steps as they run and their lines as they are logged.
     var live = try Live.init(c.gpa, c.arena, c.io, &job, c.log);
     collect.collect.listener = live.listener();
@@ -536,7 +555,7 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
     // what step caching saved this job, next to what output keys cost it.
     if (c.cfg.step_cache and job.steps.len > 0) {
         var replayed: usize = 0;
-        for (log.collect.lines.items) |l| {
+        for (log.collect.collected(c.arena)) |l| {
             if (l.step >= 1 and l.step <= job.steps.len and std.mem.eql(u8, l.text, dagger.reused_note)) replayed += 1;
         }
         try c.err.print("job {d}: {d} of {d} steps replayed from the cache\n", .{ job.check_run_id, replayed, job.steps.len });
@@ -556,7 +575,7 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
         };
     }
     const shown = try shownSteps(c.arena, live.ids, job, result, job_started_ms, .{ .log_step = complete_step, .started_ms = complete_started, .completed_ms = std.Io.Clock.real.now(c.io).toMilliseconds() });
-    try uploadLogs(c, job, shown, log.collect.lines.items, result.summaries, log.currentSecrets());
+    try uploadLogs(c, job, shown, log.collect.collected(c.arena), result.summaries, log.currentSecrets());
     {
         // The live view ends with the steps as completejob reports them.
         const finals = try c.arena.alloc(Live.Final, shown.len);

@@ -169,10 +169,10 @@ test "formatBlob prefixes timestamps and filters by step" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
     const lines = [_]sink.CollectedLine{
-        .{ .step = 0, .ts_ms = 1000, .text = "job acquired" },
-        .{ .step = 1, .ts_ms = 2000, .text = "hello" },
-        .{ .step = 2, .ts_ms = 3500, .text = "two" },
-        .{ .step = 1, .ts_ms = 4000, .text = "done" },
+        .{ .step = 0, .seq = 1, .ts_ms = 1000, .text = "job acquired" },
+        .{ .step = 1, .seq = 1, .ts_ms = 2000, .text = "hello" },
+        .{ .step = 2, .seq = 1, .ts_ms = 3500, .text = "two" },
+        .{ .step = 1, .seq = 2, .ts_ms = 4000, .text = "done" },
     };
     const s1 = try formatBlob(a.allocator(), &lines, 1);
     try std.testing.expectEqual(@as(usize, 2), s1.line_count);

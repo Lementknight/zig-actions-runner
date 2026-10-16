@@ -15,6 +15,9 @@ const engine = @import("engine.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// A line waiting for the feed, with the number the sink gave it (`sink.CollectedLine.seq`).
+pub const Pending = struct { seq: u64, text: []u8 };
+
 pub const Live = struct {
     gpa: Allocator,
     io: std.Io,
@@ -28,9 +31,11 @@ pub const Live = struct {
     next: ?dagger.Observer = null,
 
     mu: std.Io.Mutex = .init,
-    /// Lines logged but not sent, and lines sent, per log step (guarded by `mu`).
-    pending: []std.ArrayList([]u8),
-    sent: []u64,
+    /// Lines logged but not sent, per log step (guarded by `mu`).
+    /// The number a line is sent under is its own, not a count of what went before it: a line the
+    /// collector dropped at its cap still used one, so counting arrivals here would renumber
+    /// everything after it.
+    pending: []std.ArrayList(Pending),
     /// The steps GitHub has been told of, in the order they started (guarded by `mu`).
     steps: std.ArrayList(Step) = .empty,
     steps_changed: bool = false,
@@ -75,11 +80,9 @@ pub const Live = struct {
                 id.* = try arena.dupe(u8, &buf);
             }
         }
-        const pending = try arena.alloc(std.ArrayList([]u8), n);
+        const pending = try arena.alloc(std.ArrayList(Pending), n);
         @memset(pending, .empty);
-        const sent = try arena.alloc(u64, n);
-        @memset(sent, 0);
-        return .{ .gpa = gpa, .io = io, .job = job, .log = log, .ids = ids, .pending = pending, .sent = sent };
+        return .{ .gpa = gpa, .io = io, .job = job, .log = log, .ids = ids, .pending = pending };
     }
 
     /// Connects the feed, reports "Set up job" running and starts sending. The Live must not move.
@@ -112,14 +115,14 @@ pub const Live = struct {
         l.next_number = l.next_number + reserved - count;
     }
 
-    fn onLine(ptr: *anyopaque, step: u32, text: []const u8) void {
+    fn onLine(ptr: *anyopaque, step: u32, seq: u64, text: []const u8) void {
         const l: *Live = @ptrCast(@alignCast(ptr));
         if (step >= l.pending.len) return;
         l.mu.lockUncancelable(l.io);
         defer l.mu.unlock(l.io);
         if (l.finished) return;
         const copy = l.gpa.dupe(u8, text) catch return;
-        l.pending[step].append(l.gpa, copy) catch l.gpa.free(copy);
+        l.pending[step].append(l.gpa, .{ .seq = seq, .text = copy }) catch l.gpa.free(copy);
     }
 
     /// Steps that will not run (the job failed in "Set up job") still have their numbers in the
@@ -220,7 +223,7 @@ pub const Live = struct {
 
         var steps_json: ?[]const u8 = null;
         var order: u64 = 0;
-        const Batch = struct { log_step: u32, start_line: u64, lines: [][]u8 };
+        const Batch = struct { log_step: u32, start_line: u64, lines: []Pending };
         var batches: std.ArrayList(Batch) = .empty;
         {
             l.mu.lockUncancelable(l.io);
@@ -234,11 +237,10 @@ pub const Live = struct {
             for (l.pending, 0..) |*p, i| {
                 if (p.items.len == 0) continue;
                 const lines = p.toOwnedSlice(l.gpa) catch continue;
-                batches.append(arena, .{ .log_step = @intCast(i), .start_line = l.sent[i] + 1, .lines = lines }) catch {
+                batches.append(arena, .{ .log_step = @intCast(i), .start_line = lines[0].seq, .lines = lines }) catch {
                     freeLines(l.gpa, lines);
                     continue;
                 };
-                l.sent[i] += lines.len;
             }
         }
         if (steps_json) |js| {
@@ -251,7 +253,9 @@ pub const Live = struct {
         for (batches.items) |b| {
             defer freeLines(l.gpa, b.lines);
             if (!l.feed_open) continue;
-            const msg = feedMessage(arena, l.ids[b.log_step], b.lines, b.start_line) catch continue;
+            const texts = arena.alloc([]const u8, b.lines.len) catch continue;
+            for (b.lines, texts) |p, *t| t.* = p.text;
+            const msg = feedMessage(arena, l.ids[b.log_step], texts, b.start_line) catch continue;
             l.feedSend(msg);
         }
         // A step that prints nothing for a while (`npm install`, a compiler) would leave the feed
@@ -342,8 +346,8 @@ pub const Live = struct {
     }
 };
 
-fn freeLines(gpa: Allocator, lines: []const []u8) void {
-    for (lines) |line| gpa.free(line);
+fn freeLines(gpa: Allocator, lines: []const Pending) void {
+    for (lines) |line| gpa.free(line.text);
     gpa.free(lines);
 }
 
