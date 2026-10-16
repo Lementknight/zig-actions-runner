@@ -4,7 +4,7 @@
 # did it run, or was it replayed? The signal is the note the runner writes into a replayed step's own
 # log (`dagger.reused_note`), so this needs nothing but `gh`.
 #
-#   check.sh <repo> [P2|P3|P4|P6|all]
+#   check.sh <repo> [P1|P2|P3|P4|P6|E1|all]
 #
 # What each check is the live counterpart of:
 #
@@ -15,9 +15,19 @@
 #   P2c     a non-volatile variable changed            → it must run (`stable-env-matters`)
 #   P2d     the subject's position in the job changed  → it must run (`position-matters`)
 #   P4      the subject names a run-specific value     → it must run, every time (`marked-misses`)
+#   P1      the same job with the cache off, then replayed → the observer said the same thing
+#           (`replay≡run`), which also covers $GITHUB_ENV: what it said includes a variable an
+#           earlier step exported, and on the replayed run that step was replayed too
+#   E1      a marked step leaving the same bytes → the steps after it are replayed anyway
+#           (`cutoff`); leaving new bytes → they run (`different-bytes-different-container`)
 set -eu
 repo=${1:?repo}
 only=${2:-all}
+# E1 needs the engine's host: output keys are what it tests, and they stop themselves when they cost
+# more than RUNNER_OUTPUT_KEYS_MAX_MS, which the first run of this check tripped at 10.5 s against a
+# 10 s limit. Testing whether they cut off is not testing whether they are cheap, so the limit is
+# raised for the duration and put back afterwards.
+ssh_host=${3:-}
 ref_a=3a33ba578e0dd93444e0ff386cc26e665d92e31e
 ref_b=60755706125129a9f9dfb99ac22f7ba016a1b60c
 note="Reused from Dagger's cache"
@@ -61,6 +71,29 @@ outcome() {
 		echo replayed
 	else
 		echo ran
+	fi
+}
+
+# said <step> <run id>: what the step printed — only its `observed <key>=<value>` lines, so the
+# comparison is of output and not of the script echoed above it, which is identical by construction.
+said() {
+	gh run view "$2" -R "$repo" --log 2>/dev/null |
+		grep -F "	$1	" | sed 's/^[^\t]*\t[^\t]*\t//; s/^[0-9TZ:.-]* //' |
+		grep -vF "$note" | grep -E '^observed [a-z]+=' | sort
+}
+
+# assert_same <name> <run a> <run b> <step>: the step produced the same thing in both runs.
+assert_same() {
+	a=$(said "$4" "$2")
+	b=$(said "$4" "$3")
+	if [ -n "$a" ] && [ "$a" = "$b" ]; then
+		printf '  ok    %-30s %s said the same in both runs (%s lines)\n' "$1" "$4" "$(printf '%s\n' "$a" | wc -l | tr -d ' ')"
+		pass=$((pass + 1))
+	else
+		printf '  FAIL  %-30s %s differed between runs %s and %s\n' "$1" "$4" "$2" "$3"
+		printf '        cache off: %s\n' "$a"
+		printf '        replayed : %s\n' "$b"
+		fail=$((fail + 1))
 	fi
 }
 
@@ -122,6 +155,55 @@ if want P4; then
 	printf '  --    %-30s run %s\n' "P4 first run" "$id"
 	id=$(dispatch property.yml -f "text=base" -f "ref=$ref_a" -f "envval=base" -f "volatile=yes")
 	assert "P4 a marked step always runs" "$id" "subject volatile" ran
+fi
+
+if want P1; then
+	# The same job with the step cache off, then warm, then replayed: what the observer said must
+	# not depend on whether it ran or was replayed. This is also the $GITHUB_ENV obligation, since
+	# what it says includes a variable an earlier step exported — and on the replayed run, that
+	# earlier step was replayed too.
+	off=$(dispatch property-replay.yml -f "step_cache=false")
+	assert "P1 the cache off runs everything" "$off" "observe" ran
+	warm=$(dispatch property-replay.yml -f "step_cache=true")
+	printf '  --    %-30s run %s\n' "P1 warming" "$warm"
+	on=$(dispatch property-replay.yml -f "step_cache=true")
+	assert "P1 then it is replayed" "$on" "observe" replayed
+	assert "GITHUB_ENV the exporter too" "$on" "export" replayed
+	assert_same "P1 replay equals run" "$off" "$on" "observe"
+fi
+if want E1; then
+	[ -n "$ssh_host" ] || { echo "check: E1 needs the engine's ssh host as the third argument" >&2; exit 2; }
+	pi() { ssh -o HostName=100.91.14.54 "$ssh_host" "$@"; }
+	was=$(pi "sed -n 's/^Environment=RUNNER_OUTPUT_KEYS_MAX_MS=//p' /home/claude/zig-runner.service")
+	set_limit() { # $1 = value, or empty to remove the line
+		if [ -n "$1" ]; then
+			pi "grep -q '^Environment=RUNNER_OUTPUT_KEYS_MAX_MS=' /home/claude/zig-runner.service &&
+                sed -i 's/^Environment=RUNNER_OUTPUT_KEYS_MAX_MS=.*/Environment=RUNNER_OUTPUT_KEYS_MAX_MS=$1/' /home/claude/zig-runner.service ||
+                sed -i '/^Environment=RUNNER_OUTPUT_KEYS=/a Environment=RUNNER_OUTPUT_KEYS_MAX_MS=$1' /home/claude/zig-runner.service"
+		else
+			pi "sed -i '/^Environment=RUNNER_OUTPUT_KEYS_MAX_MS=/d' /home/claude/zig-runner.service"
+		fi
+		pi "sudo install -m 0644 /home/claude/zig-runner.service /etc/systemd/system/zig-runner.service"
+		pi "sudo systemctl daemon-reload"
+		pi "sudo systemctl restart zig-runner"
+		sleep 8
+	}
+	restore_limit() { set_limit "$was"; printf '  --    %-30s %s\n' "E1 limit restored" "${was:-default}"; }
+	trap restore_limit EXIT
+	set_limit 600000
+	printf '  --    %-30s %s\n' "E1 limit raised to 600 s" "(was ${was:-the 10 s default})"
+	# Early cutoff: a marked step always runs, but the steps after it are replayed when it leaves
+	# the same bytes, and run when it does not.
+	id=$(dispatch property-cutoff.yml -f "stable=yes")
+	printf '  --    %-30s run %s\n' "E1 warming (stable output)" "$id"
+	id=$(dispatch property-cutoff.yml -f "stable=yes")
+	assert "E1 the marked step runs" "$id" "marked" ran
+	assert "E1 but the reader after it" "$id" "reader" replayed
+	assert "E1 and the step after that" "$id" "after" replayed
+	id=$(dispatch property-cutoff.yml -f "stable=no")
+	printf '  --    %-30s run %s\n' "E1 warming (new output)" "$id"
+	id=$(dispatch property-cutoff.yml -f "stable=no")
+	assert "E1 new bytes, no cutoff" "$id" "reader" ran
 fi
 
 echo
