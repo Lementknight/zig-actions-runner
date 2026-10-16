@@ -76,18 +76,43 @@ of the five that changed one.
 
 ## What is not here yet
 
-- **Pruning**: fill the output store, prune it (`RUNNER_OUTPUT_KEYS_DAYS`), re-run, and assert the
-  results are identical and only the replay counts differ — `coherent-subset` and `ahead-subset` in
-  the proofs.
-- **A shared cache**: two jobs of the same workflow at once, asserted to give what running them one
-  after the other gives — `elsewhere⇒ahead`.
+- **R2, a shared cache**: two jobs of the same workflow at once, each asserted to get its own answer
+  rather than the other's — `elsewhere⇒ahead`. **Written, not yet run.** It needs no change to the
+  runner's configuration, so it is the safe one to run next.
 - **P5**, which needs the shelved `feat/declared-inputs-v2`.
+- **Pruning is deliberately not here.** It is proved (`coherent-subset`, `ahead-subset`: dropping
+  entries preserves both of P1's hypotheses, so pruning can only cause misses) and it is not
+  checkable from outside. The store step prunes with `find … -mtime +0`, which means "at least a day
+  old", so a fresh entry cannot be pruned on demand; the study's earlier pruning test backdated
+  entries inside the volume. A first attempt at a live check wrote
+  `RUNNER_OUTPUT_KEYS_DAYS=0` into the unit, which the runner rejects as an invalid number — it
+  exited 1, `RestartPreventExitStatus` correctly kept it down, and jobs queued behind a dead service
+  until someone noticed. Hence the rule below.
 
-Two things found while building this are worth knowing before adding more. The cache-dir variables
-(`UV_CACHE_DIR` and the rest) are set for **container jobs only**, so a default-image job has to name
-the path the volume is mounted at. And `gh run view --log` is tab-separated, so strip its fields with
-`cut -f3-`: a `sed` with `\t` does nothing on macOS, which made two of these assertions compare empty
-strings and pass without saying so.
+## Rules for a check that touches the runner
+
+Only E1 and B change anything on the machine, and only one setting: the cost limit, raised so that
+output keys are allowed to run at all. Any check that does this must
+
+1. **validate the value first** — the runner itself rejects bad configuration, so
+   `zig build run -- --output-keys-days=0` says in a second what a restart says in five minutes;
+2. **assert the service came back** — active, and with a runner registered — and stop the suite if
+   not, rather than dispatching jobs behind a service that is down;
+3. **put the setting back** in a trap, whatever happens.
+
+`set_limit` now does 2 and 3. A helper that wrote arbitrary configuration has been removed: nothing
+here should be able to set a value nobody checked.
+
+Three smaller things found while building this, worth knowing before adding more:
+
+- The cache-dir variables (`UV_CACHE_DIR` and the rest) are set for **container jobs only**, so a
+  default-image job has to name the path the volume is mounted at.
+- `gh run view --log` is tab-separated, and BSD sed does not read `\t` as a tab, so strip its fields
+  with `cut -f3-`. The sed version did nothing on macOS and made two assertions compare empty strings
+  and pass without saying so.
+- Each commit to the test repository triggers whatever that repository builds on a push. Three
+  separate commits meant three concurrent site builds and a load average of 10.9 on four cores:
+  batch them.
 
 ## Why this cannot run in CI
 
