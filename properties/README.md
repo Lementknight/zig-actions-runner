@@ -46,6 +46,28 @@ P2d needs the second workflow, `property-shifted.yml`, which is `property.yml` w
 before the subject. A skipped step still occupies its place in a job, so an `if:` cannot move the
 subject; only a different workflow can.
 
+## The blind spots
+
+Three checks assert that the design still *cannot* see what it cannot see — the counterexamples in
+`proofs/Runner/Counterexamples.agda` made executable. They pass by finding a stale answer, so the day
+one of them **fails**, detection has improved and the documents here are out of date.
+
+| Check | The step | What it showed |
+|---|---|---|
+| B1 | reads the run id without ever spelling its name | replayed, and reported `38952425691` on run `38954899582` |
+| B2 | a value that is not a function of its inputs | replayed; the cache froze one answer, and a cache-off run gave another |
+| B3 | reads a marker in a cache volume an always-run step rewrote | replayed, and reported the marker from a much earlier run |
+
+B1's indirection is the case SPEC.md §6 calls "not detected": the script builds the variable's name
+from pieces, so `readsRunSpecific` — which looks for the contiguous string — cannot see it. B3 needs
+output keys, because without them the writer's new key would force the reader to run and there would
+be no stale read to find.
+
+**A replayed step's output is from whenever its entry was first recorded**, not from the run before.
+B1 and B3 first asserted the latter and failed: the step was reporting an id from forty minutes
+earlier, because the entry had been served since then. They now assert what the blind spot actually
+is — that the answer is not this run's — which is both true and the thing worth knowing.
+
 **The suite cannot pass vacuously**, which matters for a suite that passes everything: it asserts
 both polarities. P3 and P6 fail unless the note is *present*, P2 and P4 fail unless it is *absent*,
 so a discriminator that always said one thing would fail half of them. Checked directly on the first
@@ -54,16 +76,18 @@ of the five that changed one.
 
 ## What is not here yet
 
-- **P1** (replay equals run) wants the same job twice, once with `ZIG_RUNNER_STEP_CACHE: false`, and
-  the step logs, file commands and conclusions compared. Cheap to add, since the opt-out is per
-  workflow.
-- **P3 for a mounted cache volume**, which needs a package cache written between two runs.
+- **Pruning**: fill the output store, prune it (`RUNNER_OUTPUT_KEYS_DAYS`), re-run, and assert the
+  results are identical and only the replay counts differ — `coherent-subset` and `ahead-subset` in
+  the proofs.
+- **A shared cache**: two jobs of the same workflow at once, asserted to give what running them one
+  after the other gives — `elsewhere⇒ahead`.
 - **P5**, which needs the shelved `feat/declared-inputs-v2`.
-- **Early cutoff**, **pruning**, **a shared cache** and **`$GITHUB_ENV`** — the rest of the
-  obligations table in [proofs/README.md](../proofs/README.md).
-- **Three checks that must fail**, which is the point of generating them: counterexample 1's indirect
-  volatile read, counterexample 3's flaky step, and counterexample 4's cache-volume read are what
-  this design cannot detect. When one starts passing, something has changed.
+
+Two things found while building this are worth knowing before adding more. The cache-dir variables
+(`UV_CACHE_DIR` and the rest) are set for **container jobs only**, so a default-image job has to name
+the path the volume is mounted at. And `gh run view --log` is tab-separated, so strip its fields with
+`cut -f3-`: a `sed` with `\t` does nothing on macOS, which made two of these assertions compare empty
+strings and pass without saying so.
 
 ## Why this cannot run in CI
 
