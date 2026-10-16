@@ -561,9 +561,18 @@ Three arms on the Pi, each a fresh engine (so an empty step cache) and the same 
 | heap held | ~350 MB | **~125 MB** |
 | page cache | 1,915 MB | 1,970 MB |
 
-**`GOGC=400` buys nothing measurable here and costs about 225 MB of a 4 GB cap.** Job time and engine CPU are the same within noise across both arms. The 6% and 13% CPU savings that chose `GOGC=400` (DEPLOY.md "Sizing") were measured on a different workload, real Node builds with more steps; they may still hold there, so the documented default should not change on this evidence alone.
+**`GOGC=400` buys nothing measurable *on this workload* and costs about 225 MB of a 4 GB cap.** Job time and engine CPU are the same within noise across both arms. But flask's job is four long steps, and the 6% and 13% CPU savings that chose `GOGC=400` (DEPLOY.md "Sizing") came from work with many steps, where the engine allocates per exec. Repeated there — a job of 40 trivial steps, three rounds an arm, the engine's cgroup CPU read either side:
 
-**What these arms cannot test.** Each starts from a fresh engine, so the step cache is empty and the engine never approaches its memory cap: `memory.events max` stayed at 0 in every arm. The pathology this was meant to address (§8.2: the cap hit 154,000 times, the same work taking 1 s or 17 s) needs thousands of cached results and days of churn to reappear. So this says `GOGC=100` is free in the short run, not that it prevents the pathology. The Pi is left at `GOGC=100` to find out, with the per-job cost and saving lines still being logged.
+| 40 steps, a round without provisioning | Engine CPU |
+|---|---|
+| `GOGC=400` | **6 s** (a first attempt measured 18 s) |
+| `GOGC=100` | **7 s** (a first attempt measured 22 s) |
+
+So `GOGC=400` does save roughly 15–20% of the engine's CPU once a job has many steps, which is what it was chosen for, and the default stands. Reading it cost two attempts: the first sampled CPU after a short job had already finished, and the second matched a stale run on its first round, shifting every reading by one. Both attempts agree on the direction and the rough size, which is what the decision needed.
+
+**What it is paying for that.** About 225 MB of heap held, out of a 4 GB cap, on a machine with 8 GB shared with other services. That is the trade: CPU on step-heavy jobs against headroom for page cache (§8.2's pathology). The Pi runs the documented `GOGC=400`.
+
+**What none of these arms can test.** Each starts from a fresh engine, so the step cache is empty and the engine never approaches its memory cap: `memory.events max` stayed at 0 in every arm. The pathology this was meant to address (§8.2: the cap hit 154,000 times, the same work taking 1 s or 17 s) needs thousands of cached results and days of churn to reappear. So this says `GOGC=100` is free in the short run, not that it prevents the pathology. The Pi is left at `GOGC=100` to find out, with the per-job cost and saving lines still being logged.
 
 **Findings.**
 
@@ -604,4 +613,4 @@ Three arms on the Pi, each a fresh engine (so an empty step cache) and the same 
 - **The cost of handing a step its inputs:** experiment 5's overhead, measured on its own rather than as a feature's by-product, and on a machine with an SSD as well as the Pi. It decides whether any form of finer keying can pay here.
 - **Engine memory over days:** the 15-minute log under ordinary jobs, to decide whether the cache cap should be lower (8.2).
 - **Output keys to default:** the open items of experiment 3, then the same measurement across the Go and Python workloads.
-- **Whether `GOGC=100`'s headroom prevents the memory pathology** (11.2), which needs a loaded engine and days rather than fresh arms; and whether `GOGC=400`'s documented CPU saving still holds on a step-heavy workload, which is where it was first measured.
+- **Whether `GOGC=100`'s headroom would prevent the memory pathology** (11.2), which needs a loaded engine and days rather than fresh arms. Its CPU cost is now known (15–20% on step-heavy jobs), so this is the other half of that trade.
