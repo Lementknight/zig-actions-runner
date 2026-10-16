@@ -33,6 +33,12 @@ P2d needs the second workflow, `property-shifted.yml`, which is `property.yml` w
 before the subject. A skipped step still occupies its place in a job, so an `if:` cannot move the
 subject; only a different workflow can.
 
+**The suite cannot pass vacuously**, which matters for a suite that passes everything: it asserts
+both polarities. P3 and P6 fail unless the note is *present*, P2 and P4 fail unless it is *absent*,
+so a discriminator that always said one thing would fail half of them. Checked directly on the first
+run of it: of six dispatches, the note appeared on exactly the one with identical inputs and on none
+of the five that changed one.
+
 ## What is not here yet
 
 - **P1** (replay equals run) wants the same job twice, once with `ZIG_RUNNER_STEP_CACHE: false`, and
