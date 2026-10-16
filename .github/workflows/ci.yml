@@ -31,8 +31,9 @@ jobs:
         with:
           path: |
             ~/.cache/zig
+            runner/.zig-cache
             /opt/zig-*-linux-${{ env.ZIG_VERSION }}
-          key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-v2
+          key: ${{ runner.os }}-zig-${{ env.ZIG_VERSION }}-v3
 
       - name: Install Zig
         run: |
