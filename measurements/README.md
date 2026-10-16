@@ -20,9 +20,32 @@ whatever `--environment` printed. `note` says where a line came from when it was
 
 | File | Claim | Provenance |
 |---|---|---|
+| `E7.7-gogc-measured.jsonl` | E7.7, engine CPU over 40 steps | **measured** on the Pi, 2026-10-16, by `e7.7/arm-gogc.sh` |
+| `E7.7-pilot.jsonl` | E7.7's pilot, which is also its negative control | **measured** on the Pi, 2026-10-16, by `e7.7/arm.sh` |
 | `E7.6-gogc-flask-warm.jsonl` | E7.6, job seconds on warm re-runs | **transcribed** from STUDY.md §11.2 |
 | `E7.6-gogc-flask-cpu.jsonl` | E7.6b, engine CPU for the same arms | **transcribed** from STUDY.md §11.2 |
-| `E7.7-gogc-steps.jsonl` | E7.7, engine CPU over 40 steps | **transcribed** from STUDY.md §11.2 |
+| `E7.7-gogc-steps.jsonl` | E7.7 as the study recorded it | **transcribed** from STUDY.md §11.2 |
+
+## E7.7, settled
+
+The first claim measured under the protocol rather than read off a counter. `e7.7/` holds all of it:
+`gen-workflow.sh` for the workload (40 trivial steps, each carrying the trial's token so nothing is
+replayed), `arm-gogc.sh` for a trial (recreate the engine at a given `GOGC`, let the runner
+re-register, provision in a throwaway job, then measure), and `facts.sh` for the environment.
+
+```
+  gogc400   n=3  median 5.926 s   (baseline)
+  gogc100   n=3  median 6.825 s   difference +0.899  95% CI [0.751, 1.456]  effect
+```
+
+So `GOGC=400` saves about **15%** of the engine's CPU on a step-heavy job — 0.90 s of 5.93 s, with
+the interval running from 12.7% to 24.6%. The study said "roughly 15–20%" from one number per arm;
+the direction was right and the size was luck. [CLAIMS.md](../docs/CLAIMS.md) E7.7 is now verified.
+
+The pilot came first, as §3.2.5 asks. Its two arms ran the *identical* command, which makes it the
+negative control as well: medians 6.204 s and 6.224 s, CI [−0.284, +0.437], `no_effect_found`. Its
+spread (sd 0.29) asked for three repetitions an arm, not the nineteen a warm-up round's provisioning
+made it look like before `dimension` learned to exclude warm-ups.
 
 **All three are transcriptions, not measurements**, and they are here for one reason: the harness has
 to agree with answers that are already known before it is trusted with answers that are not. They
