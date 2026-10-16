@@ -1,20 +1,39 @@
 #!/usr/bin/env bash
-# Fast checks on the Zig code being committed: formatting (zig fmt) and the errors zig ast-check finds
-# without compiling (syntax, unused locals and parameters, shadowing). The staged content is checked,
-# not the working tree, so a partially staged file is judged as it will be committed.
+# Fast checks on what is being committed: the Zig code's formatting (zig fmt) and the errors zig
+# ast-check finds without compiling (syntax, unused locals and parameters, shadowing), and workflow
+# YAML (runner/tools/check_workflows.zig). The staged content is checked, not the working tree, so a
+# partially staged file is judged as it will be committed.
 # The full build and tests run before a push (pre-push).
 set -euo pipefail
 [ "${SKIP_ZIG_HOOKS:-}" = 1 ] && exit 0
 
 files=()
 while IFS= read -r -d '' f; do files+=("$f"); done < <(git diff --cached --name-only -z --diff-filter=ACMR -- '*.zig' '*.zon')
-[ ${#files[@]} -eq 0 ] && exit 0
+workflows=()
+while IFS= read -r -d '' f; do workflows+=("$f"); done < <(git diff --cached --name-only -z --diff-filter=ACMR -- '.github/workflows/*.yml' '.github/workflows/*.yaml')
+[ ${#files[@]} -eq 0 ] && [ ${#workflows[@]} -eq 0 ] && exit 0
 
 # shellcheck source-path=SCRIPTDIR source=zig-common.sh
 . "$(dirname "$0")/zig-common.sh"
 require_zig
 
 failed=0
+
+# Workflow YAML, checked as it will be committed. A mistake here fails a whole run for a reason
+# GitHub reports only as "This run likely failed because of a workflow file issue".
+if [ ${#workflows[@]} -gt 0 ]; then
+	staged=$(mktemp -d)
+	trap 'rm -rf "$staged"' EXIT
+	for f in "${workflows[@]}"; do
+		mkdir -p "$staged/$(dirname "$f")"
+		git show ":$f" > "$staged/$f"
+	done
+	if ! out=$(cd "$root/runner" && zig build check-workflows -- "$staged/.github/workflows" 2>&1); then
+		printf '%s\n' "${out//$staged\//}" >&2
+		say "workflow YAML is not valid (see above)."
+		failed=1
+	fi
+fi
 for f in "${files[@]}"; do
 	if ! git show ":$f" | zig fmt --stdin --check >/dev/null 2>&1; then
 		say "not formatted: $f   (zig fmt $f, then git add it)"
@@ -31,7 +50,7 @@ for f in "${files[@]}"; do
 done
 
 if [ "$failed" -ne 0 ]; then
-	say "commit stopped: fix the Zig issues above."
+	say "commit stopped: fix the issues above."
 	skip_hint commit
 	exit 1
 fi
