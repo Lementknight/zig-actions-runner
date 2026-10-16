@@ -2,6 +2,8 @@
 
 Status: in progress · Reference machine: Raspberry Pi 5 (4 cores, 8 GB, SD card) · Companion: [DESIGN.md](DESIGN.md), [SPEC.md](SPEC.md)
 
+How a claim here must be produced, and what the caching algorithms must prove rather than measure, is in [MEASURE.md](MEASURE.md); claims made before it are being re-checked against it.
+
 This study decides how the runner should execute steps. Today every step runs through Dagger; the alternatives are BuildKit directly, or an executor of our own in Zig. Rather than pick by intuition, each part of the problem is measured on its own, and each design choice is written down with what it gains and what it gives up.
 
 ## 1. The problem
