@@ -4,7 +4,7 @@
 # did it run, or was it replayed? The signal is the note the runner writes into a replayed step's own
 # log (`dagger.reused_note`), so this needs nothing but `gh`.
 #
-#   check.sh <repo> [P1|P2|P3|P4|P6|E1|all]
+#   check.sh <repo> [P1|P2|P3|P4|P6|E1|B|all] [ssh host, for E1 and B]
 #
 # What each check is the live counterpart of:
 #
@@ -74,12 +74,44 @@ outcome() {
 	fi
 }
 
+# `cut -f3-` rather than a sed with \t: BSD sed does not read \t as a tab, so the field-stripping
+# version did nothing on macOS and two assertions compared empty strings without saying so.
+#
 # said <step> <run id>: what the step printed — only its `observed <key>=<value>` lines, so the
 # comparison is of output and not of the script echoed above it, which is identical by construction.
 said() {
 	gh run view "$2" -R "$repo" --log 2>/dev/null |
-		grep -F "	$1	" | sed 's/^[^\t]*\t[^\t]*\t//; s/^[0-9TZ:.-]* //' |
+		grep -F "	$1	" | cut -f3- | sed 's/^[^ ]* //' |
 		grep -vF "$note" | grep -E '^observed [a-z]+=' | sort
+}
+
+# value <key> <run id> <step>: one `observed <key>=<value>` line's value.
+value() {
+	gh run view "$2" -R "$repo" --log 2>/dev/null |
+		grep -F "	$3	" | cut -f3- | sed 's/^[^ ]* //' |
+		grep -E "^observed $1=" | head -1 | cut -d= -f2- | tr -d '\r'
+}
+
+# assert_eq <name> <what> <got> <wanted>
+assert_eq() {
+	if [ "$3" = "$4" ]; then
+		printf '  ok    %-30s %s is %s\n' "$1" "$2" "$3"
+		pass=$((pass + 1))
+	else
+		printf '  FAIL  %-30s %s is %s, wanted %s\n' "$1" "$2" "$3" "$4"
+		fail=$((fail + 1))
+	fi
+}
+
+# assert_ne <name> <what> <a> <b>
+assert_ne() {
+	if [ "$3" != "$4" ]; then
+		printf '  ok    %-30s %s differs (%s against %s)\n' "$1" "$2" "$3" "$4"
+		pass=$((pass + 1))
+	else
+		printf '  FAIL  %-30s %s is the same in both (%s), wanted a difference\n' "$1" "$2" "$3"
+		fail=$((fail + 1))
+	fi
 }
 
 # assert_same <name> <run a> <run b> <step>: the step produced the same thing in both runs.
@@ -127,6 +159,40 @@ assert_all() {
 
 want() { [ "$only" = all ] || [ "$only" = "$1" ]; }
 
+# Output keys stop themselves when they cost more than RUNNER_OUTPUT_KEYS_MAX_MS, and the first run
+# of these checks tripped that at 10.5 s against a 10 s limit. E1 and B are about what output keys
+# *do*, not what they cost, so they raise the limit for their own duration and put it back. E3.4 in
+# docs/CLAIMS.md is the claim that measures the cost.
+raised=""
+pi() { ssh -o HostName=100.91.14.54 "$ssh_host" "$@"; }
+set_limit() { # $1 = milliseconds, or empty to remove the line
+	if [ -n "$1" ]; then
+		pi "grep -q '^Environment=RUNNER_OUTPUT_KEYS_MAX_MS=' /home/claude/zig-runner.service &&
+		    sed -i 's/^Environment=RUNNER_OUTPUT_KEYS_MAX_MS=.*/Environment=RUNNER_OUTPUT_KEYS_MAX_MS=$1/' /home/claude/zig-runner.service ||
+		    sed -i '/^Environment=RUNNER_OUTPUT_KEYS=/a Environment=RUNNER_OUTPUT_KEYS_MAX_MS=$1' /home/claude/zig-runner.service"
+	else
+		pi "sed -i '/^Environment=RUNNER_OUTPUT_KEYS_MAX_MS=/d' /home/claude/zig-runner.service"
+	fi
+	pi "sudo install -m 0644 /home/claude/zig-runner.service /etc/systemd/system/zig-runner.service"
+	pi "sudo systemctl daemon-reload"
+	pi "sudo systemctl restart zig-runner"
+	sleep 8
+}
+restore_limit() {
+	[ -n "$raised" ] || return 0
+	set_limit "$was"
+	printf '  --    %-30s %s\n' "limit restored" "${was:-the default}"
+}
+need_output_keys() {
+	[ -n "$ssh_host" ] || { echo "check: this check needs the engine's ssh host as the third argument" >&2; exit 2; }
+	[ -z "$raised" ] || return 0
+	was=$(pi "sed -n 's/^Environment=RUNNER_OUTPUT_KEYS_MAX_MS=//p' /home/claude/zig-runner.service")
+	trap restore_limit EXIT
+	set_limit 600000
+	raised=yes
+	printf '  --    %-30s %s\n' "limit raised to 600 s" "(was ${was:-the 10 s default})"
+}
+
 echo "Properties of the step cache, against the engine behind $repo's runner."
 echo
 
@@ -172,26 +238,7 @@ if want P1; then
 	assert_same "P1 replay equals run" "$off" "$on" "observe"
 fi
 if want E1; then
-	[ -n "$ssh_host" ] || { echo "check: E1 needs the engine's ssh host as the third argument" >&2; exit 2; }
-	pi() { ssh -o HostName=100.91.14.54 "$ssh_host" "$@"; }
-	was=$(pi "sed -n 's/^Environment=RUNNER_OUTPUT_KEYS_MAX_MS=//p' /home/claude/zig-runner.service")
-	set_limit() { # $1 = value, or empty to remove the line
-		if [ -n "$1" ]; then
-			pi "grep -q '^Environment=RUNNER_OUTPUT_KEYS_MAX_MS=' /home/claude/zig-runner.service &&
-                sed -i 's/^Environment=RUNNER_OUTPUT_KEYS_MAX_MS=.*/Environment=RUNNER_OUTPUT_KEYS_MAX_MS=$1/' /home/claude/zig-runner.service ||
-                sed -i '/^Environment=RUNNER_OUTPUT_KEYS=/a Environment=RUNNER_OUTPUT_KEYS_MAX_MS=$1' /home/claude/zig-runner.service"
-		else
-			pi "sed -i '/^Environment=RUNNER_OUTPUT_KEYS_MAX_MS=/d' /home/claude/zig-runner.service"
-		fi
-		pi "sudo install -m 0644 /home/claude/zig-runner.service /etc/systemd/system/zig-runner.service"
-		pi "sudo systemctl daemon-reload"
-		pi "sudo systemctl restart zig-runner"
-		sleep 8
-	}
-	restore_limit() { set_limit "$was"; printf '  --    %-30s %s\n' "E1 limit restored" "${was:-default}"; }
-	trap restore_limit EXIT
-	set_limit 600000
-	printf '  --    %-30s %s\n' "E1 limit raised to 600 s" "(was ${was:-the 10 s default})"
+	need_output_keys
 	# Early cutoff: a marked step always runs, but the steps after it are replayed when it leaves
 	# the same bytes, and run when it does not.
 	id=$(dispatch property-cutoff.yml -f "stable=yes")
@@ -204,6 +251,40 @@ if want E1; then
 	printf '  --    %-30s run %s\n' "E1 warming (new output)" "$id"
 	id=$(dispatch property-cutoff.yml -f "stable=no")
 	assert "E1 new bytes, no cutoff" "$id" "reader" ran
+fi
+
+if want B; then
+	need_output_keys
+	echo
+	echo "  Blind spots. These assert that the design still cannot see what it cannot see:"
+	echo "  if one of them FAILS, detection has improved and the documents are out of date."
+	echo
+
+	# B1: a step that reads the run id without naming it (counterexample 1, SPEC.md's
+	# "not detected"). It is replayed, and reports an earlier run's id.
+	dispatch property-blind.yml -f "spot=volatile" -f "step_cache=true" > /dev/null
+	b=$(dispatch property-blind.yml -f "spot=volatile" -f "step_cache=true")
+	assert "B1 an unseen volatile read" "$b" "blind volatile" replayed
+	# Not "it equals the previous run's id": a replayed step's output is from whenever the entry was
+	# first recorded, which may be any earlier run. What makes it a blind spot is that it is not this
+	# run's id, which is what the step would have printed had it run.
+	assert_ne "B1 it reports a stale run id" "the run id it printed" "$(value runid "$b" "blind volatile")" "$b"
+
+	# B2: a step whose answer is not a function of its inputs (counterexample 3). The cache freezes
+	# the first answer, so a flaky step cannot fail twice.
+	off=$(dispatch property-blind.yml -f "spot=flaky" -f "step_cache=false")
+	warm=$(dispatch property-blind.yml -f "spot=flaky" -f "step_cache=true")
+	frozen=$(dispatch property-blind.yml -f "spot=flaky" -f "step_cache=true")
+	assert "B2 a flaky step" "$frozen" "blind flaky" replayed
+	assert_eq "B2 the cache froze its answer" "the value" "$(value nondeterminism "$frozen" "blind flaky")" "$(value nondeterminism "$warm" "blind flaky")"
+	assert_ne "B2 which a run would not" "the cache-off value" "$(value nondeterminism "$off" "blind flaky")" "$(value nondeterminism "$warm" "blind flaky")"
+
+	# B3: a step that reads a cache volume (counterexample 4). The volume's content is in no key, so
+	# the reader is replayed although an always-run step rewrote what it reads.
+	dispatch property-blind.yml -f "spot=mount" -f "step_cache=true" > /dev/null
+	b=$(dispatch property-blind.yml -f "spot=mount" -f "step_cache=true")
+	assert "B3 a cache-volume read" "$b" "blind mount" replayed
+	assert_ne "B3 it reports stale content" "the marker it read" "$(value marker "$b" "blind mount")" "$b"
 fi
 
 echo
