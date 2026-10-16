@@ -40,6 +40,20 @@ jobs:
           path: ~/.cache/zig
           key: ${{ runner.os }}-zig-global-${{ env.ZIG_VERSION }}
 
+      # TEMPORARY: where does the first `zig build` of a job actually spend its time?
+      - name: Probe the cache
+        working-directory: runner
+        run: |
+          echo "--- restored global cache ---"
+          du -sh ~/.cache/zig 2>/dev/null || echo "absent"
+          du -sh ~/.cache/zig/* 2>/dev/null | sort -h | tail -5
+          echo "--- first zig build (check-workflows) ---"
+          time zig build check-workflows
+          echo "--- second, identical ---"
+          time zig build check-workflows
+          echo "--- global cache now ---"
+          du -sh ~/.cache/zig
+
       - name: Format check
         working-directory: runner
         run: zig fmt --check .
