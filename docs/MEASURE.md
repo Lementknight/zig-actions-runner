@@ -131,8 +131,9 @@ illustrated by one example each:
 P2 and P3 together are a metamorphic test: the relation between two runs is asserted, without needing
 a model of what the step outputs. That is what makes them generable rather than hand-written.
 
-P1, P2, P3, P4, the hit half of P6 and **early cutoff** for output keys are now proved, of a model of
-the step cache, in [proofs/](../proofs/README.md) (`./proofs/check.sh`, and in CI). What that buys is
+All six properties are now proved of a model of the step cache, in [proofs/](../proofs/README.md)
+(`./proofs/check.sh`, and in CI), along with early cutoff for output keys, that pruning the store can
+only cause misses, and that a pool sharing one cache is safe. What that buys is
 not confidence in the numbers but a precise statement of what the implementation owes: P1 holds under
 one real hypothesis, that the steps the runner does not mark always-run are deterministic and read
 neither a volatile variable nor the content of a mounted cache volume. The proofs come with a job for
@@ -154,6 +155,8 @@ proofs/README.md, "three things this turned up".
    scripts. Built against the `GOGC` and output-keys experiments, whose answers are known, so a
    harness that disagrees with them is wrong.
 3. **The properties** (§4) as tests in the runner's own suite, generated per input kind, run in CI
-   against a real engine rather than the fake session.
+   against a real engine rather than the fake session. The model now says what to generate and what
+   each case must assert — [proofs/README.md](../proofs/README.md), "Obligations for the harness" —
+   including three families that must *fail*, since they are what the design cannot detect.
 4. **Re-check the claims** that step 1 marked unverified, in the order of what they are being used to
    justify.
