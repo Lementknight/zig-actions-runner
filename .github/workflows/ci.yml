@@ -27,6 +27,19 @@ jobs:
           curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /opt
           echo "/opt/zig-${arch}-linux-${ZIG_VERSION}" >> "$GITHUB_PATH"
 
+      # On the first `zig build` of a job, Zig builds its own build runner and standard library for
+      # the host. That was ~95 s of this job's ~120 s, paid by whichever step runs `zig build` first
+      # — the workflow check, measured at 99-103 s against 12 ms for the checker itself. The cache
+      # holds nothing project-specific (there are no package dependencies), so one entry per Zig
+      # version per OS is enough and the key is stable: it is written once and read thereafter.
+      # Only here, not on the self-hosted job, where uploading a cache is what experiment 6.6
+      # measured at 2 MB/s.
+      - name: Cache Zig's global cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: ${{ runner.os }}-zig-global-${{ env.ZIG_VERSION }}
+
       - name: Format check
         working-directory: runner
         run: zig fmt --check .
