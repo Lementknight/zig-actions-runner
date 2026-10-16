@@ -395,15 +395,12 @@ fn shell(arena: Allocator, io: std.Io, environ: *const std.process.Environ.Map, 
 }
 
 fn drain(arena: Allocator, io: std.Io, f: std.Io.File) ![]const u8 {
-    var acc: std.ArrayList(u8) = .empty;
     var buf: [4096]u8 = undefined;
     var r = f.readerStreaming(io, &buf);
-    while (true) {
-        const n = r.interface.readSliceShort(&buf) catch break;
-        if (n == 0) break;
-        try acc.appendSlice(arena, buf[0..n]);
-    }
-    return acc.items;
+    return r.interface.allocRemaining(arena, .limited(16 * 1024 * 1024)) catch |e| switch (e) {
+        error.StreamTooLong => "(output over 16 MB, truncated)",
+        else => return e,
+    };
 }
 
 /// The last `MEASURE <number>` line in the output, so a command may print progress first.
@@ -554,7 +551,9 @@ fn cmdDimension(arena: Allocator, io: std.Io, args: []const []const u8) !u8 {
         if (std.mem.trim(u8, line, " \r\t").len == 0) continue;
         const parsed = std.json.parseFromSlice(Sample, arena, line, .{ .ignore_unknown_fields = true }) catch continue;
         const s = parsed.value;
-        if (s.failed or s.value == null) continue;
+        // Warm-up rounds are excluded here as in `analyse`: a first round's spread is provisioning,
+        // not variability, and dimensioning from it asks for repetitions nothing needs.
+        if (s.warmup or s.failed or s.value == null) continue;
         var idx: ?usize = null;
         for (names.items, 0..) |n, k| if (std.mem.eql(u8, n, s.arm)) {
             idx = k;
