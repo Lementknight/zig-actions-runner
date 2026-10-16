@@ -2219,8 +2219,12 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         if (uv_env) |e| {
             try w.writeAll("withEnvVariable(name:\"UV_PROJECT_ENVIRONMENT\",value:");
             try std.json.Stringify.value(e, .{}, w);
-            try w.writeAll(") { ");
-            extra_braces += 1;
+            // The environment outlives the job, and `uv venv` refuses to replace one that exists
+            // ("A virtual environment already exists at ..."), where on a hosted runner the
+            // workspace is new every job and it always succeeds. This keeps `uv venv` meaning
+            // "make me a fresh environment"; `uv sync` still reconciles the one that is there.
+            try w.writeAll(") { withEnvVariable(name:\"UV_VENV_CLEAR\",value:\"1\") { ");
+            extra_braces += 2;
         }
         const defaults = try ev.defaultEnv();
         for (defaults) |e| {
@@ -6768,6 +6772,8 @@ test "uv's environment goes in its cache, with a .venv symlink to it" {
     const base = fake.seen.items[1];
     const path = "/home/runner/.cache/uv/zig-runner-envs/refs-heads-main";
     try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"UV_PROJECT_ENVIRONMENT\",value:\"" ++ path ++ "\")") != null);
+    // `uv venv` would otherwise fail on the second job for a ref, the environment being there already.
+    try std.testing.expect(std.mem.indexOf(u8, base, "withEnvVariable(name:\"UV_VENV_CLEAR\",value:\"1\")") != null);
     try std.testing.expect(std.mem.indexOf(u8, base, "ln -sfn " ++ path ++ " /home/runner/work/r/r/.venv") != null);
 
     // Off: no variable, no link.
