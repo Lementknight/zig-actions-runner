@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Fast checks on what is being committed: the Zig code's formatting (zig fmt) and the errors zig
-# ast-check finds without compiling (syntax, unused locals and parameters, shadowing), and workflow
-# YAML (runner/tools/check_workflows.zig). The staged content is checked, not the working tree, so a
-# partially staged file is judged as it will be committed.
+# ast-check finds without compiling (syntax, unused locals and parameters, shadowing), workflow
+# YAML (runner/tools/check_workflows.zig), and the Agda proofs (proofs/check.sh, about a second).
+# The staged content is checked, not the working tree, so a partially staged file is judged as it
+# will be committed.
 # The full build and tests run before a push (pre-push).
 set -euo pipefail
 [ "${SKIP_ZIG_HOOKS:-}" = 1 ] && exit 0
@@ -11,43 +12,72 @@ files=()
 while IFS= read -r -d '' f; do files+=("$f"); done < <(git diff --cached --name-only -z --diff-filter=ACMR -- '*.zig' '*.zon')
 workflows=()
 while IFS= read -r -d '' f; do workflows+=("$f"); done < <(git diff --cached --name-only -z --diff-filter=ACMR -- '.github/workflows/*.yml' '.github/workflows/*.yaml')
-[ ${#files[@]} -eq 0 ] && [ ${#workflows[@]} -eq 0 ] && exit 0
+proofs=()
+while IFS= read -r -d '' f; do proofs+=("$f"); done < <(git diff --cached --name-only -z --diff-filter=ACMR -- proofs)
+[ ${#files[@]} -eq 0 ] && [ ${#workflows[@]} -eq 0 ] && [ ${#proofs[@]} -eq 0 ] && exit 0
 
 # shellcheck source-path=SCRIPTDIR source=zig-common.sh
 . "$(dirname "$0")/zig-common.sh"
-require_zig
 
 failed=0
+staged=""
+cleanup() { if [ -n "$staged" ]; then rm -rf "$staged"; fi; }
+trap cleanup EXIT
+
+# Copies paths out of the index into $staged, so the checks see what is being committed.
+stage_paths() { # <pathspec>...
+	local f
+	[ -n "$staged" ] || staged=$(mktemp -d)
+	while IFS= read -r -d '' f; do
+		mkdir -p "$staged/$(dirname "$f")"
+		git show ":$f" > "$staged/$f"
+	done < <(git ls-files -z -- "$@")
+}
 
 # Workflow YAML, checked as it will be committed. A mistake here fails a whole run for a reason
 # GitHub reports only as "This run likely failed because of a workflow file issue".
 if [ ${#workflows[@]} -gt 0 ]; then
-	staged=$(mktemp -d)
-	trap 'rm -rf "$staged"' EXIT
-	for f in "${workflows[@]}"; do
-		mkdir -p "$staged/$(dirname "$f")"
-		git show ":$f" > "$staged/$f"
-	done
+	require_zig
+	stage_paths '.github/workflows/*.yml' '.github/workflows/*.yaml'
 	if ! out=$(cd "$root/runner" && zig build check-workflows -- "$staged/.github/workflows" 2>&1); then
 		printf '%s\n' "${out//$staged\//}" >&2
 		say "workflow YAML is not valid (see above)."
 		failed=1
 	fi
 fi
-for f in "${files[@]}"; do
-	if ! git show ":$f" | zig fmt --stdin --check >/dev/null 2>&1; then
-		say "not formatted: $f   (zig fmt $f, then git add it)"
+
+# The proofs, with the Agda version CI pins (see proofs/check.sh, which picks it and says which it
+# used). ci.yml comes along because that is where the pinned version is written down.
+if [ ${#proofs[@]} -gt 0 ]; then
+	stage_paths proofs '.github/workflows/ci.yml'
+	if ! out=$(cd "$staged/proofs" && sh ./check.sh 2>&1); then
+		# Agda prints absolute paths; show them relative to the repository. On macOS the temporary
+		# directory resolves through /private, so strip that form too.
+		phys=$(cd "$staged" && pwd -P)
+		out=${out//$phys\//}
+		printf '%s\n' "${out//$staged\//}" >&2
+		say "the proofs do not type-check (see above)."
 		failed=1
 	fi
-	case "$f" in
-	*.zig)
-		if ! out=$(git show ":$f" | zig ast-check 2>&1); then
-			printf '%s\n' "${out//<stdin>/$f}" >&2
+fi
+
+if [ ${#files[@]} -gt 0 ]; then
+	require_zig
+	for f in "${files[@]}"; do
+		if ! git show ":$f" | zig fmt --stdin --check > /dev/null 2>&1; then
+			say "not formatted: $f   (zig fmt $f, then git add it)"
 			failed=1
 		fi
-		;;
-	esac
-done
+		case "$f" in
+		*.zig)
+			if ! out=$(git show ":$f" | zig ast-check 2>&1); then
+				printf '%s\n' "${out//<stdin>/$f}" >&2
+				failed=1
+			fi
+			;;
+		esac
+	done
+fi
 
 if [ "$failed" -ne 0 ]; then
 	say "commit stopped: fix the issues above."

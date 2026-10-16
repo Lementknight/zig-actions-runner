@@ -72,11 +72,11 @@ keysFrom ks t s (st ∷ sts) =
 -- Every key asked from a container that names the job starts from one too.
 keys-stay-nonced : (ks : Keys) (t : Trial) (s : State) (job : List Step)
   → Nonced t s → All (λ k → Nonced t (Key.kParent k)) (keysFrom ks t s job)
-keys-stay-nonced ks t s []         nc = []
+keys-stay-nonced ks t s []         nc = all[]
 keys-stay-nonced ks t s (st ∷ sts) nc =
-  parent-nonced (mark st)
-    ∷ keys-stay-nonced ks t (nextState ks t s st (mark st) (exec (inputFor t s st (mark st)) t)) sts
-        (nonced-stays ks t s st (mark st) (exec (inputFor t s st (mark st)) t) nc)
+  all∷ (parent-nonced (mark st))
+    (keys-stay-nonced ks t (nextState ks t s st (mark st) (exec (inputFor t s st (mark st)) t)) sts
+        (nonced-stays ks t s st (mark st) (exec (inputFor t s st (mark st)) t) nc))
   where
     parent-nonced : (m : Mark) → Nonced t (Key.kParent (K (inputFor t s st m)))
     parent-nonced plain    = nc
@@ -98,8 +98,8 @@ no-cutoff-without-keys t c s st rest cl =
   where
     misses : {ks : List Key} → All (λ k → Nonced t (Key.kParent k)) ks
       → All (λ k → look k c ≡ nothing) ks
-    misses []            = []
-    misses (nc ∷ ncs) = look-miss _ _ (λ o mem → cl mem nc) ∷ misses ncs
+    misses all[]          = all[]
+    misses (all∷ nc ncs) = all∷ (look-miss _ _ (λ o mem → cl mem nc)) (misses ncs)
 
 ------------------------------------------------------------------------------
 -- With output keys, the same bytes mean the same keys
@@ -113,8 +113,8 @@ AllPlain = All (λ st → mark st ≡ plain)
 -- unmarked step has none.
 keys-job-independent : (t t' : Trial) (s : State) (sts : List Step)
   → AllPlain sts → keysFrom on t s sts ≡ keysFrom on t' s sts
-keys-job-independent t t' s []         []           = refl
-keys-job-independent t t' s (st ∷ sts) (pl ∷ pls) rewrite pl =
+keys-job-independent t t' s []         all[]        = refl
+keys-job-independent t t' s (st ∷ sts) (all∷ pl pls) rewrite pl =
   cong (λ x → K (input s (body (Step.text st) (Step.num st)) (Step.env st) (Step.mounts st)) ∷ x)
        (keys-job-independent t t' _ sts pls)
 

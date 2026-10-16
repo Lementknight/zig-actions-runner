@@ -10,11 +10,39 @@ needs, they give a concrete job where dropping it makes the cache hand back an a
 would not have given.
 
 ```
-./check.sh        # needs `brew install agda`; nothing else, no standard library
+./check.sh
 ```
 
 Every module is `--safe`: no postulates, no holes, no `trustMe`. A clean run is the whole claim. CI
-checks it on every pull request.
+checks it on every pull request, and so does `pre-commit`, on the staged content.
+
+**The Agda version is pinned**, because it has to be: Ubuntu's apt Agda was 2.6.3 and Homebrew's was
+2.8.0.2, and these proofs type-checked on the second and not the first — overloading a constructor
+name is resolved from the expected type in one and ambiguous in the other. CI installs the version
+named by `AGDA_VERSION` in [ci.yml](../.github/workflows/ci.yml), and `check.sh` prefers an
+`agda-<that version>` on `PATH`, falling back to plain `agda` with a warning that results may differ.
+Any recent Agda will very likely do (`brew install agda`, `apt install agda`); to match CI exactly,
+install the same binary distribution it uses — macOS arm64 shown, the rest are in the same release:
+
+```sh
+v=2.7.0; asset=agda-$v-arm64-macos-14-ghc9.8.2-icu74.2.zip
+curl -fsSLO "https://github.com/wenkokke/setup-agda/releases/download/latest/$asset"
+unzip -q "$asset" -d "$HOME/.local/opt/agda-$v"
+# macOS kills unsigned downloaded binaries (SIGKILL, exit 137), so sign them ad hoc:
+xattr -cr "$HOME/.local/opt/agda-$v"
+codesign --force --sign - "$HOME/.local/opt/agda-$v"/lib/*.dylib "$HOME/.local/opt/agda-$v/bin/agda"
+```
+
+Then a wrapper named for the version, `~/.local/bin/agda-2.7.0`, which `check.sh` will find. The
+bundle was built on someone else's machine, so its compiled-in data directory does not exist here and
+`Agda_datadir` has to say where the real one is:
+
+```sh
+#!/bin/sh
+Agda_datadir="$HOME/.local/opt/agda-2.7.0/data"
+export Agda_datadir
+exec "$HOME/.local/opt/agda-2.7.0/bin/agda" "$@"
+```
 
 ## What is modelled, and what it is in the code
 

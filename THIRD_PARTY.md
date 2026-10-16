@@ -27,6 +27,8 @@ The Dagger engine pulls these images when jobs run; none of them is part of this
 
 The optional `api/` and `web/` depend on npm packages listed in their `package-lock.json` files, all under open-source licenses (MIT, Apache-2.0, BSD, ISC, MPL-2.0 and similar).
 
+CI installs one more tool, which is in no build: [`wenkokke/setup-agda`](https://github.com/wenkokke/setup-agda) (MIT, Copyright (c) 2022 Wen Kokke), pinned by commit, which puts an Agda of the pinned version on the runner to type-check `proofs/`. That binary distribution carries its own notices (Agda's, under BSD-style terms, with GMP under LGPL-3.0 and ICU under the Unicode license); `proofs/` itself is this project's own code and uses no Agda library.
+
 ## actions/runner's license
 
 ```
