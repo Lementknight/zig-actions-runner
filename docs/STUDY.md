@@ -574,9 +574,32 @@ Three arms on the Pi, each a fresh engine (so an empty step cache) and the same 
 5. **So the architecture stays.** Nothing measured — per-step latency, the job floor, retained state or memory — supports replacing Dagger.
 6. **`GOGC=400` looks like the wrong trade on this machine** (11.2), though not for the reason expected: not because a lower value is faster, but because it is free. The same job time and CPU, 225 MB less heap. Whether that headroom prevents §8.2's pathology needs a loaded engine and days, which the Pi is now accumulating at `GOGC=100`.
 
-## 12. Next
+## 12. Experiment 8: test selection for Python
 
-- **Test selection for Python,** on a workload that needs it. flask does not: its 493 tests run in under 3 s, and experiment 6 found its job's time to be `uv sync`. A project with slow tests is needed before this question means anything.
+**Question.** Go's test cache reruns only the packages a change affects. pytest has nothing equivalent, so every test runs every time. Is there something a runner should do about it?
+
+**Workload.** sqlalchemy's `test/base test/sql`, 9,300 tests, on the Pi; and `pytest-testmon`, which traces which tests touch which code and reruns only those affected. Its database is a file, so persisting it between jobs is the part a runner could help with.
+
+| | Time | Tests chosen |
+|---|---|---|
+| full pytest, the baseline | 58.5 s | 9,300 run |
+| testmon's first run, building its database | **227.0 s** | 9,300 run |
+| testmon again, nothing changed | **7.5 s** | 62 of 9,380 |
+| after changing a leaf module (`util/langhelpers.py`) | 7.5 s | 62 |
+| after changing a core module (`sql/elements.py`) | **261.8 s** | **7,452 (79%)** |
+
+**Selection is a bad trade here, and the reason is the tracing.** Running tests under testmon costs about four times what running them plainly does, so the moment a change touches something widely used — 79% of the suite for one core module — selection costs 4.5 times the full run it was meant to replace. It wins only when almost nothing is affected, and that is precisely the case the step cache already handles for nothing: a re-run replays the whole step (experiment 2, and §2's ripgrep row, "3 of 3 steps replayed"). Tool-level selection pays four times over to discover what the runner already knew.
+
+**One row is inconclusive.** Changing a leaf module selected the same 62 tests as changing nothing, which means either testmon missed it or the function the edit landed in is covered by no test. Without checking which, it cannot be read as evidence that testmon is wrong, so it is not.
+
+**Findings.**
+
+1. **The runner should do nothing here.** The unchanged case is already free through the step cache; the changed case is where selection is most expensive. Persisting a selection database between jobs, which is what a runner could offer, would make the bad case no better.
+2. **This is one suite on one machine,** and the tracing overhead is testmon's rather than selection's in principle. A tool that selected without tracing every run would deserve its own measurement.
+3. **What would help a large Python suite here is parallelism and the step cache,** not selection: `pytest -n 2` is already in use, and an unchanged suite replays in about a second.
+
+## 13. Next
+
 - **Whether the staging recipe (experiment 6) can be made the default** without an exec that reads a volume, which Dagger will not key on content.
 - **The cost of handing a step its inputs:** experiment 5's overhead, measured on its own rather than as a feature's by-product, and on a machine with an SSD as well as the Pi. It decides whether any form of finer keying can pay here.
 - **Engine memory over days:** the 15-minute log under ordinary jobs, to decide whether the cache cap should be lower (8.2).
