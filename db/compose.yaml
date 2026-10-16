@@ -1,0 +1,48 @@
+# A local TimescaleDB for development: the `job_logs` hypertable the runner streams a job's log
+# into, and the run state beside it (docs/SPEC.md §4).
+#
+#   docker compose -f db/compose.yaml up -d
+#   cd runner && zig build run -- --db-check            # with the PG* variables below
+#
+# The migrations in this directory are mounted where the Postgres image looks for them, so the
+# schema applies itself the first time the container starts, in file-name order. They run once, on
+# an empty data volume: after a schema change, either add a migration and apply it by hand or
+# `docker compose -f db/compose.yaml down -v` to start over.
+#
+# Local only. The password is in this file on purpose — it is a development database on the
+# loopback interface, there is nothing in it worth protecting, and a password nobody has to look up
+# is one nobody puts in a shell history. Nothing here is how the deployed runner reaches a database
+# (docs/DEPLOY.md).
+name: zig-runner-db
+
+services:
+  db:
+    # TimescaleDB on Postgres 17, which `by_range()` and the compression policies in 001_init.sql
+    # need; the -ha images are the ones published for arm64, so this runs on a Mac and on a Pi.
+    image: timescale/timescaledb-ha:pg17
+    environment:
+      POSTGRES_DB: zig_runner
+      POSTGRES_USER: zig_runner
+      POSTGRES_PASSWORD: zig-runner-dev
+      # Faster to start and to drop; this database holds nothing that matters.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      # Loopback only, and deliberately not 5432: a machine may already be running a Postgres there,
+      # and the symptom is confusing — the runner reaches that one instead and is told its role does
+      # not exist, while this container looks healthy.
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - db-state:/home/postgres/pgdata
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zig_runner -d zig_runner"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    labels:
+      wud.watch: "false"
+      com.centurylinklabs.watchtower.enable: "false"
+
+volumes:
+  db-state:
