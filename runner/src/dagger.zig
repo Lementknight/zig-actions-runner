@@ -226,6 +226,10 @@ pub const Resolved = union(enum) {
         always_run: ?[]const u8 = null,
         /// Write the event payload from the volatile ZIG_RUNNER_EVENT variable to GITHUB_EVENT_PATH.
         write_event: bool = false,
+        /// Give this step `volatile_sentinel` in place of the run-specific values (see
+        /// `Options.enforce_volatile`). Set for a step that is *not* always-run, where a real value
+        /// would be one it could read without the runner knowing and be replayed with.
+        withhold_volatile: bool = false,
     },
     checkout: Fetched,
 };
@@ -281,7 +285,7 @@ fn stepScriptFc(arena: Allocator, n: u32, fc: u32, r: Resolved, action_name: []c
                 try shellQuote(w, wd);
                 try w.writeAll(" && ");
             }
-            try writeEnvCommand(w, arena, "env ", sc.env, sc.secret_env, sc.write_event, fc, action_name);
+            try writeEnvCommand(w, arena, "env ", sc.env, sc.secret_env, sc.write_event, sc.withhold_volatile, fc, action_name);
             try writeShellCommand(w, arena, sc.shell, path);
             // The script file goes once it ran: otherwise every later step's filesystem holds it, and
             // with it whatever the script embeds (a commit from `${{ github.sha }}`).
@@ -339,7 +343,7 @@ const docker_home = "/github/home";
 /// The busybox `sh -c` script that runs a Docker action's command `argv` as step `n`: as
 /// `stepScriptFc`, with the image's command in place of a shell script, and busybox's own `mkdir`,
 /// `printf` and `env` (the image may have none).
-fn containerScript(arena: Allocator, n: u32, fc: u32, argv: []const []const u8, env: []const job_mod.EnvVar, secret_env: []const []const u8, always_run: ?[]const u8, write_event: bool, action_name: []const u8) ![]const u8 {
+fn containerScript(arena: Allocator, n: u32, fc: u32, argv: []const []const u8, env: []const job_mod.EnvVar, secret_env: []const []const u8, always_run: ?[]const u8, write_event: bool, withhold_volatile: bool, action_name: []const u8) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.print("echo '{s}begin {d}'\nB=" ++ busybox_path ++ "\n\"$B\" mkdir -p " ++ fc_dir ++ " " ++ docker_home ++ " " ++ event_dir ++ " && : ", .{ marker, n });
@@ -351,7 +355,7 @@ fn containerScript(arena: Allocator, n: u32, fc: u32, argv: []const []const u8, 
         try w.writeByte('\n');
     }
     if (write_event) try w.writeAll("if [ -n \"${" ++ event_env ++ "+x}\" ]; then \"$B\" printf '%s' \"$" ++ event_env ++ "\" > " ++ event_path ++ "; fi\n");
-    try writeEnvCommand(w, arena, "\"$B\" env ", env, secret_env, write_event, fc, action_name);
+    try writeEnvCommand(w, arena, "\"$B\" env ", env, secret_env, write_event, withhold_volatile, fc, action_name);
     for (argv) |a| {
         try shellQuote(w, a);
         try w.writeByte(' ');
@@ -424,11 +428,16 @@ fn jsonStrings(arena: Allocator, v: ?std.json.Value) ![]const []const u8 {
 
 /// `<env_cmd>-u <aliases> NAME=value ... GITHUB_OUTPUT=... GITHUB_ACTION=... `: what a step's command
 /// starts with, so it gets its env (secret values expanded from their aliases, see `Resolved.run`).
-fn writeEnvCommand(w: *std.Io.Writer, arena: Allocator, env_cmd: []const u8, env: []const job_mod.EnvVar, secret_env: []const []const u8, write_event: bool, fc: u32, action_name: []const u8) !void {
+fn writeEnvCommand(w: *std.Io.Writer, arena: Allocator, env_cmd: []const u8, env: []const job_mod.EnvVar, secret_env: []const []const u8, write_event: bool, withhold_volatile: bool, fc: u32, action_name: []const u8) !void {
     try w.writeAll(env_cmd);
     for (secret_env, 0..) |_, i| try w.print("-u {s} ", .{try secretAlias(arena, i)});
     if (write_event) try w.writeAll("-u " ++ event_env ++ " ");
     try w.writeAll("-u " ++ ran_env ++ " ");
+    // Before the step's own env, so a workflow that sets one of these itself still wins.
+    if (withhold_volatile) for (volatile_env) |name| {
+        try shellQuote(w, try std.fmt.allocPrint(arena, "{s}=" ++ volatile_sentinel, .{name}));
+        try w.writeByte(' ');
+    };
     for (env) |e| {
         const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ e.name, e.value });
         try shellQuote(w, pair);
@@ -817,6 +826,12 @@ pub const Options = struct {
     /// Mount `package_cache_dirs` from persistent cache volumes, scoped to the repository. The runner
     /// turns this on (`RUNNER_PACKAGE_CACHES`, on by default).
     package_caches: bool = false,
+    /// Give a step that did not name a run-specific value `volatile_sentinel` instead of the real
+    /// one (see `volatile_sentinel`). On by default: without it, such a step is replayed with an
+    /// earlier run's value, which proofs/Runner/Enforce.agda shows is the one hypothesis behind step
+    /// caching that the runner can discharge rather than assume. `RUNNER_ENFORCE_VOLATILE=false`
+    /// restores GitHub's behaviour for a workflow that needs it.
+    enforce_volatile: bool = true,
     /// Reuse unchanged steps' results across runs (see `volatile_env`). The runner turns this on
     /// (`RUNNER_STEP_CACHE`, on by default).
     step_cache: bool = false,
@@ -2265,6 +2280,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         .js_runtime = opts.js_runtime,
         .nesting = opts.nesting,
         .step_cache = step_cache,
+        .enforce_volatile = step_cache and opts.enforce_volatile,
         .output_keys = if (step_cache and opts.output_keys and job.github.repository.len > 0)
             try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/step-outputs", .{ job.github.repository, try packageCacheScope(arena, &ev, job.github.repository) })
         else
@@ -2624,6 +2640,8 @@ const Exec = struct {
     nesting: bool,
     /// Unchanged steps may be reused across runs (see `Options.step_cache`).
     step_cache: bool,
+    /// See `Options.enforce_volatile`.
+    enforce_volatile: bool,
     /// With `Options.output_keys`: the key of the cache volume that stores steps' changes by digest
     /// (scoped like the package caches), and the volume once created.
     output_keys: ?[]const u8,
@@ -2788,7 +2806,10 @@ const Exec = struct {
                     "it reads run- or commit-specific values"
                 else
                     null;
-                if (reason) |r| resolved.run.always_run = try std.fmt.allocPrint(arena, "zig-runner runs this step every time: {s} (run {s})", .{ r, x.run_nonce });
+                if (reason) |r| resolved.run.always_run = try std.fmt.allocPrint(arena, "zig-runner runs this step every time: {s} (run {s})", .{ r, x.run_nonce })
+                    // A step that is replayable must not be given a value that differs between runs,
+                    // because it can read one without the runner being able to tell (`volatile_sentinel`).
+                else resolved.run.withhold_volatile = x.enforce_volatile;
             }
         }
         const script = try std.mem.concat(arena, u8, &.{ x.forward_prelude, try stepScriptFc(arena, num, fc, resolved, action_name) });
@@ -4106,7 +4127,9 @@ const Exec = struct {
         const always_run: ?[]const u8 = if (x.step_cache) try std.fmt.allocPrint(arena, "zig-runner runs this step every time: it uses secrets (run {s})", .{x.run_nonce}) else null;
         const fc = x.next_fc;
         x.next_fc += 1;
-        const script = try containerScript(arena, num, fc, argv.items, plain.items, names, always_run, x.event_from_env, if (dr.repository.len > 0) dr.repository else dr.label);
+        // `false`: a Docker action always runs under step caching (it gets the job token), so it is
+        // never replayed and keeps the real run-specific values.
+        const script = try containerScript(arena, num, fc, argv.items, plain.items, names, always_run, x.event_from_env, false, if (dr.repository.len > 0) dr.repository else dr.label);
 
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
@@ -4660,6 +4683,21 @@ const volatile_env = [_][]const u8{
     // Follow the actor, the commit and the branch, as the variables above do.
     "GITHUB_ACTOR_ID", "GITHUB_WORKFLOW_REF", "GITHUB_WORKFLOW_SHA", "GITHUB_REF_PROTECTED",
 };
+
+/// What a step that did not name a run-specific value is given instead of one.
+///
+/// `readsRunSpecific` below is a syntactic test — it looks for the name in the script text — and it
+/// cannot be made sound: a script reaches the value through a file it sources, a program that reads
+/// the environment, or a name built from pieces. Such a step is then replayed with an earlier run's
+/// value, which is wrong rather than merely stale (docs/STUDY.md experiment 2, and the B1 check in
+/// properties/). So a step that did not name one does not get one. The value is a constant, so the
+/// step's cache key is unaffected; it is in the script's own `env` prefix, so it is part of that key
+/// and cannot vary; and it is visible, so a step that prints it says so in its log.
+///
+/// This is a deliberate divergence from GitHub's runner, which always sets the real values. See
+/// docs/SPEC.md "Where this runner differs from GitHub's" and proofs/Runner/Enforce.agda, which is
+/// why it is sound: an unmarked step's input becomes a function of its cache key.
+const volatile_sentinel = "zig-runner-withheld";
 
 /// Whether a script names a variable whose value differs between runs while the cache key does not
 /// (the volatile ones and the event payload). Scripts the step runs from files are not looked into.
@@ -6898,6 +6936,55 @@ test "package caches in a container job: variables point the tools at the volume
     const theirs = std.mem.indexOf(u8, base, "withEnvVariable(name:\"GOCACHE\",value:\"/tmp/gocache\")").?;
     try std.testing.expect(ours < theirs);
     try std.testing.expect(braceBalanced(base));
+}
+
+test "enforcement: a replayable step is not given the run-specific values, an always-run step is" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The same step, told once that it is replayable and once that it always runs.
+    const plain = try stepScript(arena, 1, .{ .run = .{
+        .script = "echo hi",
+        .shell = null,
+        .working_directory = null,
+        .env = &.{},
+        .withhold_volatile = true,
+    } }, "");
+    const marked = try stepScript(arena, 1, .{ .run = .{
+        .script = "echo hi",
+        .shell = null,
+        .working_directory = null,
+        .env = &.{},
+        .always_run = "zig-runner runs this step every time: it uses secrets (run 1.1, job j1)",
+    } }, "");
+
+    // A replayable step gets the sentinel for every name in `volatile_env`, in the script's own env
+    // prefix, so the value is part of its cache key and cannot differ between runs.
+    for (volatile_env) |name| {
+        const pair = try std.fmt.allocPrint(arena, "{s}={s}", .{ name, volatile_sentinel });
+        try std.testing.expect(std.mem.indexOf(u8, plain, pair) != null);
+        try std.testing.expect(std.mem.indexOf(u8, marked, pair) == null);
+    }
+    // And a step that always runs is given nothing of the sort: it is never replayed, so the real
+    // values the container carries are safe for it to read.
+    try std.testing.expect(std.mem.indexOf(u8, marked, volatile_sentinel) == null);
+}
+
+test "enforcement: off by configuration, a replayable step keeps GitHub's behaviour" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // `withhold_volatile` is what `Options.enforce_volatile` decides; with it false the script has
+    // no sentinel in it, which is what RUNNER_ENFORCE_VOLATILE=false asks for.
+    const script = try stepScript(arena, 1, .{ .run = .{
+        .script = "echo hi",
+        .shell = null,
+        .working_directory = null,
+        .env = &.{},
+        .withhold_volatile = false,
+    } }, "");
+    try std.testing.expect(std.mem.indexOf(u8, script, volatile_sentinel) == null);
 }
 
 test "step caching: run-specific values are volatile, steps with secrets always run, workflows can opt out" {

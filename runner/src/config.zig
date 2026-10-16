@@ -67,6 +67,11 @@ pub const Config = struct {
     /// Experimental: key the steps after one that always runs on what it produced rather than on
     /// the step itself (see `dagger.Options.output_keys`).
     output_keys: bool = false,
+    /// Give a step that did not name a run-specific value (`GITHUB_SHA`, `GITHUB_RUN_ID`, the actor,
+    /// the refs) a constant instead of the real one, so that a step which reads one indirectly
+    /// cannot be replayed with an earlier run's value. On by default, and a deliberate divergence
+    /// from GitHub's runner: see SPEC "Where this runner differs from GitHub's".
+    enforce_volatile: bool = true,
     /// Put uv's project environment inside its cache volume, so uv can hardlink into it instead of
     /// copying every file (28.6 s against 0.2 s on a Raspberry Pi; see SPEC Â§6 "Package caches").
     /// The workspace gets a `.venv` symlink to it, so paths into `.venv` still work.
@@ -119,6 +124,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_STEP_CACHE")) |v| c.step_cache = try boolean(v);
         if (environ.get("RUNNER_STEP_USER")) |v| c.step_user = try stepUser(v);
         if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
+        if (environ.get("RUNNER_ENFORCE_VOLATILE")) |v| c.enforce_volatile = try boolean(v);
         if (environ.get("RUNNER_UV_ENV_IN_CACHE")) |v| c.uv_env_in_cache = try boolean(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_MAX_MS")) |v| c.output_keys_max_ms = try millis(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_DAYS")) |v| c.output_keys_days = try count(v);
@@ -175,6 +181,7 @@ pub const Config = struct {
             else if (std.mem.eql(u8, key, "step-user")) c.step_user = try stepUser(val) //
             else if (std.mem.eql(u8, key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
             else if (std.mem.eql(u8, key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
+            else if (std.mem.eql(u8, key, "enforce-volatile")) c.enforce_volatile = try boolean(val) //
             else if (std.mem.eql(u8, key, "output-keys")) c.output_keys = try boolean(val) //
             else if (std.mem.eql(u8, key, "output-keys-days")) c.output_keys_days = try count(val) //
             else if (std.mem.eql(u8, key, "runners")) c.runners = try count(val) //
@@ -342,6 +349,10 @@ test "the output-keys limit: milliseconds, and 0 turns it off" {
     defer env.deinit();
     try env.put("GH_TOKEN", "t");
     try env.put("GH_SCOPE", "o/r");
+    try std.testing.expect((try Config.load(&env, &.{"runner"})).enforce_volatile);
+    try env.put("RUNNER_ENFORCE_VOLATILE", "false");
+    try std.testing.expect(!(try Config.load(&env, &.{"runner"})).enforce_volatile);
+    try std.testing.expect((try Config.load(&env, &.{ "runner", "--enforce-volatile=true" })).enforce_volatile);
     try std.testing.expectEqual(@as(u32, 10_000), (try Config.load(&env, &.{"runner"})).output_keys_max_ms);
     try env.put("RUNNER_OUTPUT_KEYS_MAX_MS", "0");
     try std.testing.expectEqual(@as(u32, 0), (try Config.load(&env, &.{"runner"})).output_keys_max_ms);
