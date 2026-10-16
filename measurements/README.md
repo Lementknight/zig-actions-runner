@@ -20,6 +20,7 @@ whatever `--environment` printed. `note` says where a line came from when it was
 
 | File | Claim | Provenance |
 |---|---|---|
+| `E3.4-outputkeys-measured.jsonl` | E3.4/E3.4b, what output keys cost on a first run | **measured** on the Pi, 2026-10-16, by `e3.4/arm-outputkeys.sh` |
 | `E7.7-gogc-measured.jsonl` | E7.7, engine CPU over 40 steps | **measured** on the Pi, 2026-10-16, by `e7.7/arm-gogc.sh` |
 | `E7.7-pilot.jsonl` | E7.7's pilot, which is also its negative control | **measured** on the Pi, 2026-10-16, by `e7.7/arm.sh` |
 | `E7.6-gogc-flask-warm.jsonl` | E7.6, job seconds on warm re-runs | **transcribed** from STUDY.md §11.2 |
@@ -46,6 +47,30 @@ The pilot came first, as §3.2.5 asks. Its two arms ran the *identical* command,
 negative control as well: medians 6.204 s and 6.224 s, CI [−0.284, +0.437], `no_effect_found`. Its
 spread (sd 0.29) asked for three repetitions an arm, not the nineteen a warm-up round's provisioning
 made it look like before `dimension` learned to exclude warm-ups.
+
+## E3.4, settled — and not as it was stated
+
+The second claim through the harness, and the first the harness overturned. `e3.4/` holds the
+workload (a checkout of go-task/task, one step that reads a run-specific value so it is always-run,
+and three steps after it, every step carrying the trial's token) and the arm, which is the
+operator's flag in the unit file and a restart — no engine recreate, because the token already makes
+every step new.
+
+```
+  keys_off   n=4  median 1.047 s   (baseline)
+  control    n=4  median 0.833 s   difference -0.214  95% CI [-0.250, +0.024]  no_effect_found
+  keys_on    n=4  median 2.518 s   difference +1.471  95% CI [+1.356, +1.699]  effect
+```
+
+The third arm runs the *identical* command to the baseline, so the suite shows in one run that it can
+tell a difference it found from one it did not. Output keys cost **+1.47 s of engine CPU** on a job
+whose own work is about a second: 140%, with the interval running from 130% to 162%.
+
+That does not refute "a first run costs about the same" so much as locate it. The cost is roughly
+fixed per always-run step, so on the 60 s job the study measured it hid inside the noise, and on a
+2 s job it is most of the job. Which is why they stay opt-in, and why
+`RUNNER_OUTPUT_KEYS_MAX_MS` — a limit on what they may spend before a repository stops using them —
+is the right shape of answer rather than a flag someone sets once.
 
 ## The transcriptions, and why they are here
 
