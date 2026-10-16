@@ -1,6 +1,6 @@
 # Design: a lightweight, self-hosted GitHub Actions runner in Zig
 
-Audience: the team, and anyone self-hosting it · Details: [SPEC.md](SPEC.md) · Running it: [DEPLOY.md](DEPLOY.md) · Measurements and trade-offs: [STUDY.md](STUDY.md)
+Audience: the team, and anyone self-hosting it · Details: [SPEC.md](SPEC.md) · Running it: [DEPLOY.md](DEPLOY.md) · Measurements and trade-offs: [STUDY.md](STUDY.md) · Prior art: [RELATED.md](RELATED.md)
 
 ## 1. Problem
 

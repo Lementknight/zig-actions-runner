@@ -1,6 +1,6 @@
 # Measuring: a framework for the claims in this study, and the properties behind them
 
-Audience: whoever adds or re-checks a claim · Companion: [STUDY.md](STUDY.md), [DESIGN.md](DESIGN.md)
+Audience: whoever adds or re-checks a claim · Companion: [STUDY.md](STUDY.md), [DESIGN.md](DESIGN.md), [RELATED.md](RELATED.md)
 
 This study's claims were produced ad hoc, one shell script at a time, and several were wrong before
 they were right. This document exists so that the next claim is harder to get wrong than to get
