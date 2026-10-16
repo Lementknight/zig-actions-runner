@@ -33,3 +33,6 @@ _work/
 
 # Runner configuration with credentials (deploy/runner.env.example is the template).
 deploy/runner.env
+
+# A zls clone someone keeps here; not part of this repository.
+zls/
