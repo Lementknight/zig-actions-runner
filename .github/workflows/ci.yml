@@ -41,6 +41,25 @@ jobs:
         working-directory: runner
         run: zig build test --summary all
 
+  proofs:
+    name: Agda proofs of the step cache
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Ubuntu's own Agda, not a third-party action: the proofs use no standard library, so a plain
+      # type-checker is all they need. The version is in the log, since a failure here is as likely
+      # to be a difference between Agda releases as a broken proof.
+      - name: Install Agda
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends agda
+          agda --version
+
+      # Every module is --safe, so a clean run is the whole claim; see proofs/README.md.
+      - name: Check the proofs
+        run: ./proofs/check.sh
+
   db-integration:
     name: Database integration (Tiger Data)
     # This project's own runner, so a workflow run exercises it too. Manual only: the job waits for a

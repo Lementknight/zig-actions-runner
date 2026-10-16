@@ -169,6 +169,10 @@ data _∈_ {A : Set} (x : A) : List A → Set where
   here  : {xs : List A} → x ∈ (x ∷ xs)
   there : {y : A} {xs : List A} → x ∈ xs → x ∈ (y ∷ xs)
 
+data All {A : Set} (P : A → Set) : List A → Set where
+  []  : All P []
+  _∷_ : {x : A} {xs : List A} → P x → All P xs → All P (x ∷ xs)
+
 any : {A : Set} → (A → Bool) → List A → Bool
 any p []       = false
 any p (x ∷ xs) = p x ∨ any p xs
