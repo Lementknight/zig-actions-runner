@@ -27,6 +27,11 @@ jobs:
         working-directory: runner
         run: zig fmt --check .
 
+      # The workflow YAML of this repository, with the parser the runner uses (tools/check_workflows.zig).
+      - name: Check workflow YAML
+        working-directory: runner
+        run: zig build check-workflows
+
       # The git hooks in .githooks/ run these same checks locally (see README.md).
       - name: Lint the git hooks
         run: shellcheck -x .githooks/pre-commit .githooks/pre-push .githooks/zig-common.sh
