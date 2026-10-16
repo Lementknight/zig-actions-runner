@@ -149,7 +149,9 @@ pub const CollectSink = struct {
         const text = aw.written();
         s.cache = null;
         const seq = s.nextSeq(step_number);
-        try s.inner.append(job_id, step_number, stream, text);
+        // The number goes down with the line, so the database row and the line GitHub shows carry
+        // the same one rather than two counters that happen to agree.
+        try s.inner.appendStep(job_id, step_number, seq, stream, text);
         if (s.listener) |l| l.onLine(l.ptr, step_number, seq, text);
         if (s.bytes + text.len > max_bytes) {
             s.dropped += 1;
@@ -200,6 +202,16 @@ pub const LogSink = union(enum) {
     stdout: StdoutSink,
     collect: CollectSink,
     postgres: pgsink.PgSink,
+
+    /// As `append`, with the line's number in its own step where the caller knows it. Only
+    /// `CollectSink` does; everything else logs through `append`.
+    pub fn appendStep(s: *LogSink, job_id: u64, step_number: u32, step_seq: ?u64, stream: Stream, line: []const u8) Error!void {
+        return switch (s.*) {
+            .postgres => |*p| p.appendStep(job_id, step_number, step_seq, stream, line),
+            // The console and the collector show a line the same way whatever its number is.
+            else => s.append(job_id, step_number, stream, line),
+        };
+    }
 
     pub fn append(s: *LogSink, job_id: u64, step_number: u32, stream: Stream, line: []const u8) Error!void {
         switch (s.*) {
