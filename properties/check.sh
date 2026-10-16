@@ -4,7 +4,7 @@
 # did it run, or was it replayed? The signal is the note the runner writes into a replayed step's own
 # log (`dagger.reused_note`), so this needs nothing but `gh`.
 #
-#   check.sh <repo> [P1|P2|P3|P4|P6|E1|B|all] [ssh host, for E1 and B]
+#   check.sh <repo> [P1|P2|P3|P4|P6|E1|B|R2|all] [ssh host, for E1 and B]
 #
 # What each check is the live counterpart of:
 #
@@ -63,6 +63,45 @@ dispatch() {
 		return 1
 	}
 	echo "$id"
+}
+
+# dispatch_bg <workflow> <flags...> → prints the run id without waiting for it, and without
+# waiting for the repository to be idle: the point of R2 is two jobs at once.
+dispatch_bg() {
+	wf=$1
+	shift
+	before=$(gh run list -R "$repo" --workflow "$wf" -L 1 --json databaseId -q '.[0].databaseId' 2> /dev/null || echo "")
+	gh workflow run "$wf" -R "$repo" "$@" > /dev/null
+	for _ in $(seq 1 30); do
+		sleep 2
+		id=$(gh run list -R "$repo" --workflow "$wf" -L 1 --json databaseId -q '.[0].databaseId')
+		[ -n "$id" ] && [ "$id" != "$before" ] && break
+	done
+	[ -n "$id" ] && [ "$id" != "$before" ] || { echo "check: no new run for $wf" >&2; return 1; }
+	echo "$id"
+}
+
+wait_run() {
+	gh run watch "$1" -R "$repo" --exit-status --interval 5 > /dev/null 2>&1 || {
+		echo "check: run $1 did not succeed" >&2
+		gh run view "$1" -R "$repo" --log-failed >&2 || true
+		return 1
+	}
+}
+
+# $1 is before $2. ISO-8601 of one shape sorts lexicographically, and `sort` is POSIX where `\<`
+# is not.
+earlier() {
+	[ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | LC_ALL=C sort | head -n 1)" = "$1" ]
+}
+
+# Did two runs overlap in time? Concurrency that did not happen proves nothing.
+overlapped() {
+	a_s=$(gh run view "$1" -R "$repo" --json startedAt -q .startedAt)
+	a_e=$(gh run view "$1" -R "$repo" --json updatedAt -q .updatedAt)
+	b_s=$(gh run view "$2" -R "$repo" --json startedAt -q .startedAt)
+	b_e=$(gh run view "$2" -R "$repo" --json updatedAt -q .updatedAt)
+	earlier "$a_s" "$b_e" && earlier "$b_s" "$a_e"
 }
 
 # Was <step> in <run> replayed, or did it run?
@@ -177,6 +216,20 @@ set_limit() { # $1 = milliseconds, or empty to remove the line
 	pi "sudo systemctl daemon-reload"
 	pi "sudo systemctl restart zig-runner"
 	sleep 8
+	# A config the runner rejects makes it exit 1, and RestartPreventExitStatus keeps it down. That
+	# happened once here, with jobs queueing behind a dead service, so this refuses to go on.
+	[ "$(pi "systemctl is-active zig-runner")" = active ] || {
+		echo "check: the runner did not come back after the restart; look at its journal" >&2
+		pi "sudo journalctl -u zig-runner -n 5 --no-pager" >&2 || true
+		exit 7
+	}
+	for _ in $(seq 1 30); do
+		n=$(gh api "repos/$repo/actions/runners" --jq '[.runners[]|select(.status=="online")]|length' 2> /dev/null || echo 0)
+		[ "${n:-0}" -ge 1 ] && return 0
+		sleep 2
+	done
+	echo "check: no runner registered after the restart; refusing to queue jobs behind it" >&2
+	exit 8
 }
 restore_limit() {
 	[ -n "$raised" ] || return 0
@@ -285,6 +338,24 @@ if want B; then
 	b=$(dispatch property-blind.yml -f "spot=mount" -f "step_cache=true")
 	assert "B3 a cache-volume read" "$b" "blind mount" replayed
 	assert_ne "B3 it reports stale content" "the marker it read" "$(value marker "$b" "blind mount")" "$b"
+fi
+
+if want R2; then
+	# A cache a pool shares is safe (`elsewhere⇒ahead`): two jobs at once must each get its own
+	# answer, not the other's. Each job has its own session for exactly this reason (SPEC.md).
+	a=$(dispatch_bg property.yml -f "text=base" -f "ref=$ref_a" -f "envval=concurrent-a" -f "volatile=no")
+	b=$(dispatch_bg property.yml -f "text=base" -f "ref=$ref_a" -f "envval=concurrent-b" -f "volatile=no")
+	wait_run "$a"
+	wait_run "$b"
+	if overlapped "$a" "$b"; then
+		printf '  ok    %-30s runs %s and %s\n' "R2 the two jobs overlapped" "$a" "$b"
+		pass=$((pass + 1))
+	else
+		printf '  FAIL  %-30s %s and %s did not overlap, so this proves nothing\n' "R2 concurrency" "$a" "$b"
+		fail=$((fail + 1))
+	fi
+	assert_eq "R2 the first got its own value" "what it observed" "$(value env "$a" "subject plain")" "concurrent-a"
+	assert_eq "R2 and the second got its own" "what it observed" "$(value env "$b" "subject plain")" "concurrent-b"
 fi
 
 echo

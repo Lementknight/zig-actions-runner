@@ -53,15 +53,15 @@ EOF
         if: inputs.volatile == 'no'
         run: |
           : "subject ${{ inputs.text }}"
-          wc -c < README.md
-          echo "$PROP_ENV"
+          echo "observed readme=$(wc -c < README.md)"
+          echo "observed env=$PROP_ENV"
       - name: subject volatile
         if: inputs.volatile == 'yes'
         run: |
           : "subject ${{ inputs.text }}"
-          wc -c < README.md
-          echo "$PROP_ENV"
-          echo "run $GITHUB_RUN_ID"
+          echo "observed readme=$(wc -c < README.md)"
+          echo "observed env=$PROP_ENV"
+          echo "observed runid=$GITHUB_RUN_ID"
       - name: after
         run: ": after the subject"
 EOF
@@ -134,7 +134,7 @@ jobs:
           fi
       - name: reader
         run: |
-          echo "read $(cat out.txt | wc -c) bytes"
+          echo "observed bytes=$(wc -c < out.txt)"
       - name: after
         run: ": after the reader"
 EOF
