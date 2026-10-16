@@ -9,8 +9,10 @@ on:
 
 env:
   ZIG_VERSION: "0.17.0"
-  # The Agda the proofs are checked with, here and in the hooks (proofs/check.sh reads it from here).
-  AGDA_VERSION: "2.7.0"
+  # The Agda the proofs are checked with, here and in the hooks (proofs/check.sh reads it from here),
+  # and the checksum of the release binary this pins to. See proofs/README.md.
+  AGDA_VERSION: "2.8.0.2"
+  AGDA_SHA256: "2bcf24bb561b1be859bba841e5d67962d1616b3251bc147f878e4f60a2fbd9f7"
 
 jobs:
   unit:
@@ -45,22 +47,25 @@ jobs:
 
   proofs:
     name: Agda proofs of the step cache
-    # Not ubuntu-latest: setup-agda's prebuilt binaries are built per image, and 22.04 is the newest
-    # the pinned version has, so this is the image whose binary is used rather than built.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned by commit, not by tag, so the action cannot change under us; the tag is v2.5.0.
-      # Ubuntu's apt Agda was 2.6.3, two and a half years behind the one installed locally, and the
-      # proofs type-checked on one and not the other. One named version on both ends instead:
-      # AGDA_VERSION above, and proofs/check.sh prefers the same one.
+      # The Agda project's own release binary, pinned by version and checksum, so this and a
+      # developer's machine check the same language: apt's Agda is 2.6.3 and these proofs do not
+      # type-check on it. The Linux build is statically linked, so it needs no packages, and the
+      # proofs import no library, so it needs no data directory (`agda --setup` would make one).
       - name: Install Agda ${{ env.AGDA_VERSION }}
-        uses: wenkokke/setup-agda@52f1e708494c8717630b3e1378383b01a56a379c
-        with:
-          agda-version: ${{ env.AGDA_VERSION }}
-          # The proofs use no library, so do not fetch or configure one.
-          agda-stdlib-version: none
+        run: |
+          v=${{ env.AGDA_VERSION }}
+          curl -fsSL -o /tmp/agda.tar.xz \
+            "https://github.com/agda/agda/releases/download/v$v/Agda-v$v-linux.tar.xz"
+          echo "${{ env.AGDA_SHA256 }}  /tmp/agda.tar.xz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xJf /tmp/agda.tar.xz -C "$HOME/.local/bin"
+          mv "$HOME/.local/bin/agda" "$HOME/.local/bin/agda-$v"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/agda-$v" --version
 
       # Every module is --safe, so a clean run is the whole claim; see proofs/README.md.
       - name: Check the proofs

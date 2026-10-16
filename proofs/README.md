@@ -16,33 +16,29 @@ would not have given.
 Every module is `--safe`: no postulates, no holes, no `trustMe`. A clean run is the whole claim. CI
 checks it on every pull request, and so does `pre-commit`, on the staged content.
 
-**The Agda version is pinned**, because it has to be: Ubuntu's apt Agda was 2.6.3 and Homebrew's was
-2.8.0.2, and these proofs type-checked on the second and not the first — overloading a constructor
-name is resolved from the expected type in one and ambiguous in the other. CI installs the version
-named by `AGDA_VERSION` in [ci.yml](../.github/workflows/ci.yml), and `check.sh` prefers an
-`agda-<that version>` on `PATH`, falling back to plain `agda` with a warning that results may differ.
-Any recent Agda will very likely do (`brew install agda`, `apt install agda`); to match CI exactly,
-install the same binary distribution it uses — macOS arm64 shown, the rest are in the same release:
+**The Agda version is pinned**, because it has to be: Ubuntu's apt Agda is 2.6.3 and Homebrew's is
+2.8.0.2, and these proofs type-check on the second and not the first — overloading a constructor name
+is resolved from the expected type in one and ambiguous in the other. CI installs the version named by
+`AGDA_VERSION` in [ci.yml](../.github/workflows/ci.yml), by **checksum**, from the Agda project's own
+release binaries. `check.sh` prefers an `agda-<that version>` on `PATH` and falls back to plain `agda`
+with a warning that results may differ.
+
+`brew install agda` gives 2.8.0.2 today, which is the pinned version and needs nothing further. To
+pin it exactly as CI does, take the same upstream binary — macOS arm64 here, and the Linux, x64 and
+Windows builds are in [the same release](https://github.com/agda/agda/releases/tag/v2.8.0.2):
 
 ```sh
-v=2.7.0; asset=agda-$v-arm64-macos-14-ghc9.8.2-icu74.2.zip
-curl -fsSLO "https://github.com/wenkokke/setup-agda/releases/download/latest/$asset"
-unzip -q "$asset" -d "$HOME/.local/opt/agda-$v"
-# macOS kills unsigned downloaded binaries (SIGKILL, exit 137), so sign them ad hoc:
-xattr -cr "$HOME/.local/opt/agda-$v"
-codesign --force --sign - "$HOME/.local/opt/agda-$v"/lib/*.dylib "$HOME/.local/opt/agda-$v/bin/agda"
+v=2.8.0.2
+curl -fsSLO "https://github.com/agda/agda/releases/download/v$v/Agda-v$v-macOS-arm64.tar.xz"
+shasum -a 256 "Agda-v$v-macOS-arm64.tar.xz"   # 6ee796a0cb70a0cd80edfc7d2aec24a93aa22558fb3e99caaaeadf33dbb64be7
+mkdir -p "$HOME/.local/opt/agda-$v" && tar -xJf "Agda-v$v-macOS-arm64.tar.xz" -C "$HOME/.local/opt/agda-$v"
+xattr -cr "$HOME/.local/opt/agda-$v"                        # macOS SIGKILLs unsigned downloads
+codesign --force --sign - "$HOME/.local/opt/agda-$v/agda"   # (exit 137) until they are signed
+ln -sfn "$HOME/.local/opt/agda-$v/agda" "$HOME/.local/bin/agda-$v"
 ```
 
-Then a wrapper named for the version, `~/.local/bin/agda-2.7.0`, which `check.sh` will find. The
-bundle was built on someone else's machine, so its compiled-in data directory does not exist here and
-`Agda_datadir` has to say where the real one is:
-
-```sh
-#!/bin/sh
-Agda_datadir="$HOME/.local/opt/agda-2.7.0/data"
-export Agda_datadir
-exec "$HOME/.local/opt/agda-2.7.0/bin/agda" "$@"
-```
+One binary, nothing else: it is statically linked on Linux, and these proofs import no library, so
+they need none of Agda's data files. (`agda --setup` writes them out if something ever does.)
 
 ## What is modelled, and what it is in the code
 
