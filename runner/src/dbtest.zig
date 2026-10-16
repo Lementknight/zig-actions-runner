@@ -18,10 +18,32 @@ pub const Scratch = struct {
         else
             (try pg.fromEnv(&env)) orelse return error.SkipZigTest;
 
-        // The migration lives in the repository; a test run outside it (or before db/ landed) skips.
-        const migration = std.Io.Dir.cwd().readFileAlloc(std.testing.io, "../db/migrations/001_init.sql", arena, .limited(1 << 20)) catch return error.SkipZigTest;
-        const up_start = (std.mem.indexOf(u8, migration, "-- migrate:up") orelse return error.SkipZigTest) + "-- migrate:up".len;
-        const up_end = std.mem.indexOf(u8, migration, "-- migrate:down") orelse migration.len;
+        // The migrations live in the repository; a test run outside it (or before db/ landed) skips.
+        // Every one of them, in file-name order, because a scratch schema built from the first alone
+        // is a schema no deployment has — and a column added by a later migration then looks to the
+        // sink like a database that rejects its writes.
+        var dir = std.Io.Dir.cwd().openDir(std.testing.io, "../db/migrations", .{ .iterate = true }) catch return error.SkipZigTest;
+        defer dir.close(std.testing.io);
+        var names: std.ArrayList([]const u8) = .empty;
+        var it = dir.iterate();
+        while (it.next(std.testing.io) catch null) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".sql")) continue;
+            try names.append(arena, try arena.dupe(u8, entry.name));
+        }
+        if (names.items.len == 0) return error.SkipZigTest;
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        var ups: std.ArrayList([]const u8) = .empty;
+        for (names.items) |name| {
+            const path = try std.fmt.allocPrint(arena, "../db/migrations/{s}", .{name});
+            const text = std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, arena, .limited(1 << 20)) catch return error.SkipZigTest;
+            const up_start = (std.mem.indexOf(u8, text, "-- migrate:up") orelse continue) + "-- migrate:up".len;
+            const up_end = std.mem.indexOf(u8, text, "-- migrate:down") orelse text.len;
+            try ups.append(arena, text[up_start..up_end]);
+        }
 
         var rnd: [6]u8 = undefined;
         std.testing.io.random(&rnd);
@@ -32,7 +54,7 @@ pub const Scratch = struct {
         try admin.exec(try std.fmt.allocPrint(arena, "CREATE SCHEMA \"{s}\"", .{schema}));
         errdefer admin.exec(std.fmt.allocPrint(arena, "DROP SCHEMA \"{s}\" CASCADE", .{schema}) catch "select 1") catch {};
         try admin.exec(try std.fmt.allocPrint(arena, "SET search_path TO \"{s}\", public", .{schema}));
-        try admin.exec(migration[up_start..up_end]);
+        for (ups.items) |up| try admin.exec(up);
         return .{ .arena = arena, .cfg = cfg, .schema = schema, .admin = admin };
     }
 

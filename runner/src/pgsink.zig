@@ -22,7 +22,12 @@ const Row = struct {
     ts_ms: i64,
     job_id: u64,
     step: u32,
+    /// Per job, gapless: the order of the whole job's log.
     seq: u64,
+    /// Per step, as the line was numbered when it was logged (`sink.CollectedLine.seq`), so a row
+    /// can be matched to a line in the log GitHub shows. Null for the runner's own messages, which
+    /// belong to no step's output.
+    step_seq: ?u64,
     stream: sink.Stream,
     text: []u8,
 };
@@ -55,6 +60,12 @@ pub const PgSink = struct {
     flusher: ?Io.Future(void) = null,
 
     pub fn append(s: *PgSink, job_id: u64, step_number: u32, stream: sink.Stream, line: []const u8) sink.Error!void {
+        return s.appendStep(job_id, step_number, null, stream, line);
+    }
+
+    /// As `append`, with the line's number in its own step (`sink.CollectedLine.seq`). Only the
+    /// job's sink knows it; the runner's own messages come through `append`.
+    pub fn appendStep(s: *PgSink, job_id: u64, step_number: u32, step_seq: ?u64, stream: sink.Stream, line: []const u8) sink.Error!void {
         try s.inner.append(job_id, step_number, stream, line);
         // Job id 0 marks messages that belong to no job (registering, waiting for work): console only.
         if (job_id == 0) return;
@@ -71,7 +82,15 @@ pub const PgSink = struct {
         if (!gop.found_existing) gop.value_ptr.* = 1;
         const seq = gop.value_ptr.*;
         gop.value_ptr.* += 1;
-        try s.rows.append(s.gpa, .{ .ts_ms = now(s.io), .job_id = job_id, .step = step_number, .seq = seq, .stream = stream, .text = owned });
+        try s.rows.append(s.gpa, .{
+            .ts_ms = now(s.io),
+            .job_id = job_id,
+            .step = step_number,
+            .seq = seq,
+            .step_seq = step_seq,
+            .stream = stream,
+            .text = owned,
+        });
         if (s.rows.items.len >= s.flush_lines or now(s.io) - s.last_flush_ms >= s.flush_ms) s.flushLocked();
         s.enforceCap();
     }
@@ -160,9 +179,11 @@ pub const PgSink = struct {
             try w.writeAll(try timefmt.isoTime(arena_state.allocator(), r.ts_ms));
             try w.print("\t{d}\t{d}\t{d}\t{s}\t", .{ r.job_id, r.step, r.seq, @tagName(r.stream) });
             try pg.copyField(w, r.text);
+            // `\N` is COPY's null: a line that belongs to no step has no number in one.
+            if (r.step_seq) |ss| try w.print("\t{d}", .{ss}) else try w.writeAll("\t\\N");
             try w.writeByte('\n');
         }
-        const n = try s.client.?.copyIn("COPY job_logs (ts, job_id, step_number, seq, stream, line) FROM STDIN", data.written());
+        const n = try s.client.?.copyIn("COPY job_logs (ts, job_id, step_number, seq, stream, line, step_seq) FROM STDIN", data.written());
         if (n != s.rows.items.len) return error.ShortCopy;
         s.written += n;
         for (s.rows.items) |r| s.gpa.free(r.text);
@@ -305,4 +326,39 @@ test "messages that belong to no job (id 0) stay on the console" {
     try pgs.append(0, 0, .stderr, "registered runner");
     try std.testing.expectEqual(@as(usize, 0), pgs.rows.items.len);
     try std.testing.expect(std.mem.indexOf(u8, w.buffered(), "registered runner") != null);
+}
+
+test "integration: a line's number in its step reaches the database, and a runner's message has none" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var sc = try @import("dbtest.zig").Scratch.create(arena);
+    defer sc.destroy();
+    var console_out: Io.Writer.Allocating = .init(arena);
+    var console: sink.LogSink = .{ .stdout = .{ .writer = &console_out.writer } };
+    var db: sink.LogSink = .{ .postgres = testSink(&sc, &console) };
+    defer db.postgres.close();
+
+    // As a job logs: through the collector, which numbers a line in its step and passes the number
+    // down. Two steps, interleaved, so the numbering cannot be a count of the job's lines.
+    var collect: sink.LogSink = .{ .collect = .{ .arena = arena, .io = std.testing.io, .inner = &db } };
+    try collect.append(7, 1, .stdout, "step one, first");
+    try collect.append(7, 2, .stdout, "step two, first");
+    try collect.append(7, 1, .stdout, "step one, second");
+    // As the runner logs its own messages: no step of its own, so no number in one.
+    try db.append(7, 0, .stderr, "job succeeded");
+    try db.flush();
+
+    try std.testing.expectEqual(@as(u64, 4), try countLogs(&sc));
+    // In the job's order the step numbers read 1, 1, 2: step two's first line falls between step
+    // one's two, which is the whole point of numbering a line in its step rather than in the job.
+    try std.testing.expectEqualStrings("1/1/2", try sc.scalar(
+        "select string_agg(step_seq::text, '/' order by seq) from job_logs where job_id = 7 and step_number in (1, 2)",
+    ));
+    try std.testing.expectEqualStrings("1/2/3", try sc.scalar(
+        "select string_agg(seq::text, '/' order by seq) from job_logs where job_id = 7 and step_number in (1, 2)",
+    ));
+    // The one with no step has no number: null, not zero, so a reader cannot mistake it for a line.
+    try std.testing.expectEqualStrings("1", try sc.scalar("select count(*) from job_logs where job_id = 7 and step_seq is null"));
+    try std.testing.expectEqualStrings("job succeeded", try sc.scalar("select line from job_logs where job_id = 7 and step_seq is null"));
 }
