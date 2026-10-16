@@ -151,9 +151,18 @@ proofs/README.md, "three things this turned up".
    17 are verified, 32 are usable but under-powered, 8 are unverified and may not be used to justify
    a change, and 2 were superseded. It also found that four commands in this repository can reproduce
    any of them, which is the case for stage 2.
-2. **The harness** (§3.3), with the environment capture and JSON samples, replacing the one-off shell
-   scripts. Built against the `GOGC` and output-keys experiments, whose answers are known, so a
-   harness that disagrees with them is wrong.
+2. ~~**The harness** (§3.3), with the environment capture and JSON samples, replacing the one-off
+   shell scripts.~~ **Built:** `runner/tools/measure.zig`, `zig build measure`. It enforces what this
+   section asks for rather than trusting anyone to remember it: `--min-effect` is required, arms are
+   interleaved in a seeded order, `--control` names the arm whose answer is known, warm-up rounds are
+   recorded and excluded, every trial gets a fresh token and must show an advancing identity, both
+   streams are captured, and one JSON line per trial is kept. Its statistics are unit-tested, since
+   they decide the verdicts.
+
+   Validated as this stage asks, against answers already known: fed the study's own recorded numbers,
+   it returns `no_effect_found` for E7.6 and **`not_enough_samples` for E7.7** — the claim
+   [CLAIMS.md](CLAIMS.md) marks unverified. See [measurements/](../measurements/README.md). What
+   remains is to drive it on the Pi, where the arms cost minutes each.
 3. **The properties** (§4) as tests in the runner's own suite, generated per input kind, run in CI
    against a real engine rather than the fake session. The model now says what to generate and what
    each case must assert — [proofs/README.md](../proofs/README.md), "Obligations for the harness" —

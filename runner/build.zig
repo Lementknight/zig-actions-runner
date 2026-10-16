@@ -23,7 +23,8 @@ pub fn build(b: *std.Build) void {
     b.step("run", "Run the runner").dependOn(&run_cmd.step);
 
     const tests = b.addTest(.{ .root_module = exe.root_module });
-    b.step("test", "Run tests").dependOn(&b.addRunArtifact(tests).step);
+    const test_step = b.step("test", "Run tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
 
     // Checks the workflow YAML of this repository (and any path given after `--`), with the YAML
     // parser the runner itself uses. See tools/check_workflows.zig and the git hooks.
@@ -42,4 +43,21 @@ pub fn build(b: *std.Build) void {
     check.addArg("../.github/workflows");
     check.addPassthruArgs();
     b.step("check-workflows", "Check workflow YAML (this repository's, plus any paths after --)").dependOn(&check.step);
+
+    // The measurement harness (docs/MEASURE.md stage 2). Its statistics decide verdicts, so they
+    // are unit-tested with the rest of the suite; `zig build measure -- run ...` drives it.
+    const measure = b.addExecutable(.{
+        .name = "measure",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/measure.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const measure_run = b.addRunArtifact(measure);
+    measure_run.stdio = .inherit;
+    measure_run.addPassthruArgs();
+    b.step("measure", "Run the measurement harness (arguments after --)").dependOn(&measure_run.step);
+    const measure_tests = b.addTest(.{ .root_module = measure.root_module });
+    test_step.dependOn(&b.addRunArtifact(measure_tests).step);
 }
