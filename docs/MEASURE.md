@@ -1,6 +1,6 @@
 # Measuring: a framework for the claims in this study, and the properties behind them
 
-Audience: whoever adds or re-checks a claim · Companion: [STUDY.md](STUDY.md), [DESIGN.md](DESIGN.md), [RELATED.md](RELATED.md)
+Audience: whoever adds or re-checks a claim · Companion: [STUDY.md](STUDY.md), [DESIGN.md](DESIGN.md), [RELATED.md](RELATED.md), [proofs/](../proofs/README.md)
 
 This study's claims were produced ad hoc, one shell script at a time, and several were wrong before
 they were right. This document exists so that the next claim is harder to get wrong than to get
@@ -128,6 +128,14 @@ illustrated by one example each:
 
 P2 and P3 together are a metamorphic test: the relation between two runs is asserted, without needing
 a model of what the step outputs. That is what makes them generable rather than hand-written.
+
+P1, P2, P3, P4 and the hit half of P6 are now **proved**, of a model of the step cache, in
+[proofs/](../proofs/README.md) (`./proofs/check.sh`). What that buys is not confidence in the
+numbers but a precise statement of what the implementation owes: P1 holds under one real hypothesis,
+that the steps the runner does not mark always-run are deterministic and read neither a volatile
+variable nor the content of a mounted cache volume. The proofs come with a job for each way that
+hypothesis fails, so the remaining question is enforcement, not whether the design is sound. Stage 3
+below is those statements generated against a real engine; the model also says what to generate.
 
 ## 5. Staging
 

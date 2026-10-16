@@ -243,6 +243,13 @@ fn fcPath(arena: Allocator, kind: []const u8, n: u32) ![]const u8 {
 /// The script creates the step's file commands first and touches them again afterwards, so the
 /// query can always read them even if the step deleted them. A `run:` step sees them as
 /// `$GITHUB_OUTPUT`, `$GITHUB_ENV`, `$GITHUB_PATH` and `$GITHUB_STEP_SUMMARY`.
+///
+/// `n` in the begin/end markers is not only for the log: the script text is part of a step's cache
+/// key, so the number is what keeps two steps of one job from sharing a key. The always-run marker
+/// cannot do it (`run_nonce` is per job, so every marked step in a job carries the same one), and
+/// two steps alike in script, environment and parent container but differing in what they read from
+/// a mounted cache volume would then have the second replayed from the first. Numbering them apart
+/// is load-bearing; see proofs/ (`Runner.Counterexamples.SharedNumber`).
 pub fn stepScript(arena: Allocator, n: u32, r: Resolved, action_name: []const u8) ![]const u8 {
     return stepScriptFc(arena, n, n, r, action_name);
 }
