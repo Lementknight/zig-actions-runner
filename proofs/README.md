@@ -98,8 +98,10 @@ Then `input-determined-by-key` says its input is a function of its key, and
 runs. `Runner.Counterexamples.Enforced` is counterexample 1's own `exec` against the same two jobs,
 no longer able to tell them apart.
 
-What that leaves to assume is determinism and mount-blindness: two obligations instead of three. It
-is not yet in the runner; the design and the one decision it needs are in the pull request. Early cutoff
+What that leaves to assume is determinism and mount-blindness: two obligations instead of three.
+**It is in the runner**, on by default, as `RUNNER_ENFORCE_VOLATILE` — a step that did not name a
+run-specific value is given the constant `zig-runner-withheld` in its own `env` prefix. See SPEC.md
+§9, the first entry in "Where this runner differs from GitHub's". Early cutoff
 turns out to need it too, and that is new: what a step exports through `$GITHUB_ENV` is in the next
 step's container, so an unmarked step that exported different variables in two jobs would part the
 keys after it.

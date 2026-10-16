@@ -74,6 +74,15 @@ On SIGTERM, waiting runners stop and remove their registrations, and running job
 
 ## 8. Open questions
 
+- **A replayable step is not told which run it is in** (`RUNNER_ENFORCE_VOLATILE`, on by default).
+  Step caching keeps the run id, the commit and the refs out of a step's key, and marks a step
+  always-run when its script names one. That test is syntactic, so a step that reads the value
+  indirectly is replayed with an earlier run's — the first blind spot the property suite pinned, live,
+  reporting an id forty minutes stale. Such a step now gets the constant `zig-runner-withheld`
+  instead. It costs fidelity with GitHub, which always sets the real values, and buys the one
+  hypothesis behind step caching that can be discharged rather than assumed
+  (`proofs/Runner/Enforce.agda`). The first deliberate divergence of SPEC.md §9.
+
 - **Hits across commits.** Tried and set aside (STUDY.md, experiment 5). A `run:` step could declare the files it reads, and the runner would key it on those instead of the whole checkout. Every replay decision was right, but both workloads ran faster without it: the tools' own caches already make the declarable steps cheap, the expensive steps (`go test`, pytest) are the ones a project cannot easily declare, and handing each step its inputs costs more than replaying them saves on a Raspberry Pi. The prototype is on `feat/declared-inputs-v2`. What is still open is the cost of handing a step its inputs at all, which decides whether any finer keying can pay.
 - **Test selection for Python: nothing for the runner to do** (STUDY.md, experiment 8). Measured on sqlalchemy's 9,300 tests: selection saves eight times over when nothing relevant changed, but running tests under the tracing it needs costs four times as much, so a change to one core module selected 79% of the suite and took 4.5 times the full run. The unchanged case is already free through the step cache, which is the only case selection wins.
 - **What a step costs in memory and inodes.** Experiment 7 found Dagger's per-step latency to be about 1% of a real job, so a different executor cannot win there; the engine's memory pressure (experiment 4) is the open dimension.

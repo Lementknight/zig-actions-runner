@@ -171,6 +171,7 @@ fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log
         .step_cache = cfg.step_cache,
         .step_user = cfg.step_user,
         .output_keys = cfg.output_keys,
+        .enforce_volatile = cfg.enforce_volatile,
         .output_keys_days = cfg.output_keys_days,
         .sink_job_id = job.check_run_id,
     }, job, log);

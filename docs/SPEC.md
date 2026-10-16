@@ -462,7 +462,34 @@ A quick check that a new deployment works end to end:
 3. The step's output appears live in GitHub's log view, and the job succeeds.
 4. Re-running the job replays the step from Dagger's cache: its log ends with "Reused from Dagger's cache".
 
-## 9. Conventions
+## 9. Where this runner differs from GitHub's
+
+Fidelity was the prototype's goal and it has done its job: real workflows run here unchanged. Past
+that point, copying a behaviour that is unsound costs correctness for nothing, so this runner
+diverges where it has a reason, defaults to the correct thing, and leaves an operator an escape
+hatch. Each divergence is listed here with what it buys.
+
+- **A replayable step is not given the run-specific values** (`RUNNER_ENFORCE_VOLATILE`, on by
+  default). With step caching, `GITHUB_SHA`, `GITHUB_RUN_ID`, `GITHUB_RUN_NUMBER`,
+  `GITHUB_RUN_ATTEMPT`, the actor and the refs are deliberately not part of a step's cache key, so an
+  unchanged step can be replayed. The runner marks a step always-run when its script *names* one of
+  them, but that test is syntactic and cannot be made sound: a script reaches the value through a
+  file it sources, a program that reads the environment, or a name built from pieces. Such a step
+  would then be replayed with **an earlier run's value**, which is wrong rather than stale.
+
+  So a step that did not name one is given the constant `zig-runner-withheld` instead, in its own
+  `env` prefix — a constant, so its cache key is unaffected; visible, so a step that prints it says
+  so in its log. A step that names one, uses a secret, or can mint an OIDC token always runs and
+  keeps the real values, as do JavaScript and Docker actions (they get the job token). GitHub's
+  runner always sets the real values; this one trades that for a step whose result cannot depend on
+  which run produced it. `proofs/Runner/Enforce.agda` is why it is sound — an unmarked step's input
+  becomes a function of its cache key — and `RUNNER_ENFORCE_VOLATILE=false` restores GitHub's
+  behaviour for a workflow that needs it.
+
+  Not covered: `GITHUB_EVENT_PATH`'s payload, which each step writes from a volatile variable and
+  which still carries the real event; a step that reads it without naming it has the same hazard.
+
+## 10. Conventions
 
 - Zig: `zig fmt`, no allocations in the log hot path beyond the buffer, errors returned not panicked.
 - Commits: small, one component each; update SPEC.md with any contract change.
