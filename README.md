@@ -29,6 +29,7 @@ git config core.hooksPath .githooks
 ```
 
 - **pre-commit** (fast) checks the staged `.zig` and `.zon` files: `zig fmt` formatting, and the errors `zig ast-check` finds without compiling (syntax, unused locals and parameters, shadowing). It checks what is staged, not the working tree.
+- **check-workflows** (`cd runner && zig build check-workflows`) checks this repository's workflow YAML with the parser the runner uses for `action.yml`, plus the one rule that parser is laxer about than YAML: a plain scalar cannot contain `": "`. pre-commit runs it on staged workflow files and CI on all of them. Give it other paths after `--`.
 - **pre-push** runs what CI's "Zig unit tests" job runs, plus a build: `zig fmt --check`, `zig build` and `zig build test` in `runner/`, on the commit being pushed. It runs only when the commits the remote does not have yet change `runner/`, and uses a temporary worktree when the working tree differs from that commit.
 
 Both do nothing when no Zig code changed, need `zig` on `PATH` when it did, and warn when its version differs from CI's (`ZIG_VERSION` in `.github/workflows/ci.yml`). To skip them once: `git commit --no-verify` / `git push --no-verify`, or `SKIP_ZIG_HOOKS=1`.
