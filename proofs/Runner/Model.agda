@@ -3,20 +3,27 @@
 -- The vocabulary: this runner as a build system in the sense of Build Systems à
 -- la Carte, with a scheduler (a job's steps run in order, as GitHub Actions
 -- specifies) and a rebuilder (Dagger reuses an exec whose key it has already
--- seen). Runner.Build is the algorithm and its theorems.
+-- seen). Runner.Build is the algorithm and its theorems; Runner.OutputKeys is
+-- the constructive-trace mechanism built on top of it.
 --
 -- Every modelling choice below is a claim about the real system, and the code
 -- that backs it up is named:
+--
+--  * A container's identity *is* the recipe that built it. Dagger's container
+--    id is a lazy description, and two containers built the same way have the
+--    same cache key, which is what `State` models: the parts of the recipe a
+--    key depends on. This is why a step whose own key is new makes every step
+--    after it new too, and it is the whole reason output keys exist.
 --
 --  * A step's key keeps the container it starts from, the script text, and the
 --    non-volatile environment; it forgets the mounts and the volatile
 --    variables. That is what dagger.zig builds: `withExec` under
 --    `loadContainerFromID`, `withVolatileVariable` for the names in
---    `volatile_env`, and `withDirectory` / `withMountedCache` for content,
---    which BuildKit excludes from an exec's cache key.
+--    `volatile_env`, and `withMountedCache` for the package caches, whose
+--    content BuildKit excludes from an exec's cache key.
 --
 --  * "Always run" is not a flag the engine understands. The runner writes the
---    run's nonce into the step's script, and the script is part of the key
+--    job's nonce into the step's script, and the script is part of the key
 --    (`always_run`, threaded through `containerScript` in dagger.zig).
 --    `stamped` models that, so the proofs are about the mechanism that exists
 --    rather than one we wish existed.
@@ -34,18 +41,15 @@ open import Prelude
 ------------------------------------------------------------------------------
 -- Atoms
 --
--- Variable names, script bodies, container ids and file contents are things the
--- system only ever compares for equality, so numbers stand in for them: a
--- container id is a digest, and this model never looks inside one.
+-- Variable names, script bodies, file contents and digests are things the
+-- system only ever compares for equality, so numbers stand in for them. A
+-- digest is a number here, and the model never looks inside one.
 
 Name : Set
 Name = ℕ
 
 Body : Set
 Body = ℕ
-
-State : Set
-State = ℕ
 
 Content : Set
 Content = ℕ
@@ -57,17 +61,17 @@ Trial : Set
 Trial = ℕ
 
 -- A script is its text together with the step's position in the job, or that
--- script with a run nonce written into it.
+-- script with the job's nonce written into it.
 --
 -- The position is in here because it is in the real script: `containerScript`
--- and `stepScriptFc` write `echo '<marker>begin <n>'` and the step's file-command
--- paths, so two steps of a job never have the same script text. That is a log
--- marker doing load-bearing work for the cache, and Runner.Counterexamples
--- shows what goes wrong without it.
+-- and `stepScriptFc` write `echo '<marker>begin <n>'` and the step's
+-- file-command paths, so two steps of a job never have the same script text.
+-- That is a log marker doing load-bearing work for the cache, and
+-- Runner.Counterexamples shows what goes wrong without it.
 --
 -- `stamped` is the always-run marker, a constructor rather than a flag because
--- that is how the runner implements it: a run nonce written into the script
--- text, which is part of the key.
+-- that is how the runner implements it: a nonce written into the script text,
+-- which is part of the key.
 data Script : Set where
   body    : Body → ℕ → Script
   stamped : Trial → Script → Script
@@ -102,7 +106,7 @@ Unstamped (body _ _)    = ⊤
 Unstamped (stamped _ _) = ⊥
 
 ------------------------------------------------------------------------------
--- Steps, inputs, outputs
+-- Environments and mounts
 
 Binding : Set
 Binding = Name × Content
@@ -110,10 +114,74 @@ Binding = Name × Content
 Env : Set
 Env = List Binding
 
--- A mount is a path and the content mounted there: a checkout, an action's
--- directory, or a cache volume.
+_≟Env_ : DecEq Env
+_≟Env_ = List-dec (×-dec _≟ℕ_ _≟ℕ_)
+
+-- A mount is a path and the content mounted there: a cache volume for a package
+-- manager. Mount content is in no key, by design.
 Mounts : Set
 Mounts = List (Name × Content)
+
+------------------------------------------------------------------------------
+-- Containers
+--
+-- A container's cache identity: the job's base container, what an exec with a
+-- given recipe leaves, or — this is the output-keys mechanism — a container
+-- with a stored output copied into it by the output's content digest.
+--
+-- `afterCopy` is the one that matters. Its identity mentions what was produced
+-- and not who produced it, so two jobs whose marked step produced the same
+-- bytes arrive at the same container, and the steps after it can be replayed.
+-- That is a constructive trace in Build Systems à la Carte's sense.
+
+data State : Set where
+  base      : ℕ → State
+  afterExec : State → Script → Env → State
+  afterCopy : State → Content → State
+
+base-injective : {b b' : ℕ} → base b ≡ base b' → b ≡ b'
+base-injective refl = refl
+
+afterExec-injective₁ : {s s' : State} {sc sc' : Script} {e e' : Env}
+  → afterExec s sc e ≡ afterExec s' sc' e' → s ≡ s'
+afterExec-injective₁ refl = refl
+
+afterExec-injective₂ : {s s' : State} {sc sc' : Script} {e e' : Env}
+  → afterExec s sc e ≡ afterExec s' sc' e' → sc ≡ sc'
+afterExec-injective₂ refl = refl
+
+afterExec-injective₃ : {s s' : State} {sc sc' : Script} {e e' : Env}
+  → afterExec s sc e ≡ afterExec s' sc' e' → e ≡ e'
+afterExec-injective₃ refl = refl
+
+afterCopy-injective₁ : {s s' : State} {c c' : Content} → afterCopy s c ≡ afterCopy s' c' → s ≡ s'
+afterCopy-injective₁ refl = refl
+
+afterCopy-injective₂ : {s s' : State} {c c' : Content} → afterCopy s c ≡ afterCopy s' c' → c ≡ c'
+afterCopy-injective₂ refl = refl
+
+_≟State_ : DecEq State
+base b           ≟State base b'             with b ≟ℕ b'
+... | yes refl = yes refl
+... | no  ¬p   = no (λ eq → ¬p (base-injective eq))
+base b           ≟State afterExec _ _ _     = no (λ ())
+base b           ≟State afterCopy _ _       = no (λ ())
+afterExec _ _ _  ≟State base b'             = no (λ ())
+afterExec s sc e ≟State afterExec s' sc' e' with s ≟State s' | sc ≟Script sc' | e ≟Env e'
+... | yes refl | yes refl | yes refl = yes refl
+... | no  ¬p   | _        | _        = no (λ eq → ¬p (afterExec-injective₁ eq))
+... | _        | no ¬q    | _        = no (λ eq → ¬q (afterExec-injective₂ eq))
+... | _        | _        | no ¬r    = no (λ eq → ¬r (afterExec-injective₃ eq))
+afterExec _ _ _  ≟State afterCopy _ _       = no (λ ())
+afterCopy _ _    ≟State base b'             = no (λ ())
+afterCopy _ _    ≟State afterExec _ _ _     = no (λ ())
+afterCopy s c    ≟State afterCopy s' c'     with s ≟State s' | c ≟ℕ c'
+... | yes refl | yes refl = yes refl
+... | no  ¬p   | _        = no (λ eq → ¬p (afterCopy-injective₁ eq))
+... | _        | no ¬q    = no (λ eq → ¬q (afterCopy-injective₂ eq))
+
+------------------------------------------------------------------------------
+-- Steps, inputs, outputs
 
 -- A step as the workflow writes it. `reads` is the set of variable names the
 -- script really consults; `readsRunSpecific` in dagger.zig is a syntactic
@@ -137,11 +205,14 @@ record Input : Set where
     env    : Env
     mounts : Mounts
 
+-- What running a step produces: what it wrote, and the content digest of what
+-- it changed in the filesystem. The digest is `changes(from:).layer.digest` in
+-- `outputKeyed`; it is a fact about the bytes, not about who produced them.
 record Output : Set where
   constructor output
   field
-    after : State
-    log   : Log
+    log    : Log
+    digest : Content
 
 ------------------------------------------------------------------------------
 -- Keys
@@ -159,11 +230,17 @@ record Key : Set where
     kEnv    : Env
 
 _≟Key_ : DecEq Key
-key p s e ≟Key key p' s' e' with p ≟ℕ p' | s ≟Script s' | List-dec (×-dec _≟ℕ_ _≟ℕ_) e e'
+key p s e ≟Key key p' s' e' with p ≟State p' | s ≟Script s' | e ≟Env e'
 ... | yes refl | yes refl | yes refl = yes refl
 ... | no  ¬p   | _        | _        = no (λ eq → ¬p (cong Key.kParent eq))
 ... | _        | no ¬q    | _        = no (λ eq → ¬q (cong Key.kScript eq))
 ... | _        | _        | no ¬r    = no (λ eq → ¬r (cong Key.kEnv eq))
+
+-- The container an exec with this key leaves. A key and a container identity
+-- are the same information, which is the point: that is why a new key for one
+-- step is a new container for every step after it.
+stateOf : Key → State
+stateOf k = afterExec (Key.kParent k) (Key.kScript k) (Key.kEnv k)
 
 -- Which names are run-specific: `volatile_env` in dagger.zig.
 Volatile : Set
