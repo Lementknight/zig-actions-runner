@@ -28,6 +28,19 @@ earlier run…" — so a check is a dispatch, a wait, and a `grep`. Nothing need
 | P2c | a non-volatile variable the subject sees | the subject **ran** | `stable-env-matters` |
 | P2d | the subject's position in the job, and nothing else | the subject **ran** | `position-matters` |
 | P4 | the subject names `GITHUB_RUN_ID`, twice over | the subject **ran** both times | `marked-misses` |
+| P1 | the cache off, then warm, then replayed | the observer **said the same thing**, and the exporter was replayed too | `replay≡run` |
+| E1 | a marked step leaving the same bytes / new bytes | the steps after it **replayed** / **ran** | `cutoff`, `different-bytes-different-container` |
+
+P1 doubles as the `$GITHUB_ENV` obligation: what the observer says includes a variable an earlier
+step exported, and on the replayed run that earlier step was replayed too, so its export came out of
+the cache with everything else.
+
+**E1 needs the engine's ssh host**, and this is why. The first run of it failed, and the runner was
+right: output keys cost 10.5 s on that job against a `RUNNER_OUTPUT_KEYS_MAX_MS` of 10 s, so the
+runner switched them off for the repository — and a mechanism that has opted out cannot cut off. The
+check now raises the limit for its own duration and puts it back. Testing whether output keys cut off
+is not testing whether they are cheap; E3.4 in [CLAIMS.md](../docs/CLAIMS.md) is the one that measures
+the cost.
 
 P2d needs the second workflow, `property-shifted.yml`, which is `property.yml` with one more step
 before the subject. A skipped step still occupies its place in a job, so an `if:` cannot move the
