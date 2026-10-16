@@ -71,6 +71,11 @@ pub const Config = struct {
     /// copying every file (28.6 s against 0.2 s on a Raspberry Pi; see SPEC Â§6 "Package caches").
     /// The workspace gets a `.venv` symlink to it, so paths into `.venv` still work.
     uv_env_in_cache: bool = true,
+    /// Output keys cost two walks of the job's filesystem, whatever the step changed: 25 s on a
+    /// large checkout against 1 s on a small one (STUDY.md Â§3.6). When a job spends longer than
+    /// this on them, later jobs for that repository skip them until the runner restarts. 0 never
+    /// skips.
+    output_keys_max_ms: u32 = 10_000,
     /// With output keys: days a stored output may go unused before it is removed.
     output_keys_days: u32 = 7,
     dry_run: bool = false,
@@ -115,6 +120,7 @@ pub const Config = struct {
         if (environ.get("RUNNER_STEP_USER")) |v| c.step_user = try stepUser(v);
         if (environ.get("RUNNER_OUTPUT_KEYS")) |v| c.output_keys = try boolean(v);
         if (environ.get("RUNNER_UV_ENV_IN_CACHE")) |v| c.uv_env_in_cache = try boolean(v);
+        if (environ.get("RUNNER_OUTPUT_KEYS_MAX_MS")) |v| c.output_keys_max_ms = try millis(v);
         if (environ.get("RUNNER_OUTPUT_KEYS_DAYS")) |v| c.output_keys_days = try count(v);
         if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
         if (environ.get("RUNNER_COUNT")) |v| c.runners = try count(v);
@@ -168,6 +174,7 @@ pub const Config = struct {
             else if (std.mem.eql(u8, key, "step-cache")) c.step_cache = try boolean(val) //
             else if (std.mem.eql(u8, key, "step-user")) c.step_user = try stepUser(val) //
             else if (std.mem.eql(u8, key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
+            else if (std.mem.eql(u8, key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
             else if (std.mem.eql(u8, key, "output-keys")) c.output_keys = try boolean(val) //
             else if (std.mem.eql(u8, key, "output-keys-days")) c.output_keys_days = try count(val) //
             else if (std.mem.eql(u8, key, "runners")) c.runners = try count(val) //
@@ -225,6 +232,13 @@ pub const Config = struct {
             .direct => .{ .host = c.engine_host, .docker_socket = c.docker_socket, .container = c.engine_container },
             .cli => null,
         };
+    }
+
+    /// Milliseconds, up to an hour; 0 turns the limit off.
+    fn millis(s: []const u8) error{InvalidNumber}!u32 {
+        const n = try num(u32, s);
+        if (n > 3_600_000) return error.InvalidNumber;
+        return n;
     }
 
     /// A runner count: 1 to 1024.
@@ -321,6 +335,22 @@ test "JavaScript actions run on Bun unless Node is asked for" {
     try std.testing.expectEqual(JsRuntime.bun, (try Config.load(&env, &.{ "runner", "--js-runtime=bun" })).js_runtime);
     try env.put("RUNNER_JS_RUNTIME", "deno");
     try std.testing.expectError(error.InvalidJsRuntime, Config.load(&env, &.{"runner"}));
+}
+
+test "the output-keys limit: milliseconds, and 0 turns it off" {
+    var env: std.process.Environ.Map = .init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("GH_TOKEN", "t");
+    try env.put("GH_SCOPE", "o/r");
+    try std.testing.expectEqual(@as(u32, 10_000), (try Config.load(&env, &.{"runner"})).output_keys_max_ms);
+    try env.put("RUNNER_OUTPUT_KEYS_MAX_MS", "0");
+    try std.testing.expectEqual(@as(u32, 0), (try Config.load(&env, &.{"runner"})).output_keys_max_ms);
+    try env.put("RUNNER_OUTPUT_KEYS_MAX_MS", "4000000"); // over an hour
+    try std.testing.expectError(error.InvalidNumber, Config.load(&env, &.{"runner"}));
+    // The variable is read before the flags, so a bad one fails whatever the flags say; with a good
+    // one, the flag wins.
+    try env.put("RUNNER_OUTPUT_KEYS_MAX_MS", "9000");
+    try std.testing.expectEqual(@as(u32, 2500), (try Config.load(&env, &.{ "runner", "--output-keys-max-ms=2500" })).output_keys_max_ms);
 }
 
 test "dagger nesting is on by default and can be turned off" {
