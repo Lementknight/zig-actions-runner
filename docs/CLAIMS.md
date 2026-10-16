@@ -46,10 +46,18 @@ In the repository today:
 
 | | Command |
 |---|---|
+| **the protocol, around any command** | `cd runner && zig build measure -- run …` ([measurements/](../measurements/README.md)) |
+| re-analysing samples without re-running them | `zig build measure -- analyse <file>.jsonl --min-effect X` |
+| the repetitions a wanted precision needs | `zig build measure -- dimension <file>.jsonl --target X` |
 | the replay decisions and the key's contents | `cd runner && zig build test` (unit tests over the query text) |
 | the caching properties | `./proofs/check.sh` |
 | how often output keys applied, per job | `sudo journalctl -u zig-runner \| grep "output keys:"` on the Pi |
 | how many steps a job replayed | `sudo journalctl -u zig-runner \| grep "replayed from the cache"` |
+
+The harness was validated against the two claims whose answers were already known, by transcribing
+their recorded numbers and analysing them: E7.6 comes back `no_effect_found`, as the study says, and
+**E7.7 comes back `not_enough_samples`** — the verdict this register reached by reading, reached
+independently by arithmetic. The samples are in [measurements/](../measurements/README.md).
 
 ## §2 Workloads
 
