@@ -3,6 +3,7 @@
 open import Prelude
 open import Runner.Model
 import Runner.Build as B
+import Runner.Enforce as Enf
 
 -- Runner.Build proves that replay equals run, and what it needs is
 -- `Disciplined`: for a step the runner does not mark always-run, inputs that
@@ -338,3 +339,36 @@ module Exported where
   same-answers : Progress.outs (build (always off) 2 (progress start [] warm 0 []) job)
                  ≡ uncached (always off) 2 start [] [] job
   same-answers = refl
+
+------------------------------------------------------------------------------
+-- 8. The same step, with the hole closed
+--
+-- Counterexample 1 is the blind spot: a step that reads the run id without naming it is replayed
+-- and reports a stale value. Runner.Enforce closes it by giving an unmarked step only what its key
+-- keeps. Here is that counterexample's own `exec`, unchanged, against the same two jobs: it can no
+-- longer tell them apart, because it is handed the same thing in both.
+
+module Enforced where
+
+  execV : Input → Trial → Output
+  execV i t = output (valueOf runId (Input.env i)) 0 []
+
+  module En = Enf vol
+  open En
+
+  theStep : Step
+  theStep = step 1 0 [] []
+
+  -- Run ids 7 and 9, and one input.
+  same-input : inputPlain start (jobEnv 7) theStep ≡ inputPlain start (jobEnv 9) theStep
+  same-input = refl
+
+  -- So the step that distinguished them cannot: there is nothing left to distinguish.
+  cannot-tell-them-apart : execV (inputPlain start (jobEnv 7) theStep) 1
+                         ≡ execV (inputPlain start (jobEnv 9) theStep) 2
+  cannot-tell-them-apart = refl
+
+  -- And what it reads is the sentinel rather than another run's value: absent here, a constant in
+  -- the runner, which is the same thing to every theorem and more visible in a log.
+  reads-nothing-of-the-run : execV (inputPlain start (jobEnv 7) theStep) 1 ≡ output 0 0 []
+  reads-nothing-of-the-run = refl

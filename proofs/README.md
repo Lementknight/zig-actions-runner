@@ -78,6 +78,7 @@ well-typed inhabitant, which is why determinism has to be asked for by name.
 | early cutoff | `cutoff`, `cutoff-needs-only-the-digest`, `no-cutoff-without-keys`, `different-bytes-different-container` | `Runner/OutputKeys.agda` |
 | pruning is safe | `coherent-subset`, `ahead-subset`: both of P1's hypotheses survive dropping entries, so pruning can only cause misses | `Runner/Build.agda` |
 | a shared cache is safe | `elsewhere⇒ahead`: no other job can write under this job's nonce, which is why a pool may share one cache | `Runner/Build.agda` |
+| **the volatile clause, discharged** | `input-determined-by-key`, `volatile-clause-discharged`, `nothing-volatile-survives` | `Runner/Enforce.agda` |
 
 P1 is the one that matters: *a job run against a cache left by other jobs produces what the same job
 produces with the step cache off, step for step.* It needs one real hypothesis.
@@ -85,7 +86,20 @@ produces with the step cache off, step for step.* It needs one real hypothesis.
 **`Disciplined`** — for a step the runner does not mark, inputs agreeing on everything the key keeps
 give the same result. It bundles three obligations: the step is deterministic, it does not consult a
 volatile variable, and it does not depend on the content of a mounted cache volume. The runner
-enforces none of them; it marks the steps it can detect and relies on this for the rest. Early cutoff
+enforces none of them; it marks the steps it can detect and relies on this for the rest.
+
+**One of the three can be discharged rather than assumed**, and `Runner/Enforce.agda` proves it.
+Detection cannot be made sound — a script can reach a volatile value through a file it sources, a
+program that reads the environment, or a name it builds from pieces, which is counterexample 1 and
+the live B1 check. So apply what P5 does for files: hand an unmarked step **only what its key keeps**.
+Then `input-determined-by-key` says its input is a function of its key, and
+`volatile-clause-discharged` says equal keys give equal results as soon as the step is deterministic
+— nothing need be assumed about what it reads, because nothing in its environment varies between
+runs. `Runner.Counterexamples.Enforced` is counterexample 1's own `exec` against the same two jobs,
+no longer able to tell them apart.
+
+What that leaves to assume is determinism and mount-blindness: two obligations instead of three. It
+is not yet in the runner; the design and the one decision it needs are in the pull request. Early cutoff
 turns out to need it too, and that is new: what a step exports through `$GITHUB_ENV` is in the next
 step's container, so an unmarked step that exported different variables in two jobs would part the
 keys after it.

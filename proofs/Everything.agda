@@ -8,4 +8,5 @@ import Runner.Model
 import Runner.Build
 import Runner.OutputKeys
 import Runner.Declared
+import Runner.Enforce
 import Runner.Counterexamples
