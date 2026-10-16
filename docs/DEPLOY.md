@@ -69,6 +69,39 @@ GH_TOKEN=... GH_SCOPE=owner/repo ./runner --runners 4
 
 Each connection then costs a `buildctl dial-stdio` process in the engine container, about 11 MB each, three per job. The socket setups above avoid that.
 
+## A database for the logs
+
+The runner keeps every line of a job (redacted, timestamped, numbered) and writes it to the
+`job_logs` hypertable when `DATABASE_URL` or the `PG*` variables are set; without them it logs to
+its console only. Nothing else has to be turned on — the Postgres sink is chosen by the
+configuration being there (SPEC §4, §5.1).
+
+For development, one locally:
+
+```sh
+docker compose -f db/compose.yaml up -d
+export PGHOST=127.0.0.1 PGPORT=55432 PGDATABASE=zig_runner PGUSER=zig_runner \
+       PGPASSWORD=zig-runner-dev PGSSLMODE=disable
+cd runner && zig build run -- --db-check        # the schema, the hypertable, the version
+zig test src/main.zig                           # including the tests that need a database
+```
+
+The migrations in `db/` are mounted where the Postgres image looks for them, so the schema applies
+itself the first time the container starts: five tables, `job_logs` a hypertable partitioned by the
+day, compressed after a day (segmented by `job_id`, ordered by `seq`) and dropped after thirty.
+`docker compose -f db/compose.yaml down -v` starts over.
+
+**Port 55432, not 5432**, because a machine may already be running a Postgres on 5432 — and the
+symptom if it does is confusing rather than obvious: the container looks healthy, while the runner
+connects to the *other* server and is told its role does not exist.
+
+What this is not: how a deployed runner reaches a database. That takes `DATABASE_URL` (or `PG*`) in
+the runner's environment file, pointing at a database that is backed up and not on the loopback
+interface of a laptop. The runner treats a database outage as a logging problem and never as a job
+failure: lines stay buffered, the next flush reconnects and retries, and if the buffer outgrows its
+cap the oldest lines are dropped and counted — which is the only way a gap can appear in a job's
+`seq`.
+
 ## Sizing
 
 Measured with release builds on Linux ([SPEC §7](SPEC.md)):
