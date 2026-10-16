@@ -175,6 +175,11 @@ data All {A : Set} (P : A → Set) : List A → Set where
   all[] : All P []
   all∷  : {x : A} {xs : List A} → P x → All P xs → All P (x ∷ xs)
 
+infixr 5 _++_
+_++_ : {A : Set} → List A → List A → List A
+[]       ++ ys = ys
+(x ∷ xs) ++ ys = x ∷ (xs ++ ys)
+
 any : {A : Set} → (A → Bool) → List A → Bool
 any p []       = false
 any p (x ∷ xs) = p x ∨ any p xs

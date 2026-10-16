@@ -1,7 +1,7 @@
 # The step cache, in Agda
 
 Audience: whoever changes the caching, or doubts it · Companion: [MEASURE.md](../docs/MEASURE.md),
-[RELATED.md](../docs/RELATED.md), [SPEC.md](../docs/SPEC.md) §6
+[CLAIMS.md](../docs/CLAIMS.md), [RELATED.md](../docs/RELATED.md), [SPEC.md](../docs/SPEC.md) §6
 
 [MEASURE.md](../docs/MEASURE.md) §4 lists six properties the caching must *have* rather than merely
 measure. No benchmark can establish one of them: a measurement says a step was replayed quickly, not
@@ -51,11 +51,14 @@ they need none of Agda's data files. (`agda --setup` writes them out if somethin
 | `Trial` | one job's nonce: `run_nonce` is the run id, the attempt **and** the job |
 | `Key = parent · script · stable env` | the exec recipe: `loadContainerFromID` + `withEnvVariable` + `withExec` |
 | `stable` drops volatile names | `withVolatileVariable` for the names in `volatile_env` |
+| `Progress.env`, and `Output.sets` feeding it | the container's variables, and what a step exported through `$GITHUB_ENV` / `$GITHUB_PATH`, which the runner reads from the step's file commands — a replayed step's included |
 | `Input.mounts`, absent from the key | `withMountedCache`: BuildKit leaves mounts out of an exec's key |
-| `Output = log · digest` | what the step wrote, and `changes(from:).layer.digest` |
+| `Output = log · digest · sets` | the step's output, `changes(from:).layer.digest`, and its file commands |
 | `mark st = everyRun` | `readsRunSpecific`, plus the secret and OIDC reasons, which are the same case |
-| `Keys = on \| off` | `RUNNER_OUTPUT_KEYS` |
-| `Progress.ran` | the `N of M steps replayed from the cache` line |
+| `Mode = ℕ → Keys` | `RUNNER_OUTPUT_KEYS`, **per step**: `outputKeyed` falls back to the step's own container whenever anything fails, which is `off` for that step |
+| `Subset` | the output store's pruning by age (`output_keys_days`) |
+| `Elsewhere` | a cache a pool of runners shares, written by other jobs |
+| `Runner.Declared` | the shelved `ZIG_RUNNER_INPUTS` prototype, which is *not* in the shipped runner |
 
 Two choices are deliberate and worth arguing with. The key is modelled as a *projection*, not a hash,
 so collisions are out of scope rather than silently assumed away. And `exec` takes the trial as well
@@ -66,12 +69,15 @@ well-typed inhabitant, which is why determinism has to be asked for by name.
 
 | MEASURE.md | Statement | Where |
 |---|---|---|
-| **P1** replay equals run | `replay≡run`, for output keys on and off alike | `Runner/Build.agda` |
+| **P1** replay equals run | `replay≡run`, for every mode — output keys on, off, or falling back per step | `Runner/Build.agda` |
 | **P2** a changed input invalidates | `text-matters`, `position-matters`, `parent-matters`, `stable-env-matters` | `Runner/Build.agda` |
 | **P3** an excluded input does not | `mounts-invisible`, `volatile-invisible` | `Runner/Build.agda` |
 | **P4** volatile ⇒ always-run | `marked-misses`, and `Marked` for the whole mechanism | `Runner/Build.agda`, `Runner/Counterexamples.agda` |
-| **P6** minimality | `hit-keeps-ran`, `warm-runs-nothing` | `Runner/Build.agda` |
-| early cutoff | `cutoff`, `no-cutoff-without-keys` | `Runner/OutputKeys.agda` |
+| **P5** enforcement over guessing | `undeclared-absent`, `enforced-depends-only-on-the-declaration`, and `Guessing` for what the alternative costs | `Runner/Declared.agda` |
+| **P6** minimality | `hit-keeps-ran`, `warm-runs-nothing`, `recorded⇒not-run`, `step-runs-at-most-once` | `Runner/Build.agda` |
+| early cutoff | `cutoff`, `cutoff-needs-only-the-digest`, `no-cutoff-without-keys`, `different-bytes-different-container` | `Runner/OutputKeys.agda` |
+| pruning is safe | `coherent-subset`, `ahead-subset`: both of P1's hypotheses survive dropping entries, so pruning can only cause misses | `Runner/Build.agda` |
+| a shared cache is safe | `elsewhere⇒ahead`: no other job can write under this job's nonce, which is why a pool may share one cache | `Runner/Build.agda` |
 
 P1 is the one that matters: *a job run against a cache left by other jobs produces what the same job
 produces with the step cache off, step for step.* It needs one real hypothesis.
@@ -79,29 +85,13 @@ produces with the step cache off, step for step.* It needs one real hypothesis.
 **`Disciplined`** — for a step the runner does not mark, inputs agreeing on everything the key keeps
 give the same result. It bundles three obligations: the step is deterministic, it does not consult a
 volatile variable, and it does not depend on the content of a mounted cache volume. The runner
-enforces none of them; it marks the steps it can detect and relies on this for the rest.
+enforces none of them; it marks the steps it can detect and relies on this for the rest. Early cutoff
+turns out to need it too, and that is new: what a step exports through `$GITHUB_ENV` is in the next
+step's container, so an unmarked step that exported different variables in two jobs would part the
+keys after it.
 
 Everything else the proof uses is bookkeeping the implementation already does: `Coherent` (entries are
 honest), `Ahead` and `Numbered` (the cache holds nothing yet for the steps still to come).
-
-## Output keys, and what they buy
-
-A marked step cannot be replayed — that is the point of marking it. Without help neither can anything
-after it, because the container it hands on is identified by its own recipe, nonce and all. That is
-`no-cutoff-without-keys`: *every* step after a marked one asks a key no other job's cache can hold,
-whatever anything produced. It is the cost [SPEC.md](../docs/SPEC.md) §6 states as a fact.
-
-`outputKeyed` replaces that container with the one before the step plus what the step produced, by
-digest. `cutoff` is then the payoff: two jobs whose marked step produced the same bytes ask *exactly
-the same keys* for every step after it, so whatever the first recorded, the second finds. In Build
-Systems à la Carte's taxonomy the step cache is a verifying trace and this is a constructive one, and
-this property is early cutoff. Soundness of those replays is not a new question: `replay≡run` is
-proved for output keys on as well as off, with no extra hypothesis.
-
-It is not unconditional. `different-bytes-different-container` says a changed output still forces what
-follows, and `OutputKeys` in the counterexamples computes the four numbers of experiment 7.6: cold 2
-runs, warm with keys 1, warm without keys 2, and warm-but-noisy-output 2 — which is why
-`outputs_ignored` exists.
 
 ## What the counterexamples establish
 
@@ -112,9 +102,12 @@ Each is a complete, computing job in `Runner/Counterexamples.agda`.
 | 1 | reads `GITHUB_RUN_ID` without naming it | job 2 is handed job 1's answer and runs nothing | `Disciplined` |
 | 3 | a flaky test, unmarked | job 1 passed, so job 2 "passes" without running | `Disciplined` |
 | 4 | reads a cache volume, unmarked | replayed although the volume changed between jobs | `Disciplined` |
+| `Guessing` | keyed on a guessed input set, run in the whole workspace | replayed with a stale answer; enforced, it sees nothing instead | P5 |
 
-2 is the positive one: declare the read, and the marker makes the key new, so the step runs and agrees
-with running. 5 is a correction, below. 6 is output keys.
+The others are positive: **2** declares the read and the marker makes the key new; **5** is a
+correction (below); **6** computes experiment 7.6's four numbers — cold 2 runs, warm with keys 1,
+warm without keys 2, warm with a noisy output 2, which is why `outputs_ignored` exists; **7** shows a
+replayed setup step still exporting its variable, so the step after it is replayed too.
 
 ## Three things this turned up
 
@@ -134,21 +127,38 @@ with running. 5 is a correction, below. 6 is output keys.
   that reads run-specific values from a file in the repository is "not detected". Counterexample 1
   shows what that costs: not a slower job, a wrong one.
 
+## Obligations for the harness
+
+What a proof of a property buys is a *test that is worth generating*: the model says which cases
+matter and what must hold in each, so [MEASURE.md](../docs/MEASURE.md) stage 3 does not have to guess.
+Each row is one generated family, against a real engine rather than the fake session.
+
+| From | Generate | Assert |
+|---|---|---|
+| P1 | any job, twice at the same commit: `RUNNER_STEP_CACHE=false`, then on | the same step logs, file commands and conclusions; and `N of M steps replayed` is M the second time |
+| P2 | four jobs, each changing exactly one keyed input: the script text, the step's position in the job, a file in the workspace, a non-volatile variable | the step ran — the `ZIG_RUNNER_RAN` marker is this job's |
+| P3 | two jobs differing only in a volatile value (run id, actor, commit), and two differing only in a cache volume's content | the step was replayed |
+| P4 | one job per name in `volatile_env`, whose script names it; and one using a secret, and one with `id-token: write` | the step ran, every time |
+| P5 | on `feat/declared-inputs-v2`: a step whose declaration omits a file it reads | the step **fails**; it does not replay |
+| P6 | a job whose every step hits | no step ran, and `N of M` is M |
+| early cutoff | a marked step with a stable output, followed by unmarked steps; then the same with an output that changes every run | the marked step runs both times; the steps after it are replayed in the first case and run in the second |
+| pruning | fill the output store, prune it (`RUNNER_OUTPUT_KEYS_DAYS`), re-run | results identical to the unpruned run; only the replay counts differ |
+| shared cache | two jobs of the same workflow at once, on a pool sharing one engine | the same results as running them one after the other |
+| `$GITHUB_ENV` | a setup step that exports a variable, replayed, and a step after it that reads it | the second step sees the same value and is itself replayed |
+
+Three of these cannot be made to pass, and that is the point of having them: counterexample 1's
+indirect volatile read, counterexample 3's flaky step, and counterexample 4's cache-volume read are
+what the design *cannot* detect. Generate them as **expected failures**, so that the day one starts
+passing, something has changed.
+
 ## What this does not model
 
-Not proof of anything about: hash collisions (the key is a projection); **P5** and declared inputs,
-shelved on `feat/declared-inputs-v2`; `GITHUB_ENV` and `GITHUB_PATH` feeding the next step's
-environment; the fallback paths in `outputKeyed`, which only ever make the job more conservative;
-concurrency across the pool, and the engine's garbage collection; anything bash does; and every
-question of *cost* — nothing here says a replay is faster, only that it is right.
+Not proof of anything about: hash collisions (the key is a projection, so two different recipes never
+collide here); the *interleaving* of concurrent jobs, only the shared cache they end up with
+(`Elsewhere`) — the store's first-writer-wins `mv -T` is not modelled; anything bash does; and every
+question of *cost* — nothing here says a replay is faster, only that it is right. Experiment 5's +28%
+and +85% are why `Runner.Declared`'s mechanism is shelved, and no theorem in it argues otherwise.
 
 `Step.reads` is the set of names a script really consults. `readsRunSpecific` approximates it by
 looking for the name in the text, so the model's `mark` is an idealisation of the runner's, and
 counterexample 1 is exactly the distance between them.
-
-## Next
-
-Stage 3 of [MEASURE.md](../docs/MEASURE.md) wants these as generated tests against a real engine. The
-statements above are what to generate from: P2 and P3 are a metamorphic pair over one input kind at a
-time, P4 is `marked-misses` with a real nonce, and `cutoff` is the output-keys experiment with the
-digest held equal by construction rather than by luck.

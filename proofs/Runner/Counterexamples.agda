@@ -32,9 +32,13 @@ valueOf n (b ∷ bs) with n ≟ℕ fst b
 ... | yes _ = snd b
 ... | no  _ = valueOf n bs
 
--- The job's base container.
+-- The job's base container, and the variables it sets on it. The run id is one
+-- of those, as `withVolatileVariable` makes it.
 start : State
 start = base 0
+
+jobEnv : Content → Env
+jobEnv runIdValue = (runId , runIdValue) ∷ []
 
 ------------------------------------------------------------------------------
 -- 1. A volatile read the runner did not notice
@@ -46,37 +50,36 @@ start = base 0
 
 module VolatileRead where
 
-  -- The step logs what it read from the run id.
+  -- The step logs what it read from the run id, changes nothing and exports
+  -- nothing.
   execV : Input → Trial → Output
-  execV i t = output (valueOf runId (Input.env i)) 0
+  execV i t = output (valueOf runId (Input.env i)) 0 []
 
   module V = B vol execV
   open V
 
-  -- One step, in two jobs: the first has GITHUB_RUN_ID=7, the second 9.
+  -- One step, in two jobs: the first job's run id is 7, the second's is 9.
   -- `reads` is empty, so the runner marks neither.
-  first  : Step
-  first  = step 1 0 ((runId , 7) ∷ []) [] []
-  second : Step
-  second = step 1 0 ((runId , 9) ∷ []) [] []
+  theStep : Step
+  theStep = step 1 0 [] []
 
   warm : Cache
-  warm = Progress.cache (build off 1 (progress start [] 0 []) (first ∷ []))
+  warm = Progress.cache (build (always off) 1 (progress start (jobEnv 7) [] 0 []) (theStep ∷ []))
 
   replayed : List Output
-  replayed = Progress.outs (build off 2 (progress start warm 0 []) (second ∷ []))
+  replayed = Progress.outs (build (always off) 2 (progress start (jobEnv 9) warm 0 []) (theStep ∷ []))
 
   ran : List Output
-  ran = uncached off 2 start [] (second ∷ [])
+  ran = uncached (always off) 2 start (jobEnv 9) [] (theStep ∷ [])
 
   -- The second job is handed the first's answer, and never runs the step.
-  replayed-logs-7 : replayed ≡ (output 7 0 ∷ [])
+  replayed-logs-7 : replayed ≡ (output 7 0 [] ∷ [])
   replayed-logs-7 = refl
 
-  ran-logs-9 : ran ≡ (output 9 0 ∷ [])
+  ran-logs-9 : ran ≡ (output 9 0 [] ∷ [])
   ran-logs-9 = refl
 
-  nothing-ran : Progress.ran (build off 2 (progress start warm 0 []) (second ∷ [])) ≡ 0
+  nothing-ran : Progress.ran (build (always off) 2 (progress start (jobEnv 9) warm 0 []) (theStep ∷ [])) ≡ 0
   nothing-ran = refl
 
   -- So P1 fails, and nothing in the engine is at fault: the key kept everything
@@ -94,25 +97,22 @@ module VolatileRead where
 module Marked where
 
   execV : Input → Trial → Output
-  execV i t = output (valueOf runId (Input.env i)) 0
+  execV i t = output (valueOf runId (Input.env i)) 0 []
 
   module V = B vol execV
   open V
 
-  first  : Step
-  first  = step 1 0 ((runId , 7) ∷ []) [] (runId ∷ [])
-  second : Step
-  second = step 1 0 ((runId , 9) ∷ []) [] (runId ∷ [])
+  theStep : Step
+  theStep = step 1 0 [] (runId ∷ [])
 
   warm : Cache
-  warm = Progress.cache (build off 1 (progress start [] 0 []) (first ∷ []))
+  warm = Progress.cache (build (always off) 1 (progress start (jobEnv 7) [] 0 []) (theStep ∷ []))
 
-  -- It runs, and it gives what running gives.
-  it-ran : Progress.ran (build off 2 (progress start warm 0 []) (second ∷ [])) ≡ 1
+  it-ran : Progress.ran (build (always off) 2 (progress start (jobEnv 9) warm 0 []) (theStep ∷ [])) ≡ 1
   it-ran = refl
 
-  sound : Progress.outs (build off 2 (progress start warm 0 []) (second ∷ []))
-          ≡ uncached off 2 start [] (second ∷ [])
+  sound : Progress.outs (build (always off) 2 (progress start (jobEnv 9) warm 0 []) (theStep ∷ []))
+          ≡ uncached (always off) 2 start (jobEnv 9) [] (theStep ∷ [])
   sound = refl
 
 ------------------------------------------------------------------------------
@@ -126,30 +126,30 @@ module Flaky where
   -- The result differs between jobs although every input the key keeps is the
   -- same: a test that passes once and fails once.
   execF : Input → Trial → Output
-  execF i t = output t 0
+  execF i t = output t 0 []
 
   module F = B vol execF
   open F
 
   test : Step
-  test = step 1 0 [] [] []
+  test = step 1 0 [] []
 
   warm : Cache
-  warm = Progress.cache (build off 1 (progress start [] 0 []) (test ∷ []))
+  warm = Progress.cache (build (always off) 1 (progress start [] [] 0 []) (test ∷ []))
 
   -- Job 1 passed, so job 2 "passes" too, without running the test. A runner
   -- that replays steps cannot observe flakiness in the steps it replays: it is
   -- not that we have not measured it (docs/RELATED.md), it is that this design
   -- hides it by construction, and `Disciplined` is where it hides.
-  replay-hides-it : Progress.outs (build off 2 (progress start warm 0 []) (test ∷ []))
-                    ≡ (output 1 0 ∷ [])
+  replay-hides-it : Progress.outs (build (always off) 2 (progress start [] warm 0 []) (test ∷ []))
+                    ≡ (output 1 0 [] ∷ [])
   replay-hides-it = refl
 
-  running-shows-it : uncached off 2 start [] (test ∷ []) ≡ (output 2 0 ∷ [])
+  running-shows-it : uncached (always off) 2 start [] [] (test ∷ []) ≡ (output 2 0 [] ∷ [])
   running-shows-it = refl
 
-  unsound : ¬ (Progress.outs (build off 2 (progress start warm 0 []) (test ∷ []))
-               ≡ uncached off 2 start [] (test ∷ []))
+  unsound : ¬ (Progress.outs (build (always off) 2 (progress start [] warm 0 []) (test ∷ []))
+               ≡ uncached (always off) 2 start [] [] (test ∷ []))
   unsound ()
 
 ------------------------------------------------------------------------------
@@ -164,7 +164,7 @@ module MountedCache where
 
   -- The step logs what it found at path 3, a cache volume.
   execM : Input → Trial → Output
-  execM i t = output (valueOf 3 (Input.mounts i)) 0
+  execM i t = output (valueOf 3 (Input.mounts i)) 0 []
 
   module M = B vol execM
   open M
@@ -172,16 +172,16 @@ module MountedCache where
   -- The same step in two jobs. Between them something else filled the volume:
   -- another job's `uv sync`, a `go mod download`, a pruning pass.
   first  : Step
-  first  = step 1 0 [] ((3 , 5) ∷ []) []
+  first  = step 1 0 ((3 , 5) ∷ []) []
   second : Step
-  second = step 1 0 [] ((3 , 9) ∷ []) []
+  second = step 1 0 ((3 , 9) ∷ []) []
 
   warm : Cache
-  warm = Progress.cache (build off 1 (progress start [] 0 []) (first ∷ []))
+  warm = Progress.cache (build (always off) 1 (progress start [] [] 0 []) (first ∷ []))
 
   -- The key is the same, so the step is replayed with the old volume's answer.
-  unsound : ¬ (Progress.outs (build off 2 (progress start warm 0 []) (second ∷ []))
-               ≡ uncached off 2 start [] (second ∷ []))
+  unsound : ¬ (Progress.outs (build (always off) 2 (progress start [] warm 0 []) (second ∷ []))
+               ≡ uncached (always off) 2 start [] [] (second ∷ []))
   unsound ()
 
 ------------------------------------------------------------------------------
@@ -197,7 +197,7 @@ module MountedCache where
 module SameStepTwice where
 
   execM : Input → Trial → Output
-  execM i t = output (valueOf 3 (Input.mounts i)) 0
+  execM i t = output (valueOf 3 (Input.mounts i)) 0 []
 
   module M = B vol execM
   open M
@@ -205,16 +205,15 @@ module SameStepTwice where
   -- Identical but for the volume's content, and numbered the same, which the
   -- runner never emits — so the script text cannot be what separates them.
   readsFive : Step
-  readsFive = step 1 0 [] ((3 , 5) ∷ []) (runId ∷ [])
+  readsFive = step 1 0 ((3 , 5) ∷ []) (runId ∷ [])
   readsSix  : Step
-  readsSix  = step 1 0 [] ((3 , 6) ∷ []) (runId ∷ [])
+  readsSix  = step 1 0 ((3 , 6) ∷ []) (runId ∷ [])
 
   afterFirst : Progress
-  afterFirst = build off 1 (progress start [] 0 []) (readsFive ∷ [])
+  afterFirst = build (always off) 1 (progress start [] [] 0 []) (readsFive ∷ [])
 
   -- The second occurrence does not find the first's entry.
-  misses : look (K (inputFor 1 (Progress.state afterFirst) readsSix (mark readsSix)))
-                (Progress.cache afterFirst)
+  misses : look (K (inputAt 1 afterFirst readsSix (mark readsSix))) (Progress.cache afterFirst)
            ≡ nothing
   misses = refl
 
@@ -223,11 +222,11 @@ module SameStepTwice where
   deeper = refl
 
   -- So both run, and the job reports what running reports.
-  both-ran : Progress.ran (build off 1 (progress start [] 0 []) (readsFive ∷ readsSix ∷ [])) ≡ 2
+  both-ran : Progress.ran (build (always off) 1 (progress start [] [] 0 []) (readsFive ∷ readsSix ∷ [])) ≡ 2
   both-ran = refl
 
-  sound : Progress.outs (build off 1 (progress start [] 0 []) (readsFive ∷ readsSix ∷ []))
-          ≡ uncached off 1 start [] (readsFive ∷ readsSix ∷ [])
+  sound : Progress.outs (build (always off) 1 (progress start [] [] 0 []) (readsFive ∷ readsSix ∷ []))
+          ≡ uncached (always off) 1 start [] [] (readsFive ∷ readsSix ∷ [])
   sound = refl
 
 ------------------------------------------------------------------------------
@@ -247,43 +246,95 @@ module OutputKeys where
   -- else, which is stable.
   execD : Input → Trial → Output
   execD i t with Input.script i
-  ... | stamped _ (body 2 _) = output 0 t
-  ... | _                    = output 0 42
+  ... | stamped _ (body 2 _) = output 0 t []
+  ... | _                    = output 0 42 []
 
   module D = B vol execD
   open D
 
   deploy : Step
-  deploy = step 1 0 [] [] (runId ∷ [])
+  deploy = step 1 0 [] (runId ∷ [])
 
   noisyDeploy : Step
-  noisyDeploy = step 2 0 [] [] (runId ∷ [])
+  noisyDeploy = step 2 0 [] (runId ∷ [])
 
   check : Step
-  check = step 5 1 [] [] []
+  check = step 5 1 [] []
 
   -- Job 1 runs both steps and records them.
   warm : Cache
-  warm = Progress.cache (build on 1 (progress start [] 0 []) (deploy ∷ check ∷ []))
+  warm = Progress.cache (build (always on) 1 (progress start [] [] 0 []) (deploy ∷ check ∷ []))
 
-  cold-job-runs-both : Progress.ran (build on 1 (progress start [] 0 []) (deploy ∷ check ∷ [])) ≡ 2
+  cold-job-runs-both :
+    Progress.ran (build (always on) 1 (progress start [] [] 0 []) (deploy ∷ check ∷ [])) ≡ 2
   cold-job-runs-both = refl
 
   -- Job 2, with output keys: the deploy runs again, as it must, and the check
   -- after it is replayed anyway. That is early cutoff.
-  cutoff-replays-the-check : Progress.ran (build on 2 (progress start warm 0 []) (deploy ∷ check ∷ [])) ≡ 1
+  cutoff-replays-the-check :
+    Progress.ran (build (always on) 2 (progress start [] warm 0 []) (deploy ∷ check ∷ [])) ≡ 1
   cutoff-replays-the-check = refl
 
   -- Without output keys, the same job runs both: the deploy's new key is a new
-  -- container, and the check cannot be found under it.
-  without-keys-runs-both : Progress.ran (build off 2 (progress start warm 0 []) (deploy ∷ check ∷ [])) ≡ 2
+  -- container, and the check cannot be found under it. This is also what a
+  -- fallback costs, since a fallback is `off` for that one step.
+  without-keys-runs-both :
+    Progress.ran (build (always off) 2 (progress start [] warm 0 []) (deploy ∷ check ∷ [])) ≡ 2
   without-keys-runs-both = refl
 
   -- And output keys buy nothing when the always-run step's output is never the
   -- same twice: the digest is the key, so a new digest is a new container.
   -- `outputs_ignored` in dagger.zig exists for exactly this reason.
   noisy : Cache
-  noisy = Progress.cache (build on 1 (progress start [] 0 []) (noisyDeploy ∷ check ∷ []))
+  noisy = Progress.cache (build (always on) 1 (progress start [] [] 0 []) (noisyDeploy ∷ check ∷ []))
 
-  noise-defeats-cutoff : Progress.ran (build on 2 (progress start noisy 0 []) (noisyDeploy ∷ check ∷ [])) ≡ 2
+  noise-defeats-cutoff :
+    Progress.ran (build (always on) 2 (progress start [] noisy 0 []) (noisyDeploy ∷ check ∷ [])) ≡ 2
   noise-defeats-cutoff = refl
+
+------------------------------------------------------------------------------
+-- 7. A replayed step still exports its variables
+--
+-- `$GITHUB_ENV` is how a setup step tells the next one where the toolchain is,
+-- and the runner reads those file commands out of the step's result — including
+-- a *replayed* result, which is why this works at all. If a replay exported
+-- nothing, the next step's container would differ and nothing after it could be
+-- replayed either.
+
+module Exported where
+
+  -- A setup step (text 1) that exports a variable; everything else exports
+  -- nothing and logs what it was told.
+  execE : Input → Trial → Output
+  execE i t with Input.script i
+  ... | body 1 _ = output 0 42 ((7 , 99) ∷ [])
+  ... | _        = output (valueOf 7 (Input.env i)) 42 []
+
+  module E = B vol execE
+  open E
+
+  setup : Step
+  setup = step 1 0 [] []
+  use   : Step
+  use   = step 2 1 [] []
+
+  job : List Step
+  job = setup ∷ use ∷ []
+
+  warm : Cache
+  warm = Progress.cache (build (always off) 1 (progress start [] [] 0 []) job)
+
+  -- Job 1 runs both, and the second step saw what the first exported.
+  first-job : Progress.outs (build (always off) 1 (progress start [] [] 0 []) job)
+              ≡ (output 99 42 [] ∷ output 0 42 ((7 , 99) ∷ []) ∷ [])
+  first-job = refl
+
+  -- Job 2 replays both, and the replayed setup step still contributes its
+  -- variable — so the second step's key is the one that was recorded, and it is
+  -- replayed too.
+  second-job-runs-nothing : Progress.ran (build (always off) 2 (progress start [] warm 0 []) job) ≡ 0
+  second-job-runs-nothing = refl
+
+  same-answers : Progress.outs (build (always off) 2 (progress start [] warm 0 []) job)
+                 ≡ uncached (always off) 2 start [] [] job
+  same-answers = refl

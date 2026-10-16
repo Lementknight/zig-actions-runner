@@ -32,17 +32,29 @@ mark st with any vol (Step.reads st)
 ... | true  = everyRun
 ... | false = plain
 
--- The input a step is run on. Marking it costs a script that no other job can
--- have produced, because the job's nonce is written into the script text and
--- the script text is part of the key.
-inputFor : Trial → State → Step → Mark → Input
-inputFor t s st plain    = input s (body (Step.text st) (Step.num st)) (Step.env st) (Step.mounts st)
-inputFor t s st everyRun = input s (stamped t (body (Step.text st) (Step.num st))) (Step.env st) (Step.mounts st)
+-- The input a step is run on: the container it starts from, its script, the
+-- container's variables, and what is mounted. Marking it costs a script that no
+-- other job can have produced, because the job's nonce is written into the
+-- script text and the script text is part of the key.
+inputFor : Trial → State → Env → Step → Mark → Input
+inputFor t s e st plain    = input s (body (Step.text st) (Step.num st)) e (Step.mounts st)
+inputFor t s e st everyRun = input s (stamped t (body (Step.text st) (Step.num st))) e (Step.mounts st)
 
 -- `RUNNER_OUTPUT_KEYS`.
 data Keys : Set where
   off : Keys
   on  : Keys
+
+-- Per step, not per job: `outputKeyed` falls back to the step's own container
+-- whenever anything goes wrong (a query without a field the runner needs, a
+-- session that went away), and that is the `off` behaviour for that one step.
+-- Two of the trial's 189 jobs did exactly this. So the mode is a function of the
+-- step, and every theorem below holds for any such function.
+Mode : Set
+Mode = ℕ → Keys
+
+always : Keys → Mode
+always k _ = k
 
 -- The container the next step starts from.
 --
@@ -51,29 +63,33 @@ data Keys : Set where
 -- output keys on, a marked step instead hands on the container it started from
 -- with what it produced copied in by digest (`outputKeyed`), so what the next
 -- step starts from says what was produced and not who produced it.
-nextState : Keys → Trial → State → Step → Mark → Output → State
-nextState off t s st m        o = stateOf (K (inputFor t s st m))
-nextState on  t s st plain    o = stateOf (K (inputFor t s st plain))
-nextState on  t s st everyRun o = afterCopy s (Output.digest o)
+nextState : Keys → Trial → State → Env → Step → Mark → Output → State
+nextState off t s e st m        o = stateOf (K (inputFor t s e st m))
+nextState on  t s e st plain    o = stateOf (K (inputFor t s e st plain))
+nextState on  t s e st everyRun o = afterCopy s (Output.digest o)
 
 record Progress : Set where
   constructor progress
   field
     state : State
+    env   : Env
     cache : Cache
     ran   : ℕ
     outs  : List Output
 
+-- The input the step at the head of the job runs on.
+inputAt : Trial → Progress → Step → Mark → Input
+inputAt t p st m = inputFor t (Progress.state p) (Progress.env p) st m
+
 -- What the step contributes: the recorded output on a hit, a run on a miss.
 produced : Trial → Progress → Step → Mark → Maybe Output → Output
 produced t p st m (just o) = o
-produced t p st m nothing  = exec (inputFor t (Progress.state p) st m) t
+produced t p st m nothing  = exec (inputAt t p st m) t
 
 -- A miss records what it ran, under the key it ran with.
 addEntry : Trial → Progress → Step → Mark → Maybe Output → Cache
 addEntry t p st m (just o) = Progress.cache p
-addEntry t p st m nothing  =
-  (K (inputFor t (Progress.state p) st m) , exec (inputFor t (Progress.state p) st m) t) ∷ Progress.cache p
+addEntry t p st m nothing  = (K (inputAt t p st m) , exec (inputAt t p st m) t) ∷ Progress.cache p
 
 ranAfter : Progress → Maybe Output → ℕ
 ranAfter p (just o) = Progress.ran p
@@ -84,35 +100,43 @@ ranAfter p nothing  = suc (Progress.ran p)
 -- the rest of the job sees of this step — the container it hands on and the
 -- output it contributes — goes through `produced`, which is what makes replay
 -- transparent when `produced` is right.
-advance : Keys → Trial → Progress → Step → Mark → Maybe Output → Progress
-advance ks t p st m r =
-  progress (nextState ks t (Progress.state p) st m (produced t p st m r))
+-- The variables the next step sees: what the step exported, on top of what the
+-- container already had. A replayed step exports what it exported when it ran,
+-- because the runner reads the file commands out of the cached result.
+nextEnv : Env → Output → Env
+nextEnv e o = Output.sets o ++ e
+
+advance : Mode → Trial → Progress → Step → Mark → Maybe Output → Progress
+advance md t p st m r =
+  progress (nextState (md (Step.num st)) t (Progress.state p) (Progress.env p) st m (produced t p st m r))
+           (nextEnv (Progress.env p) (produced t p st m r))
            (addEntry t p st m r)
            (ranAfter p r)
            (produced t p st m r ∷ Progress.outs p)
 
-stepOnce : Keys → Trial → Progress → Step → Progress
-stepOnce ks t p st =
-  advance ks t p st (mark st)
-    (look (K (inputFor t (Progress.state p) st (mark st))) (Progress.cache p))
+stepOnce : Mode → Trial → Progress → Step → Progress
+stepOnce md t p st =
+  advance md t p st (mark st) (look (K (inputAt t p st (mark st))) (Progress.cache p))
 
 -- The scheduler: a job's steps, in order. GitHub Actions gives no choice here,
 -- which is why the interesting questions are all about the rebuilder.
-build : Keys → Trial → Progress → List Step → Progress
-build ks t p []         = p
-build ks t p (st ∷ sts) = build ks t (stepOnce ks t p st) sts
+build : Mode → Trial → Progress → List Step → Progress
+build md t p []         = p
+build md t p (st ∷ sts) = build md t (stepOnce md t p st) sts
 
 -- The same job with the step cache off: every step runs. The outputs come back
 -- in reverse, as `Progress.outs` collects them.
-uncached : Keys → Trial → State → List Output → List Step → List Output
-uncached ks t s acc []         = acc
-uncached ks t s acc (st ∷ sts) =
-  uncached ks t (nextState ks t s st (mark st) (exec (inputFor t s st (mark st)) t))
-              (exec (inputFor t s st (mark st)) t ∷ acc) sts
+uncached : Mode → Trial → State → Env → List Output → List Step → List Output
+uncached md t s e acc []         = acc
+uncached md t s e acc (st ∷ sts) =
+  uncached md t (nextState (md (Step.num st)) t s e st (mark st) (exec (inputFor t s e st (mark st)) t))
+                (nextEnv e (exec (inputFor t s e st (mark st)) t))
+                (exec (inputFor t s e st (mark st)) t ∷ acc) sts
 
-uncached-cong : (ks : Keys) (t : Trial) {s s' : State} {acc acc' : List Output} (sts : List Step)
-  → s ≡ s' → acc ≡ acc' → uncached ks t s acc sts ≡ uncached ks t s' acc' sts
-uncached-cong ks t sts refl refl = refl
+uncached-cong : (md : Mode) (t : Trial) {s s' : State} {e e' : Env} {acc acc' : List Output}
+  (sts : List Step)
+  → s ≡ s' → e ≡ e' → acc ≡ acc' → uncached md t s e acc sts ≡ uncached md t s' e' acc' sts
+uncached-cong md t sts refl refl refl = refl
 
 ------------------------------------------------------------------------------
 -- P2 and P3: what the key keeps, and what it forgets
@@ -170,12 +194,12 @@ depth (base _)          = 0
 depth (afterExec s _ _) = suc (depth s)
 depth (afterCopy s _)   = suc (depth s)
 
-depth-advances : (ks : Keys) (t : Trial) (s : State) (st : Step) (m : Mark) (o : Output)
-  → depth (nextState ks t s st m o) ≡ suc (depth s)
-depth-advances off t s st plain    o = refl
-depth-advances off t s st everyRun o = refl
-depth-advances on  t s st plain    o = refl
-depth-advances on  t s st everyRun o = refl
+depth-advances : (ks : Keys) (t : Trial) (s : State) (e : Env) (st : Step) (m : Mark) (o : Output)
+  → depth (nextState ks t s e st m o) ≡ suc (depth s)
+depth-advances off t s e st plain    o = refl
+depth-advances off t s e st everyRun o = refl
+depth-advances on  t s e st plain    o = refl
+depth-advances on  t s e st everyRun o = refl
 
 -- So a key asked from a deeper container is a different key, whatever the
 -- script, the environment or the mounts.
@@ -241,21 +265,21 @@ disciplined⇒deterministic d i t t' u = d i i t t' refl u
 -- A hit on this step holds what running the step now would produce. This is P1
 -- for one step, and it is the thing that has to hold every time a step is
 -- replayed.
-Replays : Trial → Cache → State → Step → Mark → Set
-Replays t c s st m = (o : Output)
-  → look (K (inputFor t s st m)) c ≡ just o → exec (inputFor t s st m) t ≡ o
+Replays : Trial → Cache → State → Env → Step → Mark → Set
+Replays t c s e st m = (o : Output)
+  → look (K (inputFor t s e st m)) c ≡ just o → exec (inputFor t s e st m) t ≡ o
 
 -- A marked step cannot hit at all: its key names this job and its own position.
-marked-misses : {t : Trial} {c : Cache} (s : State) (st : Step)
-  → Ahead t (Step.num st) c → look (K (inputFor t s st everyRun)) c ≡ nothing
-marked-misses s st ah = look-miss _ _ (λ o mem → ah mem (Step.text st) (Step.num st) refl ≤-refl)
+marked-misses : {t : Trial} {c : Cache} (s : State) (e : Env) (st : Step)
+  → Ahead t (Step.num st) c → look (K (inputFor t s e st everyRun)) c ≡ nothing
+marked-misses s e st ah = look-miss _ _ (λ o mem → ah mem (Step.text st) (Step.num st) refl ≤-refl)
 
 -- An unmarked step's hit is honest, and honest is enough once the step is
 -- disciplined. The two cases are the whole design: either the result depends
 -- only on what the key keeps, or the step is marked and does not get replayed.
-unmarked-replays : Disciplined → {t : Trial} {c : Cache} (s : State) (st : Step)
-  → Coherent c → Replays t c s st plain
-unmarked-replays d s st co o eq with co (look-sound _ _ eq)
+unmarked-replays : Disciplined → {t : Trial} {c : Cache} (s : State) (e : Env) (st : Step)
+  → Coherent c → Replays t c s e st plain
+unmarked-replays d s e st co o eq with co (look-sound _ _ eq)
 ... | ⟨ j , ⟨ t' , (kj , ej) ⟩ ⟩ = trans (d _ j _ t' (sym kj) tt) ej
 
 ------------------------------------------------------------------------------
@@ -265,14 +289,14 @@ unmarked-replays d s st co o eq with co (look-sound _ _ eq)
 -- contributes; the cache stays coherent, and still holds nothing for the steps
 -- that come after.
 step-ok : Disciplined → (t : Trial) (p : Progress) (st : Step) (m : Mark) (r : Maybe Output)
-  → look (K (inputFor t (Progress.state p) st m)) (Progress.cache p) ≡ r
+  → look (K (inputAt t p st m)) (Progress.cache p) ≡ r
   → Coherent (Progress.cache p) → Ahead t (Step.num st) (Progress.cache p)
-  → (produced t p st m r ≡ exec (inputFor t (Progress.state p) st m) t)
+  → (produced t p st m r ≡ exec (inputAt t p st m) t)
     × (Coherent (addEntry t p st m r) × Ahead t (suc (Step.num st)) (addEntry t p st m r))
 step-ok d t p st plain (just o) eq co ah =
-  sym (unmarked-replays d (Progress.state p) st co o eq) , (co , ahead-loosen ah)
+  sym (unmarked-replays d (Progress.state p) (Progress.env p) st co o eq) , (co , ahead-loosen ah)
 step-ok d t p st everyRun (just o) eq co ah =
-  ⊥-elim (impossible (trans (sym (marked-misses (Progress.state p) st ah)) eq))
+  ⊥-elim (impossible (trans (sym (marked-misses (Progress.state p) (Progress.env p) st ah)) eq))
   where
     impossible : {o' : Output} → ¬ (nothing ≡ just o')
     impossible ()
@@ -280,14 +304,14 @@ step-ok d t p st plain nothing eq co ah =
   refl , (coherent-cons ⟨ _ , ⟨ t , (refl , refl) ⟩ ⟩ co , ahead-cons new (ahead-loosen ah))
   where
     new : (b : Body) (i : ℕ)
-      → Key.kScript (K (inputFor t (Progress.state p) st plain)) ≡ stamped t (body b i)
+      → Key.kScript (K (inputAt t p st plain)) ≡ stamped t (body b i)
       → ¬ (suc (Step.num st) ≤ i)
     new b i ()
 step-ok d t p st everyRun nothing eq co ah =
   refl , (coherent-cons ⟨ _ , ⟨ t , (refl , refl) ⟩ ⟩ co , ahead-cons new (ahead-loosen ah))
   where
     new : (b : Body) (i : ℕ)
-      → Key.kScript (K (inputFor t (Progress.state p) st everyRun)) ≡ stamped t (body b i)
+      → Key.kScript (K (inputAt t p st everyRun)) ≡ stamped t (body b i)
       → ¬ (suc (Step.num st) ≤ i)
     new b i eq' le =
       suc≰ (Step.num st)
@@ -301,50 +325,93 @@ Numbered n (st ∷ sts) = (Step.num st ≡ n) × Numbered (suc n) sts
 
 -- P1, replay equals run. A job run against a cache from other jobs produces
 -- what the same job produces with the step cache off — every step of it —
--- provided the steps the runner does not mark are disciplined. It holds with
--- output keys on or off, since what the rest of the job sees of a step goes
--- through `produced` either way.
+-- provided the steps the runner does not mark are disciplined. It holds for any
+-- mode: output keys on, off, or falling back on whichever steps they like, since
+-- what the rest of the job sees of a step goes through `produced` either way.
 --
 -- What the proof needs beyond Disciplined is only bookkeeping the
 -- implementation already does: entries are honest, and the job's steps are
 -- numbered. There is no hypothesis left over about mounted content, because the
 -- numbering discharges it inside a job and Disciplined covers it across jobs.
-replay≡run : Disciplined → (ks : Keys) (t : Trial) (n : ℕ) (p : Progress) (job : List Step)
+replay≡run : Disciplined → (md : Mode) (t : Trial) (n : ℕ) (p : Progress) (job : List Step)
   → Numbered n job
   → Coherent (Progress.cache p) → Ahead t n (Progress.cache p)
-  → Progress.outs (build ks t p job) ≡ uncached ks t (Progress.state p) (Progress.outs p) job
-replay≡run d ks t n p []         _            co ah = refl
-replay≡run d ks t n p (st ∷ sts) (num , nums) co ah
+  → Progress.outs (build md t p job)
+    ≡ uncached md t (Progress.state p) (Progress.env p) (Progress.outs p) job
+replay≡run d md t n p []         _            co ah = refl
+replay≡run d md t n p (st ∷ sts) (num , nums) co ah
   with step-ok d t p st (mark st) _ refl co (subst (λ x → Ahead t x (Progress.cache p)) (sym num) ah)
 ... | (out-eq , (co' , ah')) =
-      trans (replay≡run d ks t (suc n) (stepOnce ks t p st) sts nums co'
+      trans (replay≡run d md t (suc n) (stepOnce md t p st) sts nums co'
               (subst (λ x → Ahead t (suc x)
                        (addEntry t p st (mark st)
-                         (look (K (inputFor t (Progress.state p) st (mark st))) (Progress.cache p))))
+                         (look (K (inputAt t p st (mark st))) (Progress.cache p))))
                      num ah'))
-            (uncached-cong ks t sts
-              (cong (nextState ks t (Progress.state p) st (mark st)) out-eq)
+            (uncached-cong md t sts
+              (cong (nextState (md (Step.num st)) t (Progress.state p) (Progress.env p) st (mark st)) out-eq)
+              (cong (nextEnv (Progress.env p)) out-eq)
               (cong (λ x → x ∷ Progress.outs p) out-eq))
 
 ------------------------------------------------------------------------------
 -- P6: minimality
 
 -- Every step of the job hits.
-Warm : Keys → Trial → Progress → List Step → Set
-Warm ks t p []         = ⊤
-Warm ks t p (st ∷ sts) =
-  Σ Output (λ o → (look (K (inputFor t (Progress.state p) st (mark st))) (Progress.cache p) ≡ just o)
-                  × Warm ks t (stepOnce ks t p st) sts)
+Warm : Mode → Trial → Progress → List Step → Set
+Warm md t p []         = ⊤
+Warm md t p (st ∷ sts) =
+  Σ Output (λ o → (look (K (inputAt t p st (mark st))) (Progress.cache p) ≡ just o)
+                  × Warm md t (stepOnce md t p st) sts)
 
-hit-keeps-ran : (ks : Keys) (t : Trial) (p : Progress) (st : Step) {o : Output}
-  → look (K (inputFor t (Progress.state p) st (mark st))) (Progress.cache p) ≡ just o
-  → Progress.ran (stepOnce ks t p st) ≡ Progress.ran p
-hit-keeps-ran ks t p st eq rewrite eq = refl
+hit-keeps-ran : (md : Mode) (t : Trial) (p : Progress) (st : Step) {o : Output}
+  → look (K (inputAt t p st (mark st))) (Progress.cache p) ≡ just o
+  → Progress.ran (stepOnce md t p st) ≡ Progress.ran p
+hit-keeps-ran md t p st eq rewrite eq = refl
 
 -- P6, the half that matters for the claim "N of M steps replayed from the
 -- cache": a job whose every step hits runs nothing at all.
-warm-runs-nothing : (ks : Keys) (t : Trial) (p : Progress) (job : List Step)
-  → Warm ks t p job → Progress.ran (build ks t p job) ≡ Progress.ran p
-warm-runs-nothing ks t p []         w = refl
-warm-runs-nothing ks t p (st ∷ sts) ⟨ o , (hit , w) ⟩ =
-  trans (warm-runs-nothing ks t (stepOnce ks t p st) sts w) (hit-keeps-ran ks t p st hit)
+warm-runs-nothing : (md : Mode) (t : Trial) (p : Progress) (job : List Step)
+  → Warm md t p job → Progress.ran (build md t p job) ≡ Progress.ran p
+warm-runs-nothing md t p []         w = refl
+warm-runs-nothing md t p (st ∷ sts) ⟨ o , (hit , w) ⟩ =
+  trans (warm-runs-nothing md t (stepOnce md t p st) sts w) (hit-keeps-ran md t p st hit)
+
+-- P6, the other half: a step whose key the cache holds does not run. `look-found`
+-- is what connects "it was recorded" to "it is replayed", which is the step the
+-- log line `N of M steps replayed from the cache` reports.
+recorded⇒not-run : (md : Mode) (t : Trial) (p : Progress) (st : Step) {o : Output}
+  → (K (inputAt t p st (mark st)) , o) ∈ Progress.cache p
+  → Progress.ran (stepOnce md t p st) ≡ Progress.ran p
+recorded⇒not-run md t p st mem with look-found (K (inputAt t p st (mark st))) (Progress.cache p) mem
+... | ⟨ o' , eq ⟩ = hit-keeps-ran md t p st eq
+
+-- And a step runs at most once: `ran` either stays or goes up by one.
+step-runs-at-most-once : (md : Mode) (t : Trial) (p : Progress) (st : Step)
+  → (Progress.ran (stepOnce md t p st) ≡ Progress.ran p)
+    ⊎ (Progress.ran (stepOnce md t p st) ≡ suc (Progress.ran p))
+step-runs-at-most-once md t p st with look (K (inputAt t p st (mark st))) (Progress.cache p)
+... | just o  = inl refl
+... | nothing = inr refl
+
+------------------------------------------------------------------------------
+-- Garbage collection, and a cache other jobs are writing to
+
+-- Pruning the store can only cause misses, never wrong results (STUDY.md §7.4
+-- says so; this is why). Both hypotheses of P1 survive dropping entries, so P1
+-- holds of whatever is left.
+coherent-subset : {c c' : Cache} → Subset c' c → Coherent c → Coherent c'
+coherent-subset sub co mem = co (sub mem)
+
+ahead-subset : {t : Trial} {n : ℕ} {c c' : Cache} → Subset c' c → Ahead t n c → Ahead t n c'
+ahead-subset sub ah mem = ah (sub mem)
+
+-- Entries written by other jobs. A job's nonce is the run, the attempt and the
+-- job, so no other job can have written an entry under this job's nonce — which
+-- is what makes one cache shared by a pool of runners safe, and what P1 needs of
+-- it. The entries other jobs leave for *unmarked* steps are the ones this job
+-- means to hit.
+Elsewhere : Trial → Cache → Set
+Elsewhere t c = {k : Key} {o : Output} → (k , o) ∈ c
+  → (b : Body) (i : ℕ) (t' : Trial) → Key.kScript k ≡ stamped t' (body b i) → ¬ (t' ≡ t)
+
+elsewhere⇒ahead : {t : Trial} {c : Cache} → Elsewhere t c → (n : ℕ) → Ahead t n c
+elsewhere⇒ahead el n mem b i eq _ = el mem b i _ eq refl

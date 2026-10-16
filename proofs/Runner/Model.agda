@@ -187,12 +187,16 @@ afterCopy s c    ≟State afterCopy s' c'     with s ≟State s' | c ≟ℕ c'
 -- script really consults; `readsRunSpecific` in dagger.zig is a syntactic
 -- over-approximation of it, which is sound only when a script that consults a
 -- name also mentions it (see proofs/README.md, "what this does not model").
+--
+-- There is no `env` here: the variables a step sees are the container's, which
+-- the job sets once and earlier steps add to through `$GITHUB_ENV` (`Output.sets`
+-- below). A `run:` step's own `env:` travels inside the script text, as
+-- `writeEnvCommand` puts it there, so it is part of `text`.
 record Step : Set where
   constructor step
   field
     text   : Body
     num    : ℕ
-    env    : Env
     mounts : Mounts
     reads  : List Name
 
@@ -205,14 +209,19 @@ record Input : Set where
     env    : Env
     mounts : Mounts
 
--- What running a step produces: what it wrote, and the content digest of what
--- it changed in the filesystem. The digest is `changes(from:).layer.digest` in
--- `outputKeyed`; it is a fact about the bytes, not about who produced them.
+-- What running a step produces: what it wrote, the content digest of what it
+-- changed in the filesystem, and the variables it exported. The digest is
+-- `changes(from:).layer.digest` in `outputKeyed`; it is a fact about the bytes,
+-- not about who produced them. `sets` is what the step wrote to `$GITHUB_ENV`
+-- and `$GITHUB_PATH`, which the runner reads from the step's file commands and
+-- adds to the next step's container — and which it therefore reads out of a
+-- *replayed* step's file commands too, so a replay must export the same.
 record Output : Set where
   constructor output
   field
     log    : Log
     digest : Content
+    sets   : Env
 
 ------------------------------------------------------------------------------
 -- Keys
@@ -287,6 +296,22 @@ look-cons : (k : Key) (e : Key × Output) (c : Cache) {o : Output}
 look-cons k e c eq with k ≟Key fst e
 ... | yes p = inl (p , sym (just-injective eq))
 ... | no  _ = inr eq
+
+-- An entry that is there can be found. (Not the same as `look-sound`: this is
+-- the direction that says a recorded step is replayed, not that a replay was
+-- recorded.)
+look-found : (k : Key) (c : Cache) {o : Output} → (k , o) ∈ c → Σ Output (λ o' → look k c ≡ just o')
+look-found k (e ∷ c) here with k ≟Key fst e
+... | yes _  = ⟨ snd e , refl ⟩
+... | no  ¬p = ⊥-elim (¬p refl)
+look-found k (e ∷ c) (there m) with k ≟Key fst e
+... | yes _ = ⟨ snd e , refl ⟩
+... | no  _ = look-found k c m
+
+-- One cache holds only entries another holds: what garbage collection leaves
+-- behind, and what a job sees of a cache other jobs are also writing to.
+Subset : Cache → Cache → Set
+Subset c' c = {k : Key} {o : Output} → (k , o) ∈ c' → (k , o) ∈ c
 
 -- A key no entry carries cannot be found.
 look-miss : (k : Key) (c : Cache) → ((o : Output) → ¬ ((k , o) ∈ c)) → look k c ≡ nothing
