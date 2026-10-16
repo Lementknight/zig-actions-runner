@@ -188,6 +188,13 @@ filter : {A : Set} → (A → Bool) → List A → List A
 filter p []       = []
 filter p (x ∷ xs) = if p x then x ∷ filter p xs else filter p xs
 
+-- Filtering twice by the same predicate is filtering once: what is kept is already kept.
+filter-idempotent : {A : Set} (p : A → Bool) (xs : List A) → filter p (filter p xs) ≡ filter p xs
+filter-idempotent p []       = refl
+filter-idempotent p (x ∷ xs) with p x in eq
+... | false = filter-idempotent p xs
+... | true  rewrite eq = cong (λ ys → x ∷ ys) (filter-idempotent p xs)
+
 ∷-injective₁ : {A : Set} {x y : A} {xs ys : List A} → (x ∷ xs) ≡ (y ∷ ys) → x ≡ y
 ∷-injective₁ refl = refl
 
