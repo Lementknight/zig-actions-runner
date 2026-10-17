@@ -9,8 +9,7 @@ pub fn build(b: *std.Build) void {
     // The build's own version, in every job's "Set up job" and in `--version`. Answering "which
     // binary is on that machine?" by comparing file sizes and timestamps is how an hour went
     // missing once; `git describe` answers it exactly.
-    const build_options = b.addOptions();
-    build_options.addOption([]const u8, "version", buildVersion(b));
+    const version = b.createModule(.{ .root_source_file = versionFile(b) });
 
     const exe = b.addExecutable(.{
         .name = "runner",
@@ -19,7 +18,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = strip,
-            .imports = &.{.{ .name = "build_options", .module = build_options.createModule() }},
+            .imports = &.{.{ .name = "build_version", .module = version }},
         }),
     });
     b.installArtifact(exe);
@@ -69,20 +68,28 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(measure_tests).step);
 }
 
-/// `v0.2.0-116-g9eb33348`, or with `-dirty` when the tree has uncommitted changes: the release it
-/// follows, how far past it, and the exact commit. `-Dversion=...` overrides it, which is how a
-/// build from a tarball or a container without the history gets a real version; without either, the
-/// package's own version stands in, which is honest but cannot identify a build.
-fn buildVersion(b: *std.Build) []const u8 {
-    if (b.option([]const u8, "version", "The version in the job log and --version")) |v| return v;
+/// A file holding the version, for `src/version.zig` to `@embedFile`: `v0.2.0-118-g5063ae36`, with
+/// `-dirty` when the tree has uncommitted changes — the release it follows, how far past it, and
+/// the exact commit.
+///
+/// Computed when the build *runs*, not when it is configured. `zig build` caches its configuration
+/// per set of `-D` options, so a version read while configuring survives HEAD moving: the first
+/// version of this produced an aarch64 binary that named the commit before the one it was built
+/// from, which is worse than no version at all. `has_side_effects` makes git run every build, and
+/// the compilation downstream of it only redo itself when the output actually changes.
+///
+/// `-Dversion=...` skips git, which is how the builds with no history to read get a real version:
+/// the release workflow passes the tag, the image build takes a build argument. Where there is
+/// neither git nor a flag, the package's version stands in — honest, and visibly not a build.
+fn versionFile(b: *std.Build) std.Build.LazyPath {
+    if (b.option([]const u8, "version", "The version in the job log and --version")) |v|
+        return b.addWriteFiles().add("version", v);
+    // Whether git works here is a property of the checkout, not of HEAD, so this probe can be
+    // cached with the configuration; what must not be cached is the answer it produces.
     var code: u8 = 0;
-    // No `-C`: git looks upward from the working directory, so this works from the repository or
-    // from `runner/` inside it, and falls through to the package version anywhere else.
-    const out = b.runAllowFail(
-        &.{ "git", "describe", "--tags", "--always", "--dirty", "--abbrev=8" },
-        &code,
-        .ignore,
-    ) catch return @import("build.zig.zon").version;
-    const described = std.mem.trim(u8, out, " \t\r\n");
-    return if (described.len > 0) b.dupe(described) else @import("build.zig.zon").version;
+    _ = b.runAllowFail(&.{ "git", "rev-parse", "--git-dir" }, &code, .ignore) catch
+        return b.addWriteFiles().add("version", @import("build.zig.zon").version);
+    const git = b.addSystemCommand(&.{ "git", "describe", "--tags", "--always", "--dirty", "--abbrev=8" });
+    git.has_side_effects = true;
+    return git.captureStdOut(.{ .basename = "version" });
 }

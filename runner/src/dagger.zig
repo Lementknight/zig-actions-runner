@@ -23,7 +23,7 @@ const std = @import("std");
 const job_mod = @import("job.zig");
 const sink = @import("sink.zig");
 const broker = @import("github/broker.zig");
-const build_options = @import("build_options");
+const build_version = @import("version.zig");
 const expr = @import("expr.zig");
 const context = @import("context.zig");
 const commands = @import("commands.zig");
@@ -3857,7 +3857,7 @@ const Exec = struct {
         // GitHub's own line, with this runner's build after it: the protocol version is what GitHub
         // validates and says nothing about which binary is running, which is the question a job's
         // log is asked when a machine behaves unexpectedly.
-        x.setUpLine(try std.fmt.allocPrint(arena, "Current runner version: '{s}' (zig-runner {s})", .{ broker.version, build_options.version }));
+        x.setUpLine(try std.fmt.allocPrint(arena, "Current runner version: '{s}' (zig-runner {s})", .{ broker.version, build_version.string }));
         x.setUpLine(try std.fmt.allocPrint(arena, "Runner name: '{s}'", .{opts.runner_name}));
         if (x.job.runner_group.len > 0) x.setUpLine(try std.fmt.allocPrint(arena, "Runner group name: '{s}'", .{x.job.runner_group}));
         var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
@@ -6578,7 +6578,7 @@ test "logs read like GitHub's: Set up job, then each step's header with its shel
     const want_in_order = [_][]const u8{
         // GitHub's protocol version, then this build's own, which is the line a job's log is read
         // for when a machine is behaving unexpectedly.
-        "[job 0 step 0 stdout] Current runner version: '" ++ broker.version ++ "' (zig-runner " ++ build_options.version ++ ")",
+        "[job 0 step 0 stdout] Current runner version: '" ++ broker.version ++ "' (zig-runner " ++ build_version.string ++ ")",
         "[job 0 step 0 stdout] Runner name: 'zig-1a2b3c4d'",
         "[job 0 step 0 stdout] Runner group name: 'Default'",
         "[job 0 step 0 stdout] ##[group]Runner Image",
