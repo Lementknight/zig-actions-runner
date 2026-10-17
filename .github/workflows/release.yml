@@ -45,8 +45,10 @@ jobs:
         working-directory: runner
         run: |
           mkdir -p ../dist
+          # The tag, not `git describe`: checkout fetches no tags, so a derived version would
+          # silently be the package's own. This is the authoritative name for the build anyway.
           for arch in x86_64 aarch64; do
-            zig build -Doptimize=ReleaseSafe -Dstrip -Dtarget="${arch}-linux-musl" --prefix "/tmp/${arch}"
+            zig build -Doptimize=ReleaseSafe -Dstrip -Dversion="$GITHUB_REF_NAME" -Dtarget="${arch}-linux-musl" --prefix "/tmp/${arch}"
             cp "/tmp/${arch}/bin/runner" "../dist/zig-runner-linux-${arch}"
           done
           cd ../dist && sha256sum zig-runner-* > SHA256SUMS
@@ -89,5 +91,7 @@ jobs:
           context: runner
           platforms: linux/amd64,linux/arm64
           push: ${{ env.PUBLISH == 'true' }}
+          build-args: |
+            VERSION=${{ env.TAG }}
           # A pull request's ref (`123/merge`) is no image tag; it builds under a local name.
           tags: ${{ env.PUBLISH == 'true' && format('{0}:{1},{0}:latest', env.IMAGE, env.TAG) || 'zig-runner:check' }}
