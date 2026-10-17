@@ -93,7 +93,36 @@ day, compressed after a day (segmented by `job_id`, ordered by `seq`) and droppe
 
 **Port 55432, not 5432**, because a machine may already be running a Postgres on 5432 — and the
 symptom if it does is confusing rather than obvious: the container looks healthy, while the runner
-connects to the *other* server and is told its role does not exist.
+connects to the *other* server and is told its role does not exist. Both machines this was written
+for already had one.
+
+### On the machine the runner runs on
+
+The same file, with the room it is given set for a box that is also running an engine capped at 4 GB:
+
+```sh
+scp -r db/compose.yaml db/migrations <host>:~/db/
+ssh <host> 'cd ~/db && ZIG_DB_MEMORY=768m ZIG_DB_CPUS=1.0 docker compose up -d'
+ssh <host> 'PGHOST=127.0.0.1 PGPORT=55432 PGDATABASE=zig_runner PGUSER=zig_runner \
+            PGPASSWORD=zig-runner-dev PGSSLMODE=disable zig-runner --db-check'
+```
+
+Then one line in the runner's environment file — `/etc/zig-runner.env` for the systemd service, so
+the password is in a file only root can read rather than in a unit file anyone can:
+
+```
+DATABASE_URL=postgres://zig_runner:zig-runner-dev@127.0.0.1:55432/zig_runner?sslmode=disable
+```
+
+`sudo systemctl restart zig-runner`, and from the next job every line it logs is in `job_logs` as
+well as on its console. Nothing else has to be switched on.
+
+On a Raspberry Pi 5 it costs **64 MB and no measurable CPU at rest**, inside a 768 MB cap. The load
+average climbs while the image is pulled and the cluster initialised, and comes back down. What it
+costs that is harder to see is **writes to an SD card**: `synchronous_commit=off`, `wal_compression`
+and a fifteen-minute checkpoint make them as few and as large as they can be, compression after a day
+and retention at thirty bound the size, but a card is a card. A USB SSD for the data volume is the
+upgrade worth making before this holds anything anyone would miss.
 
 What this is not: how a deployed runner reaches a database. That takes `DATABASE_URL` (or `PG*`) in
 the runner's environment file, pointing at a database that is backed up and not on the loopback

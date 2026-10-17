@@ -1,18 +1,17 @@
-# A local TimescaleDB for development: the `job_logs` hypertable the runner streams a job's log
-# into, and the run state beside it (docs/SPEC.md §4).
+# The database the runner streams a job's log into: the `job_logs` hypertable and the run state
+# beside it (docs/SPEC.md §4). One file for a laptop and for the machine the runner runs on.
 #
 #   docker compose -f db/compose.yaml up -d
-#   cd runner && zig build run -- --db-check            # with the PG* variables below
+#   cd runner && zig build run -- --db-check          # with the PG* variables from docs/DEPLOY.md
 #
 # The migrations in this directory are mounted where the Postgres image looks for them, so the
 # schema applies itself the first time the container starts, in file-name order. They run once, on
-# an empty data volume: after a schema change, either add a migration and apply it by hand or
-# `docker compose -f db/compose.yaml down -v` to start over.
+# an empty data volume: after a schema change, either apply the new migration by hand or
+# `docker compose -f db/compose.yaml down -v` and start over.
 #
-# Local only. The password is in this file on purpose — it is a development database on the
-# loopback interface, there is nothing in it worth protecting, and a password nobody has to look up
-# is one nobody puts in a shell history. Nothing here is how the deployed runner reaches a database
-# (docs/DEPLOY.md).
+# Local only. The password is in this file on purpose — the port is bound to the loopback interface,
+# and a password nobody has to look up is one nobody puts in a shell history. Override it, and the
+# port, with ZIG_DB_PASSWORD and ZIG_DB_PORT where that is not good enough.
 name: zig-runner-db
 
 services:
@@ -23,17 +22,45 @@ services:
     environment:
       POSTGRES_DB: zig_runner
       POSTGRES_USER: zig_runner
-      POSTGRES_PASSWORD: zig-runner-dev
-      # Faster to start and to drop; this database holds nothing that matters.
+      POSTGRES_PASSWORD: ${ZIG_DB_PASSWORD:-zig-runner-dev}
       POSTGRES_INITDB_ARGS: "--data-checksums"
+    # Tuned for a machine whose disk is an SD card and whose memory is shared with an engine capped
+    # at 4 GB (docs/STUDY.md §8.2 is what I/O pressure there costs). The choice worth arguing with is
+    # `synchronous_commit=off`: a commit is acknowledged before its WAL is on the card, so a power
+    # cut can lose the last fraction of a second of log lines. That is the right trade for logs —
+    # they are also on the live feed and in the runner's spool file — and it is the single biggest
+    # saving in writes on flash. Everything else here makes writes fewer and larger.
+    command:
+      - postgres
+      - -c
+      - synchronous_commit=off
+      - -c
+      - wal_compression=on
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - effective_cache_size=1GB
+      - -c
+      - max_connections=20
+      # The default is 16, which is a lot of workers for four cores shared with everything else.
+      - -c
+      - timescaledb.max_background_workers=4
     ports:
       # Loopback only, and deliberately not 5432: a machine may already be running a Postgres there,
-      # and the symptom is confusing — the runner reaches that one instead and is told its role does
-      # not exist, while this container looks healthy.
-      - "127.0.0.1:55432:5432"
+      # and the symptom if it does is confusing rather than obvious — the container looks healthy
+      # while the runner reaches the other server and is told its role does not exist. Both the
+      # laptop and the Pi this was written for already had one.
+      - "127.0.0.1:${ZIG_DB_PORT:-55432}:5432"
     volumes:
       - db-state:/home/postgres/pgdata
       - ./migrations:/docker-entrypoint-initdb.d:ro
+    # Room to work without competing with the engine for the memory a job's steps need.
+    mem_limit: ${ZIG_DB_MEMORY:-1g}
+    cpus: ${ZIG_DB_CPUS:-1.0}
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U zig_runner -d zig_runner"]
       interval: 5s
