@@ -9,7 +9,7 @@ measured, on what, against what, how many times, and how to run it again — and
 one be marked unverified and not used to justify a change. This is that register, built by reading
 STUDY.md against §3.2 after the fact.
 
-**66 claims: 21 verified, 32 under-powered, 5 unverified, 4 superseded, 2 proved, 1 withdrawn, 1
+**67 claims: 22 verified, 32 under-powered, 5 unverified, 4 superseded, 2 proved, 1 withdrawn, 1
 refuted.** Sixty-two came from reading STUDY.md against §3.2; the three in §S came from measuring
 this machine instead, and are the first here that the study never made. The first refutation is
 E6.4, and it was refuted in *direction*, not merely in size: a
@@ -202,6 +202,23 @@ and ask what that costs a pool of runners.
 | S.2 | a forced-copy install takes 2.7× longer with three running at once: 24.6 s alone against 66.6 s | as above, `max-parallel` 1 vs 3 · Pi | 3 × 5 | **verified** — difference 42.0 s, 95% CI [27.5, 60.1], negative control spanning zero. `io-p1`'s 24.6 s independently reproduces the study's 25.4 s for the same uncontended operation |
 | S.3 | flask's test suite takes 1.45× longer with three at once: 4.36 s alone against 6.30 s | 3 × `uv run pytest` · Pi | 3 × 5 | **verified**, with a caveat — difference 1.94 s, 95% CI [1.76, 2.44], but the control came out 6% from the baseline with an interval excluding zero, so this instrument has a ~6% floor and nothing smaller than the 10% threshold should be read from it |
 
+| S.4 | CI on this machine is I/O-bound end to end, so the engine's CPU priority has nothing to arbitrate | `vmstat` through both workloads above · Pi | 2 workloads × ~20 samples | **verified** — runnable processes never exceeded 3 while blocked reached 26, and the CPU was 85-97% idle-waiting in both. `--cpu-shares` cannot help: there is no CPU contention. See below |
+
+**`--cpu-shares` is not the fix, and [DEPLOY.md](DEPLOY.md) recommending it for a shared machine does
+not apply to this one.** The argument for it was that three concurrent jobs take the Pi to load 11 on
+four cores, where ssh stops answering and a database and a household's services wait behind CI. That
+is true, and the diagnosis was wrong: **load average counts processes blocked in uninterruptible
+sleep**, and that is what almost all of those eleven were. Sampled through the disk-bound workload,
+`r` was 0 and `b` was 6-19 with 85-97% iowait; sampled through the *compute*-bound one, `r` reached 3
+at most while `b` reached 26, because a job is a checkout and a `uv sync` before it is a test run.
+User CPU passed 20% twice in forty samples.
+
+So the engine's `cpu.weight` sitting at its default 100 costs nothing, and setting it to 13 would buy
+nothing. What would bite is I/O priority, which is **not available as configured**: `io.weight` reads
+unavailable and the card's scheduler is `mq-deadline` with `bfq` present but unselected. Enabling it
+is a root-level change to a machine that also runs a household, so it is the operator's to make and
+then worth measuring the same way.
+
 **Concurrency pays on both workloads, and the returns differ by twenty times.** Per job it costs 2.7×
 on the disk-bound work and 1.45× on the compute-bound work; in throughput — three jobs at once
 against three in a row, derived from the per-job figures — that is about **1.1× for I/O and 2.1× for
@@ -219,9 +236,10 @@ of jobs, and the throughput that falls out of it favours three.
 The case for fewer runners is therefore about the rest of the machine rather than about CI: three
 concurrent forced-copy installs drive the Pi to **load 11 on four cores**, at which point ssh stops
 answering, and this box also serves a database and a household. That is a real reason to cap
-concurrency and a different argument from speed. The engine's `--cpu-shares 128`
-([DEPLOY.md](DEPLOY.md), "As a systemd service") is the cheaper way to buy the same protection and is
-currently **not set**.
+concurrency and a different argument from speed. It is also, per S.4, the *only* lever of the two
+that works: capping concurrency reduces the disk queue, while capping the engine's CPU priority —
+which this note first recommended as the cheaper alternative — arbitrates a resource nothing is
+competing for.
 
 Two notes on method, both from failures. S.1's first instrument was the batch's **makespan**, which
 could not resolve the question: whole-second API timings, plus however long the third job sat queued,
