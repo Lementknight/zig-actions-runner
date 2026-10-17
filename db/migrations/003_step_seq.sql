@@ -19,5 +19,7 @@ COMMENT ON COLUMN job_logs.step_seq IS 'Monotonic per step from 1, as the runner
 CREATE INDEX job_logs_step_idx ON job_logs (job_id, step_number, step_seq);
 
 -- migrate:down
-DROP INDEX IF EXISTS job_logs_step_idx;
-ALTER TABLE job_logs DROP COLUMN IF EXISTS step_seq;
+-- Forward-only (SPEC §4); no down migration. Statements here would not be inert: db/compose.yaml
+-- mounts these files where the Postgres image runs them, and it runs each one whole — a real down
+-- section would undo its own up section on a fresh volume, which is how this file first shipped a
+-- database with no step_seq column in it.
