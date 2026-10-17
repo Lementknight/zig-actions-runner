@@ -50,6 +50,21 @@ pub fn build(b: *std.Build) void {
     check.addPassthruArgs();
     b.step("check-workflows", "Check workflow YAML (this repository's, plus any paths after --)").dependOn(&check.step);
 
+    // Exposes the regex matcher so another implementation can be compared against it
+    // (`tools/regex_diff.py` drives this against Python's `re`). Writing our own matcher is only
+    // defensible if something else agrees with it.
+    const regex_mod = b.createModule(.{ .root_source_file = b.path("src/regex.zig"), .target = target, .optimize = optimize });
+    const regex_diff = b.addExecutable(.{
+        .name = "regex-diff",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/regex_diff.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "regex", .module = regex_mod }},
+        }),
+    });
+    b.installArtifact(regex_diff);
+
     // The measurement harness (docs/MEASURE.md stage 2). Its statistics decide verdicts, so they
     // are unit-tested with the rest of the suite; `zig build measure -- run ...` drives it.
     const measure = b.addExecutable(.{

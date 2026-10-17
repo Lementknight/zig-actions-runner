@@ -40,3 +40,4 @@ zls/
 # Agda's type-checking artefacts (proofs/).
 *.agdai
 _build/
+__pycache__/

@@ -57,6 +57,18 @@ jobs:
         working-directory: runner
         run: zig build test --summary all
 
+      # The regex matcher is ours, so something else has to agree with it: Python's `re` and perl,
+      # on the five patterns real actions ship, one case per supported construct, and patterns
+      # generated from the grammar the engine claims to accept. Both references found bugs the unit
+      # tests passed — see proofs/README.md, "Why the regex matcher terminates". Several seeds,
+      # because a single one left two semantic bugs unseen.
+      - name: Regex, against Python and perl
+        working-directory: runner
+        run: |
+          for seed in 1 2 3 4 5; do
+            python3 tools/regex_diff.py --random 400 --seed "$seed"
+          done
+
   proofs:
     name: Agda proofs of the step cache
     runs-on: ubuntu-latest
