@@ -109,6 +109,32 @@ keys after it.
 Everything else the proof uses is bookkeeping the implementation already does: `Coherent` (entries are
 honest), `Ahead` and `Numbered` (the cache holds nothing yet for the steps still to come).
 
+## Why the regex matcher terminates
+
+`Runner/Regex.agda` is about a different part of the runner: the backtracking matcher that problem
+matchers need (`runner/src/regex.zig`). Backtracking does not terminate for free — a loop whose body
+matches the empty string repeats at one position for ever — and the engine stops that with two
+instructions, `mark` recording where an iteration began and `progress` leaving the loop when the
+iteration consumed nothing.
+
+| What | Statement |
+|---|---|
+| `bounded` | `iterations r + pos ≤ n` — the iterations taken plus the starting position cannot exceed the input |
+| `bounded-from-zero` | so a loop over the whole input runs at most `n` times |
+| `stall`, `unbounded` | weaken the strict advance to `pos ≤ pos'` and runs of *every* length exist, so no bound can hold |
+
+So the step budget in the engine is a safety net, not the reason it stops. And `stall` is the shape
+of a bug that shipped twice: the guard was missing on stars (38 patterns reached the budget that
+Python answers) and then missing on *bounded* repeats (an empty iteration followed by a non-empty
+one captured the wrong text). Both were found by the differential test in
+`runner/tools/regex_diff.py`, which checks the engine against Python's `re` and Perl on patterns
+generated from the grammar it claims to accept — the proof says why the fix is the right one, the
+test says the fix is actually there.
+
+This is also where `Prelude` gained arithmetic (`_+_`, `+-zero`, `+-suc`, `≤-trans`, `+-mono`) and,
+with it, a fixity for `_≤_`. Without that declaration `_≤_` takes Agda's default, which binds
+tighter than any `_+_`, and `k + m ≤ k + n` parses as `k + (m ≤ k) + n`.
+
 ## What the counterexamples establish
 
 Each is a complete, computing job in `Runner/Counterexamples.agda`.

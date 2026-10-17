@@ -10,3 +10,4 @@ import Runner.OutputKeys
 import Runner.Declared
 import Runner.Enforce
 import Runner.Counterexamples
+import Runner.Regex

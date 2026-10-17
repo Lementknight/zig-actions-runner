@@ -83,6 +83,25 @@ data ℕ : Set where
 suc-injective : {m n : ℕ} → suc m ≡ suc n → m ≡ n
 suc-injective refl = refl
 
+infixl 6 _+_
+
+_+_ : ℕ → ℕ → ℕ
+zero  + n = n
+suc m + n = suc (m + n)
+
++-zero : (m : ℕ) → (m + zero) ≡ m
++-zero zero    = refl
++-zero (suc m) = cong suc (+-zero m)
+
++-suc : (m n : ℕ) → (m + suc n) ≡ suc (m + n)
++-suc zero    n = refl
++-suc (suc m) n = cong suc (+-suc m n)
+
+-- Declared, because the default fixity for an operator binds *tighter* than `_+_`, and without
+-- this `k + m ≤ k + n` parses as `k + (m ≤ k) + n` and reports that ℕ is not a sort. Nothing here
+-- relied on the default: `≤` separates two applications in every use, which parses the same way.
+infix 4 _≤_
+
 data _≤_ : ℕ → ℕ → Set where
   z≤n : {n : ℕ} → zero ≤ n
   s≤s : {m n : ℕ} → m ≤ n → suc m ≤ suc n
@@ -102,6 +121,16 @@ data _≤_ : ℕ → ℕ → Set where
 suc≰ : (n : ℕ) → ¬ (suc n ≤ n)
 suc≰ zero    ()
 suc≰ (suc n) (s≤s p) = suc≰ n p
+
+≤-trans : {l m n : ℕ} → l ≤ m → m ≤ n → l ≤ n
+≤-trans z≤n     _       = z≤n
+≤-trans (s≤s p) (s≤s q) = s≤s (≤-trans p q)
+
+-- Adding the same amount on the left keeps a bound, which is what carries a bound on a loop's tail
+-- back to where the loop started (Runner.Regex).
++-mono : (k : ℕ) {m n : ℕ} → m ≤ n → (k + m) ≤ (k + n)
++-mono zero    p = p
++-mono (suc k) p = s≤s (+-mono k p)
 
 ------------------------------------------------------------------------------
 -- Decidability
