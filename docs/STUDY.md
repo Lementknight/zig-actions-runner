@@ -474,11 +474,28 @@ Two designs were tried and discarded before the one that worked, both for reason
 | | This runner | GitHub |
 |---|---|---|
 | `uv sync`, new ref | 9.2 s (was 28.6 s) | 1.3 s |
-| `uv sync`, re-run | **0.5 s** | 0.8 s |
+| `uv sync`, re-run | **0.5 s** | 0.8 s — *see the correction below* |
 | fallback warnings | none (was 2) | none |
 | `uv run`, `.venv/bin/python`, `activate`, `.venv/bin/pytest` | all work, 134 tests pass | same |
 
-**The fidelity cost did not materialise.** (That a warm sync beats a hosted runner's 0.8 s is *unverified*: a 0.3 s margin, one sample each — CLAIMS.md E6.4.) Relocating the environment was expected to break `.venv/bin/...` and `source .venv/bin/activate`; through the symlink both work, as does pytest run from it. A warm sync is now in the same range as a hosted runner's, where it had been fifty times slower. The real costs are that environments accumulate in the volume, one per ref, until it is pruned, and that `RUNNER_UV_ENV_IN_CACHE=false` exists for anyone it surprises.
+**Correction (2026-10-17): a warm sync does not beat a hosted runner's.** Re-measured under
+MEASURE.md §3.2 with 12 trials an arm and a negative control ([measurements/e6.4/](../measurements/e6.4/README.md)),
+this runner's median is **0.015 s against `ubuntu-latest`'s 0.011 s** — the hosted runner is faster by
+27%, 95% CI [0.002, 0.006] s. CLAIMS.md E6.4 is the register's one refutation.
+
+The fault was not the sample size. **The two arms were doing different work.** The 0.5 s here
+reconciles an environment that already exists in the cache volume; the 0.8 s opposite it is a new job
+restoring a cache and then building `.venv`. The table in §10 above quotes the same hosted runner's
+warm uv at **0.1 s** for a third thing again — installing into a fresh `.venv` by hardlink — and had
+E6.4 used that number, the same evidence would have made this runner five times *slower*. Picking
+which of two numbers to compare against decided the answer, which is what a claim should never rest
+on. The re-measurement warms both arms inside their own job, so each reconciles an environment that
+is already there, and both fall to milliseconds.
+
+What this does not touch: the 135× of §10, the 28.6 s → 9.2 s above, and everything about hardlinks
+and devices. Those measure syncs that do real work and stand as recorded.
+
+**The fidelity cost did not materialise.** Relocating the environment was expected to break `.venv/bin/...` and `source .venv/bin/activate`; through the symlink both work, as does pytest run from it. A warm sync is now in the same range as a hosted runner's, where it had been fifty times slower. The real costs are that environments accumulate in the volume, one per ref, until it is pruned, and that `RUNNER_UV_ENV_IN_CACHE=false` exists for anyone it surprises.
 
 **pnpm cannot be fixed this way.** `node_modules` has to be in the workspace for imports to resolve, so there is nowhere hardlink-reachable to put it. It still pays 16.6 s against 1.4 s, and only its workflow can avoid that, by copying the store under `RUNNER_TEMP`.
 

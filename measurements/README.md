@@ -20,6 +20,8 @@ whatever `--environment` printed. `note` says where a line came from when it was
 
 | File | Claim | Provenance |
 |---|---|---|
+| `E6.4-uv-measured.jsonl` | E6.4, a warm `uv sync` here against a hosted runner | **measured** 2026-10-17, by `e6.4/arm.sh` |
+| `E6.4-uv-pilot.jsonl` | E6.4's pilot, which chose its repetitions | **measured** 2026-10-17, by `e6.4/arm.sh` |
 | `E3.4-outputkeys-measured.jsonl` | E3.4/E3.4b, what output keys cost on a first run | **measured** on the Pi, 2026-10-16, by `e3.4/arm-outputkeys.sh` |
 | `E7.7-gogc-measured.jsonl` | E7.7, engine CPU over 40 steps | **measured** on the Pi, 2026-10-16, by `e7.7/arm-gogc.sh` |
 | `E7.7-pilot.jsonl` | E7.7's pilot, which is also its negative control | **measured** on the Pi, 2026-10-16, by `e7.7/arm.sh` |
@@ -111,3 +113,32 @@ An arm is any command that prints `MEASURE <number>`; the harness supplies `$MEA
 belongs somewhere the system under test cannot ignore — for this runner, inside a step's script text,
 since that is part of its cache key. `--min-effect` is required, so the answer that would refute the
 claim exists before the first number does.
+
+## E6.4, refuted
+
+The first claim the protocol has *overturned* rather than confirmed or narrowed. `e6.4/` holds it:
+`gen-workflows.sh` for the two workflows (identical but for `runs-on`), `arm.sh` for a trial, and
+`facts.sh` for the environment.
+
+```
+  pi          n=12  median 0.015 s  (baseline)
+  hosted      n=12  median 0.011 s  difference -0.004  95% CI [-0.006, -0.002]  effect
+  pi-control  n=13  median 0.015 s  difference  0.000  95% CI [-0.002,  0.003]  no_effect_found
+```
+
+The study said a warm `uv sync` was 0.5 s here against a hosted runner's 0.8 s. It is **0.015 s here
+against 0.011 s**, and the hosted runner is 27% faster. The negative control — a second arm
+identical to the baseline — came out at exactly 0.000, which is what makes the rest of it worth
+reading.
+
+**The lesson is about arms, not samples.** The original did not fail for want of repetitions: it
+compared this runner reconciling an environment that already existed against a hosted runner
+restoring a cache and building `.venv`. Two different jobs of work, one difference attributed to the
+machines. [CLAIMS.md](../docs/CLAIMS.md) E6.4 has the full account, including that the study's own
+table gives the same hosted runner's warm uv as 0.1 s for a third quantity — which would have
+reversed the claim on the study's own evidence.
+
+The pilot is kept because it shows the other half of this. At n=3 the Pi's median was 0.035 s with
+`sd 0.019`, and the difference looked like 3×; at n=12 the median is 0.015 s with `sd 0.002` and the
+difference is 27%. The direction was right from the pilot — the two arms' readings never
+overlapped — and the size was not.
