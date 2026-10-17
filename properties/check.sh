@@ -8,8 +8,13 @@
 #
 # What each check is the live counterpart of:
 #
-#   P3, P6  identical inputs, a new run: every step replayed. The run id differs by construction, so
-#           this is also P3 for a volatile value — `volatile-invisible` in proofs/.
+#   P3, P6  identical inputs, a new run: every step replayed. This is also P3 for a volatile value
+#           (`volatile-invisible` in proofs/), though not for the reason it reads like: the subject
+#           does not see a differing run id any more. The container still carries the real one, which
+#           differs every run and is still left out of the exec key, and that is what the replay
+#           demonstrates. What the step itself sees is the sentinel, because enforcement overrides it
+#           in the step's own env prefix. The property is about the key, not about anything the
+#           subject could print.
 #   P2a     the subject's script text changed          → it must run (`text-matters`)
 #   P2b     the workspace changed (another commit)     → it must run (`parent-matters`)
 #   P2c     a non-volatile variable changed            → it must run (`stable-env-matters`)

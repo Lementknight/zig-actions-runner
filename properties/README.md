@@ -21,7 +21,7 @@ earlier run…" — so a check is a dispatch, a wait, and a `grep`. Nothing need
 
 | Check | Varies | Asserts | Proved as |
 |---|---|---|---|
-| P3 | nothing — but the run id differs by construction | the subject was **replayed** | `volatile-invisible` |
+| P3 | nothing — but the container's run id differs every run | the subject was **replayed** | `volatile-invisible` |
 | P6 | nothing | **every** step was replayed | `warm-runs-nothing` |
 | P2a | the subject's script text | the subject **ran** | `text-matters` |
 | P2b | the workspace (a different commit of go-chi/chi) | the subject **ran** | `parent-matters` |
@@ -35,6 +35,13 @@ earlier run…" — so a check is a dispatch, a wait, and a `grep`. Nothing need
 P1 doubles as the `$GITHUB_ENV` obligation: what the observer says includes a variable an earlier
 step exported, and on the replayed run that earlier step was replayed too, so its export came out of
 the cache with everything else.
+
+**P3 is about the key, not about what the subject sees**, which stopped being the same thing when
+enforcement shipped. The subject is step-cached, so it is handed `zig-runner-withheld` — a constant
+across runs, and nothing it prints could show a volatile value changing. What still differs every run
+is the run id on the *container*, set with `withVolatileVariable` and left out of the exec key, and
+the replay is what shows it was left out. P1's observer reads no volatile value at all, so the
+cache-off and replayed arms stay comparable.
 
 **E1 needs the engine's ssh host**, and this is why. The first run of it failed, and the runner was
 right: output keys cost 10.5 s on that job against a `RUNNER_OUTPUT_KEYS_MAX_MS` of 10 s, so the
