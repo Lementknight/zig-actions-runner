@@ -9,8 +9,10 @@ measured, on what, against what, how many times, and how to run it again — and
 one be marked unverified and not used to justify a change. This is that register, built by reading
 STUDY.md against §3.2 after the fact.
 
-**63 claims: 19 verified, 32 under-powered, 5 unverified, 3 superseded, 2 proved, 1 withdrawn, 1
-refuted.** The first refutation is E6.4, and it was refuted in *direction*, not merely in size: a
+**66 claims: 21 verified, 32 under-powered, 5 unverified, 4 superseded, 2 proved, 1 withdrawn, 1
+refuted.** Sixty-two came from reading STUDY.md against §3.2; the three in §S came from measuring
+this machine instead, and are the first here that the study never made. The first refutation is
+E6.4, and it was refuted in *direction*, not merely in size: a
 warm `uv sync` is slower here than on a hosted runner, where the study said faster. The
 one-line summary still holds otherwise: *little here is wrong, and little is measured to the
 standard MEASURE.md sets.* The
@@ -187,6 +189,46 @@ are unaffected. What falls is one sentence of comparison, and the habit that pro
 | E8.2 | a core-module change selects 79% of the suite and costs 261.8 s, 4.5× the full run it replaces | as above | 1 × 1 | under-powered |
 | E8.3 | a leaf-module change selected the same 62 tests as no change | as above | 1 × 1 | **unverified** — the text says so: either testmon missed it or no test covers the edit, and which was never checked |
 | E8.4 | the runner should do nothing about test selection | decision from E8.1–E8.3 | — | **superseded** in framing — [RELATED.md](RELATED.md) argues (Herzig's THEO) that this is an economic question answered with a mechanics measurement; the mechanics stand, the conclusion does not follow from them alone |
+
+## §S Storage and concurrency — the first claims that did not come from the study
+
+These were not read out of STUDY.md. They start from a measurement — the SD card gains 39%
+throughput for 15× the latency at queue depth 16 ([storage](../measurements/storage/README.md)) —
+and ask what that costs a pool of runners.
+
+| ID | Claim | Workload · machine | Arms × reps | Verdict |
+|---|---|---|---|---|
+| S.1 | three runners over-subscribe the disk: two spend 39% less time on contended copying (211 s → 128 s) | 3 × forced-copy flask install · Pi | 3 × 3 | **superseded** by S.2 — the measurement holds (control within 1.6%, interval nowhere near zero) but the conclusion drawn from it does not. It sums *total* contended time, which is a cost and not a speed; see the note below |
+| S.2 | a forced-copy install takes 2.7× longer with three running at once: 24.6 s alone against 66.6 s | as above, `max-parallel` 1 vs 3 · Pi | 3 × 5 | **verified** — difference 42.0 s, 95% CI [27.5, 60.1], negative control spanning zero. `io-p1`'s 24.6 s independently reproduces the study's 25.4 s for the same uncontended operation |
+| S.3 | flask's test suite takes 1.45× longer with three at once: 4.36 s alone against 6.30 s | 3 × `uv run pytest` · Pi | 3 × 5 | **verified**, with a caveat — difference 1.94 s, 95% CI [1.76, 2.44], but the control came out 6% from the baseline with an interval excluding zero, so this instrument has a ~6% floor and nothing smaller than the 10% threshold should be read from it |
+
+**Concurrency pays on both workloads, and the returns differ by twenty times.** Per job it costs 2.7×
+on the disk-bound work and 1.45× on the compute-bound work; in throughput — three jobs at once
+against three in a row, derived from the per-job figures — that is about **1.1× for I/O and 2.1× for
+CPU**. So no single `RUNNER_COUNT` is right for both, and the one in use (three) is not wrong: it
+simply earns very little on jobs that saturate the disk and most of the available speedup on jobs
+that do not.
+
+**What S.1 got wrong is worth keeping.** Its reading was the *sum* of the three shards' copying time,
+which falls when fewer run at once — but a sum of work-seconds is a measure of what the disk is made
+to do, not of how fast anything finishes. Minimising disk burn and maximising throughput are
+different objectives, and "two runners is better" quietly assumed they were the same one. S.2
+measures a single shard's duration instead, which is comparable across arms running different numbers
+of jobs, and the throughput that falls out of it favours three.
+
+The case for fewer runners is therefore about the rest of the machine rather than about CI: three
+concurrent forced-copy installs drive the Pi to **load 11 on four cores**, at which point ssh stops
+answering, and this box also serves a database and a household. That is a real reason to cap
+concurrency and a different argument from speed. The engine's `--cpu-shares 128`
+([DEPLOY.md](DEPLOY.md), "As a systemd service") is the cheaper way to buy the same protection and is
+currently **not set**.
+
+Two notes on method, both from failures. S.1's first instrument was the batch's **makespan**, which
+could not resolve the question: whole-second API timings, plus however long the third job sat queued,
+put the baseline arm's spread at 64-81 s — wider than any difference between arms. And S.1 varied the
+pool size by rewriting the systemd unit and restarting, which made trials that took two minutes alone
+take **thirty-five** back to back; S.2 and S.3 use `max-parallel` in the workflow instead, so the arms
+differ without the machine being touched at all.
 
 ## What this says to do next
 

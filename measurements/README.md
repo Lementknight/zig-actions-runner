@@ -20,6 +20,11 @@ whatever `--environment` printed. `note` says where a line came from when it was
 
 | File | Claim | Provenance |
 |---|---|---|
+| `S.2-io-concurrency.jsonl` | S.2, a forced-copy install with 1 and with 3 jobs at once | **measured** on the Pi, 2026-10-17, by `concurrency/arm.sh` |
+| `S.3-cpu-concurrency.jsonl` | S.3, the same sweep on flask's test suite | **measured** on the Pi, 2026-10-17, by `concurrency/arm.sh` |
+| `S.1-runners-pilot2.jsonl` | S.1, superseded: total contended copying by `RUNNER_COUNT` | **measured** on the Pi, 2026-10-17, by `concurrency/superseded/arm.sh` |
+| `S.1-runners-pilot.jsonl` | S.1's first instrument, makespan, which could not resolve it | **measured** on the Pi, 2026-10-17, by `concurrency/superseded/arm.sh` |
+| `S.1-runners-aborted.jsonl` | S.1's confirmation, abandoned after trials went from 2 to 35 minutes | **measured** on the Pi, 2026-10-17; four warm-ups, one reading, two failures |
 | `E6.4-uv-measured.jsonl` | E6.4, a warm `uv sync` here against a hosted runner | **measured** 2026-10-17, by `e6.4/arm.sh` |
 | `E6.4-uv-pilot.jsonl` | E6.4's pilot, which chose its repetitions | **measured** 2026-10-17, by `e6.4/arm.sh` |
 | `E3.4-outputkeys-measured.jsonl` | E3.4/E3.4b, what output keys cost on a first run | **measured** on the Pi, 2026-10-16, by `e3.4/arm-outputkeys.sh` |
