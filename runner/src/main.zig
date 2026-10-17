@@ -11,7 +11,7 @@ const sink = @import("sink.zig");
 const http = @import("github/http.zig");
 const broker = @import("github/broker.zig");
 const engine = @import("engine.zig");
-const build_options = @import("build_options");
+const build_version = @import("version.zig");
 
 comptime {
     _ = @import("sink.zig");
@@ -62,7 +62,7 @@ pub fn main(init: std.process.Init) !u8 {
     for (args[1..]) |arg| if (std.mem.eql(u8, arg, "--version")) {
         var out_buf: [256]u8 = undefined;
         var w: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
-        try w.interface.print("zig-runner {s} (runner protocol {s}, Dagger {s})\n", .{ build_options.version, broker.version, engine.client_version });
+        try w.interface.print("zig-runner {s} (runner protocol {s}, Dagger {s})\n", .{ build_version.string, broker.version, engine.client_version });
         try w.interface.flush();
         return @backingInt(Exit.done);
     };
