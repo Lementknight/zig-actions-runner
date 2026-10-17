@@ -39,6 +39,36 @@ re-read Go's toolchain at 25-30% iowait, which made the diff after an always-run
 instead of under a second ([DEPLOY.md](../../docs/DEPLOY.md), "Sizing"). At 67 MiB/s, re-reading a
 few hundred megabytes of toolchain is tens of seconds of pure waiting.
 
+## The scheduler does not matter, and the card has a failure mode
+
+All four schedulers the kernel offers, one sweep, each on a quiet disk
+([`sweep-schedulers.sh`](sweep-schedulers.sh)):
+
+| | none | mq-deadline | kyber | bfq |
+|---|---|---|---|---|
+| 4k randread qd1, iops | 1903 | 1960 | 2149 | **2441** |
+| 4k randread qd16, iops | 2010 | **2573** | 2180 | 2459 |
+| 4k randread qd16, p99 | **8.8 ms** | 20.6 ms | 10.9 ms | 13.4 ms |
+| 4k randwrite qd1, iops | 629 | **159** | **670** | 547 |
+| 4k randwrite qd1, p99 | 19.8 ms | **135.3 ms** | 18.7 ms | 20.3 ms |
+| 1m read, MiB/s | 62.5 | **65.1** | 58.2 | 60.5 |
+
+**No scheduler is measurably better** (CLAIMS.md S.5). Between schedulers, qd1 random reads span
+1903-2441; *repeated runs of one scheduler* span just as much — mq-deadline gave 2375 and then 1960,
+`none` 2099 and 1903, bfq 2125, 2098 and 2441. With one sample each, the card's own variance is the
+whole signal. `mq-deadline` stays because it is the default, not because it won.
+
+**And the write collapse is the card** (S.6). Note mq-deadline's 159 iops with a p99 of 135 ms, on an
+idle disk. The same thing appeared under `bfq` earlier — 176 iops, p99 132.6 ms — and was put down to
+the engine evicting 9 GB of cache during that measurement, because it was not taken on a quiet disk.
+That explanation did not survive the sweep: same collapse, different scheduler, nothing else running.
+Against 547-702 iops and a 7-20 ms tail the rest of the time, this is the card's own garbage
+collection stalling writes for an eighth of a second, and no configuration reaches it.
+
+That is the sharper version of the case for different hardware. Not "the card is slow" — **the card
+periodically drops to a quarter of its write throughput with 135 ms stalls**, on a machine also
+running a database.
+
 ## What this says about replacing it
 
 Not measured here — there is no second disk in the machine yet, and the figures below are other

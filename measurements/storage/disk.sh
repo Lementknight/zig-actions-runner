@@ -27,7 +27,17 @@ f="$dir/.disk-probe.$$"
 trap "rm -f '$f'" EXIT INT TERM
 
 command -v fio > /dev/null || { echo "disk.sh: fio is not installed" >&2; exit 2; }
-mkdir -p "$dir"
+mkdir -p "$dir" || { echo "disk.sh: cannot write to $dir — use a directory you own, on the disk under test" >&2; exit 2; }
+
+# A directory in memory would produce splendid numbers that mean nothing. `/tmp` is the trap: it is
+# a disk on this machine and a tmpfs on plenty of others, and nothing about the output would say so.
+fstype=$(df --output=fstype "$dir" 2>/dev/null | tail -1)
+case "$fstype" in
+	tmpfs | ramfs | devtmpfs)
+		echo "disk.sh: $dir is $fstype, which is memory and not a disk" >&2
+		exit 2
+		;;
+esac
 
 # One number per line: name, IOPS, bandwidth, and the median and 99th-percentile latencies, because
 # a disk that is fast on average and occasionally terrible is the one that produced the 13-21 s

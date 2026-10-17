@@ -9,10 +9,10 @@ measured, on what, against what, how many times, and how to run it again — and
 one be marked unverified and not used to justify a change. This is that register, built by reading
 STUDY.md against §3.2 after the fact.
 
-**67 claims: 22 verified, 32 under-powered, 5 unverified, 4 superseded, 2 proved, 1 withdrawn, 1
-refuted.** Sixty-two came from reading STUDY.md against §3.2; the three in §S came from measuring
-this machine instead, and are the first here that the study never made. The first refutation is
-E6.4, and it was refuted in *direction*, not merely in size: a
+**69 claims: 22 verified, 33 under-powered, 5 unverified, 4 superseded, 2 proved, 1 withdrawn, 1
+refuted, 1 no effect found.** Sixty-three came from reading STUDY.md against §3.2; the six in §S came
+from measuring this machine instead, and are the first here that the study never made. The first
+refutation is E6.4, and it was refuted in *direction*, not merely in size: a
 warm `uv sync` is slower here than on a hosted runner, where the study said faster. The
 one-line summary still holds otherwise: *little here is wrong, and little is measured to the
 standard MEASURE.md sets.* The
@@ -202,7 +202,21 @@ and ask what that costs a pool of runners.
 | S.2 | a forced-copy install takes 2.7× longer with three running at once: 24.6 s alone against 66.6 s | as above, `max-parallel` 1 vs 3 · Pi | 3 × 5 | **verified** — difference 42.0 s, 95% CI [27.5, 60.1], negative control spanning zero. `io-p1`'s 24.6 s independently reproduces the study's 25.4 s for the same uncontended operation |
 | S.3 | flask's test suite takes 1.45× longer with three at once: 4.36 s alone against 6.30 s | 3 × `uv run pytest` · Pi | 3 × 5 | **verified**, with a caveat — difference 1.94 s, 95% CI [1.76, 2.44], but the control came out 6% from the baseline with an interval excluding zero, so this instrument has a ~6% floor and nothing smaller than the 10% threshold should be read from it |
 
+| S.5 | no I/O scheduler is measurably better for this card: `none`, `mq-deadline`, `kyber` and `bfq` within one sweep | `disk.sh` × 4 schedulers · Pi | 4 × 1 | **no effect found at this precision** — qd1 random reads ranged 1903-2441 across schedulers, while *repeated* runs of a single scheduler ranged just as widely (mq-deadline 2375 then 1960; `none` 2099 then 1903; bfq 2125, 2098, 2441). The card's own variance swallows the differences |
+| S.6 | this SD card intermittently collapses to a quarter of its write throughput, with eighth-of-a-second stalls | `disk.sh` · Pi | 2 occurrences | under-powered — observed twice, **159 iops with p99 135.3 ms** under `mq-deadline` on an idle disk and **176 iops with p99 132.6 ms** under `bfq`, against 547-702 iops and p99 7-20 ms otherwise. Scheduler-independent and load-independent; the signature of the card's own garbage collection. Two samples, no controlled repetition |
 | S.4 | CI on this machine is I/O-bound end to end, so the engine's CPU priority has nothing to arbitrate | `vmstat` through both workloads above · Pi | 2 workloads × ~20 samples | **verified** — runnable processes never exceeded 3 while blocked reached 26, and the CPU was 85-97% idle-waiting in both. `--cpu-shares` cannot help: there is no CPU contention. See below |
+
+**Scheduler tuning is closed, and two of my own explanations died proving it.** `bfq` was tried
+because it is the only scheduler offering per-cgroup I/O weights, which looked like the way to stop
+CI starving a database and a household of disk. The first reading under it showed 176 write iops
+against `mq-deadline`'s 702 — a 4× collapse I attributed to the engine evicting 9 GB of cache at the
+same time, since that measurement was not taken on a quiet disk. Then a matched sweep of all four
+schedulers produced **159 iops with a p99 of 135 ms under `mq-deadline`, idle**. Same collapse,
+different scheduler, no competing load. It is the card, not the scheduler and not contention, and
+both of my explanations were wrong.
+
+What the sweep leaves is S.5 and S.6: no scheduler earns its change, and the card has a failure mode
+no configuration reaches. `mq-deadline` stays because it is the default, not because it won.
 
 **`--cpu-shares` is not the fix, and [DEPLOY.md](DEPLOY.md) recommending it for a shared machine does
 not apply to this one.** The argument for it was that three concurrent jobs take the Pi to load 11 on
