@@ -452,6 +452,45 @@ fn deref(v: Value, key: Value, arena: Allocator) Allocator.Error!Value {
     }
 }
 
+/// What a `*` object filter selects: an array's elements, or an object's values. GitHub gives an
+/// array either way, and anything else selects nothing.
+fn starValues(arena: Allocator, v: Value) Error![]const Value {
+    switch (v) {
+        .array => |a| return a,
+        .object => |o| {
+            const out = try arena.alloc(Value, o.len);
+            for (o, 0..) |e, i| out[i] = e.value;
+            return out;
+        },
+        else => return &.{},
+    }
+}
+
+/// The values selected by `n`, when `n` is a `*` filter or a property reached through one.
+///
+/// This is what makes `labels.*.name` an array of names while `labels.name` stays null: the filter
+/// is recognised from the shape of the expression rather than from the shape of the value, so
+/// property access maps over a filtered collection and dereferences anything else. It recurses, so
+/// `a.*.b.c` filters at both levels. Indexing needs nothing here — `a.*.b[0]` evaluates the filter
+/// to an array and then indexes it like any other.
+fn filteredValues(arena: Allocator, n: *const Node, scope: Scope) Error!?[]const Value {
+    switch (n.*) {
+        .star => |inner| return try starValues(arena, try eval(arena, inner, scope)),
+        .prop => |p| {
+            const items = (try filteredValues(arena, p.obj, scope)) orelse return null;
+            var out: std.ArrayList(Value) = .empty;
+            for (items) |it| {
+                const got = try deref(it, .{ .string = p.name }, arena);
+                // An element without the property contributes nothing, rather than a null: this is
+                // what makes `contains(labels.*.name, 'bug')` safe on a mixed array.
+                if (got != .null) try out.append(arena, got);
+            }
+            return out.items;
+        },
+        else => return null,
+    }
+}
+
 fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
     switch (n.*) {
         .literal => |v| return v,
@@ -462,12 +501,18 @@ fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
             };
             return lookupEntry(scope.contexts, name) orelse .null;
         },
-        .prop => |p| return deref(try eval(arena, p.obj, scope), .{ .string = p.name }, arena),
+        .prop => |p| {
+            // `n`, not `p.obj`: `filteredValues` applies this property to the filtered collection,
+            // and returns null when the chain is not a filter at all so that ordinary property
+            // access still goes through `deref`.
+            if (try filteredValues(arena, n, scope)) |items| return .{ .array = items };
+            return deref(try eval(arena, p.obj, scope), .{ .string = p.name }, arena);
+        },
         .index => |ix| {
             const o = try eval(arena, ix.obj, scope);
             return deref(o, try eval(arena, ix.idx, scope), arena);
         },
-        .star => return error.Unsupported,
+        .star => |inner| return .{ .array = try starValues(arena, try eval(arena, inner, scope)) },
         .not => |inner| return .{ .boolean = !toBool(try eval(arena, inner, scope)) },
         .bin => |b| {
             const l = try eval(arena, b.l, scope);
@@ -827,6 +872,53 @@ test "contexts, properties and indexing" {
     try std.testing.expect(try evalCondition(ar, "github.repository == 'O/R' && matrix.os == 'linux'", s));
 }
 
+test "the * object filter selects from arrays and objects, and maps through properties" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+
+    // Two labels with a name, one without: GitHub's canonical case is
+    // `contains(github.event.issue.labels.*.name, 'bug')`.
+    const bug = [_]Value.Entry{ .{ .key = "name", .value = .str("bug") }, .{ .key = "color", .value = .str("red") } };
+    const docs = [_]Value.Entry{.{ .key = "name", .value = .str("docs") }};
+    const nameless = [_]Value.Entry{.{ .key = "color", .value = .str("blue") }};
+    const labels = [_]Value{ .{ .object = &bug }, .{ .object = &docs }, .{ .object = &nameless } };
+
+    // An object to filter the values of, and a nested one to filter through twice.
+    const inner = [_]Value.Entry{.{ .key = "id", .value = .{ .number = 7 } }};
+    const services = [_]Value.Entry{
+        .{ .key = "postgres", .value = .{ .object = &inner } },
+        .{ .key = "redis", .value = .{ .object = &inner } },
+    };
+
+    const ctxs = [_]Value.Entry{
+        .{ .key = "labels", .value = .{ .array = &labels } },
+        .{ .key = "services", .value = .{ .object = &services } },
+        .{ .key = "plain", .value = .str("text") },
+    };
+    const s = tctx(&ctxs);
+
+    // Over an array of objects, and usable by `contains`, which is the point of the feature.
+    try std.testing.expectEqualStrings("bug docs", try evalStr(ar, "join(labels.*.name, ' ')", s));
+    try std.testing.expect(try evalCondition(ar, "contains(labels.*.name, 'bug')", s));
+    try std.testing.expect(!(try evalCondition(ar, "contains(labels.*.name, 'nope')", s)));
+    // An element without the property contributes nothing: three labels, two names.
+    try std.testing.expectEqualStrings("[\n  \"bug\",\n  \"docs\"\n]", try evalStr(ar, "toJSON(labels.*.name)", s));
+
+    // Over an object, `*` selects its values — `job.services.*.id` is GitHub's example.
+    try std.testing.expectEqualStrings("7 7", try evalStr(ar, "join(services.*.id, ' ')", s));
+
+    // The filter is recognised from the expression's shape, not the value's: a property of a plain
+    // array is still null, which is what it is on GitHub.
+    try std.testing.expectEqualStrings("", try evalStr(ar, "labels.name", s));
+    // Indexing a filtered result indexes the array it produced.
+    try std.testing.expectEqualStrings("docs", try evalStr(ar, "labels.*.name[1]", s));
+    // Filtering something that is neither an array nor an object selects nothing.
+    try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(plain.*.anything)", s));
+    try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(plain.*)", s));
+    try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(nosuchcontext.*.x)", s));
+}
+
 test "functions" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
@@ -890,9 +982,9 @@ test "errors say what is wrong" {
     try std.testing.expectError(error.EvalError, evaluate(ar, "format('{3}', 'a')", s));
     try std.testing.expectError(error.Unsupported, evaluate(ar, "hashFiles('**/*.zig')", s));
     try std.testing.expectEqualStrings("hashFiles() is not supported here", diag);
-    diag = "";
-    try std.testing.expectError(error.Unsupported, evaluate(ar, "github.*.x", s));
-    try std.testing.expect(std.mem.indexOf(u8, diag, "'*' object filter") != null);
+    // `github.*.x` used to be refused here. It is supported now: filtering a context that has no
+    // `x` selects nothing, which is an empty array rather than an error.
+    try std.testing.expectEqualStrings("[]", try evalStr(ar, "toJSON(github.*.x)", s));
 }
 
 test "hashFiles calls the scope's hook with its patterns" {
