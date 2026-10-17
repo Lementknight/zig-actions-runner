@@ -71,6 +71,12 @@ step did not name (SPEC.md §9), so the check now asserts the sentinel exactly r
 run's id". That older assertion would have *passed* against the sentinel while testing nothing,
 which is the failure mode a suite of passing checks has to be designed against.
 
+The sentinel alone is weaker evidence than it looks, so B1 has a cache-off arm like B2's. It is
+written on *every* run of a step-cached step, cold ones included — `enforce_volatile = step_cache
+and opts.enforce_volatile` — so finding it says nothing about replay, only about caching. With the
+cache off, the same step saw `38995442826` on run `38995442826`: its own id, because nothing was
+withheld. Without that arm, a runner that withheld the id from everything would pass.
+
 **A replayed step's output is from whenever its entry was first recorded**, not from the run before.
 B1 and B3 first asserted the latter and failed: the step was reporting an id from forty minutes
 earlier, because the entry had been served since then. B3 now asserts what the blind spot actually
