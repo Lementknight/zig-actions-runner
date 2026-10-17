@@ -9,8 +9,11 @@ measured, on what, against what, how many times, and how to run it again — and
 one be marked unverified and not used to justify a change. This is that register, built by reading
 STUDY.md against §3.2 after the fact.
 
-**63 claims: 19 verified, 32 under-powered, 6 unverified, 3 superseded, 2 proved, 1 withdrawn.** The
-one-line summary: *little here is wrong, and little is measured to the standard MEASURE.md sets.* The
+**63 claims: 19 verified, 32 under-powered, 5 unverified, 3 superseded, 2 proved, 1 withdrawn, 1
+refuted.** The first refutation is E6.4, and it was refuted in *direction*, not merely in size: a
+warm `uv sync` is slower here than on a hosted runner, where the study said faster. The
+one-line summary still holds otherwise: *little here is wrong, and little is measured to the
+standard MEASURE.md sets.* The
 large effects — 135× on uv's install, 20× on a re-run, 37× on a warm Go job — are far beyond any
 plausible noise and can be relied on in direction and order of magnitude. The small ones cannot, and
 that is where two deployed settings were decided.
@@ -139,11 +142,29 @@ independently by arithmetic. The samples are in [measurements/](../measurements/
 | E6.1 | each cache volume is its own filesystem, and two mounts of the *same* volume are too, so no hardlink can cross | `stat` and `ln` inside a job · Pi | 5 paths × 1 | **verified** — direct mechanism, each path its own control |
 | E6.2 | a warm `uv sync` takes 27.0 s from the volume against 0.2 s on the workspace's filesystem (135×); pnpm 16.6 s against 1.4 s; npm unaffected at 1.5 s | flask (84 packages, 214 MB `.venv`), pnpm/npm 68 MB · Pi | 6 variants × 1, one job | under-powered — one sample per variant, but 135× and the explicit `UV_LINK_MODE=copy` arm agreeing at 25.4 s make it safe |
 | E6.3 | with the environment in uv's cache volume, `uv sync` is 9.2 s on a new ref (was 28.6 s) | flask · Pi | before vs after × 1 | under-powered |
-| E6.4 | a warm `uv sync` is 0.5 s here against a hosted runner's 0.8 s — "faster than GitHub" | flask · Pi, `ubuntu-latest` | 1 × 1 | **unverified** — a 0.3 s margin on one sample each, across two machines; this one is quoted in SPEC.md §6 and should not be |
+| E6.4 | a warm `uv sync` is 0.5 s here against a hosted runner's 0.8 s — "faster than GitHub" | flask · Pi, `ubuntu-latest` | 3 × 12 | **refuted** (2026-10-17, [measurements/e6.4/](../measurements/e6.4/README.md)) — the hosted runner is **faster**: medians 0.011 s against 0.015 s, difference 0.004 s, 95% CI [0.002, 0.006], 27% of the baseline, with a negative control at exactly 0.000. The original compared the Pi's cheapest case against the hosted runner's most expensive one — see the note below the table |
 | E6.5 | relocating the environment broke nothing: `uv run`, `.venv/bin/python`, `activate`, `.venv/bin/pytest`, 134 tests | flask · Pi | functional × 1 | **verified** — four independent paths checked, each pass/fail |
 | E6.6 | against a hosted runner *with its own cache on*: 9 s against 151 s on a new branch, 9 s against 30 s on a repeat, 231 s against 151 s on a first run ever | hugo · Pi, `ubuntu-latest` | 3 × 1 | under-powered — the first two margins are ~16× and ~3×; the third (231 vs 151) is close enough that only its direction is safe |
 | E6.7 | `setup-go`'s `cache: true` tried to upload 2.7 GB at 2 MB/s and was cancelled at 82% | hugo · Pi | 1 × 1 | under-powered — an existence demonstration, which is all it needs to be |
 | E6.8 | pnpm cannot be fixed the same way: `node_modules` must be in the workspace | structural | — | under-powered — an argument from E6.1, not a measurement |
+
+**How E6.4 went wrong, because the mechanism is more useful than the verdict.** It was not noise, and
+not a close call misread. The study's own §10 quotes a hosted runner's warm uv *twice*, at two
+different numbers, for two different pieces of work: **0.1 s** to install into a fresh `.venv` by
+hardlinking from a cache already on the same filesystem, and **0.8 s** for a new job that restores
+the cache and then builds `.venv`. E6.4 compared this runner's 0.5 s — reconciling an environment
+that already exists in the cache volume, the cheapest thing a sync can do — against the 0.8 s. Had it
+used the 0.1 s from the table above it, the same evidence would have said the Pi was five times
+*slower*.
+
+So the fault was not the sample size. **Two arms were given different work and the difference was
+attributed to the machines.** The re-measurement makes both arms reconcile an environment that is
+already there (a `warm` step before the measured one, in the same job), which is the only reading of
+"a warm `uv sync`" under which the two machines can be compared at all. Under it, both numbers
+collapse to milliseconds — 0.015 s and 0.011 s — and the hosted runner wins by 27%.
+
+Nothing above it falls: E6.2's 135× and E6.3's 28.6 s → 9.2 s measure syncs that do real work, and
+are unaffected. What falls is one sentence of comparison, and the habit that produced it.
 
 ## §11 Experiment 7 — is the engine the per-step cost?
 
@@ -169,8 +190,8 @@ independently by arithmetic. The samples are in [measurements/](../measurements/
 
 ## What this says to do next
 
-1. **Stop citing the six unverified claims** until they are re-checked: W.5, E2.7, E5.4, E5.6, E6.4, E8.3. One is load-bearing outside the study — E6.4 in [SPEC.md](SPEC.md) §6 ("faster than GitHub's") — and is softened where it is cited. **E7.7 has been re-checked and holds**: it was the first claim through the harness, and the measurement is in `measurements/E7.7-gogc-measured.jsonl`.
+1. **Stop citing the five unverified claims** until they are re-checked: W.5, E2.7, E5.4, E5.6, E8.3. None is now load-bearing outside the study: the one that was — E6.4 in [SPEC.md](SPEC.md) §6, "faster than GitHub's" — **has been re-checked and is refuted**, and the sentence is gone rather than softened. **E7.7 has also been re-checked and holds**; the measurements are in `measurements/E7.7-gogc-measured.jsonl` and `measurements/E6.4-uv-measured.jsonl`.
 2. ~~**E7.7 first**, because it is the only unverified claim that currently decides a deployed setting.~~ **Done**, and so is **E3.4**, the other claim that decided one: it does not hold as stated, and what replaced it (E3.4b) says why output keys stay opt-in and why `RUNNER_OUTPUT_KEYS_MAX_MS` is the right shape of answer. The pilot put a 40-step job's engine CPU at 6.2 s with sd 0.29, so dimensioning asked for three repetitions rather than the nineteen a warm-up round's provisioning made it look like; three interleaved rounds an arm, each recreating the engine, settled it in 13 minutes.
-3. **Then E6.4 and W.5**, the two "faster than a hosted runner" claims. Both are single samples with margins under 30%, across machines we do not control, and both are quotable in a way that invites being quoted.
+3. ~~**Then E6.4 and W.5**, the two "faster than a hosted runner" claims.~~ **E6.4 is done and refuted**, which leaves **W.5** (sqlalchemy's install, 21.0 s here against 28.2 s hosted) as the last "faster than a hosted runner" claim standing on one sample per machine. E6.4 is the reason to doubt it: the failure there was not the sample size but that the two arms were given different work, and W.5 compares an install here against an install on a machine whose cache state was never recorded. Re-check it the same way — make both arms do the same thing, then measure — rather than by adding repetitions to the old comparison.
 4. **The harness before the rest.** Four commands in this repository cover a handful of the 62 claims; re-checking any of the others means writing the measurement again from the prose. That is MEASURE.md stage 2, and E7.6 and E3.5 are what to validate it against, their answers being known.
 5. **Nothing here asks for a design change.** No verdict moved a conclusion: the two decisions resting on unverified numbers (`GOGC=400`, and "faster than a hosted runner" in the docs) are a setting and a sentence, not an architecture. The findings carrying real weight — E6.1's filesystem split, E2.2's secret rule, E5.5's declared-inputs cost — are proved, verified, or very large.
