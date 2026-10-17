@@ -79,11 +79,17 @@ pub fn main(init: std.process.Init) !u8 {
     var store: ?db.Store = null;
     const live = !cfg.dry_run and !cfg.inspect and cfg.exec_job == null and !cfg.db_check;
     if (pg_cfg) |dbcfg| if (live) {
-        store = db.Store.open(init.gpa, io, dbcfg, null) catch |e| {
-            try err.writeAll("database unavailable: ");
+        // Dialled once here so a wrong password or a stopped database is in the journal at startup
+        // rather than at the first job — but never fatal. The database holds logs and run state,
+        // both of which the runner is documented to treat as a logging concern and never as a job
+        // failure (SPEC §5.1); refusing to start made an optional subsystem able to take CI down,
+        // and with systemd's restart policy it crash-looped with jobs queued behind it. The store
+        // and the log sink both dial again as work arrives, so this recovers on its own.
+        store = db.Store.open(init.gpa, io, dbcfg, null) catch |e| lazy: {
+            try err.writeAll("database unavailable, logging to the console and retrying: ");
             try redact.write(err, @errorName(e), secrets);
             try err.writeByte('\n');
-            return @backingInt(Exit.db);
+            break :lazy .init(init.gpa, io, dbcfg, null);
         };
         db_sink = .{ .postgres = .{
             .gpa = init.gpa,
