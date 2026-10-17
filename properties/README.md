@@ -50,12 +50,12 @@ subject; only a different workflow can.
 ## The blind spots
 
 Three checks assert that the design still *cannot* see what it cannot see — the counterexamples in
-`proofs/Runner/Counterexamples.agda` made executable. They pass by finding a stale answer, so the day
-one of them **fails**, detection has improved and the documents here are out of date.
+`proofs/Runner/Counterexamples.agda` made executable. B2 and B3 pass by finding a stale answer, so
+the day one of them **fails**, detection has improved and the documents here are out of date.
 
 | Check | The step | What it showed |
 |---|---|---|
-| B1 | reads the run id without ever spelling its name | replayed, and reported `38952425691` on run `38954899582` |
+| B1 | reads the run id without ever spelling its name | replayed, and reported `zig-runner-withheld` on run `38994482507` |
 | B2 | a value that is not a function of its inputs | replayed; the cache froze one answer, and a cache-off run gave another |
 | B3 | reads a marker in a cache volume an always-run step rewrote | replayed, and reported the marker from a much earlier run |
 
@@ -64,10 +64,19 @@ from pieces, so `readsRunSpecific` — which looks for the contiguous string —
 output keys, because without them the writer's new key would force the reader to run and there would
 be no stale read to find.
 
+**B1 is no longer a blind spot, and is kept because it was one.** Detection has not improved — the
+indirect read is as invisible as it ever was, and the step is still replayed. What changed is the
+answer it gets: enforcement writes `zig-runner-withheld` over every volatile value a step-cached
+step did not name (SPEC.md §9), so the check now asserts the sentinel exactly rather than "not this
+run's id". That older assertion would have *passed* against the sentinel while testing nothing,
+which is the failure mode a suite of passing checks has to be designed against.
+
 **A replayed step's output is from whenever its entry was first recorded**, not from the run before.
 B1 and B3 first asserted the latter and failed: the step was reporting an id from forty minutes
-earlier, because the entry had been served since then. They now assert what the blind spot actually
-is — that the answer is not this run's — which is both true and the thing worth knowing.
+earlier, because the entry had been served since then. B3 now asserts what the blind spot actually
+is — that the answer is not this run's — which is both true and the thing worth knowing. That
+forty-minute-stale id is what made the case for enforcing the volatile clause rather than
+documenting it.
 
 R2 asserts first that the two runs **overlapped in time**, from the API's own timestamps, and fails
 if they did not: two jobs that happened to run one after the other would pass the rest of it while

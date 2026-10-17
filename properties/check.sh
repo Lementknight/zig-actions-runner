@@ -310,18 +310,25 @@ if want B; then
 	need_output_keys
 	echo
 	echo "  Blind spots. These assert that the design still cannot see what it cannot see:"
-	echo "  if one of them FAILS, detection has improved and the documents are out of date."
+	echo "  if B2 or B3 FAILS, detection has improved and the documents are out of date."
+	echo "  B1 is the one that has been answered: still undetected, but no longer answered wrongly."
 	echo
 
 	# B1: a step that reads the run id without naming it (counterexample 1, SPEC.md's
-	# "not detected"). It is replayed, and reports an earlier run's id.
+	# "not detected"). Detection is still blind, and that half is what the first assertion holds to:
+	# `readsRunSpecific` is syntactic, the script never spells the name, so the step is step-cached
+	# and replayed.
+	#
+	# What the step then *sees* is no longer an earlier run's id. Until enforcement shipped this
+	# check asserted staleness — and caught an id forty minutes old — but a step-cached step now gets
+	# `zig-runner-withheld` written over every volatile value it did not name, so the wrong answer
+	# became an absent one (`volatile-clause-discharged`, proofs/Runner/Enforce.agda; SPEC.md §9).
+	# Asserting the sentinel rather than "not this run's id" matters because the sentinel satisfies
+	# that older assertion too: it would have passed while testing nothing.
 	dispatch property-blind.yml -f "spot=volatile" -f "step_cache=true" > /dev/null
 	b=$(dispatch property-blind.yml -f "spot=volatile" -f "step_cache=true")
 	assert "B1 an unseen volatile read" "$b" "blind volatile" replayed
-	# Not "it equals the previous run's id": a replayed step's output is from whenever the entry was
-	# first recorded, which may be any earlier run. What makes it a blind spot is that it is not this
-	# run's id, which is what the step would have printed had it run.
-	assert_ne "B1 it reports a stale run id" "the run id it printed" "$(value runid "$b" "blind volatile")" "$b"
+	assert_eq "B1 is told no run id at all" "the run id it printed" "$(value runid "$b" "blind volatile")" "zig-runner-withheld"
 
 	# B2: a step whose answer is not a function of its inputs (counterexample 3). The cache freezes
 	# the first answer, so a flaky step cannot fail twice.

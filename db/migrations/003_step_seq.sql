@@ -6,9 +6,10 @@
 -- logged — the same number the live feed sends as `startLine` (see sink.CollectedLine.seq). With
 -- both, a row here can be lined up with a line in the log GitHub shows, which `seq` alone cannot do.
 --
--- Null where the runner had no step number for the line: its own messages (registering, waiting for
--- work, a job's conclusion) are logged against step 0 and belong to no step's output. Null also for
--- any row written before this column existed.
+-- Null where the line belongs to no step's output, which is narrower than it sounds: step 0 is a
+-- real step ("Set up job", SPEC §4), and its lines are numbered from 1 like any other step's. What
+-- is null is the runner's own narration around a job rather than inside it — `job acquired: 4
+-- steps`, waiting for work, a job's conclusion — and any row written before this column existed.
 ALTER TABLE job_logs ADD COLUMN step_seq BIGINT;
 
 COMMENT ON COLUMN job_logs.seq IS 'Monotonic per job, gapless unless lines were dropped while the database was unreachable.';
