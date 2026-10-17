@@ -89,6 +89,11 @@ pub fn main(init: std.process.Init) !u8 {
             try err.writeAll("database unavailable, logging to the console and retrying: ");
             try redact.write(err, @errorName(e), secrets);
             try err.writeByte('\n');
+            // Flushed here, not left to the `defer`: this is the first message the runner writes
+            // that is followed by the process *continuing*, and without the flush it sat in the
+            // buffer for the life of the pool. A warning nobody can read is the silent failure the
+            // probe exists to prevent (checked on the Pi: the line was missing from the journal).
+            try err.flush();
             break :lazy .init(init.gpa, io, dbcfg, null);
         };
         db_sink = .{ .postgres = .{
