@@ -325,10 +325,18 @@ if want B; then
 	# became an absent one (`volatile-clause-discharged`, proofs/Runner/Enforce.agda; SPEC.md §9).
 	# Asserting the sentinel rather than "not this run's id" matters because the sentinel satisfies
 	# that older assertion too: it would have passed while testing nothing.
+	#
+	# The cache-off arm is what keeps this from being one-sided, the way B2's is. The sentinel is
+	# written on every run of a step-cached step, cold ones included, so its presence says nothing
+	# about replay — `enforce_volatile = step_cache and opts.enforce_volatile` (dagger.zig) is what
+	# it is evidence of. With the cache off the same step must see the real id, or "it is told no run
+	# id" would be indistinguishable from the runner withholding it from everything.
+	off=$(dispatch property-blind.yml -f "spot=volatile" -f "step_cache=false")
 	dispatch property-blind.yml -f "spot=volatile" -f "step_cache=true" > /dev/null
 	b=$(dispatch property-blind.yml -f "spot=volatile" -f "step_cache=true")
 	assert "B1 an unseen volatile read" "$b" "blind volatile" replayed
 	assert_eq "B1 is told no run id at all" "the run id it printed" "$(value runid "$b" "blind volatile")" "zig-runner-withheld"
+	assert_eq "B1 but a run of it is told" "the cache-off id" "$(value runid "$off" "blind volatile")" "$off"
 
 	# B2: a step whose answer is not a function of its inputs (counterexample 3). The cache freezes
 	# the first answer, so a flaky step cannot fail twice.
