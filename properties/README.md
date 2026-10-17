@@ -30,6 +30,7 @@ earlier run…" — so a check is a dispatch, a wait, and a `grep`. Nothing need
 | P4 | the subject names `GITHUB_RUN_ID`, twice over | the subject **ran** both times | `marked-misses` |
 | P1 | the cache off, then warm, then replayed | the observer **said the same thing**, and the exporter was replayed too | `replay≡run` |
 | E1 | a marked step leaving the same bytes / new bytes | the steps after it **replayed** / **ran** | `cutoff`, `different-bytes-different-container` |
+| R2 | two jobs of the same workflow at once, with different inputs | they **overlapped**, and each got **its own** answer rather than the other's | `elsewhere⇒ahead` |
 
 P1 doubles as the `$GITHUB_ENV` obligation: what the observer says includes a variable an earlier
 step exported, and on the replayed run that earlier step was replayed too, so its export came out of
@@ -68,6 +69,11 @@ B1 and B3 first asserted the latter and failed: the step was reporting an id fro
 earlier, because the entry had been served since then. They now assert what the blind spot actually
 is — that the answer is not this run's — which is both true and the thing worth knowing.
 
+R2 asserts first that the two runs **overlapped in time**, from the API's own timestamps, and fails
+if they did not: two jobs that happened to run one after the other would pass the rest of it while
+proving nothing about a shared cache. On its first run they overlapped and each reported its own
+value.
+
 **The suite cannot pass vacuously**, which matters for a suite that passes everything: it asserts
 both polarities. P3 and P6 fail unless the note is *present*, P2 and P4 fail unless it is *absent*,
 so a discriminator that always said one thing would fail half of them. Checked directly on the first
@@ -76,9 +82,6 @@ of the five that changed one.
 
 ## What is not here yet
 
-- **R2, a shared cache**: two jobs of the same workflow at once, each asserted to get its own answer
-  rather than the other's — `elsewhere⇒ahead`. **Written, not yet run.** It needs no change to the
-  runner's configuration, so it is the safe one to run next.
 - **P5**, which needs the shelved `feat/declared-inputs-v2`.
 - **Pruning is deliberately not here.** It is proved (`coherent-subset`, `ahead-subset`: dropping
   entries preserves both of P1's hypotheses, so pruning can only cause misses) and it is not
