@@ -9,8 +9,9 @@ measured, on what, against what, how many times, and how to run it again — and
 one be marked unverified and not used to justify a change. This is that register, built by reading
 STUDY.md against §3.2 after the fact.
 
-**69 claims: 22 verified, 33 under-powered, 5 unverified, 4 superseded, 2 proved, 1 withdrawn, 1
-refuted, 1 no effect found.** Sixty-three came from reading STUDY.md against §3.2; the six in §S came
+**70 claims: 22 verified, 33 under-powered, 5 unverified, 4 superseded, 2 proved, 1 withdrawn, 1
+refuted, 1 no effect found, 1 not measurable as framed.** Sixty-three came from reading STUDY.md
+against §3.2; the seven in §S came
 from measuring this machine instead, and are the first here that the study never made. The first
 refutation is E6.4, and it was refuted in *direction*, not merely in size: a
 warm `uv sync` is slower here than on a hosted runner, where the study said faster. The
@@ -202,9 +203,30 @@ and ask what that costs a pool of runners.
 | S.2 | a forced-copy install takes 2.7× longer with three running at once: 24.6 s alone against 66.6 s | as above, `max-parallel` 1 vs 3 · Pi | 3 × 5 | **verified** — difference 42.0 s, 95% CI [27.5, 60.1], negative control spanning zero. `io-p1`'s 24.6 s independently reproduces the study's 25.4 s for the same uncontended operation |
 | S.3 | flask's test suite takes 1.45× longer with three at once: 4.36 s alone against 6.30 s | 3 × `uv run pytest` · Pi | 3 × 5 | **verified**, with a caveat — difference 1.94 s, 95% CI [1.76, 2.44], but the control came out 6% from the baseline with an interval excluding zero, so this instrument has a ~6% floor and nothing smaller than the 10% threshold should be read from it |
 
+| S.7 | a smaller engine cache cap (10 GB against 20 GB) would reduce page-cache pressure | — | — | **not measurable as framed** — the arms share mutable state that each destroys for the other, and the cap is not currently binding. Designed, built (`concurrency/cap-arm.sh`), and abandoned before spending an hour on a confounded answer; see below. The 20 GB cap stands |
 | S.5 | no I/O scheduler is measurably better for this card: `none`, `mq-deadline`, `kyber` and `bfq` within one sweep | `disk.sh` × 4 schedulers · Pi | 4 × 1 | **no effect found at this precision** — qd1 random reads ranged 1903-2441 across schedulers, while *repeated* runs of a single scheduler ranged just as widely (mq-deadline 2375 then 1960; `none` 2099 then 1903; bfq 2125, 2098, 2441). The card's own variance swallows the differences |
 | S.6 | this SD card intermittently collapses to a quarter of its write throughput, with eighth-of-a-second stalls | `disk.sh` · Pi | 2 occurrences | under-powered — observed twice, **159 iops with p99 135.3 ms** under `mq-deadline` on an idle disk and **176 iops with p99 132.6 ms** under `bfq`, against 547-702 iops and p99 7-20 ms otherwise. Scheduler-independent and load-independent; the signature of the card's own garbage collection. Two samples, no controlled repetition |
 | S.4 | CI on this machine is I/O-bound end to end, so the engine's CPU priority has nothing to arbitrate | `vmstat` through both workloads above · Pi | 2 workloads × ~20 samples | **verified** — runnable processes never exceeded 3 while blocked reached 26, and the CPU was 85-97% idle-waiting in both. `--cpu-shares` cannot help: there is no CPU contention. See below |
+
+**S.7 was abandoned for a reason worth writing down: its arms cannot be interleaved.** The engine's
+cache cap governs state that *persists between trials*. A 10 GB trial collects the volume down to
+10 GB, destroying cache that the 20 GB trials spent their runs accumulating; the next 20 GB trial
+then starts from a cache the other arm emptied. Interleaving — which §3.2.3 requires, so that drift
+in the machine cannot be read as a difference between arms — makes each arm sabotage the other.
+Blocking the arms to avoid that reintroduces exactly the drift confound interleaving exists to
+prevent, and there is no way to restore cache state between trials. Neither design is sound.
+
+Two further reasons not to spend the hour. **The cap is not binding**: at 20 GB the volume sits at
+10.61 GB, so nothing is being evicted and the comparison would be "no eviction" against "slight
+eviction". And **the instrument is weak**: the first run after an engine restart gave shards of
+5.6 s, 21.9 s and 36.2 s for three *serial* runs of identical work — a 6.5× spread with no
+contention, because the engine rebuilds state progressively after a restart. Resolving 10% through
+that needs many hours.
+
+What stands without measurement is the cap's actual job. The recorded pathology — 67 GB across
+17,000 snapshots, whose inode cache crowded out the page cache — happened with **no cap at all**.
+The observed working set is 10-19 GB. A 20 GB cap bounds the runaway case while binding on nothing
+normal, which is what it was for. `deploy/engine.json` is unchanged and razorbill is back at 20 GB.
 
 **Scheduler tuning is closed, and two of my own explanations died proving it.** `bfq` was tried
 because it is the only scheduler offering per-cgroup I/O weights, which looked like the way to stop

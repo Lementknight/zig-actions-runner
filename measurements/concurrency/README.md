@@ -116,3 +116,27 @@ zig build measure -- run --claim S.1 --quantity "contended copying across 3 shar
 
 **`restore.sh` is not optional.** Each trial pins the pool size in the unit file, so the last trial's
 value stands until it is removed — a measurement that quietly reconfigures the machine it measured.
+
+## S.7, built and not run
+
+`cap-arm.sh` measures what the engine's cache cap costs or buys, and is kept because it works — the
+experiment around it does not.
+
+**Its arms cannot be interleaved.** The cap governs a cache that persists between trials, so a 10 GB
+trial collects the volume down to 10 GB and destroys what the 20 GB trials accumulated; the next
+20 GB trial starts from a cache the other arm emptied. Interleaving is what keeps drift from reading
+as an effect (MEASURE.md §3.2.3), and here it makes each arm sabotage the other. Blocking the arms
+brings the drift confound back, and there is no way to restore cache state between trials.
+
+Two more reasons it was not worth the hour. The cap **is not binding**: at 20 GB the volume sits at
+10.61 GB, so the comparison would be no eviction against slight eviction. And the instrument is
+weak — the first run after an engine restart gave shards of 5.6 s, 21.9 s and 36.2 s for three
+*serial* runs of identical work, because the engine rebuilds state progressively after a restart.
+
+The cap's real job needs no measurement here: the pathology it exists for (67 GB across 17,000
+snapshots) happened with **no cap at all**, and the observed working set is 10-19 GB. 20 GB bounds
+the runaway case while binding on nothing normal.
+
+An experiment that could answer it would need to snapshot and restore the cache volume between
+trials, or to run on a machine whose cache can be filled to a known state cheaply. Neither is this
+machine.
