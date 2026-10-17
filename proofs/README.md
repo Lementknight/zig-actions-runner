@@ -115,7 +115,7 @@ Each is a complete, computing job in `Runner/Counterexamples.agda`.
 
 | # | The step | What happens | Hypothesis |
 |---|---|---|---|
-| 1 | reads `GITHUB_RUN_ID` without naming it | job 2 is handed job 1's answer and runs nothing | `Disciplined` |
+| 1 | reads `GITHUB_RUN_ID` without naming it | job 2 is handed job 1's answer and runs nothing; **8** closes this | `Disciplined` |
 | 3 | a flaky test, unmarked | job 1 passed, so job 2 "passes" without running | `Disciplined` |
 | 4 | reads a cache volume, unmarked | replayed although the volume changed between jobs | `Disciplined` |
 | `Guessing` | keyed on a guessed input set, run in the whole workspace | replayed with a stale answer; enforced, it sees nothing instead | P5 |
@@ -123,7 +123,15 @@ Each is a complete, computing job in `Runner/Counterexamples.agda`.
 The others are positive: **2** declares the read and the marker makes the key new; **5** is a
 correction (below); **6** computes experiment 7.6's four numbers — cold 2 runs, warm with keys 1,
 warm without keys 2, warm with a noisy output 2, which is why `outputs_ignored` exists; **7** shows a
-replayed setup step still exporting its variable, so the step after it is replayed too.
+replayed setup step still exporting its variable, so the step after it is replayed too; **8** runs
+counterexample 1's own `exec`, unchanged, against an unmarked step's enforced input and finds it can
+no longer tell the two jobs apart (`cannot-tell-them-apart`).
+
+**1 and 8 are a pair, and only 1 of them is still the runner's behaviour.** Counterexample 1 is why
+`RUNNER_ENFORCE_VOLATILE` exists and what it would cost to turn off; 8 is what the runner does by
+default (SPEC.md §9). The live counterpart, B1 in [properties/](../properties/README.md), asserts
+both: still undetected and still replayed, as 1 has it, and told nothing rather than told wrongly, as
+8 has it. 3 and 4 have no 8 of their own — they are open.
 
 ## Three things this turned up
 
