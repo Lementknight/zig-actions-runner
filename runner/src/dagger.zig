@@ -23,6 +23,7 @@ const std = @import("std");
 const job_mod = @import("job.zig");
 const sink = @import("sink.zig");
 const broker = @import("github/broker.zig");
+const build_options = @import("build_options");
 const expr = @import("expr.zig");
 const context = @import("context.zig");
 const commands = @import("commands.zig");
@@ -3853,7 +3854,10 @@ const Exec = struct {
     /// secrets come from, and the preparation steps.
     fn logSetUp(x: *Exec, opts: Options) !void {
         const arena = x.arena;
-        x.setUpLine(try std.fmt.allocPrint(arena, "Current runner version: '{s}' (zig-runner)", .{broker.version}));
+        // GitHub's own line, with this runner's build after it: the protocol version is what GitHub
+        // validates and says nothing about which binary is running, which is the question a job's
+        // log is asked when a machine behaves unexpectedly.
+        x.setUpLine(try std.fmt.allocPrint(arena, "Current runner version: '{s}' (zig-runner {s})", .{ broker.version, build_options.version }));
         x.setUpLine(try std.fmt.allocPrint(arena, "Runner name: '{s}'", .{opts.runner_name}));
         if (x.job.runner_group.len > 0) x.setUpLine(try std.fmt.allocPrint(arena, "Runner group name: '{s}'", .{x.job.runner_group}));
         var host_buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
@@ -6572,7 +6576,9 @@ test "logs read like GitHub's: Set up job, then each step's header with its shel
     try std.testing.expect(std.mem.indexOf(u8, fake.seen.items[1], "tree(depth:1) { id entries(path:\".\") } sha: commit") != null);
     const out = w.buffered();
     const want_in_order = [_][]const u8{
-        "[job 0 step 0 stdout] Current runner version: '",
+        // GitHub's protocol version, then this build's own, which is the line a job's log is read
+        // for when a machine is behaving unexpectedly.
+        "[job 0 step 0 stdout] Current runner version: '" ++ broker.version ++ "' (zig-runner " ++ build_options.version ++ ")",
         "[job 0 step 0 stdout] Runner name: 'zig-1a2b3c4d'",
         "[job 0 step 0 stdout] Runner group name: 'Default'",
         "[job 0 step 0 stdout] ##[group]Runner Image",

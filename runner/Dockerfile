@@ -10,6 +10,10 @@
 FROM --platform=$BUILDPLATFORM alpine:3.22 AS build
 ARG ZIG_VERSION=0.17.0
 ARG TARGETARCH
+# What `--version` and every job's "Set up job" report. The build context holds no `.git`, so the
+# version cannot be derived here: unset, the binary falls back to the package version, which says
+# nothing about which build it is. The release workflow passes the tag.
+ARG VERSION=
 RUN apk add --no-cache curl xz ca-certificates
 RUN arch="$(uname -m)" \
  && curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${arch}-linux-${ZIG_VERSION}.tar.xz" | tar -xJ -C /opt \
@@ -22,7 +26,7 @@ RUN case "$TARGETARCH" in \
       arm64) target=aarch64-linux-musl ;; \
       *) echo "unsupported architecture: $TARGETARCH" >&2; exit 1 ;; \
     esac \
- && zig build -Doptimize=ReleaseSafe -Dstrip -Dtarget="$target" --prefix /out
+ && zig build -Doptimize=ReleaseSafe -Dstrip -Dtarget="$target" ${VERSION:+-Dversion="$VERSION"} --prefix /out
 
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt

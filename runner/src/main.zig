@@ -9,6 +9,9 @@ const pg = @import("pg.zig");
 const redact = @import("redact.zig");
 const sink = @import("sink.zig");
 const http = @import("github/http.zig");
+const broker = @import("github/broker.zig");
+const engine = @import("engine.zig");
+const build_options = @import("build_options");
 
 comptime {
     _ = @import("sink.zig");
@@ -52,6 +55,18 @@ pub fn main(init: std.process.Init) !u8 {
     defer err.flush() catch {};
 
     const args = try init.minimal.args.toSlice(arena);
+
+    // Before the configuration, so that asking which binary this is never needs a token: the
+    // question is usually asked of a machine whose behaviour is a surprise, where every other
+    // answer is in doubt.
+    for (args[1..]) |arg| if (std.mem.eql(u8, arg, "--version")) {
+        var out_buf: [256]u8 = undefined;
+        var w: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
+        try w.interface.print("zig-runner {s} (runner protocol {s}, Dagger {s})\n", .{ build_options.version, broker.version, engine.client_version });
+        try w.interface.flush();
+        return @backingInt(Exit.done);
+    };
+
     const cfg = Config.load(init.environ_map, args) catch |e| {
         try err.print("config error: {s}\n", .{@errorName(e)});
         return @backingInt(Exit.config);

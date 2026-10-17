@@ -59,6 +59,13 @@ journalctl -u zig-runner -f
 
 `systemctl stop` sends SIGTERM and waits up to `TimeoutStopSec` (60 minutes) for running jobs.
 
+**Which build is installed:** `zig-runner --version` prints it, and so does the first line of every
+job's log (`Current runner version: '2.338.0' (zig-runner v0.2.0-116-g9eb33348)`). The build version
+comes from `git describe` where the binary was built, so it names the exact commit — which is worth
+checking before concluding that a deployed change did not work. A binary built outside a checkout
+reports the package version instead, and cannot identify itself; pass `-Dversion` to `zig build`
+there.
+
 ## As a plain binary
 
 Without `RUNNER_ENGINE_HOST`, the runner reaches the engine through the Docker API (`/var/run/docker.sock`). It uses the engine container that the `dagger` CLI of the same version starts (`dagger-engine-v0.21.10`), so a machine where `dagger` has run once is enough:
