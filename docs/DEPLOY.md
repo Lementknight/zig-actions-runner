@@ -45,7 +45,11 @@ docker run -d --name dagger-engine-runners --restart unless-stopped --privileged
   registry.dagger.io/engine:v0.21.10 --addr unix:///run/dagger/engine.sock
 ```
 
-On a machine that also runs other services, cap the engine and lower its CPU priority, so CI cannot starve them: add `--memory 4g --memory-swap 4g --cpus 3 --cpu-shares 128 -e GOMEMLIMIT=3500MiB` (`GOMEMLIMIT` makes the engine collect harder near the cap instead of hitting it). On Raspberry Pi OS the memory cap needs `cgroup_enable=memory` added to `/boot/firmware/cmdline.txt` and a reboot; without it Docker ignores `--memory`.
+On a machine that also runs other services, cap the engine so CI cannot starve them: add `--memory 4g --memory-swap 4g --cpus 3 -e GOMEMLIMIT=3500MiB` (`GOMEMLIMIT` makes the engine collect harder near the cap instead of hitting it).
+
+**`--cpu-shares 128` used to be recommended here and has been removed, because it was measured and does nothing on the machine it was written for** (CLAIMS.md S.4). The reasoning was that CI takes a Raspberry Pi to a load average of 11 on four cores, where ssh stops answering — which happens, but load counts processes blocked in uninterruptible sleep, and that is what nearly all of them are. Sampled through a disk-heavy job, runnable processes were 0 and blocked 6–19 at 85–97% iowait; through a *compute*-heavy job, runnable peaked at 3 while blocked reached 26, because a job is a checkout and a dependency install before it is a test run. CPU priority has nothing to arbitrate. Lower it if your jobs really are CPU-bound, and check with `vmstat 3` during one before assuming they are: what shows up as "CI is hammering the machine" on small hardware is usually the disk. What does cap the disk queue is running fewer jobs at once (`RUNNER_COUNT`), at the cost of throughput — see CLAIMS.md §S for what that trade is worth on each kind of workload.
+
+On Raspberry Pi OS the memory cap needs `cgroup_enable=memory` added to `/boot/firmware/cmdline.txt` and a reboot; without it Docker ignores `--memory`.
 
 Then install the binary (from a release, or `zig build -Doptimize=ReleaseSafe -Dstrip` in `runner/`), its configuration and [`deploy/zig-runner.service`](../deploy/zig-runner.service):
 
