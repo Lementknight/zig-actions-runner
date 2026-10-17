@@ -118,21 +118,72 @@ pub fn writeSetSchema(w: *Io.Writer, schema: []const u8) Io.Writer.Error!void {
 }
 
 pub const Store = struct {
-    client: *pg.Client,
+    gpa: Allocator,
     io: Io,
+    cfg: pg.Config,
+    /// A scratch schema, set on every connection this makes. For the tests; production uses the
+    /// default search path.
+    schema: ?[]const u8 = null,
+    client: ?*pg.Client = null,
     /// One connection, shared by the process's runners: one query at a time.
     mu: Io.Mutex = .init,
+    /// Not dialled again before this, so a database that is down costs one attempt every two
+    /// seconds instead of one per row. `PgSink` backs off the same way, for the same reason.
+    retry_after_ms: i64 = 0,
+    /// The most recent failure, for `Reporter` to report when the job ends.
+    last_error: [256]u8 = undefined,
+    last_error_len: usize = 0,
 
-    /// Connects. `schema` is for tests (a scratch schema); production uses the default search path.
+    const retry_ms = 2000;
+
+    /// Describes the connection without making it. The first write dials, and a write that finds
+    /// the connection gone dials again, so a database that is down or restarted costs run-state
+    /// rows and nothing else: it never fails a job (SPEC §5.2) and never stops the runner starting.
+    pub fn init(gpa: Allocator, io: Io, cfg: pg.Config, schema: ?[]const u8) Store {
+        return .{ .gpa = gpa, .io = io, .cfg = cfg, .schema = schema };
+    }
+
+    /// Connects now and reports it if it cannot: for `--db-check`, the tests, and the one probe at
+    /// startup, all of which want the error itself rather than a retry.
     pub fn open(gpa: Allocator, io: Io, cfg: pg.Config, schema: ?[]const u8) !Store {
-        const c = try pg.Client.connect(gpa, io, cfg);
-        errdefer c.close();
-        if (schema) |sc| try execWith(gpa, c, writeSetSchemaFn, sc);
-        return .{ .client = c, .io = io };
+        var s: Store = .init(gpa, io, cfg, schema);
+        try s.dial();
+        return s;
     }
 
     pub fn close(s: *Store) void {
-        s.client.close();
+        if (s.client) |c| c.close();
+        s.client = null;
+    }
+
+    /// What went wrong most recently, empty if nothing has.
+    pub fn lastError(s: *const Store) []const u8 {
+        return s.last_error[0..s.last_error_len];
+    }
+
+    fn remember(s: *Store, what: []const u8, detail: []const u8) void {
+        const t = std.fmt.bufPrint(&s.last_error, "{s}: {s}", .{ what, detail }) catch s.last_error[0..0];
+        s.last_error_len = t.len;
+    }
+
+    fn dial(s: *Store) !void {
+        const c = try pg.Client.connect(s.gpa, s.io, s.cfg);
+        errdefer c.close();
+        if (s.schema) |sc| try execWith(s.gpa, c, writeSetSchemaFn, sc);
+        s.client = c;
+    }
+
+    /// The connection, dialled if there is none. Called with `mu` held.
+    fn ensure(s: *Store) pg.Error!*pg.Client {
+        if (s.client) |c| return c;
+        const t = Io.Clock.real.now(s.io).toMilliseconds();
+        if (t < s.retry_after_ms) return error.ConnectionClosed;
+        s.retry_after_ms = t + retry_ms;
+        s.dial() catch |e| {
+            s.remember("connect failed", @errorName(e));
+            return error.ConnectionClosed;
+        };
+        return s.client.?;
     }
 
     pub fn upsertRun(s: *Store, r: RunRow) pg.Error!void {
@@ -150,11 +201,25 @@ pub const Store = struct {
     fn run(s: *Store, comptime T: type, comptime build: fn (*Io.Writer, T) Io.Writer.Error!void, row: T) pg.Error!void {
         s.mu.lockUncancelable(s.io);
         defer s.mu.unlock(s.io);
-        var arena_state: std.heap.ArenaAllocator = .init(s.client.gpa);
+        const c = try s.ensure();
+        var arena_state: std.heap.ArenaAllocator = .init(s.gpa);
         defer arena_state.deinit();
         var aw: Io.Writer.Allocating = .init(arena_state.allocator());
         build(&aw.writer, row) catch return error.OutOfMemory;
-        return s.client.exec(aw.written());
+        c.exec(aw.written()) catch |e| {
+            s.remember("write failed", if (c.lastErrorText().len > 0) c.lastErrorText() else @errorName(e));
+            // A connection the server has dropped is let go, so the next row dials again instead
+            // of failing for the life of the process. A `ServerError` is the statement's problem,
+            // not the connection's, so that one is kept.
+            switch (e) {
+                error.ConnectionClosed, error.BadMessage, error.UnexpectedMessage => {
+                    c.close();
+                    s.client = null;
+                },
+                else => {},
+            }
+            return e;
+        };
     }
 };
 
@@ -171,6 +236,29 @@ fn execWith(gpa: Allocator, c: *pg.Client, comptime build: fn (*Io.Writer, []con
 }
 
 // --- tests ---
+
+test "a store whose database is down describes itself, writes nothing, and never stops the runner" {
+    const down: pg.Config = .{ .host = "127.0.0.1", .port = 1, .user = "u", .database = "d", .sslmode = .disable };
+
+    // `open` is for the callers that want the error: `--db-check`, and the one probe at startup.
+    try std.testing.expectError(error.ConnectionRefused, Store.open(std.testing.allocator, std.testing.io, down, null));
+
+    // `init` is what the runner falls back to, and it cannot fail: the whole point is that a
+    // database nobody can reach is not a reason to refuse to run jobs.
+    var store: Store = .init(std.testing.allocator, std.testing.io, down, null);
+    defer store.close();
+
+    // A write reports the failure and keeps the process going. `Reporter.note` counts these and
+    // reports them when the job ends; nothing here propagates to the job's result.
+    try std.testing.expectError(error.ConnectionClosed, store.upsertRun(.{ .id = 1, .repo = "o/r", .workflow = "ci", .status = "in_progress" }));
+    try std.testing.expect(std.mem.indexOf(u8, store.lastError(), "connect failed") != null);
+
+    // The second write inside the backoff window does not dial again — a job of forty steps must
+    // not cost forty connection attempts to a database that is down.
+    const first_deadline = store.retry_after_ms;
+    try std.testing.expectError(error.ConnectionClosed, store.upsertStep(.{ .job_id = 1, .number = 1, .name = "s", .status = "in_progress" }));
+    try std.testing.expectEqual(first_deadline, store.retry_after_ms);
+}
 
 test "upsert statements quote values, keep created_at, and use NULL for absent fields" {
     var buf: [2048]u8 = undefined;

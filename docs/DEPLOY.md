@@ -131,6 +131,13 @@ failure: lines stay buffered, the next flush reconnects and retries, and if the 
 cap the oldest lines are dropped and counted — which is the only way a gap can appear in a job's
 `seq`.
 
+That holds at startup too. A database the runner cannot reach when it starts prints one warning and
+the runner carries on with the console sink, dialling again as work arrives; a password you fix is
+picked up without a restart. **If logs stop arriving, look for that warning in the journal rather
+than at the jobs**, which pass either way — `journalctl -u zig-runner | grep "database unavailable"`.
+To check a change to `DATABASE_URL` before restarting anything, `zig-runner --db-check` does report
+the failure, with exit code 3.
+
 ## Sizing
 
 Measured with release builds on Linux ([SPEC §7](SPEC.md)):

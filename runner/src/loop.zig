@@ -325,7 +325,7 @@ const Reporter = struct {
 
     fn note(r: *Reporter, e: anyerror) void {
         r.failures += 1;
-        r.last_error = if (r.store.client.lastErrorText().len > 0) r.store.client.lastErrorText() else @errorName(e);
+        r.last_error = if (r.store.lastError().len > 0) r.store.lastError() else @errorName(e);
     }
 
     fn stepStartedFn(ptr: *anyopaque, number: u32, name: []const u8, started_ms: i64) void {
