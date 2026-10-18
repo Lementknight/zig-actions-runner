@@ -458,7 +458,27 @@ pub const Client = struct {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
+        try c.sendMessage(null, try startupMessage(arena, cfg));
+        try c.flush();
 
+        var auth: AuthState = .{};
+        while (true) {
+            const m = try c.readMessage(arena);
+            switch (m.tag) {
+                'R' => try c.authenticate(arena, cfg, m.body, &auth),
+                'E' => {
+                    c.remember(m.body);
+                    return error.ServerError;
+                },
+                'Z' => return, // ReadyForQuery: connected
+                else => {}, // ParameterStatus (S), BackendKeyData (K), NoticeResponse (N)
+            }
+        }
+    }
+
+    /// The StartupMessage: protocol 3.0 and the parameters the server needs, NUL-terminated pairs
+    /// ending in an empty name.
+    fn startupMessage(arena: std.mem.Allocator, cfg: Config) ![]const u8 {
         var body: std.Io.Writer.Allocating = .init(arena);
         try body.writer.writeInt(u32, 196608, .big); // protocol 3.0
         for ([_][2][]const u8{
@@ -473,80 +493,82 @@ pub const Client = struct {
             try body.writer.writeByte(0);
         }
         try body.writer.writeByte(0);
-        try c.sendMessage(null, body.written());
-        try c.flush();
+        return body.written();
+    }
 
-        var scram: ?Scram = null;
-        var expected_final: ?[]const u8 = null;
-        while (true) {
-            const m = try c.readMessage(arena);
-            switch (m.tag) {
-                'R' => {
-                    if (m.body.len < 4) return error.BadMessage;
-                    const kind = std.mem.readInt(u32, m.body[0..4], .big);
-                    switch (kind) {
-                        0 => {}, // AuthenticationOk
-                        3 => { // cleartext
-                            try c.sendMessage('p', try std.fmt.allocPrint(arena, "{s}\x00", .{cfg.password}));
-                            try c.flush();
-                        },
-                        5 => { // MD5: "md5" + md5(md5(password + user) + salt)
-                            if (m.body.len < 8) return error.BadMessage;
-                            const hex = std.fmt.bytesToHex;
-                            var h1: [16]u8 = undefined;
-                            var md5 = std.crypto.hash.Md5.init(.{});
-                            md5.update(cfg.password);
-                            md5.update(cfg.user);
-                            md5.final(&h1);
-                            const h1_hex = hex(h1, .lower);
-                            var h2: [16]u8 = undefined;
-                            var md5b = std.crypto.hash.Md5.init(.{});
-                            md5b.update(&h1_hex);
-                            md5b.update(m.body[4..8]);
-                            md5b.final(&h2);
-                            const h2_hex = hex(h2, .lower);
-                            try c.sendMessage('p', try std.fmt.allocPrint(arena, "md5{s}\x00", .{h2_hex}));
-                            try c.flush();
-                        },
-                        10 => { // SASL: pick SCRAM-SHA-256
-                            if (std.mem.indexOf(u8, m.body[4..], "SCRAM-SHA-256") == null) return error.UnsupportedAuthentication;
-                            var nonce_raw: [18]u8 = undefined;
-                            c.io.random(&nonce_raw);
-                            const enc = std.base64.standard.Encoder;
-                            const nonce = try arena.alloc(u8, enc.calcSize(nonce_raw.len));
-                            _ = enc.encode(nonce, &nonce_raw);
-                            const s = try Scram.init(arena, "", nonce);
-                            const first = try s.clientFirst(arena);
-                            var msg: std.Io.Writer.Allocating = .init(arena);
-                            try msg.writer.writeAll("SCRAM-SHA-256\x00");
-                            try msg.writer.writeInt(u32, @intCast(first.len), .big);
-                            try msg.writer.writeAll(first);
-                            try c.sendMessage('p', msg.written());
-                            try c.flush();
-                            scram = s;
-                        },
-                        11 => { // SASLContinue: server-first-message
-                            const s = scram orelse return error.UnexpectedMessage;
-                            const fin = s.clientFinal(arena, cfg.password, m.body[4..]) catch return error.AuthenticationFailed;
-                            try c.sendMessage('p', fin.message);
-                            try c.flush();
-                            expected_final = fin.expected_server_final;
-                        },
-                        12 => { // SASLFinal: verify the server's signature
-                            const want = expected_final orelse return error.UnexpectedMessage;
-                            if (!std.mem.eql(u8, m.body[4..], want)) return error.AuthenticationFailed;
-                        },
-                        else => return error.UnsupportedAuthentication,
-                    }
-                },
-                'E' => {
-                    c.remember(m.body);
-                    return error.ServerError;
-                },
-                'Z' => return, // ReadyForQuery: connected
-                else => {}, // ParameterStatus (S), BackendKeyData (K), NoticeResponse (N)
-            }
+    /// What SCRAM carries across the server's messages: the exchange, and the signature the server
+    /// must end with.
+    const AuthState = struct { scram: ?Scram = null, expected_final: ?[]const u8 = null };
+
+    /// One Authentication message, by kind: Ok, cleartext, MD5, or the three SASL steps of
+    /// SCRAM-SHA-256. Anything else the server could ask for is unsupported.
+    fn authenticate(c: *Client, arena: std.mem.Allocator, cfg: Config, body: []const u8, auth: *AuthState) !void {
+        if (body.len < 4) return error.BadMessage;
+        const kind = std.mem.readInt(u32, body[0..4], .big);
+        switch (kind) {
+            0 => {}, // AuthenticationOk
+            3 => { // cleartext
+                try c.sendMessage('p', try std.fmt.allocPrint(arena, "{s}\x00", .{cfg.password}));
+                try c.flush();
+            },
+            5 => { // MD5
+                if (body.len < 8) return error.BadMessage;
+                try c.sendMessage('p', try md5Password(arena, cfg, body[4..8]));
+                try c.flush();
+            },
+            10 => { // SASL: pick SCRAM-SHA-256
+                if (std.mem.indexOf(u8, body[4..], "SCRAM-SHA-256") == null) return error.UnsupportedAuthentication;
+                auth.scram = try c.saslFirst(arena);
+            },
+            11 => { // SASLContinue: server-first-message
+                const s = auth.scram orelse return error.UnexpectedMessage;
+                const fin = s.clientFinal(arena, cfg.password, body[4..]) catch return error.AuthenticationFailed;
+                try c.sendMessage('p', fin.message);
+                try c.flush();
+                auth.expected_final = fin.expected_server_final;
+            },
+            12 => { // SASLFinal: verify the server's signature
+                const want = auth.expected_final orelse return error.UnexpectedMessage;
+                if (!std.mem.eql(u8, body[4..], want)) return error.AuthenticationFailed;
+            },
+            else => return error.UnsupportedAuthentication,
         }
+    }
+
+    /// The MD5 password message: "md5" + md5(md5(password + user) + salt), NUL-terminated.
+    fn md5Password(arena: std.mem.Allocator, cfg: Config, salt: []const u8) ![]const u8 {
+        const hex = std.fmt.bytesToHex;
+        var h1: [16]u8 = undefined;
+        var md5 = std.crypto.hash.Md5.init(.{});
+        md5.update(cfg.password);
+        md5.update(cfg.user);
+        md5.final(&h1);
+        const h1_hex = hex(h1, .lower);
+        var h2: [16]u8 = undefined;
+        var md5b = std.crypto.hash.Md5.init(.{});
+        md5b.update(&h1_hex);
+        md5b.update(salt);
+        md5b.final(&h2);
+        const h2_hex = hex(h2, .lower);
+        return std.fmt.allocPrint(arena, "md5{s}\x00", .{h2_hex});
+    }
+
+    /// Starts SCRAM-SHA-256: a fresh nonce, the client-first-message sent as SASLInitialResponse.
+    fn saslFirst(c: *Client, arena: std.mem.Allocator) !Scram {
+        var nonce_raw: [18]u8 = undefined;
+        c.io.random(&nonce_raw);
+        const enc = std.base64.standard.Encoder;
+        const nonce = try arena.alloc(u8, enc.calcSize(nonce_raw.len));
+        _ = enc.encode(nonce, &nonce_raw);
+        const s = try Scram.init(arena, "", nonce);
+        const first = try s.clientFirst(arena);
+        var msg: std.Io.Writer.Allocating = .init(arena);
+        try msg.writer.writeAll("SCRAM-SHA-256\x00");
+        try msg.writer.writeInt(u32, @intCast(first.len), .big);
+        try msg.writer.writeAll(first);
+        try c.sendMessage('p', msg.written());
+        try c.flush();
+        return s;
     }
 
     /// Runs one or more statements, discarding any rows.
