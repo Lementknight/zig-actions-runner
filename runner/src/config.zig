@@ -105,10 +105,45 @@ pub const Config = struct {
 
     /// Values are borrowed from `environ` / `args`, which must outlive the Config.
     pub fn load(environ: *const std.process.Environ.Map, args: []const [:0]const u8) Error!Config {
-        var token: ?[]const u8 = environ.get("GH_TOKEN");
-        var scope_str: ?[]const u8 = environ.get("GH_SCOPE");
+        var creds: Credentials = .{ .token = environ.get("GH_TOKEN"), .scope = environ.get("GH_SCOPE") };
         var c: Config = .{ .gh_token = "", .scope = undefined };
+        try c.fromEnviron(environ);
 
+        var i: usize = 1; // args[0] is the program name
+        while (i < args.len) : (i += 1) {
+            const arg: []const u8 = args[i];
+            if (c.modeFlag(arg)) continue;
+            if (!std.mem.startsWith(u8, arg, "--")) return error.UnknownFlag;
+            var key = arg[2..];
+            var val: []const u8 = undefined;
+            if (std.mem.indexOfScalar(u8, key, '=')) |eq| {
+                val = key[eq + 1 ..];
+                key = key[0..eq];
+            } else {
+                i += 1;
+                if (i >= args.len) return error.MissingFlagValue;
+                val = args[i];
+            }
+            try c.applyFlag(key, val, &creds);
+        }
+
+        if (c.exec_job != null or c.db_check) {
+            // Offline mode: no GitHub credentials needed.
+            c.gh_token = creds.token orelse "";
+            c.scope = .{ .org = "offline" };
+            return c;
+        }
+        c.gh_token = creds.token orelse return error.MissingGhToken;
+        c.scope = try Scope.parse(creds.scope orelse return error.MissingGhScope);
+        return c;
+    }
+
+    /// `GH_TOKEN` and `GH_SCOPE` as given, by variable or flag, before they are required — a mode
+    /// that runs offline needs neither.
+    const Credentials = struct { token: ?[]const u8, scope: ?[]const u8 };
+
+    /// Every setting the environment can give (SPEC.md §2's table).
+    fn fromEnviron(c: *Config, environ: *const std.process.Environ.Map) Error!void {
         if (environ.get("RUNNER_LABELS")) |v| c.labels = v;
         if (environ.get("RUNNER_GROUP_ID")) |v| c.runner_group_id = try num(u64, v);
         if (environ.get("RUNNER_NAME_PREFIX")) |v| c.name_prefix = v;
@@ -136,74 +171,46 @@ pub const Config = struct {
         if (environ.get("RUNNER_OUTPUT_KEYS_DAYS")) |v| c.output_keys_days = try count(v);
         if (environ.get("RUNNER_ONCE")) |v| c.once = try boolean(v);
         if (environ.get("RUNNER_COUNT")) |v| c.runners = try count(v);
+    }
 
-        var i: usize = 1; // args[0] is the program name
-        while (i < args.len) : (i += 1) {
-            const arg: []const u8 = args[i];
-            if (std.mem.eql(u8, arg, "--db-check")) {
-                c.db_check = true;
-                continue;
-            }
-            if (std.mem.eql(u8, arg, "--dry-run")) {
-                c.dry_run = true;
-                continue;
-            }
-            if (std.mem.eql(u8, arg, "--inspect")) {
-                c.inspect = true;
-                continue;
-            }
-            if (std.mem.eql(u8, arg, "--once")) {
-                c.once = true;
-                continue;
-            }
-            if (!std.mem.startsWith(u8, arg, "--")) return error.UnknownFlag;
-            var key = arg[2..];
-            var val: []const u8 = undefined;
-            if (std.mem.indexOfScalar(u8, key, '=')) |eq| {
-                val = key[eq + 1 ..];
-                key = key[0..eq];
-            } else {
-                i += 1;
-                if (i >= args.len) return error.MissingFlagValue;
-                val = args[i];
-            }
-            if (std.mem.eql(u8, key, "token")) token = val //
-            else if (std.mem.eql(u8, key, "scope")) scope_str = val //
-            else if (std.mem.eql(u8, key, "exec-job")) c.exec_job = val //
-            else if (std.mem.eql(u8, key, "labels")) c.labels = val //
-            else if (std.mem.eql(u8, key, "group-id")) c.runner_group_id = try num(u64, val) //
-            else if (std.mem.eql(u8, key, "name-prefix")) c.name_prefix = val //
-            else if (std.mem.eql(u8, key, "database-url")) c.database_url = val //
-            else if (std.mem.eql(u8, key, "dagger-cmd")) c.dagger_cmd = val //
-            else if (std.mem.eql(u8, key, "image")) c.image = val //
-            else if (std.mem.eql(u8, key, "log-flush-lines")) c.log_flush_lines = try num(u32, val) //
-            else if (std.mem.eql(u8, key, "log-flush-ms")) c.log_flush_ms = try num(u32, val) //
-            else if (std.mem.eql(u8, key, "js-runtime")) c.js_runtime = try jsRuntime(val) //
-            else if (std.mem.eql(u8, key, "engine")) c.engine = try engineMode(val) //
-            else if (std.mem.eql(u8, key, "engine-host")) c.engine_host = val //
-            else if (std.mem.eql(u8, key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
-            else if (std.mem.eql(u8, key, "package-caches")) c.package_caches = try boolean(val) //
-            else if (std.mem.eql(u8, key, "step-cache")) c.step_cache = try boolean(val) //
-            else if (std.mem.eql(u8, key, "step-user")) c.step_user = try stepUser(val) //
-            else if (std.mem.eql(u8, key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
-            else if (std.mem.eql(u8, key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
-            else if (std.mem.eql(u8, key, "log-spool-dir")) c.log_spool_dir = val //
-            else if (std.mem.eql(u8, key, "enforce-volatile")) c.enforce_volatile = try boolean(val) //
-            else if (std.mem.eql(u8, key, "output-keys")) c.output_keys = try boolean(val) //
-            else if (std.mem.eql(u8, key, "output-keys-days")) c.output_keys_days = try count(val) //
-            else if (std.mem.eql(u8, key, "runners")) c.runners = try count(val) //
-            else return error.UnknownFlag;
-        }
+    /// The flags that take no value and choose what the process does. True when `arg` was one.
+    fn modeFlag(c: *Config, arg: []const u8) bool {
+        if (std.mem.eql(u8, arg, "--db-check")) c.db_check = true //
+        else if (std.mem.eql(u8, arg, "--dry-run")) c.dry_run = true //
+        else if (std.mem.eql(u8, arg, "--inspect")) c.inspect = true //
+        else if (std.mem.eql(u8, arg, "--once")) c.once = true //
+        else return false;
+        return true;
+    }
 
-        if (c.exec_job != null or c.db_check) {
-            // Offline mode: no GitHub credentials needed.
-            c.gh_token = token orelse "";
-            c.scope = .{ .org = "offline" };
-            return c;
-        }
-        c.gh_token = token orelse return error.MissingGhToken;
-        c.scope = try Scope.parse(scope_str orelse return error.MissingGhScope);
-        return c;
+    /// One `--key value` flag (SPEC.md §2's flag list); flags override the environment.
+    fn applyFlag(c: *Config, key: []const u8, val: []const u8, creds: *Credentials) Error!void {
+        if (std.mem.eql(u8, key, "token")) creds.token = val //
+        else if (std.mem.eql(u8, key, "scope")) creds.scope = val //
+        else if (std.mem.eql(u8, key, "exec-job")) c.exec_job = val //
+        else if (std.mem.eql(u8, key, "labels")) c.labels = val //
+        else if (std.mem.eql(u8, key, "group-id")) c.runner_group_id = try num(u64, val) //
+        else if (std.mem.eql(u8, key, "name-prefix")) c.name_prefix = val //
+        else if (std.mem.eql(u8, key, "database-url")) c.database_url = val //
+        else if (std.mem.eql(u8, key, "dagger-cmd")) c.dagger_cmd = val //
+        else if (std.mem.eql(u8, key, "image")) c.image = val //
+        else if (std.mem.eql(u8, key, "log-flush-lines")) c.log_flush_lines = try num(u32, val) //
+        else if (std.mem.eql(u8, key, "log-flush-ms")) c.log_flush_ms = try num(u32, val) //
+        else if (std.mem.eql(u8, key, "js-runtime")) c.js_runtime = try jsRuntime(val) //
+        else if (std.mem.eql(u8, key, "engine")) c.engine = try engineMode(val) //
+        else if (std.mem.eql(u8, key, "engine-host")) c.engine_host = val //
+        else if (std.mem.eql(u8, key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
+        else if (std.mem.eql(u8, key, "package-caches")) c.package_caches = try boolean(val) //
+        else if (std.mem.eql(u8, key, "step-cache")) c.step_cache = try boolean(val) //
+        else if (std.mem.eql(u8, key, "step-user")) c.step_user = try stepUser(val) //
+        else if (std.mem.eql(u8, key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
+        else if (std.mem.eql(u8, key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
+        else if (std.mem.eql(u8, key, "log-spool-dir")) c.log_spool_dir = val //
+        else if (std.mem.eql(u8, key, "enforce-volatile")) c.enforce_volatile = try boolean(val) //
+        else if (std.mem.eql(u8, key, "output-keys")) c.output_keys = try boolean(val) //
+        else if (std.mem.eql(u8, key, "output-keys-days")) c.output_keys_days = try count(val) //
+        else if (std.mem.eql(u8, key, "runners")) c.runners = try count(val) //
+        else return error.UnknownFlag;
     }
 
     /// Where logs and run state go: `DATABASE_URL` / `--database-url`, else the standard PG* variables.
