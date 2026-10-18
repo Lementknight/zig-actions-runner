@@ -4218,89 +4218,41 @@ const Exec = struct {
     /// Runs one of a JavaScript action's scripts (`pre`, `main` or `post`, relative to the action's
     /// directory) with the configured runtime (Bun by default, see SPEC §6). `state` reaches it as
     /// STATE_<name>. Null when the runtime could not be set up (the reason is logged).
-    fn runJsScript(x: *Exec, num: u32, phase: Phase, act: Loaded, _: job_mod.Uses, script_rel: []const u8, inputs: []const expr.Value.Entry, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef, state: []const job_mod.EnvVar) !?ExecOut {
+    fn runJsScript(
+        x: *Exec,
+        num: u32,
+        phase: Phase,
+        act: Loaded,
+        _: job_mod.Uses,
+        script_rel: []const u8,
+        inputs: []const expr.Value.Entry,
+        step_env: []const job_mod.EnvVar,
+        step_secret: []const SecretRef,
+        state: []const job_mod.EnvVar,
+    ) !?ExecOut {
         const arena = x.arena;
         var mounts: std.ArrayList(Mount) = .empty;
         if (!x.js_mounted) {
-            const rt = (if (x.musl) js_runtimes_musl else js_runtimes).get(x.js_runtime);
-            var msg: []const u8 = "";
-            const libs: []const u8 = if (x.musl) " libs: directory(path:\"/usr/lib\") { filter(include:[\"libstdc++.so*\",\"libgcc_s.so*\"]) { id } }" else "";
-            const doc = if (rt.npm_dir) |npm|
-                try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }} npm: directory(path:\"{s}\") {{ id }}{s} }} }} }}", .{ rt.image, rt.binary, npm, libs })
-            else
-                try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }}{s} }} }} }}", .{ rt.image, rt.binary, libs });
-            const data = gql(arena, x.transport, doc, &msg) catch {
-                _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}: {s}", .{ rt.image, msg });
-                return null;
-            };
-            const bin = (if (jsonFind(data, "bin")) |b| jsonFindString(b, "id") else null) orelse {
-                _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}", .{rt.image});
-                return null;
-            };
-            if (x.musl) {
-                const libs_id = (if (jsonFind(data, "libs")) |l| jsonFindString(l, "id") else null) orelse {
-                    _ = try x.actionFailed(num, "could not get the C++ runtime from {s}", .{rt.image});
-                    return null;
-                };
-                try mounts.append(arena, .{ .dir = .{ .path = js_lib_dir, .id = libs_id } });
-                try mounts.append(arena, .{ .file = .{ .path = js_musl_dir ++ "/node", .id = bin, .permissions = 0o755 } });
-                try mounts.append(arena, .{ .new_file = .{ .path = js_runtime_path, .contents = try muslWrapper(arena, "node"), .permissions = 0o755 } });
-            } else try mounts.append(arena, .{ .file = .{ .path = js_runtime_path, .id = bin, .permissions = 0o755 } });
-            try mounts.append(arena, .{ .new_file = .{ .path = js_shim_path, .contents = node_shim, .permissions = 0o755 } });
-            switch (x.js_runtime) {
-                // The same binary named `bun` is Bun's own CLI, for `bun x`.
-                .bun => {
-                    if (x.musl) {
-                        try mounts.append(arena, .{ .file = .{ .path = js_musl_dir ++ "/bun", .id = bin, .permissions = 0o755 } });
-                        try mounts.append(arena, .{ .new_file = .{ .path = js_bun_path, .contents = try muslWrapper(arena, "bun"), .permissions = 0o755 } });
-                    } else try mounts.append(arena, .{ .file = .{ .path = js_bun_path, .id = bin, .permissions = 0o755 } });
-                    try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npx", .contents = npx_bun_shim, .permissions = 0o755 } });
-                },
-                .node => {
-                    const npm = (if (jsonFind(data, "npm")) |d| jsonFindString(d, "id") else null) orelse {
-                        _ = try x.actionFailed(num, "could not get npm from {s}", .{rt.image});
-                        return null;
-                    };
-                    try mounts.append(arena, .{ .dir = .{ .path = js_npm_dir, .id = npm } });
-                    try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npx", .contents = npx_node_shim, .permissions = 0o755 } });
-                    try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npm", .contents = npm_node_shim, .permissions = 0o755 } });
-                },
-            }
+            if (!try x.appendJsRuntimeMounts(num, &mounts)) return null;
         }
         // Mounted once: a later phase sees what an earlier one left in the action's directory.
         if (!x.mounted_actions.contains(act.mount)) try mounts.append(arena, .{ .dir = .{ .path = act.mount, .id = act.dir, .owner = x.dir_owner } });
-
-        // Inputs as INPUT_<NAME> (spaces become underscores, as in @actions/core), the action's
-        // location, and the services actions/cache and artifact actions talk to.
-        var env: std.ArrayList(job_mod.EnvVar) = .empty;
-        try env.appendSlice(arena, try inputEnv(arena, inputs));
-        try env.append(arena, .{ .name = "GITHUB_ACTION_REPOSITORY", .value = act.repository });
-        try env.append(arena, .{ .name = "GITHUB_ACTION_REF", .value = act.ref });
-        try x.runtimeEnv(&env, state);
-
-        var plain: std.ArrayList(job_mod.EnvVar) = .empty;
-        var secret: std.ArrayList(SecretRef) = .empty;
-        try plain.appendSlice(arena, step_env);
-        try secret.appendSlice(arena, step_secret);
-        splitEnv(arena, x.transport, x.job.*, &x.secret_counter, env.items, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
+        const env = try x.jsEnv(act, inputs, state, step_env, step_secret);
 
         // GitHub folds the action's inputs at the start of its main step; its pre and post steps
         // start with their output.
         if (phase == .main) try x.logGroup(num, phase, act.ref_label, try shownInputs(arena, inputs), step_env, step_secret, &.{});
 
-        // Started through bash where there is one: dash drops variables whose names are not
-        // identifiers (INPUT_GITHUB-TOKEN) when it starts a program; bash, and busybox's sh (Alpine
-        // images, which have no bash), pass them on.
-        var script: std.Io.Writer.Allocating = .init(arena);
-        try script.writer.writeAll("PATH=\"" ++ js_bin_dir ++ ":$PATH\" exec " ++ js_runtime_path ++ " ");
-        try shellQuote(&script.writer, try std.fmt.allocPrint(arena, "{s}/{s}", .{ act.path, script_rel }));
+        const script = try jsCommand(arena, js_runtime_path, act, script_rel);
         const fc = x.next_fc;
         x.next_fc += 1;
         // What the first try starts from and uses up, should Node have to run it again.
         const before = x.container_id;
         const pending_env = try arena.dupe(job_mod.EnvVar, x.ev.pending_env.items);
         const pending_path = try arena.dupe([]const u8, x.ev.pending_path.items);
-        const out = try x.execScript(num, fc, .{ .run = .{ .script = script.written(), .shell = null, .working_directory = null, .env = plain.items } }, if (act.repository.len > 0) act.repository else act.ref_label, secret.items, mounts.items);
+        const name = if (act.repository.len > 0) act.repository else act.ref_label;
+        const resolved: Resolved = .{ .run = .{ .script = script, .shell = null, .working_directory = null, .env = env.plain } };
+        const out = try x.execScript(num, fc, resolved, name, env.secret, mounts.items);
         x.js_mounted = true;
         try x.mounted_actions.put(arena, act.mount, {});
         if (!out.bun_refused or x.js_runtime != .bun) return out;
@@ -4316,12 +4268,104 @@ const Exec = struct {
         try x.ev.pending_env.appendSlice(arena, pending_env);
         x.ev.pending_path.clearRetainingCapacity();
         try x.ev.pending_path.appendSlice(arena, pending_path);
-        var again: std.Io.Writer.Allocating = .init(arena);
-        try again.writer.writeAll("PATH=\"" ++ js_bin_dir ++ ":$PATH\" exec " ++ js_fallback_path ++ " ");
-        try shellQuote(&again.writer, try std.fmt.allocPrint(arena, "{s}/{s}", .{ act.path, script_rel }));
+        const again: Resolved = .{ .run = .{
+            .script = try jsCommand(arena, js_fallback_path, act, script_rel),
+            .shell = null,
+            .working_directory = null,
+            .env = env.plain,
+        } };
         const fc_again = x.next_fc;
         x.next_fc += 1;
-        return try x.execScript(num, fc_again, .{ .run = .{ .script = again.written(), .shell = null, .working_directory = null, .env = plain.items } }, if (act.repository.len > 0) act.repository else act.ref_label, secret.items, try std.mem.concat(arena, Mount, &.{ mounts.items, node_mounts }));
+        const all_mounts = try std.mem.concat(arena, Mount, &.{ mounts.items, node_mounts });
+        return try x.execScript(num, fc_again, again, name, env.secret, all_mounts);
+    }
+
+    /// The command that runs one of the action's scripts: the runtime at `runtime_path`, with the
+    /// shims on PATH, through bash where there is one — dash drops variables whose names are not
+    /// identifiers (INPUT_GITHUB-TOKEN) when it starts a program; bash, and busybox's sh (Alpine
+    /// images, which have no bash), pass them on.
+    fn jsCommand(arena: Allocator, runtime_path: []const u8, act: Loaded, script_rel: []const u8) ![]const u8 {
+        var script: std.Io.Writer.Allocating = .init(arena);
+        try script.writer.print("PATH=\"" ++ js_bin_dir ++ ":$PATH\" exec {s} ", .{runtime_path});
+        try shellQuote(&script.writer, try std.fmt.allocPrint(arena, "{s}/{s}", .{ act.path, script_rel }));
+        return script.written();
+    }
+
+    /// Inputs as INPUT_<NAME> (spaces become underscores, as in @actions/core), the action's
+    /// location, and the services actions/cache and artifact actions talk to — on top of the step's
+    /// env, split into plain variables and Dagger secrets.
+    fn jsEnv(
+        x: *Exec,
+        act: Loaded,
+        inputs: []const expr.Value.Entry,
+        state: []const job_mod.EnvVar,
+        step_env: []const job_mod.EnvVar,
+        step_secret: []const SecretRef,
+    ) !ContainerEnv {
+        const arena = x.arena;
+        var env: std.ArrayList(job_mod.EnvVar) = .empty;
+        try env.appendSlice(arena, try inputEnv(arena, inputs));
+        try env.append(arena, .{ .name = "GITHUB_ACTION_REPOSITORY", .value = act.repository });
+        try env.append(arena, .{ .name = "GITHUB_ACTION_REF", .value = act.ref });
+        try x.runtimeEnv(&env, state);
+        var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+        var secret: std.ArrayList(SecretRef) = .empty;
+        try plain.appendSlice(arena, step_env);
+        try secret.appendSlice(arena, step_secret);
+        splitEnv(arena, x.transport, x.job.*, &x.secret_counter, env.items, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
+        return .{ .plain = plain.items, .secret = secret.items };
+    }
+
+    /// The JavaScript runtime's files, taken from its image once per job: the binary (and on musl its
+    /// C++ runtime and a wrapper), the `node` shim, and Bun's or Node's CLI with its npx/npm shims.
+    /// False when the image could not be had: the step has been failed with the reason.
+    fn appendJsRuntimeMounts(x: *Exec, num: u32, mounts: *std.ArrayList(Mount)) !bool {
+        const arena = x.arena;
+        const rt = (if (x.musl) js_runtimes_musl else js_runtimes).get(x.js_runtime);
+        var msg: []const u8 = "";
+        const libs: []const u8 = if (x.musl) " libs: directory(path:\"/usr/lib\") { filter(include:[\"libstdc++.so*\",\"libgcc_s.so*\"]) { id } }" else "";
+        const doc = if (rt.npm_dir) |npm|
+            try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }} npm: directory(path:\"{s}\") {{ id }}{s} }} }} }}", .{ rt.image, rt.binary, npm, libs })
+        else
+            try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }}{s} }} }} }}", .{ rt.image, rt.binary, libs });
+        const data = gql(arena, x.transport, doc, &msg) catch {
+            _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}: {s}", .{ rt.image, msg });
+            return false;
+        };
+        const bin = (if (jsonFind(data, "bin")) |b| jsonFindString(b, "id") else null) orelse {
+            _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}", .{rt.image});
+            return false;
+        };
+        if (x.musl) {
+            const libs_id = (if (jsonFind(data, "libs")) |l| jsonFindString(l, "id") else null) orelse {
+                _ = try x.actionFailed(num, "could not get the C++ runtime from {s}", .{rt.image});
+                return false;
+            };
+            try mounts.append(arena, .{ .dir = .{ .path = js_lib_dir, .id = libs_id } });
+            try mounts.append(arena, .{ .file = .{ .path = js_musl_dir ++ "/node", .id = bin, .permissions = 0o755 } });
+            try mounts.append(arena, .{ .new_file = .{ .path = js_runtime_path, .contents = try muslWrapper(arena, "node"), .permissions = 0o755 } });
+        } else try mounts.append(arena, .{ .file = .{ .path = js_runtime_path, .id = bin, .permissions = 0o755 } });
+        try mounts.append(arena, .{ .new_file = .{ .path = js_shim_path, .contents = node_shim, .permissions = 0o755 } });
+        switch (x.js_runtime) {
+            // The same binary named `bun` is Bun's own CLI, for `bun x`.
+            .bun => {
+                if (x.musl) {
+                    try mounts.append(arena, .{ .file = .{ .path = js_musl_dir ++ "/bun", .id = bin, .permissions = 0o755 } });
+                    try mounts.append(arena, .{ .new_file = .{ .path = js_bun_path, .contents = try muslWrapper(arena, "bun"), .permissions = 0o755 } });
+                } else try mounts.append(arena, .{ .file = .{ .path = js_bun_path, .id = bin, .permissions = 0o755 } });
+                try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npx", .contents = npx_bun_shim, .permissions = 0o755 } });
+            },
+            .node => {
+                const npm = (if (jsonFind(data, "npm")) |d| jsonFindString(d, "id") else null) orelse {
+                    _ = try x.actionFailed(num, "could not get npm from {s}", .{rt.image});
+                    return false;
+                };
+                try mounts.append(arena, .{ .dir = .{ .path = js_npm_dir, .id = npm } });
+                try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npx", .contents = npx_node_shim, .permissions = 0o755 } });
+                try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npm", .contents = npm_node_shim, .permissions = 0o755 } });
+            },
+        }
+        return true;
     }
 
     /// Node at `js_fallback_path`, for an action Bun cannot load, from the same images as
