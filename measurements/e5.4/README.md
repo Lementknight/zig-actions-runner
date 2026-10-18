@@ -46,7 +46,7 @@ prevent. The shortfall is recorded here rather than quietly re-run.
 ## Why it is worth measuring rather than withdrawing
 
 Unlike E2.7 and E5.6, which were withdrawn, this cost is **live**. `withDirectory` with `owner:` is
-what hands a Docker action its workspace, at [dagger.zig:4291](../../runner/src/dagger.zig#L4291):
+what hands a Docker action its workspace, at [dagger.zig:4290](../../runner/src/dagger.zig#L4290):
 
 ```zig
 if (img.user.len > 0) {

@@ -6,7 +6,7 @@
 # It writes a .github/ tree — two workflows and two local Dockerfile actions — to be copied into the
 # test repository.
 #
-# `owner:` is emitted by exactly one condition in the runner (dagger.zig:4291): the Docker action's
+# `owner:` is emitted by exactly one condition in the runner (dagger.zig:4290): the Docker action's
 # image declares a non-root user. So the two arms run the same action against the same workspace and
 # differ only in a `USER` line in the Dockerfile. Both images are built from the same base with the
 # same entrypoint, so the runner emits `owner:` for one and not the other and nothing else differs.
