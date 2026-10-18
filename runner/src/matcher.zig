@@ -170,6 +170,10 @@ pub const Set = struct {
         severity: ?[]const u8 = null,
         code: ?[]const u8 = null,
         message: ?[]const u8 = null,
+        /// `fromPath`: a file the reported `file` is relative *to*, not a file to report. It is
+        /// carried like the rest because the pattern that captures it is usually an earlier line
+        /// than the one reporting the error — a project file named once, then diagnostics beneath.
+        from_path: ?[]const u8 = null,
     };
 
     /// The allocator is a parameter rather than a field so that a `Set` has a safe default: it
@@ -245,7 +249,7 @@ pub const Set = struct {
         try out.append(arena, .{
             .level = e.carried.severity orelse e.matcher.severity,
             .message = e.carried.message orelse line,
-            .file = e.carried.file,
+            .file = resolveFile(arena, e.carried.file, e.carried.from_path),
             .line = e.carried.line,
             .end_line = e.carried.end_line,
             .col = e.carried.col,
@@ -267,6 +271,30 @@ pub const Set = struct {
     }
 };
 
+/// Resolves a reported file against the directory of the pattern's `fromPath`, as GitHub's runner
+/// does. A tool invoked on a project file often reports paths relative to *that* file rather than
+/// to the workspace, and `fromPath` is how a matcher says so.
+///
+/// This was parsed and then ignored for a while, which is worse than not supporting it: the
+/// annotation still appeared, pointing at a path that does not exist, with nothing to say so.
+///
+/// An already-rooted file is returned untouched — joining would be wrong, and so would stripping
+/// the leading separator off the result. Otherwise the join is normalised, so a `fromPath` of
+/// `a/b/p.proj` and a file of `../c/x.cs` give `a/c/x.cs` rather than `a/b/../c/x.cs`.
+///
+/// Only POSIX separators are handled. A matcher written for Windows paths would not resolve here,
+/// and that is consistent with the rest of the runner (SPEC.md, "Not supported yet").
+fn resolveFile(arena: Allocator, file: ?[]const u8, from_path: ?[]const u8) ?[]const u8 {
+    const f = file orelse return null;
+    if (f.len == 0 or f[0] == '/') return f;
+    const fp = from_path orelse return f;
+    const dir = std.fs.path.dirname(fp) orelse return f;
+    const joined = std.fs.path.resolvePosix(arena, &.{ "/", dir, f }) catch return f;
+    // resolvePosix answers with a rooted path; the annotation wants it workspace-relative, as the
+    // matcher reported it.
+    return if (joined.len > 1 and joined[0] == '/') joined[1..] else f;
+}
+
 /// Copies this pattern's captures into the sequence's carried values. A pattern that names a group
 /// overwrites; one that does not leaves what an earlier pattern captured.
 fn carry(c: *Set.Carried, pat: Pattern, m: regex.Captures, line: []const u8) void {
@@ -279,6 +307,7 @@ fn carry(c: *Set.Carried, pat: Pattern, m: regex.Captures, line: []const u8) voi
         .{ .idx = pat.severity, .dst = &c.severity },
         .{ .idx = pat.code, .dst = &c.code },
         .{ .idx = pat.message, .dst = &c.message },
+        .{ .idx = pat.from_path, .dst = &c.from_path },
     };
     for (fields) |f| if (f.idx) |i| {
         if (m.text(i, line)) |t| f.dst.* = t;
@@ -439,4 +468,75 @@ test "the default severity applies only when no pattern captures one" {
     const got = try set.feed(ar, "something happened");
     try testing.expectEqualStrings("warning", got[0].level);
     try testing.expectEqualStrings("something happened", got[0].message);
+}
+
+/// The shape every `fromPath` matcher has: one pattern catching the file a tool was invoked on, and
+/// a looping one catching the diagnostics under it, whose paths are relative to *that* file rather
+/// than to the workspace. Modelled on the matcher .NET's SDK ships, which is the canonical user of
+/// the property; the runner does not support .NET (SPEC.md §9), but `fromPath` belongs to the
+/// matcher format rather than to any one toolchain, so it has to work.
+const from_path_matcher =
+    \\{ "problemMatcher": [ { "owner": "proj", "pattern": [
+    \\  { "regexp": "^Building (.+\\.proj)$", "fromPath": 1 },
+    \\  { "regexp": "^(.+)\\((\\d+),(\\d+)\\): (error|warning) ([A-Z]+\\d+): (.*)$",
+    \\    "file": 1, "line": 2, "column": 3, "severity": 4, "code": 5, "message": 6,
+    \\    "loop": true } ] } ] }
+;
+
+test "fromPath resolves a reported file against the directory of the project file" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    var set: Set = .{};
+    try set.add(ar, (try load(ar, from_path_matcher)).matchers);
+
+    // The first line only establishes where the following paths are rooted, and annotates nothing.
+    try testing.expectEqual(@as(usize, 0), (try set.feed(ar, "Building src/app/app.proj")).len);
+
+    // `Program.cs` is relative to src/app/, not to the workspace. Before this worked, the
+    // annotation said "Program.cs" and pointed at a file that is not there.
+    const one = try set.feed(ar, "Program.cs(12,5): error CS0103: The name 'x' does not exist.");
+    try testing.expectEqual(@as(usize, 1), one.len);
+    try testing.expectEqualStrings("src/app/Program.cs", one[0].file.?);
+    try testing.expectEqualStrings("12", one[0].line.?);
+    try testing.expectEqualStrings("CS0103", one[0].code.?);
+    try testing.expectEqualStrings("error", one[0].level);
+
+    // The looping pattern keeps the carried fromPath, so every diagnostic under one project line
+    // resolves the same way.
+    const two = try set.feed(ar, "sub/Other.cs(3,1): warning CS0168: unused.");
+    try testing.expectEqualStrings("src/app/sub/Other.cs", two[0].file.?);
+
+    // `..` in the reported path is normalised rather than left in place.
+    const up = try set.feed(ar, "../shared/Util.cs(7,2): error CS0246: missing type.");
+    try testing.expectEqualStrings("src/shared/Util.cs", up[0].file.?);
+
+    // An already-rooted path is left exactly as reported.
+    const abs = try set.feed(ar, "/opt/sdk/Gen.cs(1,1): error CS0001: generated.");
+    try testing.expectEqualStrings("/opt/sdk/Gen.cs", abs[0].file.?);
+}
+
+test "a matcher with no fromPath still reports the file as captured" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    // The regression this pairs with: resolveFile must be a no-op without fromPath, which is every
+    // matcher real actions ship today.
+    var set: Set = .{};
+    try set.add(ar, (try load(ar, go_matcher)).matchers);
+    const got = try set.feed(ar, "pkg/thing/x.go:12:5: undefined: alpha");
+    try testing.expectEqualStrings("pkg/thing/x.go", got[0].file.?);
+}
+
+// A project file at the repository root: `dirname` gives an empty directory, and the reported path
+// must come through unchanged rather than acquiring a separator.
+test "fromPath at the root leaves the path alone" {
+    var a: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+    var set: Set = .{};
+    try set.add(ar, (try load(ar, from_path_matcher)).matchers);
+    _ = try set.feed(ar, "Building app.proj");
+    const got = try set.feed(ar, "Program.cs(1,1): error CS0001: x.");
+    try testing.expectEqualStrings("Program.cs", got[0].file.?);
 }
