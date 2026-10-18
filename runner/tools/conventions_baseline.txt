@@ -20,13 +20,13 @@ fn src/expr.zig callFunction 79
 fn src/github/broker.zig requestOnce 74
 fn src/job.zig parse 72
 fn src/yaml.zig blockScalar 71
-long-lines src/dbtest.zig 11
+long-lines src/dbtest.zig 10
 long-lines src/inspect.zig 38
-long-lines src/config.zig 30
+long-lines src/config.zig 29
 long-lines src/hpack.zig 9
-long-lines src/regex.zig 15
+long-lines src/regex.zig 13
 long-lines src/main.zig 18
-long-lines src/dagger.zig 979
+long-lines src/dagger.zig 972
 long-lines src/action.zig 24
 long-lines src/engine.zig 49
 long-lines src/github/broker.zig 13
@@ -38,19 +38,19 @@ long-lines src/github/auth.zig 15
 long-lines src/github/results.zig 30
 long-lines src/github/feed.zig 2
 long-lines src/live.zig 24
-long-lines src/sink.zig 17
+long-lines src/sink.zig 15
 long-lines src/pgsink.zig 28
 long-lines src/job.zig 114
-long-lines src/loop.zig 109
+long-lines src/loop.zig 108
 long-lines src/yaml.zig 27
-long-lines src/expr.zig 54
+long-lines src/expr.zig 53
 long-lines src/commands.zig 22
 long-lines src/redact.zig 1
 long-lines src/context.zig 9
 long-lines src/timefmt.zig 2
-long-lines src/db.zig 44
+long-lines src/db.zig 43
 long-lines src/pg.zig 46
-long-lines src/matcher.zig 6
+long-lines src/matcher.zig 4
 long-lines tools/check_workflows.zig 4
-long-lines tools/regex_diff.zig 2
-long-lines tools/measure.zig 40
+long-lines tools/regex_diff.zig 1
+long-lines tools/measure.zig 36
