@@ -1658,8 +1658,12 @@ const Shared = struct {
 
     /// A warning from off the log path. `appendFmt` reaches `appendLocked`, which mutates the log
     /// and the per-step line counts that the live-output task also writes — so it needs `mu`, and
-    /// the first version of `loadPendingMatchers` called it without. That is a data race on the
-    /// log, and the runner segfaulted on an unrelated job because of it.
+    /// the first version of `loadPendingMatchers` called it without. That is a real data race.
+    ///
+    /// It is **not** what caused the segfault that came with the problem-matcher work; the dangling
+    /// line in `matchLocked` is, and that one has evidence. This was found while looking for the
+    /// crash and fixed on its own merits. The distinction is kept because the alternative is a
+    /// reader concluding the crash is accounted for by a lock they can see.
     fn warnUnlocked(sh: *Shared, step: u32, text: []const u8) void {
         sh.mu.lockUncancelable(sh.io);
         defer sh.mu.unlock(sh.io);

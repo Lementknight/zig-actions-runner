@@ -285,7 +285,8 @@ pub const Set = struct {
 /// Only POSIX separators are handled. A matcher written for Windows paths would not resolve here,
 /// and that is consistent with the rest of the runner (SPEC.md, "Not supported yet").
 ///
-/// Checked against GitHub's own runner on one workflow (`comparisons/matcher-frompath.yml`): both
+/// Checked against GitHub's own runner on one workflow (`matcher-frompath`, emitted by
+/// `comparisons/gen-workflows.sh`): both
 /// resolved a sibling, a subdirectory and a `..` path to the same three files. Worth doing because
 /// this is the one matcher property written from the documentation rather than from watching
 /// GitHub.
