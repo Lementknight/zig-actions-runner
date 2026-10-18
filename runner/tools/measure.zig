@@ -210,6 +210,50 @@ const RunOpts = struct {
 };
 
 fn cmdRun(arena: Allocator, io: std.Io, environ: *const std.process.Environ.Map, args: []const []const u8) !u8 {
+    const o = parseRunOpts(arena, args) catch |e| switch (e) {
+        error.Usage => return usage(),
+        error.BadArgs => return 2,
+        else => return e,
+    };
+
+    const seed = if (o.seed != 0) o.seed else @as(u64, @bitCast(@as(i64, @truncate(std.Io.Clock.real.now(io).toNanoseconds()))));
+    var prng: std.Random.DefaultPrng = .init(seed);
+    const rand = prng.random();
+
+    var file = try std.Io.Dir.cwd().createFile(io, o.out, .{});
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(io, &buf);
+
+    var state: TrialState = .{ .seed = seed };
+    const order = try arena.alloc(usize, o.arms.items.len);
+    for (order, 0..) |*x, k| x.* = k;
+
+    const rounds = o.warmup + o.reps;
+    std.debug.print("measure: claim {s}, {d} arms, {d} warmup + {d} rounds, seed {d}\n", .{ o.claim, o.arms.items.len, o.warmup, o.reps, seed });
+    var round: u32 = 0;
+    while (round < rounds) : (round += 1) {
+        // Interleaved, and the order inside a round is shuffled: drift cannot line up with an arm.
+        rand.shuffle(usize, order);
+        for (order) |idx| {
+            const token = try std.fmt.allocPrint(arena, "m{x}", .{rand.int(u64)});
+            for (state.tokens.items) |t| if (std.mem.eql(u8, t, token)) {
+                std.debug.print("measure: two trials got the same token ({s}); refusing to continue.\n", .{token});
+                return 1;
+            };
+            try state.tokens.append(arena, token);
+            const arm = o.arms.items[idx];
+            try runTrial(arena, io, environ, o, arm, round, token, &fw.interface, &state);
+        }
+    }
+    std.debug.print("measure: {d} samples written to {s}{s}\n", .{ rounds * o.arms.items.len, o.out, if (state.failures > 0) " (with failures above)" else "" });
+    return if (state.failures > 0) 1 else 0;
+}
+
+/// `measure run`'s arguments, parsed and checked. `error.Usage` when they do not parse (the caller
+/// prints the usage); `error.BadArgs` when they parse but break a precondition, already complained
+/// about.
+fn parseRunOpts(arena: Allocator, args: []const []const u8) !RunOpts {
     var o: RunOpts = .{};
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
@@ -221,42 +265,48 @@ fn cmdRun(arena: Allocator, io: std.Io, environ: *const std.process.Environ.Map,
                 return as[idx.*];
             }
         }.get;
-        if (std.mem.eql(u8, a, "--claim")) o.claim = next(&i, args) orelse return usage() //
-        else if (std.mem.eql(u8, a, "--quantity")) o.quantity = next(&i, args) orelse return usage() //
-        else if (std.mem.eql(u8, a, "--min-effect")) o.min_effect = std.fmt.parseFloat(f64, next(&i, args) orelse return usage()) catch return usage() //
+        if (std.mem.eql(u8, a, "--claim")) o.claim = next(&i, args) orelse return error.Usage //
+        else if (std.mem.eql(u8, a, "--quantity")) o.quantity = next(&i, args) orelse return error.Usage //
+        else if (std.mem.eql(u8, a, "--min-effect")) o.min_effect = std.fmt.parseFloat(f64, next(&i, args) orelse return error.Usage) catch return error.Usage //
         else if (std.mem.eql(u8, a, "--relative")) o.relative = true //
-        else if (std.mem.eql(u8, a, "--reps")) o.reps = std.fmt.parseInt(u32, next(&i, args) orelse return usage(), 10) catch return usage() //
-        else if (std.mem.eql(u8, a, "--warmup")) o.warmup = std.fmt.parseInt(u32, next(&i, args) orelse return usage(), 10) catch return usage() //
-        else if (std.mem.eql(u8, a, "--seed")) o.seed = std.fmt.parseInt(u64, next(&i, args) orelse return usage(), 10) catch return usage() //
-        else if (std.mem.eql(u8, a, "--out")) o.out = next(&i, args) orelse return usage() //
-        else if (std.mem.eql(u8, a, "--prepare")) o.prepare = next(&i, args) orelse return usage() //
-        else if (std.mem.eql(u8, a, "--identity")) o.identity = next(&i, args) orelse return usage() //
-        else if (std.mem.eql(u8, a, "--environment")) o.environment = next(&i, args) orelse return usage() //
-        else if (std.mem.eql(u8, a, "--control")) o.control = next(&i, args) orelse return usage() //
+        else if (std.mem.eql(u8, a, "--reps")) o.reps = std.fmt.parseInt(u32, next(&i, args) orelse return error.Usage, 10) catch return error.Usage //
+        else if (std.mem.eql(u8, a, "--warmup")) o.warmup = std.fmt.parseInt(u32, next(&i, args) orelse return error.Usage, 10) catch return error.Usage //
+        else if (std.mem.eql(u8, a, "--seed")) o.seed = std.fmt.parseInt(u64, next(&i, args) orelse return error.Usage, 10) catch return error.Usage //
+        else if (std.mem.eql(u8, a, "--out")) o.out = next(&i, args) orelse return error.Usage //
+        else if (std.mem.eql(u8, a, "--prepare")) o.prepare = next(&i, args) orelse return error.Usage //
+        else if (std.mem.eql(u8, a, "--identity")) o.identity = next(&i, args) orelse return error.Usage //
+        else if (std.mem.eql(u8, a, "--environment")) o.environment = next(&i, args) orelse return error.Usage //
+        else if (std.mem.eql(u8, a, "--control")) o.control = next(&i, args) orelse return error.Usage //
         else if (std.mem.eql(u8, a, "--arm")) {
-            const spec = next(&i, args) orelse return usage();
+            const spec = next(&i, args) orelse return error.Usage;
             const eq = std.mem.indexOfScalar(u8, spec, '=') orelse {
                 std.debug.print("measure: --arm wants 'name=command', got '{s}'\n", .{spec});
-                return 2;
+                return error.BadArgs;
             };
             try o.arms.append(arena, .{ .name = spec[0..eq], .command = spec[eq + 1 ..] });
         } else {
             std.debug.print("measure: unknown argument '{s}'\n", .{a});
-            return usage();
+            return error.Usage;
         }
     }
+    if (!runOptsValid(o)) return error.BadArgs;
+    return o;
+}
+
+/// The protocol's preconditions on a run, each with its own complaint (MEASURE.md §3.2).
+fn runOptsValid(o: RunOpts) bool {
     // The criterion comes first, or there is no experiment (§3.2.1).
     if (o.min_effect == null) {
         std.debug.print("measure: --min-effect is required: say what would refute the claim first.\n", .{});
-        return 2;
+        return false;
     }
     if (o.arms.items.len < 2) {
         std.debug.print("measure: at least two arms, one of them a baseline.\n", .{});
-        return 2;
+        return false;
     }
     if (o.out.len == 0) {
         std.debug.print("measure: --out is required: every sample is kept.\n", .{});
-        return 2;
+        return false;
     }
     if (o.control) |c| {
         var found = false;
@@ -265,108 +315,102 @@ fn cmdRun(arena: Allocator, io: std.Io, environ: *const std.process.Environ.Map,
         };
         if (!found) {
             std.debug.print("measure: --control '{s}' is not one of the arms.\n", .{c});
-            return 2;
+            return false;
         }
     } else std.debug.print("measure: warning: no --control, so nothing in this suite has a known answer (§3.2.2).\n", .{});
+    return true;
+}
 
-    const seed = if (o.seed != 0) o.seed else @as(u64, @bitCast(@as(i64, @truncate(std.Io.Clock.real.now(io).toNanoseconds()))));
-    var prng: std.Random.DefaultPrng = .init(seed);
-    const rand = prng.random();
+/// What carries across the trials of one run: every token handed out (they must all differ), the
+/// last identity (it must advance), the seed written with each sample, and how many trials failed.
+const TrialState = struct {
+    seed: u64,
+    tokens: std.ArrayList([]const u8) = .empty,
+    last_identity: ?[]const u8 = null,
+    failures: usize = 0,
+};
 
-    var file = try std.Io.Dir.cwd().createFile(io, o.out, .{});
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var fw = file.writer(io, &buf);
+/// Never swallow output (MEASURE.md §3.3): a failed trial's command, stdout and stderr, whole.
+fn reportTrialFailure(arm: Arm, round: u32, res: Run, no_reading: bool) void {
+    std.debug.print(
+        \\measure: {s} round {d} failed (exit {d}{s})
+        \\  command: {s}
+        \\  stdout: {s}
+        \\  stderr: {s}
+        \\
+    , .{ arm.name, round, res.code, if (no_reading) ", no `MEASURE <n>` line" else "", arm.command, res.stdout, res.stderr });
+}
 
-    var tokens: std.ArrayList([]const u8) = .empty;
-    var last_identity: ?[]const u8 = null;
-    var failures: usize = 0;
-
-    const order = try arena.alloc(usize, o.arms.items.len);
-    for (order, 0..) |*x, k| x.* = k;
-
-    const rounds = o.warmup + o.reps;
-    std.debug.print("measure: claim {s}, {d} arms, {d} warmup + {d} rounds, seed {d}\n", .{ o.claim, o.arms.items.len, o.warmup, o.reps, seed });
-    var round: u32 = 0;
-    while (round < rounds) : (round += 1) {
-        // Interleaved, and the order inside a round is shuffled: drift cannot line up with an arm.
-        rand.shuffle(usize, order);
-        for (order) |idx| {
-            const arm = o.arms.items[idx];
-            const token = try std.fmt.allocPrint(arena, "m{x}", .{rand.int(u64)});
-            for (tokens.items) |t| if (std.mem.eql(u8, t, token)) {
-                std.debug.print("measure: two trials got the same token ({s}); refusing to continue.\n", .{token});
-                return 1;
-            };
-            try tokens.append(arena, token);
-
-            if (o.prepare) |p| {
-                const pr = try shell(arena, io, environ, p, token);
-                if (pr.code != 0) {
-                    std.debug.print("measure: --prepare failed ({d}) before {s} round {d}\n{s}{s}\n", .{ pr.code, arm.name, round, pr.stdout, pr.stderr });
-                    failures += 1;
-                    continue;
-                }
-            }
-
-            const started = std.Io.Clock.awake.now(io).toMilliseconds();
-            const res = try shell(arena, io, environ, arm.command, token);
-            const ended = std.Io.Clock.awake.now(io).toMilliseconds();
-
-            const value = parseReading(res.stdout);
-            var failed = res.code != 0 or value == null;
-            if (failed) {
-                failures += 1;
-                std.debug.print(
-                    \\measure: {s} round {d} failed (exit {d}{s})
-                    \\  command: {s}
-                    \\  stdout: {s}
-                    \\  stderr: {s}
-                    \\
-                , .{ arm.name, round, res.code, if (value == null) ", no `MEASURE <n>` line" else "", arm.command, res.stdout, res.stderr });
-            }
-
-            var identity: ?[]const u8 = null;
-            if (o.identity) |idc| {
-                const ir = try shell(arena, io, environ, idc, token);
-                const got = std.mem.trim(u8, ir.stdout, " \n\r\t");
-                identity = try arena.dupe(u8, got);
-                if (last_identity) |prev| if (std.mem.eql(u8, prev, got)) {
-                    std.debug.print("measure: {s} round {d}: identity did not advance ('{s}'): a stale reading.\n", .{ arm.name, round, got });
-                    failed = true;
-                    failures += 1;
-                };
-                last_identity = identity;
-            }
-
-            var environment: ?[]const u8 = null;
-            if (o.environment) |ec| {
-                const er = try shell(arena, io, environ, ec, token);
-                environment = try arena.dupe(u8, std.mem.trim(u8, er.stdout, " \n\r\t"));
-            }
-
-            try writeSample(arena, &fw.interface, .{
-                .claim = o.claim,
-                .quantity = o.quantity,
-                .arm = arm.name,
-                .round = round,
-                .warmup = round < o.warmup,
-                .value = if (failed) null else value,
-                .started_ms = started,
-                .ended_ms = ended,
-                .token = token,
-                .identity = identity,
-                .exit_code = res.code,
-                .failed = failed,
-                .environment = environment,
-                .seed = seed,
-            });
-            try fw.interface.flush();
-            std.debug.print("  round {d} {s}: {?d:.3} ({d} ms){s}\n", .{ round, arm.name, value, ended - started, if (round < o.warmup) " [warmup, excluded]" else "" });
+/// One trial: `--prepare`, the arm's command timed, its `MEASURE <n>` read, `--identity` checked
+/// against the previous trial's, `--environment` captured, and one JSON line written and flushed.
+fn runTrial(
+    arena: Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    o: RunOpts,
+    arm: Arm,
+    round: u32,
+    token: []const u8,
+    w: *std.Io.Writer,
+    state: *TrialState,
+) !void {
+    if (o.prepare) |p| {
+        const pr = try shell(arena, io, environ, p, token);
+        if (pr.code != 0) {
+            std.debug.print("measure: --prepare failed ({d}) before {s} round {d}\n{s}{s}\n", .{ pr.code, arm.name, round, pr.stdout, pr.stderr });
+            state.failures += 1;
+            return;
         }
     }
-    std.debug.print("measure: {d} samples written to {s}{s}\n", .{ rounds * o.arms.items.len, o.out, if (failures > 0) " (with failures above)" else "" });
-    return if (failures > 0) 1 else 0;
+
+    const started = std.Io.Clock.awake.now(io).toMilliseconds();
+    const res = try shell(arena, io, environ, arm.command, token);
+    const ended = std.Io.Clock.awake.now(io).toMilliseconds();
+
+    const value = parseReading(res.stdout);
+    var failed = res.code != 0 or value == null;
+    if (failed) {
+        state.failures += 1;
+        reportTrialFailure(arm, round, res, value == null);
+    }
+
+    var identity: ?[]const u8 = null;
+    if (o.identity) |idc| {
+        const ir = try shell(arena, io, environ, idc, token);
+        const got = std.mem.trim(u8, ir.stdout, " \n\r\t");
+        identity = try arena.dupe(u8, got);
+        if (state.last_identity) |prev| if (std.mem.eql(u8, prev, got)) {
+            std.debug.print("measure: {s} round {d}: identity did not advance ('{s}'): a stale reading.\n", .{ arm.name, round, got });
+            failed = true;
+            state.failures += 1;
+        };
+        state.last_identity = identity;
+    }
+
+    var environment: ?[]const u8 = null;
+    if (o.environment) |ec| {
+        const er = try shell(arena, io, environ, ec, token);
+        environment = try arena.dupe(u8, std.mem.trim(u8, er.stdout, " \n\r\t"));
+    }
+
+    try writeSample(arena, w, .{
+        .claim = o.claim,
+        .quantity = o.quantity,
+        .arm = arm.name,
+        .round = round,
+        .warmup = round < o.warmup,
+        .value = if (failed) null else value,
+        .started_ms = started,
+        .ended_ms = ended,
+        .token = token,
+        .identity = identity,
+        .exit_code = res.code,
+        .failed = failed,
+        .environment = environment,
+        .seed = state.seed,
+    });
+    try w.flush();
+    std.debug.print("  round {d} {s}: {?d:.3} ({d} ms){s}\n", .{ round, arm.name, value, ended - started, if (round < o.warmup) " [warmup, excluded]" else "" });
 }
 
 const Run = struct { code: u8, stdout: []const u8, stderr: []const u8 };
