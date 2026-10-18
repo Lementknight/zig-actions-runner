@@ -2490,6 +2490,215 @@ fn logCheckoutHeader(
     sh.append(num, "##[endgroup]");
 }
 
+/// One step of the job: its condition, env and timeout evaluated, then run as a script, a checkout,
+/// an action or an image, and recorded. Null means the loop moves to the next step — the step ran,
+/// was skipped, or was failed and recorded; a Result means the engine failed and the job is over.
+fn runStep(
+    x: *Exec,
+    watch: *Watch,
+    cancel: ?*Cancel,
+    results: []StepResult,
+    step: job_mod.Step,
+    res: *StepResult,
+    num: u32,
+) !?Result {
+    const ev = x.ev;
+    const arena = x.arena;
+    res.name = step.name;
+    if (cancel) |c| if (c.requested.load(.acquire)) {
+        ev.cancelled = true;
+    };
+    // 1. The condition, with the job env visible.
+    const sc0 = try stepCondition(x, step, res, num) orelse return null;
+
+    // 2. Step env and continue-on-error, then the step's own inputs.
+    const step_env = ev.renderEnv(step.env, sc0) catch {
+        const msg = try std.fmt.allocPrint(arena, "could not evaluate env: {s}", .{ev.diag});
+        try failStep(ev, x.sh, x.observer, step, res, num, msg, false);
+        return null;
+    };
+    const sc1 = try ev.scope(step_env);
+    const coe = std.mem.eql(u8, ev.render(step.continue_on_error, sc1) catch "false", "true");
+    res.continued = coe;
+    const timeout: ?[]const u8 = if (step.timeout_minutes) |t| (ev.render(t, sc1) catch null) else null;
+    const timeout_ms = timeoutMs(timeout);
+
+    // Env that carries a secret goes in as a Dagger secret, the rest in the script.
+    var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+    var secret: std.ArrayList(SecretRef) = .empty;
+    splitEnv(arena, x.transport, x.job.*, &x.secret_counter, step_env, &plain, &secret, &x.err_msg) catch {
+        const msg = try std.fmt.allocPrint(arena, "Dagger could not register a secret: {s}", .{x.err_msg});
+        try failStep(ev, x.sh, x.observer, step, res, num, msg, coe);
+        return null;
+    };
+
+    var resolved: Resolved = undefined;
+    var mount_buf: [1]Mount = undefined;
+    var mounts: []const Mount = &.{};
+    switch (step.action) {
+        .unsupported => |why| {
+            try failStep(ev, x.sh, x.observer, step, res, num, why, coe);
+            return null;
+        },
+        .script => |sc| {
+            resolved = try prepareScript(x, step, res, num, coe, sc1, step_env, plain.items, sc) orelse return null;
+        },
+        .checkout => |inputs| {
+            const f = try prepareCheckout(x, step, res, num, coe, sc1, step_env, inputs) orelse return null;
+            resolved = .{ .checkout = f };
+            mount_buf[0] = .{ .dir = .{ .path = f.mount, .id = f.result.dir, .owner = x.dir_owner } };
+            mounts = &mount_buf;
+        },
+        .uses, .docker => {
+            const how = StepRun{ .coe = coe, .timeout = timeout, .timeout_ms = timeout_ms, .scope = sc1 };
+            return runActionStep(x, watch, results, step, res, num, how, plain.items, secret.items);
+        },
+    }
+    const how = StepRun{ .coe = coe, .timeout = timeout, .timeout_ms = timeout_ms, .scope = sc1 };
+    return runResolvedStep(x, watch, results, step, res, num, how, resolved, mounts, secret.items);
+}
+
+/// What a step runs under once its env is evaluated: continue-on-error, its timeout as written and
+/// in milliseconds (0 for none), and the scope its expressions see.
+const StepRun = struct {
+    coe: bool,
+    timeout: ?[]const u8,
+    timeout_ms: i64,
+    scope: expr.Scope,
+};
+
+/// `timeout-minutes` as written, in milliseconds; 0 when absent, unparsable or not positive.
+fn timeoutMs(timeout: ?[]const u8) i64 {
+    const t = timeout orelse return 0;
+    const minutes = std.fmt.parseFloat(f64, std.mem.trim(u8, t, " ")) catch return 0;
+    return if (minutes > 0) @intFromFloat(minutes * 60_000) else 0;
+}
+
+/// The step's name and condition, evaluated with the job env visible. Returns the scope the rest of
+/// the step is evaluated in, or null when the step was skipped or could not be evaluated — in both
+/// cases it has been recorded and the loop moves on.
+fn stepCondition(x: *Exec, step: job_mod.Step, res: *StepResult, num: u32) !?expr.Scope {
+    const ev = x.ev;
+    const arena = x.arena;
+    ev.diag = "";
+    const sc0 = try ev.scope(&.{});
+    if (step.name_expr) |ne| res.name = expr.evalString(arena, ne, sc0) catch step.name;
+    const should_run = expr.evalCondition(arena, step.condition, sc0) catch {
+        const msg = try std.fmt.allocPrint(arena, "could not evaluate the condition '{s}': {s}", .{ step.condition, ev.diag });
+        try failStep(ev, x.sh, x.observer, step, res, num, msg, false);
+        return null;
+    };
+    if (!should_run) {
+        res.outcome = .skipped;
+        try ev.record(step, .skipped, false, &.{});
+        if (x.observer) |o| o.finished(num, res.*);
+        return null;
+    }
+    return sc0;
+}
+
+/// A `uses:` action or a `docker://` image step: timed, watched for its timeout, and recorded.
+fn runActionStep(
+    x: *Exec,
+    watch: *Watch,
+    results: []StepResult,
+    step: job_mod.Step,
+    res: *StepResult,
+    num: u32,
+    how: StepRun,
+    plain: []const job_mod.EnvVar,
+    secret: []const SecretRef,
+) !?Result {
+    res.started_ms = std.Io.Clock.real.now(x.io).toMilliseconds();
+    if (x.observer) |o| o.started(num, res.name, res.started_ms);
+    watch.begin(if (how.timeout_ms > 0) res.started_ms + how.timeout_ms else 0);
+    const ran = switch (step.action) {
+        .uses => |u| x.runAction(num, u, how.scope, plain, secret, false),
+        .docker => |d| x.runImageStep(num, d, how.scope, plain, secret),
+        else => unreachable,
+    };
+    const intr = watch.end();
+    const out = ran catch |e| switch (e) {
+        error.EngineFailed => if (intr != .none) {
+            try stepInterrupted(x.ev, x.sh, x.observer, step, res, num, how.coe, intr, how.timeout orelse "");
+            return null;
+        } else return try engineFailed(x, x.observer, res, num, how.coe, results),
+        else => return e,
+    };
+    try recordOutcome(x, step, res, num, how.coe, if (out.failed) .failure else .success, out.exit_code, out.outputs);
+    return null;
+}
+
+/// A script or a checkout, resolved, run through `execScript`: timed, watched for its timeout, and
+/// recorded. A checkout also queues its post step, as actions/checkout has one.
+fn runResolvedStep(
+    x: *Exec,
+    watch: *Watch,
+    results: []StepResult,
+    step: job_mod.Step,
+    res: *StepResult,
+    num: u32,
+    how: StepRun,
+    resolved: Resolved,
+    mounts: []const Mount,
+    secret: []const SecretRef,
+) !?Result {
+    res.started_ms = std.Io.Clock.real.now(x.io).toMilliseconds();
+    if (x.observer) |o| o.started(num, res.name, res.started_ms);
+    watch.begin(if (how.timeout_ms > 0) res.started_ms + how.timeout_ms else 0);
+    const name = if (step.context_name.len > 0) step.context_name else step.id;
+    const ran = x.execScript(num, num, resolved, name, secret, mounts);
+    const intr = watch.end();
+    const out = ran catch |e| switch (e) {
+        error.EngineFailed => if (intr != .none) {
+            try stepInterrupted(x.ev, x.sh, x.observer, step, res, num, how.coe, intr, how.timeout orelse "");
+            return null;
+        } else return try engineFailed(x, x.observer, res, num, how.coe, results),
+        else => return e,
+    };
+    if (resolved == .run and out.code != 0) logExitCode(x.sh, num, out.code);
+    // As actions/checkout, a post step once the checkout ran (see `Post.checkout`).
+    if (resolved == .checkout) try appendCheckoutPost(x, num, res.name);
+    try recordOutcome(x, step, res, num, how.coe, if (out.code == 0) .success else .failure, out.code, out.outputs);
+    return null;
+}
+
+/// What every step ends with: its times and outcome on the result, the evaluator told, the job
+/// marked failed unless the step continues on error, and the observer told it finished.
+fn recordOutcome(
+    x: *Exec,
+    step: job_mod.Step,
+    res: *StepResult,
+    num: u32,
+    coe: bool,
+    outcome: Outcome,
+    exit_code: i32,
+    outputs: []const job_mod.EnvVar,
+) !void {
+    res.completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds();
+    res.outcome = outcome;
+    res.exit_code = exit_code;
+    try x.ev.record(step, res.outcome, coe, outputs);
+    if (res.outcome == .failure and !coe) x.ev.job_failed = true;
+    if (x.observer) |o| o.finished(num, res.*);
+}
+
+fn appendCheckoutPost(x: *Exec, num: u32, name: []const u8) !void {
+    try x.posts.append(x.arena, .{
+        .num = num,
+        .name = try std.fmt.allocPrint(x.arena, "Post {s}", .{name}),
+        .act = undefined,
+        .u = undefined,
+        .script = "",
+        .condition = "always()",
+        .inputs = &.{},
+        .step_env = &.{},
+        .step_secret = &.{},
+        .state = &.{},
+        .checkout = true,
+    });
+}
+
 fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *Shared, results: []StepResult, transport: Transport) !Result {
     var ev = try Evaluator.init(arena, &job);
     ev.runner_name = opts.runner_name;
@@ -2649,126 +2858,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     };
 
     for (job.steps, results, 1..) |step, *res, n| {
-        const num: u32 = @intCast(n);
-        res.name = step.name;
-        if (opts.cancel) |c| if (c.requested.load(.acquire)) {
-            ev.cancelled = true;
-        };
-
-        // 1. The condition, with the job env visible.
-        ev.diag = "";
-        const sc0 = try ev.scope(&.{});
-        if (step.name_expr) |ne| res.name = expr.evalString(arena, ne, sc0) catch step.name;
-        const should_run = expr.evalCondition(arena, step.condition, sc0) catch {
-            try failStep(&ev, sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the condition '{s}': {s}", .{ step.condition, ev.diag }), false);
-            continue;
-        };
-        if (!should_run) {
-            res.outcome = .skipped;
-            try ev.record(step, .skipped, false, &.{});
-            if (opts.observer) |o| o.finished(num, res.*);
-            continue;
-        }
-
-        // 2. Step env and continue-on-error, then the step's own inputs.
-        const step_env = ev.renderEnv(step.env, sc0) catch {
-            try failStep(&ev, sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate env: {s}", .{ev.diag}), false);
-            continue;
-        };
-        const sc1 = try ev.scope(step_env);
-        const coe = std.mem.eql(u8, ev.render(step.continue_on_error, sc1) catch "false", "true");
-        res.continued = coe;
-        const timeout: ?[]const u8 = if (step.timeout_minutes) |t| (ev.render(t, sc1) catch null) else null;
-        const timeout_ms: i64 = if (timeout) |t| ms: {
-            const minutes = std.fmt.parseFloat(f64, std.mem.trim(u8, t, " ")) catch break :ms 0;
-            break :ms if (minutes > 0) @intFromFloat(minutes * 60_000) else 0;
-        } else 0;
-
-        // Env that carries a secret goes in as a Dagger secret, the rest in the script.
-        var plain_step_env: std.ArrayList(job_mod.EnvVar) = .empty;
-        var secret_step_env: std.ArrayList(SecretRef) = .empty;
-        splitEnv(arena, transport, job, &x.secret_counter, step_env, &plain_step_env, &secret_step_env, &x.err_msg) catch {
-            try failStep(&ev, sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "Dagger could not register a secret: {s}", .{x.err_msg}), coe);
-            continue;
-        };
-
-        var resolved: Resolved = undefined;
-        var mount_buf: [1]Mount = undefined;
-        var mounts: []const Mount = &.{};
-        switch (step.action) {
-            .unsupported => |why| {
-                try failStep(&ev, sh, opts.observer, step, res, num, why, coe);
-                continue;
-            },
-            .script => |sc| {
-                resolved = try prepareScript(&x, step, res, num, coe, sc1, step_env, plain_step_env.items, sc) orelse continue;
-            },
-            .checkout => |inputs| {
-                const f = try prepareCheckout(&x, step, res, num, coe, sc1, step_env, inputs) orelse continue;
-                resolved = .{ .checkout = f };
-                mount_buf[0] = .{ .dir = .{ .path = f.mount, .id = f.result.dir, .owner = x.dir_owner } };
-                mounts = &mount_buf;
-            },
-            .uses, .docker => {
-                res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
-                if (opts.observer) |o| o.started(num, res.name, res.started_ms);
-                watch.begin(if (timeout_ms > 0) res.started_ms + timeout_ms else 0);
-                const ran = switch (step.action) {
-                    .uses => |u| x.runAction(num, u, sc1, plain_step_env.items, secret_step_env.items, false),
-                    .docker => |d| x.runImageStep(num, d, sc1, plain_step_env.items, secret_step_env.items),
-                    else => unreachable,
-                };
-                const intr = watch.end();
-                const out = ran catch |e| switch (e) {
-                    error.EngineFailed => if (intr != .none) {
-                        try stepInterrupted(&ev, sh, opts.observer, step, res, num, coe, intr, timeout orelse "");
-                        continue;
-                    } else return engineFailed(&x, opts.observer, res, num, coe, results),
-                    else => return e,
-                };
-                res.completed_ms = std.Io.Clock.real.now(io).toMilliseconds();
-                res.outcome = if (out.failed) .failure else .success;
-                res.exit_code = out.exit_code;
-                try ev.record(step, res.outcome, coe, out.outputs);
-                if (res.outcome == .failure and !coe) ev.job_failed = true;
-                if (opts.observer) |o| o.finished(num, res.*);
-                continue;
-            },
-        }
-
-        res.started_ms = std.Io.Clock.real.now(io).toMilliseconds();
-        if (opts.observer) |o| o.started(num, res.name, res.started_ms);
-        watch.begin(if (timeout_ms > 0) res.started_ms + timeout_ms else 0);
-        const ran = x.execScript(num, num, resolved, if (step.context_name.len > 0) step.context_name else step.id, secret_step_env.items, mounts);
-        const intr = watch.end();
-        const out = ran catch |e| switch (e) {
-            error.EngineFailed => if (intr != .none) {
-                try stepInterrupted(&ev, sh, opts.observer, step, res, num, coe, intr, timeout orelse "");
-                continue;
-            } else return engineFailed(&x, opts.observer, res, num, coe, results),
-            else => return e,
-        };
-        if (resolved == .run and out.code != 0) logExitCode(sh, num, out.code);
-        // As actions/checkout, a post step once the checkout ran (see `Post.checkout`).
-        if (resolved == .checkout) try x.posts.append(arena, .{
-            .num = num,
-            .name = try std.fmt.allocPrint(arena, "Post {s}", .{res.name}),
-            .act = undefined,
-            .u = undefined,
-            .script = "",
-            .condition = "always()",
-            .inputs = &.{},
-            .step_env = &.{},
-            .step_secret = &.{},
-            .state = &.{},
-            .checkout = true,
-        });
-        res.completed_ms = std.Io.Clock.real.now(io).toMilliseconds();
-        res.exit_code = out.code;
-        res.outcome = if (out.code == 0) .success else .failure;
-        try ev.record(step, res.outcome, coe, out.outputs);
-        if (res.outcome == .failure and !coe) ev.job_failed = true;
-        if (opts.observer) |o| o.finished(num, res.*);
+        if (try runStep(&x, &watch, opts.cancel, results, step, res, @intCast(n))) |finished| return finished;
     }
     // Then their `post` scripts, last first, and the services.
     const stopping = job.services.len > 0 or job.container != null;
