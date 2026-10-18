@@ -13,14 +13,35 @@ const Allocator = std.mem.Allocator;
 
 pub fn run(arena: Allocator, io: std.Io, cfg: *const Config, name: []const u8, out: *std.Io.Writer) !u8 {
     broker.trace = true;
+    const jit = (try registerAndShow(arena, io, cfg, name, out)) orelse return 2;
+    defer cleanup(arena, io, cfg, jit.runner_id, out);
+    const token = (try exchangeToken(arena, io, jit, out)) orelse return 2;
+
+    const settings = try broker.parseSettings(arena, jit.files);
+    const base = try std.fmt.allocPrint(arena, "{s}{s}", .{ settings.broker_url, if (std.mem.endsWith(u8, settings.broker_url, "/")) "" else "/" });
+    const sid = (try openSession(arena, io, settings, base, token, out)) orelse return 0;
+    try pollForMessage(arena, io, out, base, sid, token);
+    const q = try std.fmt.allocPrint(arena, "{s}session?sessionId={s}", .{ base, sid });
+    const d = try broker.call(arena, io, .DELETE, q, token, null);
+    try out.print("DELETE session -> HTTP {d}\n", .{@backingInt(d.status)});
+    return 0;
+}
+
+/// Registers a runner with a JIT config and shows the shape of each file it came with (values only
+/// for `.runner`, which holds no credentials). Null, after saying why, when registration failed.
+fn registerAndShow(
+    arena: Allocator,
+    io: std.Io,
+    cfg: *const Config,
+    name: []const u8,
+    out: *std.Io.Writer,
+) !?jitconfig.Jit {
     var status: std.http.Status = .ok;
     var message: []const u8 = "";
     const jit = jitconfig.generate(arena, io, cfg, name, &status, &message) catch |e| {
         try out.print("generate-jitconfig failed: {s} (HTTP {d})\n", .{ @errorName(e), @backingInt(status) });
-        return 2;
+        return null;
     };
-    defer cleanup(arena, io, cfg, jit.runner_id, out);
-
     try out.print("registered runner '{s}' id={d}, {d} files\n", .{ jit.runner_name, jit.runner_id, jit.files.len });
     for (jit.files) |f| {
         try out.print("\n== {s} ({d} bytes)\n", .{ f.name, f.content.len });
@@ -31,24 +52,46 @@ pub fn run(arena: Allocator, io: std.Io, cfg: *const Config, name: []const u8, o
         };
         try shape(out, parsed, 1, show_values);
     }
+    return jit;
+}
 
+/// The credentials from the JIT files, a JWT from them, and the OAuth access token it buys. Null,
+/// after saying why, when any of that failed.
+fn exchangeToken(
+    arena: Allocator,
+    io: std.Io,
+    jit: jitconfig.Jit,
+    out: *std.Io.Writer,
+) !?[]const u8 {
     const creds = auth.parseCredentials(arena, jit.files) catch |e| {
         try out.print("\nparseCredentials failed: {s}\n", .{@errorName(e)});
-        return 2;
+        return null;
     };
     var jti: [8]u8 = undefined;
     io.random(&jti);
     const jti_hex = try std.fmt.allocPrint(arena, "{x}", .{jti});
     const now = std.Io.Clock.real.now(io).toSeconds();
     const jwt = try auth.buildJwt(arena, creds, now, jti_hex);
+    var status: std.http.Status = .ok;
     const token = auth.fetchAccessToken(arena, io, creds, jwt, &status) catch |e| {
         try out.print("\nOAuth token exchange failed: {s} (HTTP {d})\n", .{ @errorName(e), @backingInt(status) });
-        return 2;
+        return null;
     };
     try out.print("\nOAuth token exchange: HTTP {d}, access_token {d} chars\n", .{ @backingInt(status), token.len });
+    return token;
+}
 
-    const settings = try broker.parseSettings(arena, jit.files);
-    const base = try std.fmt.allocPrint(arena, "{s}{s}", .{ settings.broker_url, if (std.mem.endsWith(u8, settings.broker_url, "/")) "" else "/" });
+/// POSTs a broker session and shows its shape (a session response can carry an encryption key, so
+/// shape only). The session id when GitHub gave one; null when it did not, with the error body
+/// shown (error bodies are small and carry no credentials).
+fn openSession(
+    arena: Allocator,
+    io: std.Io,
+    settings: broker.Settings,
+    base: []const u8,
+    token: []const u8,
+    out: *std.Io.Writer,
+) !?[]const u8 {
     const body = try broker.sessionBody(arena, settings, "zig-inspect");
     const url = try std.fmt.allocPrint(arena, "{s}session", .{base});
     try out.print("\nPOST session ... (body {d} bytes)\n", .{body.len});
@@ -56,50 +99,68 @@ pub fn run(arena: Allocator, io: std.Io, cfg: *const Config, name: []const u8, o
     const resp = try broker.call(arena, io, .POST, url, token, body);
     try out.print("\nPOST session -> HTTP {d}\n", .{@backingInt(resp.status)});
     const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, resp.body, .{}) catch null;
-    if (resp.status.class() == .success) {
-        // Session responses can carry an encryption key: shape only.
-        if (parsed) |v| try shape(out, v, 1, false) else try out.print("  (non-JSON, {d} bytes)\n", .{resp.body.len});
-        if (parsed) |v| if (v == .object) if (v.object.get("sessionId")) |sid| if (sid == .string) {
-            // Poll until a message arrives (up to ~5 min). Message bodies can hold tokens: shape only.
-            var polls: usize = 0;
-            while (polls < 6) : (polls += 1) {
-                try out.print("GET message (poll {d}, long-poll ~50s) ...\n", .{polls + 1});
-                try out.flush();
-                const m = try broker.call(arena, io, .GET, try broker.messageUrl(arena, base, sid.string, "Online"), token, null);
-                try out.print("GET message -> HTTP {d}, {d} body bytes\n", .{ @backingInt(m.status), m.body.len });
-                if (m.status.class() != .success) {
-                    try out.print("  error body: {s}\n", .{m.body[0..@min(m.body.len, 400)]});
-                    break;
-                }
-                if (m.body.len == 0) continue;
-                const mv = std.json.parseFromSliceLeaky(std.json.Value, arena, m.body, .{}) catch {
-                    try out.writeAll("  (non-JSON body)\n");
-                    break;
-                };
-                try shape(out, mv, 1, false);
-                // v2 job requests nest another JSON document in `body`.
-                if (mv == .object) if (mv.object.get("body")) |bv| if (bv == .string) {
-                    if (std.json.parseFromSliceLeaky(std.json.Value, arena, bv.string, .{}) catch null) |inner| {
-                        try out.writeAll("  body (parsed):\n");
-                        try shape(out, inner, 2, false);
-                        if (inner == .object) if (inner.object.get("run_service_url")) |u| if (u == .string)
-                            try out.print("  run_service_url host: {s}\n", .{hostOnly(u.string)});
-                        try probeRunService(arena, io, out, token, bv.string);
-                    } else try out.writeAll("  body is not JSON\n");
-                };
-                if (mv == .object) for ([_][]const u8{ "messageType", "MessageType" }) |k| if (mv.object.get(k)) |t| if (t == .string)
-                    try out.print("  message type: {s}\n", .{t.string});
-                break;
-            }
-            const q = try std.fmt.allocPrint(arena, "{s}session?sessionId={s}", .{ base, sid.string });
-            const d = try broker.call(arena, io, .DELETE, q, token, null);
-            try out.print("DELETE session -> HTTP {d}\n", .{@backingInt(d.status)});
-        };
-    } else {
-        // Error bodies are small and carry no credentials.
+    if (resp.status.class() != .success) {
         try out.print("  body: {s}\n", .{resp.body[0..@min(resp.body.len, 600)]});
+        return null;
     }
-    return 0;
+    if (parsed) |v| try shape(out, v, 1, false) else try out.print("  (non-JSON, {d} bytes)\n", .{resp.body.len});
+    const v = parsed orelse return null;
+    if (v != .object) return null;
+    const sid = v.object.get("sessionId") orelse return null;
+    return if (sid == .string) sid.string else null;
+}
+
+/// Long-polls for a message, up to ~5 minutes, and shows the first one that arrives (message
+/// bodies can hold tokens: shape only). Stops on an error, a non-JSON body, or the first message.
+fn pollForMessage(
+    arena: Allocator,
+    io: std.Io,
+    out: *std.Io.Writer,
+    base: []const u8,
+    sid: []const u8,
+    token: []const u8,
+) !void {
+    var polls: usize = 0;
+    while (polls < 6) : (polls += 1) {
+        try out.print("GET message (poll {d}, long-poll ~50s) ...\n", .{polls + 1});
+        try out.flush();
+        const m = try broker.call(arena, io, .GET, try broker.messageUrl(arena, base, sid, "Online"), token, null);
+        try out.print("GET message -> HTTP {d}, {d} body bytes\n", .{ @backingInt(m.status), m.body.len });
+        if (m.status.class() != .success) {
+            try out.print("  error body: {s}\n", .{m.body[0..@min(m.body.len, 400)]});
+            return;
+        }
+        if (m.body.len == 0) continue;
+        const mv = std.json.parseFromSliceLeaky(std.json.Value, arena, m.body, .{}) catch {
+            try out.writeAll("  (non-JSON body)\n");
+            return;
+        };
+        try showMessage(arena, io, out, token, mv);
+        return;
+    }
+}
+
+/// A broker message's shape, and for a v2 job request — which nests another JSON document in
+/// `body` — that document's shape, its run service host, and a probe of that service.
+fn showMessage(
+    arena: Allocator,
+    io: std.Io,
+    out: *std.Io.Writer,
+    token: []const u8,
+    mv: std.json.Value,
+) !void {
+    try shape(out, mv, 1, false);
+    if (mv == .object) if (mv.object.get("body")) |bv| if (bv == .string) {
+        if (std.json.parseFromSliceLeaky(std.json.Value, arena, bv.string, .{}) catch null) |inner| {
+            try out.writeAll("  body (parsed):\n");
+            try shape(out, inner, 2, false);
+            if (inner == .object) if (inner.object.get("run_service_url")) |u| if (u == .string)
+                try out.print("  run_service_url host: {s}\n", .{hostOnly(u.string)});
+            try probeRunService(arena, io, out, token, bv.string);
+        } else try out.writeAll("  body is not JSON\n");
+    };
+    if (mv == .object) for ([_][]const u8{ "messageType", "MessageType" }) |k| if (mv.object.get(k)) |t| if (t == .string)
+        try out.print("  message type: {s}\n", .{t.string});
 }
 
 fn cleanup(arena: Allocator, io: std.Io, cfg: *const Config, runner_id: u64, out: *std.Io.Writer) void {
