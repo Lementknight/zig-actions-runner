@@ -347,21 +347,40 @@ const Parser = struct {
     }
 
     /// A `|` or `>` scalar whose header is `header`; the body follows at more than `parent_indent`.
-    fn blockScalar(p: *Parser, header: []const u8, parent_indent: usize) Error!Node {
-        const folded = header[0] == '>';
-        var chomp: enum { clip, strip, keep } = .clip;
-        var explicit: ?usize = null;
+    const Chomp = enum { clip, strip, keep };
+
+    /// What a block scalar's header (`|`, `>-`, `|+2`, ...) says about its body.
+    const BlockHeader = struct {
+        folded: bool,
+        chomp: Chomp = .clip,
+        explicit_indent: ?usize = null,
+    };
+
+    fn blockHeader(header: []const u8) BlockHeader {
+        var h: BlockHeader = .{ .folded = header[0] == '>' };
         for (header[1..]) |c| switch (c) {
-            '-' => chomp = .strip,
-            '+' => chomp = .keep,
-            '1'...'9' => explicit = c - '0',
+            '-' => h.chomp = .strip,
+            '+' => h.chomp = .keep,
+            '1'...'9' => h.explicit_indent = c - '0',
             else => break,
         };
+        return h;
+    }
 
-        // Find where the body ends, and its indentation.
+    /// Where a block scalar's body ends, and its indentation.
+    const BlockBody = struct {
+        start: usize,
+        /// Past the last non-blank line: trailing blank lines belong to the scalar only for `keep`.
+        last: usize,
+        /// Past the trailing blank lines.
+        end: usize,
+        content_indent: ?usize,
+    };
+
+    fn blockBody(p: *Parser, parent_indent: usize, explicit_indent: ?usize) BlockBody {
         const start = p.pos;
         var end = start;
-        var content_indent: ?usize = if (explicit) |e| parent_indent + e else null;
+        var content_indent: ?usize = if (explicit_indent) |e| parent_indent + e else null;
         while (end < p.lines.len) : (end += 1) {
             const l = p.lines[end];
             if (isBlankLine(l)) continue;
@@ -371,11 +390,19 @@ const Parser = struct {
             }
             if (l.indent < content_indent.?) break;
         }
-        // Trailing blank lines belong to the scalar only for `keep`.
         var last = end;
         while (last > start and isBlankLine(p.lines[last - 1])) last -= 1;
+        return .{ .start = start, .last = last, .end = end, .content_indent = content_indent };
+    }
+
+    fn blockScalar(p: *Parser, header: []const u8, parent_indent: usize) Error!Node {
+        const h = blockHeader(header);
+        const body_span = p.blockBody(parent_indent, h.explicit_indent);
+        const start = body_span.start;
+        const last = body_span.last;
+        const end = body_span.end;
         p.pos = end;
-        const ci = content_indent orelse return .{ .string = "" };
+        const ci = body_span.content_indent orelse return .{ .string = "" };
 
         var out: std.ArrayList(u8) = .empty;
         var prev_blank = false;
@@ -386,7 +413,7 @@ const Parser = struct {
             const body = if (blank) "" else l.full[@min(ci, l.full.len)..];
             if (first) {
                 try out.appendSlice(p.arena, body);
-            } else if (!folded) {
+            } else if (!h.folded) {
                 try out.append(p.arena, '\n');
                 try out.appendSlice(p.arena, body);
             } else if (blank) {
@@ -408,7 +435,7 @@ const Parser = struct {
             prev_blank = blank;
             first = false;
         }
-        switch (chomp) {
+        switch (h.chomp) {
             .strip => {},
             .clip => if (out.items.len > 0) try out.append(p.arena, '\n'),
             .keep => {
