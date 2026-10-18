@@ -4671,7 +4671,6 @@ const Exec = struct {
     /// images without a shell work too. Null when the image could not be pulled or built (logged).
     fn runContainer(x: *Exec, num: u32, phase: Phase, dr: DockerRun, state: []const job_mod.EnvVar) !?ExecOut {
         const arena = x.arena;
-        const ev = x.ev;
         const image_line = switch (dr.image) {
             .pull => |ref| try std.fmt.allocPrint(arena, "image: {s}", .{ref}),
             .build => |b| try std.fmt.allocPrint(arena, "image: built from {s}", .{try std.fs.path.resolveAllocPosix(arena, &.{ b.context, b.dockerfile })}),
@@ -4679,8 +4678,50 @@ const Exec = struct {
         if (phase == .main) try x.logGroup(num, phase, dr.label, dr.shown, dr.step_env, dr.step_secret, &.{image_line});
         const busybox = (try x.busyboxFile(num)) orelse return null;
         const img = (try x.imageInfo(num, dr.image, dr.label)) orelse return null;
+        const argv = (try x.containerArgv(num, dr, img)) orelse return null;
+        const ws_in = try x.workspaceDirId();
+        const env = try x.containerEnv(dr, state);
+        const names = try arena.alloc([]const u8, env.secret.len);
+        for (env.secret, names) |sr, *n| n.* = sr.name;
+        // It always has the job token (ACTIONS_RUNTIME_TOKEN), so with step caching it always runs.
+        const always_run: ?[]const u8 = if (x.step_cache) try std.fmt.allocPrint(arena, "zig-runner runs this step every time: it uses secrets (run {s})", .{x.run_nonce}) else null;
+        const fc = x.next_fc;
+        x.next_fc += 1;
+        // `false`: a Docker action always runs under step caching (it gets the job token), so it is
+        // never replayed and keeps the real run-specific values.
+        const script = try containerScript(arena, num, fc, argv, env.plain, names, always_run, x.event_from_env, false, if (dr.repository.len > 0) dr.repository else dr.label);
 
-        // As `docker run [--entrypoint E] image [args]`.
+        var doc: std.Io.Writer.Allocating = .init(arena);
+        const w = &doc.writer;
+        try w.writeAll("{ loadContainerFromID(id:");
+        try std.json.Stringify.value(img.id, .{}, w);
+        try w.writeAll(") { withWorkdir(path:\"" ++ docker_workspace ++ "\") { withFile(path:\"" ++ busybox_path ++ "\",permissions:493,source:");
+        try std.json.Stringify.value(busybox, .{}, w);
+        try w.writeAll(") { ");
+        var braces: usize = 4;
+        braces += try x.writeActionDirs(w, img, ws_in);
+        braces += try x.writeActionEnv(w);
+        braces += try writeActionSecrets(arena, w, env.secret);
+        // A Docker action reaches the job's services by name, as on GitHub's container network.
+        braces += try x.writeServiceBindings(w);
+        try w.writeAll("withExec(args:");
+        try std.json.Stringify.value([_][]const u8{ busybox_path, "sh", "-c", script }, .{}, w);
+        try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
+        try w.print(" fc_all: file(path:\"{s}\") {{ contents }}", .{try fcPath(arena, "all", fc)});
+        try w.writeAll(" ws: directory(path:\"" ++ docker_workspace ++ "\") { id } home: directory(path:\"" ++ docker_home ++ "\") { id } }");
+        for (0..braces) |_| try w.writeAll(" }");
+
+        x.beginExec(num);
+        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch return error.EngineFailed;
+        const out = try x.collect(num, data);
+        try x.takeWorkspaceBack(num, data, out);
+        return out;
+    }
+
+    /// As `docker run [--entrypoint E] image [args]`: the action's entrypoint and args over the
+    /// image's. Null, with the step failed, when neither gives anything to run.
+    fn containerArgv(x: *Exec, num: u32, dr: DockerRun, img: ImageInfo) !?[]const []const u8 {
+        const arena = x.arena;
         var argv: std.ArrayList([]const u8) = .empty;
         if (dr.entrypoint) |ep| {
             try argv.append(arena, ep);
@@ -4693,19 +4734,30 @@ const Exec = struct {
             _ = try x.actionFailed(num, "{s}: the image has no entrypoint or command, and the action gives none", .{dr.label});
             return null;
         }
+        return argv.items;
+    }
 
-        const ws_in = blk: {
-            const doc = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ directory(path:{f}) {{ id }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(x.ev.workspace, .{}) });
-            const data = gql(arena, x.transport, doc, &x.err_msg) catch return error.EngineFailed;
-            break :blk jsonFindString(data, "id") orelse {
-                x.err_msg = "Dagger returned no workspace directory";
-                return error.EngineFailed;
-            };
+    /// The job's workspace as a directory id, to copy into the action's container.
+    fn workspaceDirId(x: *Exec) ![]const u8 {
+        const arena = x.arena;
+        const doc = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ directory(path:{f}) {{ id }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(x.ev.workspace, .{}) });
+        const data = gql(arena, x.transport, doc, &x.err_msg) catch return error.EngineFailed;
+        return jsonFindString(data, "id") orelse {
+            x.err_msg = "Dagger returned no workspace directory";
+            return error.EngineFailed;
         };
+    }
 
-        // The job's env (workflow, job, GITHUB_ENV), then the step's and the action's, as on GitHub.
+    /// What a Docker action's container gets in its environment, split into plain variables and
+    /// Dagger secrets.
+    const ContainerEnv = struct { plain: []const job_mod.EnvVar, secret: []const SecretRef };
+
+    /// The job's env (workflow, job, GITHUB_ENV), then the step's and the action's, then the runtime's
+    /// and the OIDC token when the job has one — as on GitHub.
+    fn containerEnv(x: *Exec, dr: DockerRun, state: []const job_mod.EnvVar) !ContainerEnv {
+        const arena = x.arena;
         var env: std.ArrayList(job_mod.EnvVar) = .empty;
-        try env.appendSlice(arena, ev.job_env.items);
+        try env.appendSlice(arena, x.ev.job_env.items);
         try env.appendSlice(arena, dr.env);
         try env.append(arena, .{ .name = "HOME", .value = docker_home });
         if (dr.repository.len > 0) {
@@ -4721,26 +4773,12 @@ const Exec = struct {
             try plain.append(arena, t.url);
             try secret.append(arena, t.token);
         }
-        const names = try arena.alloc([]const u8, secret.items.len);
-        for (secret.items, names) |sr, *n| n.* = sr.name;
-        // It always has the job token (ACTIONS_RUNTIME_TOKEN), so with step caching it always runs.
-        const always_run: ?[]const u8 = if (x.step_cache) try std.fmt.allocPrint(arena, "zig-runner runs this step every time: it uses secrets (run {s})", .{x.run_nonce}) else null;
-        const fc = x.next_fc;
-        x.next_fc += 1;
-        // `false`: a Docker action always runs under step caching (it gets the job token), so it is
-        // never replayed and keeps the real run-specific values.
-        const script = try containerScript(arena, num, fc, argv.items, plain.items, names, always_run, x.event_from_env, false, if (dr.repository.len > 0) dr.repository else dr.label);
+        return .{ .plain = plain.items, .secret = secret.items };
+    }
 
-        var doc: std.Io.Writer.Allocating = .init(arena);
-        const w = &doc.writer;
-        try w.writeAll("{ loadContainerFromID(id:");
-        try std.json.Stringify.value(img.id, .{}, w);
-        try w.writeAll(") { withWorkdir(path:\"" ++ docker_workspace ++ "\") { withFile(path:\"" ++ busybox_path ++ "\",permissions:493,source:");
-        try std.json.Stringify.value(busybox, .{}, w);
-        try w.writeAll(") { ");
-        var braces: usize = 4;
-        // The workspace, /github/home, and where file commands and the event go, owned by the image's
-        // user, which may not be root (GitHub's own example action runs as one).
+    /// The workspace, /github/home, and where file commands and the event go, owned by the image's
+    /// user, which may not be root (GitHub's own example action runs as one). How many braces opened.
+    fn writeActionDirs(x: *Exec, w: *std.Io.Writer, img: ImageInfo, ws_in: []const u8) !usize {
         const dirs = [_][2][]const u8{
             .{ docker_workspace, ws_in },
             .{ docker_home, x.docker_home orelse x.empty_dir },
@@ -4757,8 +4795,15 @@ const Exec = struct {
                 try std.json.Stringify.value(img.user, .{}, w);
             }
             try w.writeAll(") { ");
-            braces += 1;
         }
+        return dirs.len;
+    }
+
+    /// The default variables (volatile under step caching), the event payload, and the ran marker.
+    /// How many braces opened.
+    fn writeActionEnv(x: *Exec, w: *std.Io.Writer) !usize {
+        const ev = x.ev;
+        var opened: usize = 0;
         for (try ev.defaultEnv()) |e| {
             try w.writeAll(if (x.step_cache and isVolatile(e.name)) "withVolatileVariable(name:" else "withEnvVariable(name:");
             try std.json.Stringify.value(e.name, .{}, w);
@@ -4766,42 +4811,41 @@ const Exec = struct {
             // GitHub mounts the workspace at /github/workspace in a Docker action, and says so.
             try std.json.Stringify.value(if (std.mem.eql(u8, e.name, "GITHUB_WORKSPACE")) docker_workspace else e.value, .{}, w);
             try w.writeAll(") { ");
-            braces += 1;
+            opened += 1;
         }
         try w.writeAll(if (x.event_from_env) "withVolatileVariable(name:\"" ++ event_env ++ "\",value:" else "withNewFile(path:\"" ++ event_path ++ "\",contents:");
         try std.json.Stringify.value(try ev.eventJson(), .{}, w);
         try w.writeAll(") { ");
-        braces += 1;
+        opened += 1;
         if (x.step_cache) {
             try w.writeAll("withVolatileVariable(name:\"" ++ ran_env ++ "\",value:");
             try std.json.Stringify.value(x.ran_marker, .{}, w);
             try w.writeAll(") { ");
-            braces += 1;
+            opened += 1;
         }
-        for (secret.items, 0..) |sr, i| {
+        return opened;
+    }
+
+    /// Each secret as a Dagger secret variable under its alias. How many braces opened.
+    fn writeActionSecrets(arena: Allocator, w: *std.Io.Writer, secret: []const SecretRef) !usize {
+        for (secret, 0..) |sr, i| {
             try w.writeAll("withSecretVariable(name:");
             try std.json.Stringify.value(try secretAlias(arena, i), .{}, w);
             try w.writeAll(",secret:");
             try std.json.Stringify.value(sr.id, .{}, w);
             try w.writeAll(") { ");
-            braces += 1;
         }
-        // A Docker action reaches the job's services by name, as on GitHub's container network.
-        braces += try x.writeServiceBindings(w);
-        try w.writeAll("withExec(args:");
-        try std.json.Stringify.value([_][]const u8{ busybox_path, "sh", "-c", script }, .{}, w);
-        try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
-        try w.print(" fc_all: file(path:\"{s}\") {{ contents }}", .{try fcPath(arena, "all", fc)});
-        try w.writeAll(" ws: directory(path:\"" ++ docker_workspace ++ "\") { id } home: directory(path:\"" ++ docker_home ++ "\") { id } }");
-        for (0..braces) |_| try w.writeAll(" }");
+        return secret.len;
+    }
 
-        x.beginExec(num);
-        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch return error.EngineFailed;
-        const out = try x.collect(num, data);
+    /// After the action ran: /github/home kept for its next step, and the workspace as the action
+    /// left it replacing the job's — through output keys when they apply, else copied back whole,
+    /// deletions included.
+    fn takeWorkspaceBack(x: *Exec, num: u32, data: std.json.Value, out: ExecOut) !void {
+        const arena = x.arena;
         if (jsonFind(data, "home")) |h| if (jsonFindString(h, "id")) |id| {
             x.docker_home = id;
         };
-        // The workspace as the action left it replaces the job's.
         const ws_out = (if (jsonFind(data, "ws")) |d| jsonFindString(d, "id") else null) orelse {
             x.err_msg = "Dagger returned no workspace directory";
             return error.EngineFailed;
@@ -4812,7 +4856,7 @@ const Exec = struct {
             const started = std.Io.Clock.awake.now(x.io).toMilliseconds();
             if (x.countOutputKeyed(num, started, try x.outputKeyedWorkspace(num, ws_out))) |id| {
                 x.container_id = id;
-                return out;
+                return;
             }
         }
         const owner: []const u8 = if (x.dir_owner) |o| try std.fmt.allocPrint(arena, ",owner:{f}", .{std.json.fmt(o, .{})}) else "";
@@ -4822,7 +4866,6 @@ const Exec = struct {
             x.err_msg = "Dagger returned no container";
             return error.EngineFailed;
         };
-        return out;
     }
 
     /// The static busybox that starts Docker actions' commands (taken from its image once per job).
