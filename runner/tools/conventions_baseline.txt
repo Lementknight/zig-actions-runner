@@ -3,7 +3,6 @@
 # lines over 100 columns. The check fails when anything here gets worse.
 fn src/expr.zig callFunction 79
 fn src/github/broker.zig requestOnce 74
-fn src/job.zig parse 72
 fn src/yaml.zig blockScalar 71
 long-lines src/dbtest.zig 10
 long-lines src/inspect.zig 35
