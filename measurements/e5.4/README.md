@@ -64,6 +64,40 @@ before the action's entrypoint runs. For a claimed 21 s against 1–2 s that is 
 threshold is well clear of it. If the real effect turns out to be 2–3 s, this instrument cannot
 settle it and the verdict has to say so rather than round.
 
+## The first series could not see its own effect
+
+Run back to back, this workload defeats itself. The ungated series
+(`E5.4-owner-measured.jsonl`, kept) came out:
+
+```
+  root          n=8  median  8.500  (baseline)
+  user          n=8  median 12.500  difference 4.000  95% CI [-1.000, 11.500]  no_effect_found
+  root-control  n=8  median  8.000  difference -0.500  95% CI [-7.500,  5.500]  no_effect_found
+```
+
+The **negative control is what makes that readable**. Its point estimate is right (−0.5 s, near
+zero as it must be) but its interval is 13 s wide against a 5 s threshold, so the suite demonstrably
+could not see a 5 s effect and `no_effect_found` on the `user` arm says nothing about `owner:`.
+Without that arm this would have looked like a clean null result.
+
+The cause is in the per-trial environment capture, which is why §3.3 asks for it. W.5's series ran
+at a median load of **0.60**; this one at **3.35**, never below 1.89. Every trial writes 234 MB and
+the engine is still draining it when the next one starts — the experiment makes the noise it then
+cannot see through.
+
+Two lessons, both now in [MEASURE.md](../../docs/MEASURE.md) §5:
+
+- **Dimensioning off a pilot taken in a different machine state under-samples.** The pilot's first
+  trials landed while the Pi was still quiet, reported `sd 0.000` on the baseline, and asked for
+  three repetitions. Its later trials were already noisy.
+- **§3.2.4 separates the first round; that is not enough here.** A workload heavy enough to perturb
+  the machine needs the *whole series* gated on machine state, not just its start.
+
+So [`cooldown.sh`](cooldown.sh) waits for the load to fall below a threshold before every trial,
+making machine state a controlled variable. It deliberately does not drop caches — that needs root,
+and this user's sudo is narrow — and an ssh failure lets the trial run with a warning rather than
+failing it, because "I could not tell" must not be recorded as "the machine was busy".
+
 ## Cost
 
 Each trial writes 220 MB to the Pi's SD card, which [S.2–S.7](../../docs/CLAIMS.md) established as
