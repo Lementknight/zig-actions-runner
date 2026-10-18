@@ -1,0 +1,85 @@
+{
+ "plan": {
+  "planId": "p"
+ },
+ "jobId": "j",
+ "jobContainer": null,
+ "variables": {
+  "MY_SECRET": {
+   "value": "s3cr3t-value",
+   "isSecret": true
+  }
+ },
+ "resources": {
+  "endpoints": [
+   {
+    "authorization": {
+     "parameters": {
+      "AccessToken": "local-job-token"
+     }
+    }
+   }
+  ]
+ },
+ "contextData": {
+  "github": {
+   "t": 2,
+   "d": [
+    {
+     "k": "repository",
+     "v": "o/r"
+    }
+   ]
+  }
+ },
+ "steps": [
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "s1",
+   "contextName": "reg",
+   "name": "__run",
+   "condition": "success()",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "lit": "script"
+      },
+      "Value": {
+       "lit": "cat > /tmp/s.json <<'JSON'\n{\"problemMatcher\": [{\"owner\": \"stress\", \"pattern\": [{\"regexp\": \"^([^\\\\s].*)\\\\((\\\\d+),(\\\\d+)\\\\): (error|warning) ZC(\\\\d+): (.*)$\", \"file\": 1, \"line\": 2, \"column\": 3, \"severity\": 4, \"code\": 5, \"message\": 6}]}]}\nJSON\necho '::add-matcher::/tmp/s.json'\n"
+      }
+     }
+    ]
+   },
+   "displayName": "register"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "s2",
+   "contextName": "emit",
+   "name": "__run",
+   "condition": "success()",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "lit": "script"
+      },
+      "Value": {
+       "lit": "for i in $(seq 1 600); do\n  echo \"src/file$i.ts($i,$((i%80+1))): error ZC$i: a message that is reasonably long so the capture is not tiny number $i\"\n  echo \"plain line $i that should match nothing at all\"\ndone\n"
+      }
+     }
+    ]
+   },
+   "displayName": "register"
+  }
+ ]
+}

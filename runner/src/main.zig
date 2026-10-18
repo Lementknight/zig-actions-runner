@@ -37,6 +37,8 @@ comptime {
     _ = @import("expr.zig");
     _ = @import("context.zig");
     _ = @import("commands.zig");
+    _ = @import("regex.zig");
+    _ = @import("matcher.zig");
     _ = @import("pg.zig");
     _ = @import("db.zig");
     _ = @import("pgsink.zig");
@@ -203,6 +205,17 @@ fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log
     }, job, log);
     for (res.steps, job.steps, 1..) |r, st, n| {
         try err.print("step {d} [{s}] {s}: {s} (exit {d})\n", .{ n, st.name, @tagName(st.action), @tagName(r.outcome), r.exit_code });
+    }
+    // The annotations too: they are what `::error`, `::warning` and the problem matchers produce,
+    // they go to GitHub with completejob, and without them printed here there is no way to see from
+    // a local replay whether a matcher matched anything.
+    for (res.annotations) |a| {
+        try err.print("annotation {s}", .{a.an.level});
+        if (a.an.file) |f| try err.print(" {s}", .{f});
+        if (a.an.line) |l| try err.print(":{s}", .{l});
+        if (a.an.col) |c| try err.print(":{s}", .{c});
+        if (a.an.title) |t| try err.print(" [{s}]", .{t});
+        try err.print(" {s}\n", .{a.an.message});
     }
     if (res.engine_error) |m| try err.print("dagger error:\n{s}\n", .{m});
     try err.print("job {s}\n", .{if (res.succeeded) "succeeded" else "failed"});
