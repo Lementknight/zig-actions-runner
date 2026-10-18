@@ -284,6 +284,11 @@ pub const Set = struct {
 ///
 /// Only POSIX separators are handled. A matcher written for Windows paths would not resolve here,
 /// and that is consistent with the rest of the runner (SPEC.md, "Not supported yet").
+///
+/// Checked against GitHub's own runner on one workflow (`comparisons/matcher-frompath.yml`): both
+/// resolved a sibling, a subdirectory and a `..` path to the same three files. Worth doing because
+/// this is the one matcher property written from the documentation rather than from watching
+/// GitHub.
 fn resolveFile(arena: Allocator, file: ?[]const u8, from_path: ?[]const u8) ?[]const u8 {
     const f = file orelse return null;
     if (f.len == 0 or f[0] == '/') return f;
