@@ -31,6 +31,9 @@ samples either, for a different reason: its answer is a selection count, not a t
 | `S.1-runners-pilot2.jsonl` | S.1, superseded: total contended copying by `RUNNER_COUNT` | **measured** on the Pi, 2026-10-17, by `concurrency/superseded/arm.sh` |
 | `S.1-runners-pilot.jsonl` | S.1's first instrument, makespan, which could not resolve it | **measured** on the Pi, 2026-10-17, by `concurrency/superseded/arm.sh` |
 | `S.1-runners-aborted.jsonl` | S.1's confirmation, abandoned after trials went from 2 to 35 minutes | **measured** on the Pi, 2026-10-17; four warm-ups, one reading, two failures |
+| `E5.4-owner-gated.jsonl` | E5.4, `withDirectory` with `owner:` on a new directory, machine gated quiet | **measured** on the Pi, 2026-10-18, by `e5.4/arm.sh` |
+| `E5.4-owner-measured.jsonl` | E5.4's ungated series, which could not see its own effect | **measured** on the Pi, 2026-10-18; kept as the method finding |
+| `E5.4-owner-pilot.jsonl` | E5.4's pilot, whose quiet-machine spread under-sized the series | **measured** on the Pi, 2026-10-18, by `e5.4/arm.sh` |
 | `W.5-install-measured.jsonl` | W.5, an editable install from a warm package cache, here against hosted | **measured** 2026-10-17, by `w5/arm.sh` |
 | `W.5-install-pilot.jsonl` | W.5's pilot, which chose its repetitions | **measured** 2026-10-17, by `w5/arm.sh` |
 | `E6.4-uv-measured.jsonl` | E6.4, a warm `uv sync` here against a hosted runner | **measured** 2026-10-17, by `e6.4/arm.sh` |
@@ -210,3 +213,33 @@ place of a negative control, the experiment has two arms whose answers are known
 A second thing fell out of it: the 62 never run. `62 selected` is followed by no pass count, so the
 unchanged case collects 9,380 tests and executes none — which the study's "62 of 9,380" does not
 convey, and which strengthens rather than disturbs its conclusion.
+
+## E5.4, the last one — and the control earning its keep twice
+
+`owner:` on a new 234 MB directory of 20,000 files, which is how a Docker action receives its
+workspace. The claim holds:
+
+```
+  root          n=6  median  2.500 s  (baseline)
+  user          n=6  median 19.000 s  difference 16.500  95% CI [14.000, 22.000]  effect
+  root-control  n=6  median  2.000 s  difference -0.500  95% CI [-2.000,  1.000]  no_effect_found
+```
+
+19.0 s with `owner:` against 2.5 s without, so the study's 21 s and 1-2 s both sit inside the
+interval — and the method note doubting its own 21 s was the thing that was wrong, not the number.
+
+**It took two series, and the negative control is why that is knowable.** Run back to back, every
+trial's 234 MB of writes left the machine loaded for the next one: median load 3.35 against W.5's
+0.60, arms overlapping, and the control's interval **13 s wide against a 5 s threshold**. That is an
+instrument that cannot see its own effect, and without the control it would have read as a clean
+null result. Gated on the machine going quiet before each trial, the control's interval is ±2 s and
+the effect is unmistakable.
+
+Both sample files are kept. The ungated one is the evidence for the lesson now in
+[MEASURE.md](../docs/MEASURE.md) §5: §3.2.4 separates the first round, but a workload heavy enough
+to perturb the machine needs the *whole series* gated, and dimensioning off a pilot taken while the
+machine was still quiet will under-sample.
+
+The gated run was interrupted after 6 of 8 rounds. Re-dimensioning on what it produced asks for 4
+repetitions of the `user` arm, so 6 is past what the spread requires and the missing two were not
+re-run — §3.2.5's point is repetitions by dimensioning, not by habit.

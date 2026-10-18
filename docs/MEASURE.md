@@ -174,12 +174,16 @@ proofs/README.md, "three things this turned up".
    hold as stated and was replaced by E3.4b, **E6.4 and W.5 are refuted** — they were both of the
    study's "faster than a hosted runner" claims, and both compared this machine with warm caches
    against a hosted runner with cold ones — and E2.7 and E5.6 are withdrawn as not measurable as
-   written. E5.4 is the one left.
+   written. **E5.4 holds too**, measured 2026-10-18: `owner:` costs 16.5 s [14.0, 22.0] on a new
+   234 MB directory, which makes the register's unverified column empty.
 
    Two lessons from doing it, which this section did not anticipate. **A claim can fail for its arms
    rather than its sample size**, and no number of repetitions fixes that; E6.4 and W.5 both did.
    And **dimensioning off a pilot taken in a different machine state under-samples**: E5.4's pilot
    ran while the Pi was still quiet, reported `sd 0.000` on its baseline, asked for three
-   repetitions, and the series it sized then could not see a 17 s effect through the load its own
+   repetitions, and the series it sized then could not see a 16 s effect through the load its own
    workload created. §3.2.4 separates the first round; a workload heavy enough to perturb the
-   machine needs the *whole series* gated on machine state, not just its start.
+   machine needs the *whole series* gated on machine state, not just its start. Gating it fixed the
+   measurement outright: the negative control's interval went from ±7 s to ±2 s and the effect
+   appeared at 16.5 s [14.0, 22.0]. **The control is what made both the failure and the fix
+   legible** — the ungated run would otherwise have read as a clean null result.
