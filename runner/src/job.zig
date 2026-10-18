@@ -258,87 +258,144 @@ fn parseStep(arena: Allocator, sv: Value) Error!Step {
     const o = sv.object;
     const id = path(sv, &.{"id"}) orelse return error.MalformedJob;
     const condition = path(sv, &.{"condition"}) orelse "success()";
-
-    var env: []const Input = &.{};
-    var unsupported: ?[]const u8 = null;
-    if (o.get("environment")) |envv| if (envv != .null) {
-        env = mappingInputs(arena, envv) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Unsupported => blk: {
-                unsupported = "env must be a mapping of names to strings or expressions";
-                break :blk &.{};
-            },
-        };
-    };
-
-    const reference_type = path(sv, &.{ "reference", "type" }) orelse "";
-    var action: Action = .{ .unsupported = "unsupported step type" };
-    var script_text: []const u8 = "";
-    var uses_label: []const u8 = "";
-    if (unsupported) |why| {
-        action = .{ .unsupported = why };
-    } else if (std.mem.eql(u8, reference_type, "script")) {
-        action = try parseScript(arena, o.get("inputs"));
-        if (action == .script and action.script.script == .lit) script_text = action.script.script.lit;
-    } else if (std.mem.eql(u8, reference_type, "repository")) {
-        const uses_name = path(sv, &.{ "reference", "name" }) orelse "";
-        const uses_ref = path(sv, &.{ "reference", "ref" }) orelse "";
-        // As GitHub names the step: the action's directory is part of it (`owner/repo/dir@ref`).
-        const uses_path = std.mem.trim(u8, path(sv, &.{ "reference", "path" }) orelse "", "/");
-        uses_label = if (uses_path.len > 0)
-            try std.fmt.allocPrint(arena, "{s}/{s}@{s}", .{ uses_name, uses_path, uses_ref })
-        else
-            try std.fmt.allocPrint(arena, "{s}@{s}", .{ uses_name, uses_ref });
-        const repo_type = path(sv, &.{ "reference", "repositoryType" }) orelse "GitHub";
-        if (std.ascii.eqlIgnoreCase(repo_type, "self")) {
-            const local = path(sv, &.{ "reference", "path" }) orelse uses_name;
-            uses_label = local;
-            action = try parseLocalUses(arena, local, o.get("inputs"));
-        } else if (std.ascii.eqlIgnoreCase(uses_name, "actions/checkout")) {
-            action = try parseCheckoutInputs(arena, o.get("inputs"));
-        } else {
-            action = try parseUses(arena, uses_name, path(sv, &.{ "reference", "path" }) orelse "", uses_ref, uses_label, o.get("inputs"));
-        }
-    } else if (std.mem.eql(u8, reference_type, "containerRegistry")) {
-        const raw = path(sv, &.{ "reference", "image" }) orelse "";
-        const image = if (std.mem.startsWith(u8, raw, "docker://")) raw["docker://".len..] else raw;
-        uses_label = try std.fmt.allocPrint(arena, "docker://{s}", .{image});
-        action = if (image.len == 0) .{ .unsupported = "uses: docker:// names no image" } else blk: {
-            var kv: []const Input = &.{};
-            if (o.get("inputs")) |iv| if (iv != .null) {
-                kv = mappingInputs(arena, iv) catch |e| switch (e) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.Unsupported => break :blk .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s}: inputs must be strings or expressions", .{uses_label}) },
-                };
-            };
-            break :blk .{ .docker = .{ .image = image, .inputs = kv } };
-        };
-    } else {
-        action = .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported step reference type '{s}' (v0 supports run: steps)", .{reference_type}) };
-    }
-
-    var name_expr: ?[]const u8 = null;
-    var explicit: ?[]const u8 = null;
-    if (o.get("displayNameToken")) |t| if (tokenTemplate(t)) |tpl| switch (tpl) {
-        .lit => |l| if (l.len > 0) {
-            explicit = l;
-        },
-        .expr => |e| name_expr = e,
-    };
-    if (explicit == null and o.get("name") != null and o.get("name").? == .string) explicit = o.get("name").?.string;
-
+    const env = try stepEnv(arena, o);
+    const ref = if (env.unsupported) |why|
+        StepReference{ .action = .{ .unsupported = why } }
+    else
+        try parseReference(arena, sv, o);
+    const shown = stepDisplayName(o);
     return .{
         .id = id,
         .context_name = path(sv, &.{"contextName"}) orelse "",
-        .name = try displayName(arena, explicit orelse "", script_text, uses_label),
-        .name_expr = name_expr,
+        .name = try displayName(arena, shown.explicit orelse "", ref.script_text, ref.uses_label),
+        .name_expr = shown.name_expr,
         .condition = condition,
         .continue_on_error = if (o.get("continueOnError")) |c| (tokenTemplate(c) orelse .{ .lit = "false" }) else .{ .lit = "false" },
         .timeout_minutes = if (o.get("timeoutInMinutes")) |t| try numberTemplate(arena, t) else null,
-        .env = env,
-        .action = action,
-        .uses = uses_label,
+        .env = env.env,
+        .action = ref.action,
+        .uses = ref.uses_label,
     };
+}
+
+/// A step's `env:` as the job message carries it; `unsupported` says why when it is not a mapping
+/// of names to strings or expressions, and the step then fails with that rather than running.
+const StepEnv = struct {
+    env: []const Input = &.{},
+    unsupported: ?[]const u8 = null,
+};
+
+fn stepEnv(arena: Allocator, o: std.json.ObjectMap) Error!StepEnv {
+    const envv = o.get("environment") orelse return .{};
+    if (envv == .null) return .{};
+    const env = mappingInputs(arena, envv) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unsupported => return .{
+            .unsupported = "env must be a mapping of names to strings or expressions",
+        },
+    };
+    return .{ .env = env };
+}
+
+/// What a step's `reference` resolved to: the action, the literal script text when there is one
+/// (for the default display name), and the `uses:` label GitHub shows.
+const StepReference = struct {
+    action: Action,
+    script_text: []const u8 = "",
+    uses_label: []const u8 = "",
+};
+
+/// By `reference.type`: `script` (a `run:` step), `repository` (a `uses:` action, local or on
+/// GitHub, or the built-in checkout), `containerRegistry` (`uses: docker://`), or unsupported.
+fn parseReference(arena: Allocator, sv: Value, o: std.json.ObjectMap) Error!StepReference {
+    const reference_type = path(sv, &.{ "reference", "type" }) orelse "";
+    if (std.mem.eql(u8, reference_type, "script")) {
+        const action = try parseScript(arena, o.get("inputs"));
+        const is_literal = action == .script and action.script.script == .lit;
+        const text = if (is_literal) action.script.script.lit else "";
+        return .{ .action = action, .script_text = text };
+    }
+    if (std.mem.eql(u8, reference_type, "repository")) return parseRepositoryReference(arena, sv, o);
+    if (std.mem.eql(u8, reference_type, "containerRegistry")) return parseImageReference(arena, sv, o);
+    const why = try std.fmt.allocPrint(
+        arena,
+        "unsupported step reference type '{s}' (v0 supports run: steps)",
+        .{reference_type},
+    );
+    return .{ .action = .{ .unsupported = why } };
+}
+
+/// A `uses:` action: labelled as GitHub names the step (the action's directory is part of it,
+/// `owner/repo/dir@ref`), then a local action, the built-in checkout, or an action on GitHub.
+fn parseRepositoryReference(
+    arena: Allocator,
+    sv: Value,
+    o: std.json.ObjectMap,
+) Error!StepReference {
+    const uses_name = path(sv, &.{ "reference", "name" }) orelse "";
+    const uses_ref = path(sv, &.{ "reference", "ref" }) orelse "";
+    const uses_path = std.mem.trim(u8, path(sv, &.{ "reference", "path" }) orelse "", "/");
+    var uses_label: []const u8 = if (uses_path.len > 0)
+        try std.fmt.allocPrint(arena, "{s}/{s}@{s}", .{ uses_name, uses_path, uses_ref })
+    else
+        try std.fmt.allocPrint(arena, "{s}@{s}", .{ uses_name, uses_ref });
+    const repo_type = path(sv, &.{ "reference", "repositoryType" }) orelse "GitHub";
+    const action: Action = if (std.ascii.eqlIgnoreCase(repo_type, "self")) local: {
+        const local = path(sv, &.{ "reference", "path" }) orelse uses_name;
+        uses_label = local;
+        break :local try parseLocalUses(arena, local, o.get("inputs"));
+    } else if (std.ascii.eqlIgnoreCase(uses_name, "actions/checkout"))
+        try parseCheckoutInputs(arena, o.get("inputs"))
+    else
+        try parseUses(arena, uses_name, path(sv, &.{ "reference", "path" }) orelse "", uses_ref, uses_label, o.get("inputs"));
+    return .{ .action = action, .uses_label = uses_label };
+}
+
+/// `uses: docker://<image>`, with its inputs as the container's `with:`.
+fn parseImageReference(arena: Allocator, sv: Value, o: std.json.ObjectMap) Error!StepReference {
+    const raw = path(sv, &.{ "reference", "image" }) orelse "";
+    const image = if (std.mem.startsWith(u8, raw, "docker://")) raw["docker://".len..] else raw;
+    const uses_label = try std.fmt.allocPrint(arena, "docker://{s}", .{image});
+    if (image.len == 0) {
+        const none: Action = .{ .unsupported = "uses: docker:// names no image" };
+        return .{ .action = none, .uses_label = uses_label };
+    }
+    var kv: []const Input = &.{};
+    if (o.get("inputs")) |iv| if (iv != .null) {
+        kv = mappingInputs(arena, iv) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Unsupported => {
+                const why = try std.fmt.allocPrint(
+                    arena,
+                    "uses: {s}: inputs must be strings or expressions",
+                    .{uses_label},
+                );
+                return .{ .action = .{ .unsupported = why }, .uses_label = uses_label };
+            },
+        };
+    };
+    return .{ .action = .{ .docker = .{ .image = image, .inputs = kv } }, .uses_label = uses_label };
+}
+
+/// The step's name as the job message gives it: an expression to evaluate per run, or a literal
+/// (`displayNameToken`, else `name`). The default from the script or `uses:` is the caller's.
+const StepDisplayName = struct {
+    name_expr: ?[]const u8 = null,
+    explicit: ?[]const u8 = null,
+};
+
+fn stepDisplayName(o: std.json.ObjectMap) StepDisplayName {
+    var out: StepDisplayName = .{};
+    if (o.get("displayNameToken")) |t| if (tokenTemplate(t)) |tpl| switch (tpl) {
+        .lit => |l| if (l.len > 0) {
+            out.explicit = l;
+        },
+        .expr => |e| out.name_expr = e,
+    };
+    if (out.explicit == null) if (o.get("name")) |n| if (n == .string) {
+        out.explicit = n.string;
+    };
+    return out;
 }
 
 fn parseScript(arena: Allocator, inputs: ?Value) Error!Action {
