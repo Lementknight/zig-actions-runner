@@ -31,10 +31,26 @@ for _ in $(seq 1 30); do
 	id=""
 done
 [ -n "$id" ] || { echo "arm: the dispatch produced no new run" >&2; exit 4; }
+# `gh run watch --exit-status` exits non-zero both when the run failed and when the API dropped
+# the connection, and those are not the same thing: a pilot trial was lost to "connection reset by
+# peer" on a run that had in fact succeeded. So a watch failure is not conclusive — ask the API what
+# the run's conclusion actually was, and only give up if it is not success. A transient network
+# error is not a measurement outcome and must not be recorded as one.
 gh run watch "$id" -R "$repo" --exit-status --interval 5 >&2 || {
-	echo "arm: run $id did not succeed" >&2
-	gh run view "$id" -R "$repo" --log-failed >&2 || true
-	exit 5
+	echo "arm: watch of run $id failed; asking the API for its conclusion" >&2
+	concl=""
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		concl=$(gh run view "$id" -R "$repo" --json status,conclusion \
+			-q 'select(.status == "completed") | .conclusion' 2> /dev/null || echo "")
+		[ -n "$concl" ] && break
+		sleep 10
+	done
+	[ "$concl" = success ] || {
+		echo "arm: run $id concluded '${concl:-unknown}'" >&2
+		gh run view "$id" -R "$repo" --log-failed >&2 || true
+		exit 5
+	}
+	echo "arm: run $id succeeded after all; the watch was the thing that failed" >&2
 }
 
 log=$(gh run view "$id" -R "$repo" --log 2>/dev/null)
