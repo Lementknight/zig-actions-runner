@@ -2186,6 +2186,213 @@ const SpanDemux = struct {
 };
 
 /// Runs the job's steps once a session is up (through `dagger run` or directly).
+/// What the base container is built from, decided before any query is sent.
+const BasePlan = struct {
+    job_image: []const u8,
+    provision: bool,
+    as_runner: bool,
+    step_cache: bool,
+    uv_env: ?[]const u8,
+    cache_ids: []const []const u8,
+    ran_marker: []const u8,
+};
+
+/// The container every step starts from, as one query: the job image behind its registry auth and
+/// its own env, the provisioning exec, the workspace and user, the cache mounts, the event payload
+/// and the job's environment. Each writer opens GraphQL braces and returns how many, so this closes
+/// exactly that many. On failure the message is in `err_msg` and the caller fails the job with it.
+fn baseContainerId(
+    arena: Allocator,
+    transport: Transport,
+    ev: *Evaluator,
+    job: job_mod.Job,
+    plan: BasePlan,
+    secret_counter: *u32,
+    err_msg: *[]const u8,
+) ![]const u8 {
+    var doc: std.Io.Writer.Allocating = .init(arena);
+    const w = &doc.writer;
+    try w.writeAll("{ container { ");
+    var braces: usize = 2;
+    braces += try writeImage(w, arena, transport, ev, job, plan, secret_counter, err_msg);
+    braces += try writeProvisionAndWorkspace(w, arena, ev, plan);
+    braces += try writeCacheMounts(w, arena, plan);
+    braces += try writeRunEnv(w, ev, plan);
+    braces += try writeJobEnv(w, arena, transport, ev, job, secret_counter, err_msg);
+    try w.writeAll("id");
+    for (0..braces) |_| try w.writeAll(" }");
+    const data = gql(arena, transport, doc.written(), err_msg) catch return error.BaseContainerFailed;
+    return jsonFindString(data, "id") orelse {
+        err_msg.* = "Dagger returned no container";
+        return error.BaseContainerFailed;
+    };
+}
+
+/// `from` the job image, behind a private registry's credentials when there are any, with a container
+/// job's cache variables and its own `env:` set on it.
+fn writeImage(
+    w: *std.Io.Writer,
+    arena: Allocator,
+    transport: Transport,
+    ev: *Evaluator,
+    job: job_mod.Job,
+    plan: BasePlan,
+    secret_counter: *u32,
+    err_msg: *[]const u8,
+) !usize {
+    var opened: usize = 0;
+    if (job.container) |jc| {
+        // A private image: its registry's credentials.
+        if (try registryAuthNode(arena, ev, transport, secret_counter, jc, plan.job_image, err_msg)) |node| {
+            try w.writeAll(node);
+            opened += 1;
+        } else if (err_msg.len > 0) return error.BaseContainerFailed;
+    }
+    try w.writeAll("from(address:");
+    try std.json.Stringify.value(plan.job_image, .{}, w);
+    try w.writeAll(") { ");
+    opened += 1;
+    if (job.container != null) for (plan.cache_ids, 0..) |_, i| {
+        // Before the container's env, so its own value wins.
+        if (package_cache_dirs[i].env.len == 0) continue;
+        try w.writeAll("withEnvVariable(name:");
+        try std.json.Stringify.value(package_cache_dirs[i].env, .{}, w);
+        try w.writeAll(",value:");
+        try std.json.Stringify.value(package_cache_dirs[i].path, .{}, w);
+        try w.writeAll(") { ");
+        opened += 1;
+    };
+    if (job.container) |jc| {
+        // The container's env, as `docker create -e` sets it: every step sees it.
+        const env = ev.renderEnv(jc.env, try ev.scope(&.{})) catch {
+            err_msg.* = try std.fmt.allocPrint(arena, "could not evaluate the container's env: {s}", .{ev.diag});
+            return error.BaseContainerFailed;
+        };
+        for (env) |e| {
+            try w.writeAll("withEnvVariable(name:");
+            try std.json.Stringify.value(e.name, .{}, w);
+            try w.writeAll(",value:");
+            try std.json.Stringify.value(e.value, .{}, w);
+            try w.writeAll(") { ");
+            opened += 1;
+        }
+    }
+    return opened;
+}
+
+/// Provisioning in the default image, the workspace and RUNNER_TEMP, the step user, and the workdir.
+fn writeProvisionAndWorkspace(w: *std.Io.Writer, arena: Allocator, ev: *Evaluator, plan: BasePlan) !usize {
+    var opened: usize = 0;
+    if (plan.provision) {
+        try w.writeAll("withExec(args:");
+        const script = if (plan.as_runner) provision_runner_script else provision_script;
+        try std.json.Stringify.value([_][]const u8{ "sh", "-c", script }, .{}, w);
+        try w.writeAll(") { ");
+        opened += 1;
+    }
+    // The job's workspace and RUNNER_TEMP, the step user's in the default image (cached per
+    // repository). A job container's user may be unable to make them; its steps then report
+    // that themselves.
+    // With `uv_env_in_cache`, `.venv` in the workspace is a symlink to the environment in the
+    // cache, so `uv run`, `.venv/bin/...` and `activate` all keep working. The link is made
+    // here, before the checkout, which merges the repository over it and leaves it.
+    const link = if (plan.uv_env) |e| try std.fmt.allocPrint(arena, " && ln -sfn {s} {s}/.venv", .{ e, ev.workspace }) else "";
+    const chown = if (plan.as_runner) " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root else "";
+    const mk = if (plan.provision)
+        try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}{s}", .{ ev.workspace, ev.temp, link, chown })
+    else
+        try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s} 2>/dev/null || true", .{ ev.workspace, ev.temp, link });
+    try w.writeAll("withExec(args:");
+    try std.json.Stringify.value([_][]const u8{ "sh", "-c", mk }, .{}, w);
+    try w.writeAll(") { ");
+    opened += 1;
+    if (plan.as_runner) {
+        try w.writeAll("withUser(name:\"" ++ runner_user ++ "\") { ");
+        try w.writeAll("withEnvVariable(name:\"HOME\",value:\"" ++ runner_home ++ "\") { ");
+        opened += 2;
+    }
+    try w.print("withWorkdir(path:\"{s}\") {{ ", .{ev.workspace});
+    opened += 1;
+    return opened;
+}
+
+/// One cache volume mount per package manager, owned by the step user when steps run as it.
+fn writeCacheMounts(w: *std.Io.Writer, arena: Allocator, plan: BasePlan) !usize {
+    for (plan.cache_ids, 0..) |id, i| {
+        try w.writeAll("withMountedCache(path:");
+        const path = if (plan.as_runner) try runnerCachePath(arena, i) else package_cache_dirs[i].path;
+        try std.json.Stringify.value(path, .{}, w);
+        try w.writeAll(",cache:");
+        try std.json.Stringify.value(id, .{}, w);
+        if (plan.as_runner) try w.writeAll(",owner:\"" ++ runner_user ++ "\"");
+        try w.writeAll(") { ");
+    }
+    return plan.cache_ids.len;
+}
+
+/// The values that identify this run: the event payload, the ran marker, uv's environment, and the
+/// default variables — volatile under step caching, so they do not reach exec cache keys.
+fn writeRunEnv(w: *std.Io.Writer, ev: *Evaluator, plan: BasePlan) !usize {
+    var opened: usize = 0;
+    // The event payload, as on GitHub (actions read it through GITHUB_EVENT_PATH). It differs on
+    // every run, so with step caching it travels in a volatile variable that each step writes to
+    // the file; a payload too large for one variable is written into the container instead.
+    const event = try ev.eventJson();
+    if (plan.step_cache and event.len <= max_event_env) {
+        try w.writeAll("withVolatileVariable(name:\"" ++ event_env ++ "\",value:");
+    } else {
+        try w.writeAll("withNewFile(path:\"" ++ event_path ++ "\",contents:");
+    }
+    try std.json.Stringify.value(event, .{}, w);
+    try w.writeAll(") { ");
+    opened += 1;
+    if (plan.step_cache) {
+        try w.writeAll("withVolatileVariable(name:\"" ++ ran_env ++ "\",value:");
+        try std.json.Stringify.value(plan.ran_marker, .{}, w);
+        try w.writeAll(") { ");
+        opened += 1;
+    }
+    if (plan.uv_env) |e| {
+        try w.writeAll("withEnvVariable(name:\"UV_PROJECT_ENVIRONMENT\",value:");
+        try std.json.Stringify.value(e, .{}, w);
+        // The environment outlives the job, and `uv venv` refuses to replace one that exists
+        // ("A virtual environment already exists at ..."), where on a hosted runner the
+        // workspace is new every job and it always succeeds. This keeps `uv venv` meaning
+        // "make me a fresh environment"; `uv sync` still reconciles the one that is there.
+        try w.writeAll(") { withEnvVariable(name:\"UV_VENV_CLEAR\",value:\"1\") { ");
+        opened += 2;
+    }
+    const defaults = try ev.defaultEnv();
+    for (defaults) |e| {
+        // Run-specific values do not take part in exec cache keys, so unchanged steps are reused.
+        const node = if (plan.step_cache and isVolatile(e.name)) "withVolatileVariable(name:" else "withEnvVariable(name:";
+        try w.writeAll(node);
+        try std.json.Stringify.value(e.name, .{}, w);
+        try w.writeAll(",value:");
+        try std.json.Stringify.value(e.value, .{}, w);
+        try w.writeAll(") { ");
+    }
+    return opened + defaults.len;
+}
+
+/// Workflow- and job-level env is part of every step's environment; what carries a secret goes in
+/// as a Dagger secret.
+fn writeJobEnv(
+    w: *std.Io.Writer,
+    arena: Allocator,
+    transport: Transport,
+    ev: *Evaluator,
+    job: job_mod.Job,
+    secret_counter: *u32,
+    err_msg: *[]const u8,
+) !usize {
+    var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+    var secret: std.ArrayList(SecretRef) = .empty;
+    splitEnv(arena, transport, job, secret_counter, ev.job_env.items, &plain, &secret, err_msg) catch
+        return error.BaseContainerFailed;
+    return writeEnvNodes(w, plain.items, secret.items);
+}
+
 fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *Shared, results: []StepResult, transport: Transport) !Result {
     var ev = try Evaluator.init(arena, &job);
     ev.runner_name = opts.runner_name;
@@ -2242,123 +2449,17 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         io.random(&raw);
         break :ran try arena.dupe(u8, &std.fmt.bytesToHex(raw, .lower));
     };
-    const container_id: []const u8 = blk: {
-        var doc: std.Io.Writer.Allocating = .init(arena);
-        const w = &doc.writer;
-        try w.writeAll("{ container { ");
-        var extra_braces: usize = 0;
-        if (job.container) |jc| {
-            // A private image: its registry's credentials.
-            if (try registryAuthNode(arena, &ev, transport, &secret_counter, jc, job_image, &err_msg)) |node| {
-                try w.writeAll(node);
-                extra_braces += 1;
-            } else if (err_msg.len > 0) return fail(sh, results, err_msg);
-        }
-        try w.writeAll("from(address:");
-        try std.json.Stringify.value(job_image, .{}, w);
-        try w.writeAll(") { ");
-        if (job.container != null) for (cache_ids, 0..) |_, i| {
-            // Before the container's env, so its own value wins.
-            if (package_cache_dirs[i].env.len == 0) continue;
-            try w.writeAll("withEnvVariable(name:");
-            try std.json.Stringify.value(package_cache_dirs[i].env, .{}, w);
-            try w.writeAll(",value:");
-            try std.json.Stringify.value(package_cache_dirs[i].path, .{}, w);
-            try w.writeAll(") { ");
-            extra_braces += 1;
-        };
-        if (job.container) |jc| {
-            // The container's env, as `docker create -e` sets it: every step sees it.
-            const env = ev.renderEnv(jc.env, try ev.scope(&.{})) catch return fail(sh, results, try std.fmt.allocPrint(arena, "could not evaluate the container's env: {s}", .{ev.diag}));
-            for (env) |e| {
-                try w.writeAll("withEnvVariable(name:");
-                try std.json.Stringify.value(e.name, .{}, w);
-                try w.writeAll(",value:");
-                try std.json.Stringify.value(e.value, .{}, w);
-                try w.writeAll(") { ");
-                extra_braces += 1;
-            }
-        }
-        if (provision) {
-            try w.writeAll("withExec(args:");
-            try std.json.Stringify.value([_][]const u8{ "sh", "-c", if (as_runner) provision_runner_script else provision_script }, .{}, w);
-            try w.writeAll(") { ");
-        }
-        {
-            // The job's workspace and RUNNER_TEMP, the step user's in the default image (cached per
-            // repository). A job container's user may be unable to make them; its steps then report
-            // that themselves.
-            // With `uv_env_in_cache`, `.venv` in the workspace is a symlink to the environment in the
-            // cache, so `uv run`, `.venv/bin/...` and `activate` all keep working. The link is made
-            // here, before the checkout, which merges the repository over it and leaves it.
-            const link = if (uv_env) |e| try std.fmt.allocPrint(arena, " && ln -sfn {s} {s}/.venv", .{ e, ev.workspace }) else "";
-            const mk = if (provision)
-                try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}{s}", .{ ev.workspace, ev.temp, link, if (as_runner) " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root else "" })
-            else
-                try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s} 2>/dev/null || true", .{ ev.workspace, ev.temp, link });
-            try w.writeAll("withExec(args:");
-            try std.json.Stringify.value([_][]const u8{ "sh", "-c", mk }, .{}, w);
-            try w.writeAll(") { ");
-            extra_braces += 1;
-        }
-        if (as_runner) {
-            try w.writeAll("withUser(name:\"" ++ runner_user ++ "\") { withEnvVariable(name:\"HOME\",value:\"" ++ runner_home ++ "\") { ");
-            extra_braces += 2;
-        }
-        try w.print("withWorkdir(path:\"{s}\") {{ ", .{ev.workspace});
-        for (cache_ids, 0..) |id, i| {
-            try w.writeAll("withMountedCache(path:");
-            try std.json.Stringify.value(if (as_runner) try runnerCachePath(arena, i) else package_cache_dirs[i].path, .{}, w);
-            try w.writeAll(",cache:");
-            try std.json.Stringify.value(id, .{}, w);
-            if (as_runner) try w.writeAll(",owner:\"" ++ runner_user ++ "\"");
-            try w.writeAll(") { ");
-        }
-        // The event payload, as on GitHub (actions read it through GITHUB_EVENT_PATH). It differs on
-        // every run, so with step caching it travels in a volatile variable that each step writes to
-        // the file; a payload too large for one variable is written into the container instead.
-        const event = try ev.eventJson();
-        if (step_cache and event.len <= max_event_env) {
-            try w.writeAll("withVolatileVariable(name:\"" ++ event_env ++ "\",value:");
-        } else {
-            try w.writeAll("withNewFile(path:\"" ++ event_path ++ "\",contents:");
-        }
-        try std.json.Stringify.value(event, .{}, w);
-        try w.writeAll(") { ");
-        if (step_cache) {
-            try w.writeAll("withVolatileVariable(name:\"" ++ ran_env ++ "\",value:");
-            try std.json.Stringify.value(ran_marker, .{}, w);
-            try w.writeAll(") { ");
-            extra_braces += 1;
-        }
-        if (uv_env) |e| {
-            try w.writeAll("withEnvVariable(name:\"UV_PROJECT_ENVIRONMENT\",value:");
-            try std.json.Stringify.value(e, .{}, w);
-            // The environment outlives the job, and `uv venv` refuses to replace one that exists
-            // ("A virtual environment already exists at ..."), where on a hosted runner the
-            // workspace is new every job and it always succeeds. This keeps `uv venv` meaning
-            // "make me a fresh environment"; `uv sync` still reconciles the one that is there.
-            try w.writeAll(") { withEnvVariable(name:\"UV_VENV_CLEAR\",value:\"1\") { ");
-            extra_braces += 2;
-        }
-        const defaults = try ev.defaultEnv();
-        for (defaults) |e| {
-            // Run-specific values do not take part in exec cache keys, so unchanged steps are reused.
-            try w.writeAll(if (step_cache and isVolatile(e.name)) "withVolatileVariable(name:" else "withEnvVariable(name:");
-            try std.json.Stringify.value(e.name, .{}, w);
-            try w.writeAll(",value:");
-            try std.json.Stringify.value(e.value, .{}, w);
-            try w.writeAll(") { ");
-        }
-        // Workflow- and job-level env is part of every step's environment.
-        var plain_job: std.ArrayList(job_mod.EnvVar) = .empty;
-        var secret_job: std.ArrayList(SecretRef) = .empty;
-        splitEnv(arena, transport, job, &secret_counter, ev.job_env.items, &plain_job, &secret_job, &err_msg) catch return fail(sh, results, err_msg);
-        const job_env_nodes = try writeEnvNodes(w, plain_job.items, secret_job.items);
-        try w.writeAll("id");
-        for (0..defaults.len + job_env_nodes + cache_ids.len + 5 + extra_braces + @as(usize, if (provision) 1 else 0)) |_| try w.writeAll(" }");
-        const data = gql(arena, transport, doc.written(), &err_msg) catch return fail(sh, results, err_msg);
-        break :blk jsonFindString(data, "id") orelse return fail(sh, results, "Dagger returned no container");
+    const container_id = baseContainerId(arena, transport, &ev, job, .{
+        .job_image = job_image,
+        .provision = provision,
+        .as_runner = as_runner,
+        .step_cache = step_cache,
+        .uv_env = uv_env,
+        .cache_ids = cache_ids,
+        .ran_marker = ran_marker,
+    }, &secret_counter, &err_msg) catch |e| switch (e) {
+        error.BaseContainerFailed => return fail(sh, results, err_msg),
+        else => return e,
     };
 
     var x: Exec = .{
