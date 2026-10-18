@@ -254,30 +254,47 @@ need_output_keys() {
 echo "Properties of the step cache, against the engine behind $repo's runner."
 echo
 
+# Every dispatch carries this, inside the subject step's script text, which is part of its cache key.
+#
+# Without it the suite is **only valid against an engine that has not run it before**. The P2 checks
+# dispatch a changed input and assert the subject *ran*; run the suite twice and the second run's
+# "changed" input is the one the first run already cached, so the subject is replayed and all four
+# fail — looking exactly like the cache regression they exist to detect. That is what happened on
+# 2026-10-18, twice in a row, before this existed.
+#
+# It goes in the value the arms have in **common** (`base`), not in what distinguishes them, so each
+# check still isolates the one input it is about: P2c differs from the baseline only in `envval`,
+# P2d only in the subject's position, and so on. Freshness and isolation at once.
+#
+# This is MEASURE.md §3.3's first rule, which the measurement harness has enforced since it was
+# built and these checks did not.
+stamp=$(date +%s)
+base_text="base-$stamp"
+
 # The baseline warms the cache; its own outcome is not asserted.
-base=$(dispatch property.yml -f "text=base" -f "ref=$ref_a" -f "envval=base" -f "volatile=no")
+base=$(dispatch property.yml -f "text=$base_text" -f "ref=$ref_a" -f "envval=base" -f "volatile=no")
 printf '  --    %-30s run %s\n' "baseline" "$base"
 
 if want P3 || want P6; then
-	id=$(dispatch property.yml -f "text=base" -f "ref=$ref_a" -f "envval=base" -f "volatile=no")
+	id=$(dispatch property.yml -f "text=$base_text" -f "ref=$ref_a" -f "envval=base" -f "volatile=no")
 	assert "P3 a volatile value changed" "$id" "subject plain" replayed
 	assert_all "P6 a warm job runs nothing" "$id" replayed
 fi
 if want P2; then
-	id=$(dispatch property.yml -f "text=changed" -f "ref=$ref_a" -f "envval=base" -f "volatile=no")
+	id=$(dispatch property.yml -f "text=changed-$stamp" -f "ref=$ref_a" -f "envval=base" -f "volatile=no")
 	assert "P2a the script text" "$id" "subject plain" ran
-	id=$(dispatch property.yml -f "text=base" -f "ref=$ref_b" -f "envval=base" -f "volatile=no")
+	id=$(dispatch property.yml -f "text=$base_text" -f "ref=$ref_b" -f "envval=base" -f "volatile=no")
 	assert "P2b the workspace" "$id" "subject plain" ran
-	id=$(dispatch property.yml -f "text=base" -f "ref=$ref_a" -f "envval=changed" -f "volatile=no")
+	id=$(dispatch property.yml -f "text=$base_text" -f "ref=$ref_a" -f "envval=changed" -f "volatile=no")
 	assert "P2c a non-volatile variable" "$id" "subject plain" ran
-	id=$(dispatch property-shifted.yml -f "text=base" -f "ref=$ref_a" -f "envval=base" -f "volatile=no")
+	id=$(dispatch property-shifted.yml -f "text=$base_text" -f "ref=$ref_a" -f "envval=base" -f "volatile=no")
 	assert "P2d the step's position" "$id" "subject plain" ran
 fi
 if want P4; then
 	# Twice over: a marked step must run on the second run too, which is the whole point of marking.
-	id=$(dispatch property.yml -f "text=base" -f "ref=$ref_a" -f "envval=base" -f "volatile=yes")
+	id=$(dispatch property.yml -f "text=$base_text" -f "ref=$ref_a" -f "envval=base" -f "volatile=yes")
 	printf '  --    %-30s run %s\n' "P4 first run" "$id"
-	id=$(dispatch property.yml -f "text=base" -f "ref=$ref_a" -f "envval=base" -f "volatile=yes")
+	id=$(dispatch property.yml -f "text=$base_text" -f "ref=$ref_a" -f "envval=base" -f "volatile=yes")
 	assert "P4 a marked step always runs" "$id" "subject volatile" ran
 fi
 
@@ -363,8 +380,8 @@ fi
 if want R2; then
 	# A cache a pool shares is safe (`elsewhere⇒ahead`): two jobs at once must each get its own
 	# answer, not the other's. Each job has its own session for exactly this reason (SPEC.md).
-	a=$(dispatch_bg property.yml -f "text=base" -f "ref=$ref_a" -f "envval=concurrent-a" -f "volatile=no")
-	b=$(dispatch_bg property.yml -f "text=base" -f "ref=$ref_a" -f "envval=concurrent-b" -f "volatile=no")
+	a=$(dispatch_bg property.yml -f "text=$base_text" -f "ref=$ref_a" -f "envval=concurrent-a" -f "volatile=no")
+	b=$(dispatch_bg property.yml -f "text=$base_text" -f "ref=$ref_a" -f "envval=concurrent-b" -f "volatile=no")
 	wait_run "$a"
 	wait_run "$b"
 	if overlapped "$a" "$b"; then
