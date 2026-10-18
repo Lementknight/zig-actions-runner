@@ -60,7 +60,15 @@ jobs:
           uv pip install $deps
           # The environment goes; the package cache stays. This is what makes the two arms install
           # the same thing — see README.md.
-          rm -rf .venv
+          #
+          # Delete what \`.venv\` *points at*, not \`.venv\` itself. On this runner \`.venv\` is a
+          # symlink into uv's cache volume (uv_env_in_cache, dagger.zig), so \`rm -rf .venv\` removes
+          # the link and leaves the environment — after which the measured step's \`uv venv\` has
+          # nowhere to put one and the install fails with "No virtual environment found". Removing
+          # the target instead leaves a dangling link that \`uv venv\` refills, which is also what
+          # happens on a job's first use. On a hosted runner \`.venv\` is a real directory, readlink
+          # fails, and this removes \`.venv\`.
+          rm -rf "\$(readlink .venv 2>/dev/null || echo .venv)"
       - name: measured install
         run: |
           : "trial \${{ inputs.token }}"

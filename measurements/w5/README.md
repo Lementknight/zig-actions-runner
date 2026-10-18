@@ -67,10 +67,31 @@ being asked, since both arms run the identical command, but it means the new num
 arithmetically comparable with 21.0 s and 28.2 s. What is comparable is the **direction**, which is
 all the claim asserts.
 
-sqlalchemy builds Cython extensions, so this quantity includes a compile. That is the same work on
-both arms and is part of what "install" costs, but it is worth knowing before reading the result:
-a win here is partly a win at compiling C, which [W.7](../../docs/CLAIMS.md) says the Pi is ~2.5×
-*worse* at.
+**No compile is involved**, which the pre-registration first got wrong. sqlalchemy builds Cython
+extensions only when Cython is present at build time, and an editable install from a bare checkout
+has none: the hosted smoke trial logged `Built sqlalchemy` in 1.06 s of a 2.145 s install. So this
+is a pure-Python install — resolve, unpack, link, write the editable hook — and not, as first
+written here, partly a measurement of compiling C.
+
+That also resizes the question. With both package caches warm the whole install is **about two
+seconds**, against the study's 21.0 s and 28.2 s. Nearly all of what the study measured was
+therefore PyPI download time on the hosted side, and W.5's 7.2 s margin was a slice of a cost that
+disappears once both arms have the wheels locally. 20% of 2 s is 0.4 s, which the in-step
+millisecond clock resolves comfortably.
+
+## Where the environment lives, which is not the same on the two machines
+
+On this runner `.venv` in the workspace is a **symlink into uv's cache volume**
+(`uv_env_in_cache`, on by default — E6.1 to E6.3); on a hosted runner it is a real directory on the
+workspace filesystem. Both arms are left as they actually run, because that is what "faster than a
+hosted runner" has to mean, but it is a difference the number contains and E6.2 says which way it
+cuts: a sync against the volume took 27.0 s where the workspace filesystem took 0.2 s. If this arm
+loses, the volume is a candidate reason, and forcing the environment into the workspace would be the
+follow-up rather than a correction.
+
+The first attempt at this workload deleted `.venv` to force a fresh install, which on this runner
+removes the *symlink* and leaves the environment — so the measured step had nowhere to create one and
+failed with "No virtual environment found". The workload deletes the symlink's target instead.
 
 ## A date that matters
 
