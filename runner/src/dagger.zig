@@ -4365,8 +4365,27 @@ const Exec = struct {
     fn hashFiles(ptr: *anyopaque, arena: Allocator, args: []const []const u8) Allocator.Error!expr.HashFiles.Result {
         const x: *Exec = @ptrCast(@alignCast(ptr));
         const ws = x.ev.workspace;
-        const Pattern = struct { glob: []const u8, exclude: bool };
-        var patterns: std.ArrayList(Pattern) = .empty;
+        const patterns = (try hashPatterns(arena, ws, args)) orelse return .{ .ok = "" };
+        const files = switch (try x.globFiles(arena, ws, patterns)) {
+            .failed => |msg| return .{ .failed = msg },
+            .files => |f| f,
+        };
+        if (files.len == 0) return .{ .ok = "" };
+        return x.hashListed(arena, ws, files);
+    }
+
+    /// One `hashFiles` pattern as written: a glob relative to the workspace, and whether it excludes.
+    const HashPattern = struct { glob: []const u8, exclude: bool };
+
+    /// The patterns as GitHub reads them: one per argument or line, `#` lines and blanks skipped,
+    /// `!` excluding; absolute paths inside the workspace made relative, those outside it ignored.
+    /// Null when nothing includes — the result is then "" without a query.
+    fn hashPatterns(
+        arena: Allocator,
+        ws: []const u8,
+        args: []const []const u8,
+    ) Allocator.Error!?[]const HashPattern {
+        var patterns: std.ArrayList(HashPattern) = .empty;
         var any_include = false;
         for (args) |arg| {
             var lines = std.mem.splitScalar(u8, arg, '\n');
@@ -4385,33 +4404,34 @@ const Exec = struct {
                 try patterns.append(arena, .{ .glob = p, .exclude = exclude });
             }
         }
-        if (!any_include) return .{ .ok = "" };
+        if (!any_include) return null;
+        return patterns.items;
+    }
 
-        // Each pattern as given, and with `/**` for the contents of a directory it matches.
-        var doc: std.Io.Writer.Allocating = .init(arena);
-        const w = &doc.writer;
-        w.writeAll("{ loadContainerFromID(id:") catch return error.OutOfMemory;
-        std.json.Stringify.value(x.container_id, .{}, w) catch return error.OutOfMemory;
-        w.print(") {{ directory(path:{f}) {{", .{std.json.fmt(ws, .{})}) catch return error.OutOfMemory;
-        for (patterns.items, 0..) |p, i| {
-            w.print(" p{d}: glob(pattern:", .{i}) catch return error.OutOfMemory;
-            std.json.Stringify.value(p.glob, .{}, w) catch return error.OutOfMemory;
-            w.print(") d{d}: glob(pattern:", .{i}) catch return error.OutOfMemory;
-            std.json.Stringify.value(try std.fmt.allocPrint(arena, "{s}/**", .{p.glob}), .{}, w) catch return error.OutOfMemory;
-            w.writeAll(")") catch return error.OutOfMemory;
-        }
-        w.writeAll(" } } }") catch return error.OutOfMemory;
+    /// What the globs matched, or why the engine could not say.
+    const Globbed = union(enum) { files: []const []const u8, failed: []const u8 };
+
+    /// The files the patterns select, in path order: Dagger's `glob` for each pattern as given
+    /// and with `/**` for the contents of a directory it matches; the last matching pattern decides.
+    fn globFiles(
+        x: *Exec,
+        arena: Allocator,
+        ws: []const u8,
+        patterns: []const HashPattern,
+    ) Allocator.Error!Globbed {
+        const query = try globQuery(arena, x.container_id, ws, patterns);
         var msg: []const u8 = "";
-        const data = gql(arena, x.transport, doc.written(), &msg) catch |e| switch (e) {
+        const data = gql(arena, x.transport, query, &msg) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .failed = msg },
         };
-        const matches = try arena.alloc(std.StringHashMapUnmanaged(void), patterns.items.len);
+        const matches = try arena.alloc(std.StringHashMapUnmanaged(void), patterns.len);
         var candidates: std.StringArrayHashMapUnmanaged(void) = .empty;
-        for (patterns.items, matches, 0..) |p, *set, i| {
+        for (patterns, matches, 0..) |p, *set, i| {
             set.* = .empty;
             for ([_][]const u8{ "p", "d" }) |kind| {
-                const found = jsonStrings(arena, jsonFind(data, try std.fmt.allocPrint(arena, "{s}{d}", .{ kind, i }))) catch return error.OutOfMemory;
+                const key = try std.fmt.allocPrint(arena, "{s}{d}", .{ kind, i });
+                const found = jsonStrings(arena, jsonFind(data, key)) catch return error.OutOfMemory;
                 for (found) |path| {
                     if (std.mem.endsWith(u8, path, "/")) continue; // a directory
                     try set.put(arena, path, {});
@@ -4422,21 +4442,52 @@ const Exec = struct {
         var files: std.ArrayList([]const u8) = .empty;
         for (candidates.keys()) |path| {
             var included = false;
-            for (patterns.items, matches) |p, set| if (set.contains(path)) {
+            for (patterns, matches) |p, set| if (set.contains(path)) {
                 included = !p.exclude;
             };
             if (included) try files.append(arena, path);
         }
-        if (files.items.len == 0) return .{ .ok = "" };
         std.mem.sort([]const u8, files.items, {}, struct {
             fn lt(_: void, l: []const u8, r: []const u8) bool {
                 return std.mem.lessThan(u8, l, r);
             }
         }.lt);
+        return .{ .files = files.items };
+    }
 
-        // One sha256sum line per file, in order (names are listed in a file, so any number fits).
-        const list = try std.mem.join(arena, "\n", files.items);
-        doc = .init(arena);
+    /// One query: each pattern as given (`p<i>`) and with `/**` (`d<i>`), against the workspace.
+    fn globQuery(
+        arena: Allocator,
+        container_id: []const u8,
+        ws: []const u8,
+        patterns: []const HashPattern,
+    ) Allocator.Error![]const u8 {
+        var doc: std.Io.Writer.Allocating = .init(arena);
+        const w = &doc.writer;
+        w.writeAll("{ loadContainerFromID(id:") catch return error.OutOfMemory;
+        std.json.Stringify.value(container_id, .{}, w) catch return error.OutOfMemory;
+        w.print(") {{ directory(path:{f}) {{", .{std.json.fmt(ws, .{})}) catch return error.OutOfMemory;
+        for (patterns, 0..) |p, i| {
+            w.print(" p{d}: glob(pattern:", .{i}) catch return error.OutOfMemory;
+            std.json.Stringify.value(p.glob, .{}, w) catch return error.OutOfMemory;
+            w.print(") d{d}: glob(pattern:", .{i}) catch return error.OutOfMemory;
+            std.json.Stringify.value(try std.fmt.allocPrint(arena, "{s}/**", .{p.glob}), .{}, w) catch return error.OutOfMemory;
+            w.writeAll(")") catch return error.OutOfMemory;
+        }
+        w.writeAll(" } } }") catch return error.OutOfMemory;
+        return doc.written();
+    }
+
+    /// `sha256sum` over the files, in order, in the job's container (the names are listed in a
+    /// file, so any number fits), then the SHA-256 of those digests, as GitHub computes it.
+    fn hashListed(
+        x: *Exec,
+        arena: Allocator,
+        ws: []const u8,
+        files: []const []const u8,
+    ) Allocator.Error!expr.HashFiles.Result {
+        const list = try std.mem.join(arena, "\n", files);
+        var doc: std.Io.Writer.Allocating = .init(arena);
         const w2 = &doc.writer;
         w2.writeAll("{ loadContainerFromID(id:") catch return error.OutOfMemory;
         std.json.Stringify.value(x.container_id, .{}, w2) catch return error.OutOfMemory;
@@ -4446,14 +4497,28 @@ const Exec = struct {
         const hash_cmd = std.fmt.allocPrint(arena, "cd {s} && tr '\\n' '\\0' < " ++ hash_list_path ++ " | xargs -0 sha256sum --", .{ws}) catch return error.OutOfMemory;
         std.json.Stringify.value([_][]const u8{ "sh", "-c", hash_cmd }, .{}, w2) catch return error.OutOfMemory;
         w2.writeAll(",expect:ANY) { exitCode stdout stderr } } } }") catch return error.OutOfMemory;
+        var msg: []const u8 = "";
         const hdata = gql(arena, x.transport, doc.written(), &msg) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .failed = msg },
         };
         const code = if (jsonFind(hdata, "exitCode")) |c| (if (c == .integer) c.integer else 1) else 1;
-        if (code != 0) return .{ .failed = std.mem.trim(u8, jsonFindString(hdata, "stderr") orelse "sha256sum failed", " \n") };
+        if (code != 0) {
+            const stderr = jsonFindString(hdata, "stderr") orelse "sha256sum failed";
+            return .{ .failed = std.mem.trim(u8, stderr, " \n") };
+        }
+        return foldDigests(arena, jsonFindString(hdata, "stdout") orelse "", files.len);
+    }
+
+    /// The SHA-256 of the digests sha256sum printed, one line per file; a count that does not match
+    /// the files hashed is a failure, not a partial answer.
+    fn foldDigests(
+        arena: Allocator,
+        stdout: []const u8,
+        expected: usize,
+    ) Allocator.Error!expr.HashFiles.Result {
         var result = std.crypto.hash.sha2.Sha256.init(.{});
-        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, jsonFindString(hdata, "stdout") orelse "", "\n"), '\n');
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, stdout, "\n"), '\n');
         var n: usize = 0;
         while (lines.next()) |line_in| {
             // sha256sum marks names it had to escape with a leading backslash.
@@ -4464,7 +4529,7 @@ const Exec = struct {
             result.update(&digest);
             n += 1;
         }
-        if (n != files.items.len) return .{ .failed = "sha256sum did not hash every file" };
+        if (n != expected) return .{ .failed = "sha256sum did not hash every file" };
         const hex = std.fmt.bytesToHex(result.finalResult(), .lower);
         return .{ .ok = try arena.dupe(u8, &hex) };
     }
