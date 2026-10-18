@@ -18,6 +18,12 @@ whatever `--environment` printed. `note` says where a line came from when it was
 
 ## What is here
 
+Not every measurement leaves a sample file. [`storage/`](storage/README.md) holds the disk work
+behind S.5-S.7 — `disk.sh` for one device's profile and `sweep-schedulers.sh` for the four-scheduler
+sweep — whose readings are `fio` output rather than one quantity per trial, so they are summarised in
+[CLAIMS.md](../docs/CLAIMS.md) §S and its own README instead. [`e8.3/`](e8.3/README.md) has no
+samples either, for a different reason: its answer is a selection count, not a timing.
+
 | File | Claim | Provenance |
 |---|---|---|
 | `S.2-io-concurrency.jsonl` | S.2, a forced-copy install with 1 and with 3 jobs at once | **measured** on the Pi, 2026-10-17, by `concurrency/arm.sh` |

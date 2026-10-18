@@ -7,7 +7,9 @@ This is the contract between components. If you change anything here, tell the t
 ## 1. Repo layout
 
 ```
-docs/                   DESIGN.md, SPEC.md, DEPLOY.md
+docs/                   DESIGN.md, SPEC.md, DEPLOY.md; and the evidence: STUDY.md (what was
+                        measured), CLAIMS.md (every claim with a verdict), MEASURE.md (how a claim
+                        must be produced), RELATED.md (what the field already knew)
 runner/                 the runner (Zig); Dockerfile, testdata/ (job messages for --exec-job)
   src/
     main.zig            entry point: the runner, --exec-job, --inspect, --db-check
@@ -17,15 +19,28 @@ runner/                 the runner (Zig); Dockerfile, testdata/ (job messages fo
     engine.zig          Dagger's client protocol (with hpack.zig)
     job.zig, action.zig, expr.zig, context.zig, yaml.zig, commands.zig
                         the job message, actions, expressions, workflow commands
+    regex.zig, matcher.zig
+                        the regex subset (§6) and problem matchers built on it
     live.zig            live logs and step updates for GitHub
     sink.zig, redact.zig, pgsink.zig, pg.zig, db.zig
                         log sinks, secret redaction, the optional Postgres writer
+    inspect.zig, version.zig, timefmt.zig, hpack_tables.zig, dbtest.zig
+                        --inspect, the build version (§2), time formatting, generated hpack
+                        tables, and the database tests' scratch schema
     github/             jitconfig, auth, broker, run service, results (logs), live feed, HTTP
     vendor/             std's TLS client with one change (see §6)
+  tools/                check_workflows.zig, measure.zig (the measurement harness), regex_diff.*
+                        and regex_grammar.py (the regex differential test), gen_hpack_tables.py
 api/                    optional read API (TypeScript)
 web/                    optional frontend
 db/                     optional schema: migrations/, seed.sql
 deploy/                 compose.yaml, engine.json, zig-runner.service, runner.env.example
+proofs/                 the step cache's model in Agda, checked by check.sh (--safe, no stdlib)
+properties/             the proofs' obligations as live checks against a real engine
+measurements/           one JSON line per trial, the harness that took them, and a directory per
+                        claim re-checked under MEASURE.md §3
+comparisons/            workloads that run the same job here and on a hosted runner, for the
+                        questions that are "does ours behave like GitHub's?"
 .githooks/              pre-commit and pre-push checks (README.md)
 ```
 
@@ -395,7 +410,7 @@ Package caches (verified with two `--exec-job` runs in separate Dagger sessions:
 - Volumes are keyed `zig-runner/<owner>/<repo>/<scope>/<tool>`. The scope is `repo`, or `fork-pr` for a pull request from a fork (`github.event.pull_request.head.repo.full_name` differs from the repository), so untrusted code cannot plant content in the caches the repository's own branches use; GitHub scopes its cache by branch for the same reason.
 - **Installers that hardlink pay for this** (measured on a Raspberry Pi; see STUDY.md, experiment 6). Every volume is its own filesystem, and a hardlink cannot cross one: `/tmp` and the workspace share a device, each cache volume has its own. uv and pnpm hardlink package files out of their cache, so with the cache in a volume they fall back to copying file by file: a warm `uv sync` of 84 packages takes 27 s instead of 0.2 s, and `pnpm install` of 68 MB 16.6 s instead of 1.4 s. uv says so ("Failed to hardlink files; falling back to full copy"); pnpm does not. npm, Go and Cargo copy from their caches anyway and are unaffected (1.5 s for the same 68 MB). Every mount is its own device, even two mounts of one volume (checked: a hardlink between two mounts of one cache volume is refused although each sees the other's writes), so the only hardlink-reachable place from a cache is inside that same cache.
 
-  **uv therefore keeps its project environment there** (`RUNNER_UV_ENV_IN_CACHE`, on by default): `UV_PROJECT_ENVIRONMENT` is `<uv cache>/zig-runner-envs/<ref>`, and the workspace's `.venv` is a symlink to it, made before the checkout, which the checkout leaves in place. `UV_VENV_CLEAR=1` goes with it, because the environment outlives the job and `uv venv` refuses to replace one that exists, where on a hosted runner the workspace is new every job and it always succeeds; `uv sync` reconciles the environment that is there either way. Verified against `ubuntu-latest` on a Raspberry Pi: `uv run`, `.venv/bin/python`, `.venv/bin/pytest`, `source .venv/bin/activate` and a second job's `uv venv` all work, and flask's `uv sync` went from 28.6 s to **9.2 s** on a new ref and to milliseconds on a re-run, which is what this is for. It is *not* faster than a hosted runner: measured with both machines reconciling an environment that is already there, 12 trials each, this runner's median is 0.015 s against `ubuntu-latest`'s 0.011 s — the hosted runner wins by 27%, and the claim that it did not is the one refutation in [CLAIMS.md](CLAIMS.md) (E6.4). The environment persists between jobs and `uv sync` reconciles it to the lockfile, so one per ref keeps branches from reconciling a single environment in turn; they accumulate in the volume until it is pruned.
+  **uv therefore keeps its project environment there** (`RUNNER_UV_ENV_IN_CACHE`, on by default): `UV_PROJECT_ENVIRONMENT` is `<uv cache>/zig-runner-envs/<ref>`, and the workspace's `.venv` is a symlink to it, made before the checkout, which the checkout leaves in place. `UV_VENV_CLEAR=1` goes with it, because the environment outlives the job and `uv venv` refuses to replace one that exists, where on a hosted runner the workspace is new every job and it always succeeds; `uv sync` reconciles the environment that is there either way. Verified against `ubuntu-latest` on a Raspberry Pi: `uv run`, `.venv/bin/python`, `.venv/bin/pytest`, `source .venv/bin/activate` and a second job's `uv venv` all work, and flask's `uv sync` went from 28.6 s to **9.2 s** on a new ref and to milliseconds on a re-run, which is what this is for. It is *not* faster than a hosted runner: measured with both machines reconciling an environment that is already there, 12 trials each, this runner's median is 0.015 s against `ubuntu-latest`'s 0.011 s — the hosted runner wins by 27%, and the claim that it did not is one of the two refutations in [CLAIMS.md](CLAIMS.md) (E6.4; the other, W.5, is the same mistake about installing). The environment persists between jobs and `uv sync` reconciles it to the lockfile, so one per ref keeps branches from reconciling a single environment in turn; they accumulate in the volume until it is pruned.
 
   pnpm cannot be helped the same way, since `node_modules` has to be in the workspace for imports to resolve. A pnpm workflow that wants the fast path copies the store under `RUNNER_TEMP`, which is on the workspace's filesystem, and passes `--store-dir`.
 

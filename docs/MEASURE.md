@@ -147,9 +147,11 @@ proofs/README.md, "three things this turned up".
 ## 5. Staging
 
 1. ~~**The registry and the re-run commands** for the claims already in STUDY.md, marking those whose
-   evidence does not meet §3.2 as unverified.~~ **Done:** [CLAIMS.md](CLAIMS.md). 62 claims, of which
-   17 are verified, 32 are usable but under-powered, 8 are unverified and may not be used to justify
-   a change, and 2 were superseded. It also found that four commands in this repository can reproduce
+   evidence does not meet §3.2 as unverified.~~ **Done:** [CLAIMS.md](CLAIMS.md). As stage 1 left it: 62 claims, of
+   which 17 verified, 32 usable but under-powered, 8 unverified and not to be used to justify a
+   change, and 2 superseded. Those are the figures *at the time* and are kept because the rest of
+   this section refers to them; the register has moved on since (70 claims now, and stage 4 below
+   says where the eight went), so read [CLAIMS.md](CLAIMS.md)'s own header for the current count. It also found that four commands in this repository can reproduce
    any of them, which is the case for stage 2.
 2. ~~**The harness** (§3.3), with the environment capture and JSON samples, replacing the one-off
    shell scripts.~~ **Built:** `runner/tools/measure.zig`, `zig build measure`. It enforces what this
@@ -168,4 +170,16 @@ proofs/README.md, "three things this turned up".
    each case must assert — [proofs/README.md](../proofs/README.md), "Obligations for the harness" —
    including three families that must *fail*, since they are what the design cannot detect.
 4. **Re-check the claims** that step 1 marked unverified, in the order of what they are being used to
-   justify.
+   justify. **Seven of the eight are closed** (2026-10-16 to 17): E7.7 and E8.3 hold, E3.4 does not
+   hold as stated and was replaced by E3.4b, **E6.4 and W.5 are refuted** — they were both of the
+   study's "faster than a hosted runner" claims, and both compared this machine with warm caches
+   against a hosted runner with cold ones — and E2.7 and E5.6 are withdrawn as not measurable as
+   written. E5.4 is the one left.
+
+   Two lessons from doing it, which this section did not anticipate. **A claim can fail for its arms
+   rather than its sample size**, and no number of repetitions fixes that; E6.4 and W.5 both did.
+   And **dimensioning off a pilot taken in a different machine state under-samples**: E5.4's pilot
+   ran while the Pi was still quiet, reported `sd 0.000` on its baseline, asked for three
+   repetitions, and the series it sized then could not see a 17 s effect through the load its own
+   workload created. §3.2.4 separates the first round; a workload heavy enough to perturb the
+   machine needs the *whole series* gated on machine state, not just its start.
