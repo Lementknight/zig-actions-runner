@@ -750,6 +750,27 @@ test "ErrorResponse and DataRow parsing" {
     try std.testing.expectError(error.BadMessage, parseDataRow(a.allocator(), "\x00\x01\x00\x00\x00\x09ab"));
 }
 
+test "the StartupMessage is protocol 3.0 and four NUL-terminated parameters" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const cfg: Config = .{ .host = "h", .user = "u", .database = "d", .application_name = "app" };
+    const got = try Client.startupMessage(arena, cfg);
+    const want = "\x00\x03\x00\x00" ++ "user\x00u\x00" ++ "database\x00d\x00" ++
+        "application_name\x00app\x00" ++ "client_encoding\x00UTF8\x00" ++ "\x00";
+    try std.testing.expectEqualSlices(u8, want, got);
+}
+
+test "the MD5 password is md5(md5(password + user) + salt), as PostgreSQL documents it" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const cfg: Config = .{ .host = "h", .user = "u", .password = "pw", .database = "d" };
+    // The expected digest was computed outside this code, from the scheme in the Postgres manual.
+    const got = try Client.md5Password(arena, cfg, "\x01\x02\x03\x04");
+    try std.testing.expectEqualStrings("md50803a98a0618b75c8f9a50f280cad373\x00", got);
+}
+
 test "SCRAM-SHA-256 matches the RFC 7677 test vector" {
     var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer a.deinit();
