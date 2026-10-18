@@ -91,9 +91,7 @@ fn requestOnce(
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
     const bearer: ?[]const u8 = if (opts.token) |t| try std.fmt.allocPrint(scratch, "Bearer {s}", .{t}) else null;
-    const headers = try scratch.alloc(std.http.Header, opts.extra_headers.len + 1);
-    headers[0] = .{ .name = "Accept", .value = "application/json" };
-    @memcpy(headers[1..], opts.extra_headers);
+    const headers = try acceptJsonHeaders(scratch, opts.extra_headers);
     // The default 1 KiB write buffer is smaller than the ~1.6 KiB bearer token; requests stall.
     var local: std.http.Client = .{ .allocator = arena, .io = io, .write_buffer_size = 16 * 1024 };
     defer local.deinit();
@@ -116,15 +114,7 @@ fn requestOnce(
     };
 
     if (trace) std.debug.print("trace: connected\n", .{});
-    if (payload) |p| {
-        req.transfer_encoding = .{ .content_length = p.len };
-        var body = try req.sendBodyUnflushed(&.{});
-        try body.writer.writeAll(p);
-        try body.end();
-        try req.connection.?.flush();
-    } else {
-        try req.sendBodiless();
-    }
+    try send(&req, payload);
     if (trace) std.debug.print("trace: request sent\n", .{});
 
     var response = try req.receiveHead(&.{});
@@ -139,6 +129,31 @@ fn requestOnce(
         return .{ .status = response.head.status, .body = "" };
     }
 
+    const body = try readBody(scratch, &response);
+    if (trace) std.debug.print("trace: body {d} bytes\n", .{body.len});
+    return .{ .status = response.head.status, .body = try arena.dupe(u8, body) };
+}
+
+/// `Accept: application/json` ahead of the caller's headers.
+fn acceptJsonHeaders(scratch: Allocator, extra: []const std.http.Header) ![]std.http.Header {
+    const headers = try scratch.alloc(std.http.Header, extra.len + 1);
+    headers[0] = .{ .name = "Accept", .value = "application/json" };
+    @memcpy(headers[1..], extra);
+    return headers;
+}
+
+/// The request line and headers, then `payload` as the body when there is one.
+fn send(req: *std.http.Client.Request, payload: ?[]const u8) !void {
+    const p = payload orelse return req.sendBodiless();
+    req.transfer_encoding = .{ .content_length = p.len };
+    var body = try req.sendBodyUnflushed(&.{});
+    try body.writer.writeAll(p);
+    try body.end();
+    try req.connection.?.flush();
+}
+
+/// The whole body, decompressed, on `scratch`.
+fn readBody(scratch: Allocator, response: *std.http.Client.Response) ![]const u8 {
     var resp: std.Io.Writer.Allocating = .init(scratch);
     var transfer_buffer: [64]u8 = undefined;
     var decompress: std.http.Decompress = undefined;
@@ -148,8 +163,7 @@ fn requestOnce(
         error.ReadFailed => return response.bodyErr().?,
         else => |e| return e,
     };
-    if (trace) std.debug.print("trace: body {d} bytes\n", .{resp.written().len});
-    return .{ .status = response.head.status, .body = try arena.dupe(u8, resp.written()) };
+    return resp.written();
 }
 
 /// The machine's architecture as GitHub names it (`runner.arch`, RUNNER_ARCH): the runner, the
