@@ -2708,101 +2708,15 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     // Services hold state a cached step would not have changed (a migration replayed from cache
     // leaves a fresh database empty), so a job with services runs every step.
     const step_cache = opts.step_cache and !optsOutOfStepCache(ev.job_env.items) and job.services.len == 0;
-    // `container:` replaces the image every step runs in.
-    const job_image: []const u8 = if (job.container) |jc| (ev.render(jc.image, try ev.scope(&.{})) catch "") else opts.image;
-    if (job_image.len == 0) return fail(sh, results, try std.fmt.allocPrint(arena, "container: has no image: {s}", .{ev.diag}));
-    const provision = opts.provision and std.mem.eql(u8, job_image, default_image);
-    const as_runner = provision and opts.step_user == .runner;
-    // uv's project environment, inside its cache volume so uv can hardlink into it (see `uvEnvPath`).
-    const uv_env: ?[]const u8 = blk: {
-        if (!opts.uv_env_in_cache or !opts.package_caches or job.github.repository.len == 0) break :blk null;
-        const i = for (package_cache_dirs, 0..) |d, n| (if (std.mem.eql(u8, d.name, "uv")) break n) else break :blk null;
-        const path = if (job.container != null) package_cache_dirs[i].path else if (as_runner) try runnerCachePath(arena, i) else package_cache_dirs[i].path;
-        break :blk try uvEnvPath(arena, path, job.github.ref);
-    };
-    // Package managers' caches persist across jobs in Dagger cache volumes (see `package_cache_dirs`).
-    const cache_ids: []const []const u8 = if (opts.package_caches and job.github.repository.len > 0) ids: {
-        const scope = try packageCacheScope(arena, &ev, job.github.repository);
-        var doc: std.Io.Writer.Allocating = .init(arena);
-        const w = &doc.writer;
-        try w.writeAll("{");
-        for (package_cache_dirs, 0..) |d, i| {
-            try w.print(" c{d}: cacheVolume(key:", .{i});
-            // The tool cache holds binaries built for one image (glibc or musl, its libraries), so
-            // each image has its own.
-            const key = if (std.mem.eql(u8, d.name, "toolcache"))
-                try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/{s}/{s}", .{ job.github.repository, scope, d.name, job_image })
-            else
-                try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/{s}", .{ job.github.repository, scope, d.name });
-            // Volumes root filled hold files `runner_user` cannot write: steps that run as it get
-            // their own.
-            const user_key = if (as_runner) try std.mem.concat(arena, u8, &.{ key, "/", runner_user }) else key;
-            try std.json.Stringify.value(user_key, .{}, w);
-            try w.writeAll(") { id }");
-        }
-        try w.writeAll(" }");
-        const data = gql(arena, transport, doc.written(), &err_msg) catch return fail(sh, results, err_msg);
-        const ids = try arena.alloc([]const u8, package_cache_dirs.len);
-        for (ids, 0..) |*id, i| {
-            const v = jsonFind(data, try std.fmt.allocPrint(arena, "c{d}", .{i})) orelse return fail(sh, results, "Dagger returned no cache volume");
-            id.* = jsonFindString(v, "id") orelse return fail(sh, results, "Dagger returned no cache volume");
-        }
-        break :ids ids;
-    } else &.{};
-
-    const ran_marker = opts.test_ran_marker orelse ran: {
-        var raw: [12]u8 = undefined;
-        io.random(&raw);
-        break :ran try arena.dupe(u8, &std.fmt.bytesToHex(raw, .lower));
-    };
-    const container_id = baseContainerId(arena, transport, &ev, job, .{
-        .job_image = job_image,
-        .provision = provision,
-        .as_runner = as_runner,
-        .step_cache = step_cache,
-        .uv_env = uv_env,
-        .cache_ids = cache_ids,
-        .ran_marker = ran_marker,
-    }, &secret_counter, &err_msg) catch |e| switch (e) {
+    const plan = basePlan(arena, io, transport, &ev, job, opts, step_cache, &err_msg) catch |e| switch (e) {
         error.BaseContainerFailed => return fail(sh, results, err_msg),
         else => return e,
     };
-
-    var x: Exec = .{
-        .arena = arena,
-        .io = io,
-        .transport = transport,
-        .sh = sh,
-        .ev = &ev,
-        .job = &job,
-        .container_id = container_id,
-        .secret_counter = secret_counter,
-        .next_fc = @intCast(job.steps.len + 1),
-        .js_runtime = opts.js_runtime,
-        .nesting = opts.nesting,
-        .step_cache = step_cache,
-        .enforce_volatile = step_cache and opts.enforce_volatile,
-        .output_keys = if (step_cache and opts.output_keys and job.github.repository.len > 0)
-            try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/step-outputs", .{ job.github.repository, try packageCacheScope(arena, &ev, job.github.repository) })
-        else
-            null,
-        .outputs_days = opts.output_keys_days,
-        .event_from_env = step_cache and (try ev.eventJson()).len <= max_event_env,
-        .job_secret_env = jobEnvHasSecret(job, ev.job_env.items),
-        // Per job, not per run: a run's matrix jobs share its id and attempt, and a step that must run
-        // in each of them would otherwise be replayed from the first one's result.
-        .run_nonce = try std.fmt.allocPrint(arena, "{s}, job {s}", .{ try runNonce(arena, io, &ev), ran_marker }),
-        .ran_marker = ran_marker,
-        .dir_owner = if (as_runner) runner_user else null,
-        .execs = try zeroed(arena, u32, logSteps(job.steps.len)),
-        .next_log_step = @intCast(job.steps.len + 1),
-        .loaded = try nulls(arena, Exec.LoadResult, job.steps.len),
-        .pre_state = try emptySlices(arena, job_mod.EnvVar, job.steps.len),
-        .summaries = try emptySlices(arena, u8, logSteps(job.steps.len)),
-        .job_image = job_image,
-        .observer = opts.observer,
+    const container_id = baseContainerId(arena, transport, &ev, job, plan, &secret_counter, &err_msg) catch |e| switch (e) {
+        error.BaseContainerFailed => return fail(sh, results, err_msg),
+        else => return e,
     };
-
+    var x = try execFor(arena, io, transport, sh, &ev, &job, opts, plan, container_id, secret_counter, step_cache);
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
     var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel };
@@ -2812,33 +2726,7 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
         f.cancel(io);
     };
 
-    // "Set up job": what GitHub's runner logs before the first step, including fetching every action.
-    try x.logSetUp(opts);
-    var downloaded: std.StringHashMapUnmanaged(void) = .empty;
-    var unresolved: std.StringArrayHashMapUnmanaged(void) = .empty;
-    for (job.steps, 1..) |step, n| if (step.action == .uses and !step.action.uses.local) {
-        const lr = try x.loadFor(@intCast(n), step.action.uses);
-        if (lr == .unresolved) try unresolved.put(arena, lr.unresolved, {});
-        if (lr != .ok) continue;
-        const u = step.action.uses;
-        const label = try std.fmt.allocPrint(arena, "{s}/{s}@{s}", .{ u.owner, u.name, u.ref });
-        if ((try downloaded.getOrPut(arena, label)).found_existing) continue;
-        x.setUpLine(if (lr.ok.sha.len > 0)
-            try std.fmt.allocPrint(arena, "Download action repository '{s}' (SHA:{s})", .{ label, lr.ok.sha })
-        else
-            try std.fmt.allocPrint(arena, "Download action repository '{s}'", .{label}));
-    };
-    // As on GitHub, an action that cannot be resolved (even one whose step would be skipped) fails
-    // "Set up job" with one error naming them all, and no step runs.
-    if (unresolved.count() > 0) {
-        sh.errorLine(0, try std.mem.join(arena, ". ", unresolved.keys()));
-        var failed = try finish(arena, sh, results, "");
-        failed.succeeded = false;
-        failed.engine_error = null;
-        failed.set_up_failed = true;
-        return failed;
-    }
-    x.setUpLine(try std.fmt.allocPrint(arena, "Complete job name: {s}", .{if (job.display_name.len > 0) job.display_name else if (job.github.job.len > 0) job.github.job else "job"}));
+    if (try setUpJob(&x, opts, results)) |failed| return failed;
 
     if ((job.container != null or job.services.len > 0) and !try x.startServices()) {
         var failed = try finish(arena, sh, results, "");
@@ -2860,28 +2748,224 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
     for (job.steps, results, 1..) |step, *res, n| {
         if (try runStep(&x, &watch, opts.cancel, results, step, res, @intCast(n))) |finished| return finished;
     }
-    // Then their `post` scripts, last first, and the services.
+    return finishJob(&x, opts, results);
+}
+
+/// What the job runs in, decided before any step: the image, whether it is provisioned and steps run
+/// as the runner user, uv's environment, the package cache volumes, and this job's run marker.
+/// On failure the message is in `err_msg` and the caller fails the job with it.
+fn basePlan(
+    arena: Allocator,
+    io: std.Io,
+    transport: Transport,
+    ev: *Evaluator,
+    job: job_mod.Job,
+    opts: Options,
+    step_cache: bool,
+    err_msg: *[]const u8,
+) !BasePlan {
+    // `container:` replaces the image every step runs in.
+    const job_image: []const u8 = if (job.container) |jc| (ev.render(jc.image, try ev.scope(&.{})) catch "") else opts.image;
+    if (job_image.len == 0) {
+        err_msg.* = try std.fmt.allocPrint(arena, "container: has no image: {s}", .{ev.diag});
+        return error.BaseContainerFailed;
+    }
+    const provision = opts.provision and std.mem.eql(u8, job_image, default_image);
+    const as_runner = provision and opts.step_user == .runner;
+    const ran_marker = opts.test_ran_marker orelse ran: {
+        var raw: [12]u8 = undefined;
+        io.random(&raw);
+        break :ran try arena.dupe(u8, &std.fmt.bytesToHex(raw, .lower));
+    };
+    return .{
+        .job_image = job_image,
+        .provision = provision,
+        .as_runner = as_runner,
+        .step_cache = step_cache,
+        .uv_env = try uvEnvFor(arena, opts, job, as_runner),
+        .cache_ids = try cacheVolumeIds(arena, transport, ev, job, opts, job_image, as_runner, err_msg),
+        .ran_marker = ran_marker,
+    };
+}
+
+/// uv's project environment, inside its cache volume so uv can hardlink into it (see `uvEnvPath`).
+/// Null when there is no cache volume to put it in.
+fn uvEnvFor(arena: Allocator, opts: Options, job: job_mod.Job, as_runner: bool) !?[]const u8 {
+    if (!opts.uv_env_in_cache or !opts.package_caches or job.github.repository.len == 0) return null;
+    const i = for (package_cache_dirs, 0..) |d, n| (if (std.mem.eql(u8, d.name, "uv")) break n) else return null;
+    const path = if (job.container != null)
+        package_cache_dirs[i].path
+    else if (as_runner)
+        try runnerCachePath(arena, i)
+    else
+        package_cache_dirs[i].path;
+    return try uvEnvPath(arena, path, job.github.ref);
+}
+
+/// Package managers' caches persist across jobs in Dagger cache volumes (see `package_cache_dirs`):
+/// one query asks for every volume's id. Empty when caches are off or there is no repository to key
+/// them by.
+fn cacheVolumeIds(
+    arena: Allocator,
+    transport: Transport,
+    ev: *Evaluator,
+    job: job_mod.Job,
+    opts: Options,
+    job_image: []const u8,
+    as_runner: bool,
+    err_msg: *[]const u8,
+) ![]const []const u8 {
+    if (!opts.package_caches or job.github.repository.len == 0) return &.{};
+    const scope = try packageCacheScope(arena, ev, job.github.repository);
+    var doc: std.Io.Writer.Allocating = .init(arena);
+    const w = &doc.writer;
+    try w.writeAll("{");
+    for (package_cache_dirs, 0..) |d, i| {
+        try w.print(" c{d}: cacheVolume(key:", .{i});
+        // The tool cache holds binaries built for one image (glibc or musl, its libraries), so
+        // each image has its own.
+        const key = if (std.mem.eql(u8, d.name, "toolcache"))
+            try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/{s}/{s}", .{ job.github.repository, scope, d.name, job_image })
+        else
+            try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/{s}", .{ job.github.repository, scope, d.name });
+        // Volumes root filled hold files `runner_user` cannot write: steps that run as it get
+        // their own.
+        const user_key = if (as_runner) try std.mem.concat(arena, u8, &.{ key, "/", runner_user }) else key;
+        try std.json.Stringify.value(user_key, .{}, w);
+        try w.writeAll(") { id }");
+    }
+    try w.writeAll(" }");
+    const data = gql(arena, transport, doc.written(), err_msg) catch return error.BaseContainerFailed;
+    const ids = try arena.alloc([]const u8, package_cache_dirs.len);
+    for (ids, 0..) |*id, i| {
+        const v = jsonFind(data, try std.fmt.allocPrint(arena, "c{d}", .{i})) orelse {
+            err_msg.* = "Dagger returned no cache volume";
+            return error.BaseContainerFailed;
+        };
+        id.* = jsonFindString(v, "id") orelse {
+            err_msg.* = "Dagger returned no cache volume";
+            return error.BaseContainerFailed;
+        };
+    }
+    return ids;
+}
+
+/// The Exec a job's steps run through, from everything decided before the first step.
+fn execFor(
+    arena: Allocator,
+    io: std.Io,
+    transport: Transport,
+    sh: *Shared,
+    ev: *Evaluator,
+    job: *const job_mod.Job,
+    opts: Options,
+    plan: BasePlan,
+    container_id: []const u8,
+    secret_counter: u32,
+    step_cache: bool,
+) !Exec {
+    const scope = try packageCacheScope(arena, ev, job.github.repository);
+    return .{
+        .arena = arena,
+        .io = io,
+        .transport = transport,
+        .sh = sh,
+        .ev = ev,
+        .job = job,
+        .container_id = container_id,
+        .secret_counter = secret_counter,
+        .next_fc = @intCast(job.steps.len + 1),
+        .js_runtime = opts.js_runtime,
+        .nesting = opts.nesting,
+        .step_cache = step_cache,
+        .enforce_volatile = step_cache and opts.enforce_volatile,
+        .output_keys = if (step_cache and opts.output_keys and job.github.repository.len > 0)
+            try std.fmt.allocPrint(arena, "zig-runner/{s}/{s}/step-outputs", .{ job.github.repository, scope })
+        else
+            null,
+        .outputs_days = opts.output_keys_days,
+        .event_from_env = step_cache and (try ev.eventJson()).len <= max_event_env,
+        .job_secret_env = jobEnvHasSecret(job.*, ev.job_env.items),
+        // Per job, not per run: a run's matrix jobs share its id and attempt, and a step that must run
+        // in each of them would otherwise be replayed from the first one's result.
+        .run_nonce = try std.fmt.allocPrint(arena, "{s}, job {s}", .{ try runNonce(arena, io, ev), plan.ran_marker }),
+        .ran_marker = plan.ran_marker,
+        .dir_owner = if (plan.as_runner) runner_user else null,
+        .execs = try zeroed(arena, u32, logSteps(job.steps.len)),
+        .next_log_step = @intCast(job.steps.len + 1),
+        .loaded = try nulls(arena, Exec.LoadResult, job.steps.len),
+        .pre_state = try emptySlices(arena, job_mod.EnvVar, job.steps.len),
+        .summaries = try emptySlices(arena, u8, logSteps(job.steps.len)),
+        .job_image = plan.job_image,
+        .observer = opts.observer,
+    };
+}
+
+/// "Set up job": what GitHub's runner logs before the first step, including fetching every action.
+/// As on GitHub, an action that cannot be resolved (even one whose step would be skipped) fails
+/// "Set up job" with one error naming them all, and no step runs: that is the Result returned.
+fn setUpJob(x: *Exec, opts: Options, results: []StepResult) !?Result {
+    const arena = x.arena;
+    try x.logSetUp(opts);
+    var downloaded: std.StringHashMapUnmanaged(void) = .empty;
+    var unresolved: std.StringArrayHashMapUnmanaged(void) = .empty;
+    for (x.job.steps, 1..) |step, n| if (step.action == .uses and !step.action.uses.local) {
+        const lr = try x.loadFor(@intCast(n), step.action.uses);
+        if (lr == .unresolved) try unresolved.put(arena, lr.unresolved, {});
+        if (lr != .ok) continue;
+        const u = step.action.uses;
+        const label = try std.fmt.allocPrint(arena, "{s}/{s}@{s}", .{ u.owner, u.name, u.ref });
+        if ((try downloaded.getOrPut(arena, label)).found_existing) continue;
+        x.setUpLine(if (lr.ok.sha.len > 0)
+            try std.fmt.allocPrint(arena, "Download action repository '{s}' (SHA:{s})", .{ label, lr.ok.sha })
+        else
+            try std.fmt.allocPrint(arena, "Download action repository '{s}'", .{label}));
+    };
+    if (unresolved.count() > 0) {
+        x.sh.errorLine(0, try std.mem.join(arena, ". ", unresolved.keys()));
+        var failed = try finish(arena, x.sh, results, "");
+        failed.succeeded = false;
+        failed.engine_error = null;
+        failed.set_up_failed = true;
+        return failed;
+    }
+    const job = x.job;
+    const name = if (job.display_name.len > 0) job.display_name else if (job.github.job.len > 0) job.github.job else "job";
+    x.setUpLine(try std.fmt.allocPrint(arena, "Complete job name: {s}", .{name}));
+    return null;
+}
+
+/// After the last step: the `post` scripts, last first, then the services, then the job's result
+/// and outputs.
+fn finishJob(x: *Exec, opts: Options, results: []StepResult) !Result {
+    const arena = x.arena;
+    const job = x.job;
     const stopping = job.services.len > 0 or job.container != null;
     if (x.posts.items.len > 0 or stopping) if (opts.observer) |o| if (o.postsFn) |f| f(o.ptr, @intCast(x.posts.items.len), stopping);
     x.runPosts() catch |e| switch (e) {
-        error.EngineFailed => return finish(arena, sh, results, x.err_msg),
+        error.EngineFailed => return finish(arena, x.sh, results, x.err_msg),
         else => return e,
     };
     try x.stopServices();
-    var result = try finish(arena, sh, results, "");
+    var result = try finish(arena, x.sh, results, "");
     if (x.hook_failed) result.succeeded = false;
     if (opts.cancel) |c| if (c.requested.load(.acquire)) {
-        ev.cancelled = true;
+        x.ev.cancelled = true;
     };
-    if (ev.cancelled) {
+    if (x.ev.cancelled) {
         result.cancelled = true;
         result.succeeded = false;
     }
     result.extra = x.extra.items;
-    result.output_keys = .{ .applied = x.outputs_applied, .fell_back = x.outputs_fell_back, .last_reason = x.outputs_last_reason, .ms = x.outputs_ms };
+    result.output_keys = .{
+        .applied = x.outputs_applied,
+        .fell_back = x.outputs_fell_back,
+        .last_reason = x.outputs_last_reason,
+        .ms = x.outputs_ms,
+    };
     result.next_log_step = x.next_log_step;
     result.summaries = x.summaries;
-    try jobOutputs(arena, &ev, job, &result);
+    try jobOutputs(arena, x.ev, job.*, &result);
     return result;
 }
 
