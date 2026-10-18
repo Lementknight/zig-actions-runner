@@ -453,25 +453,9 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
     var collect: sink.LogSink = .{ .collect = .{ .arena = c.arena, .io = c.io, .inner = c.log } };
     collect.setSecrets(try std.mem.concat(c.arena, []const u8, &.{ c.secrets, job.secrets }));
     const log = &collect;
-    // On disk while the job runs, rather than in memory until it ends: a job's log is then bounded
-    // by the spool and survives the process (see `sink.Spool`). Best effort — a directory the runner
-    // cannot write to is said once and the lines stay in memory, because logging must not fail a job.
-    var spool: sink.Spool = undefined;
-    var spool_path: ?[]const u8 = null;
-    if (c.cfg.log_spool_dir.len > 0) spooled: {
-        const path = std.fmt.allocPrint(c.arena, "{s}/zig-runner-job-{d}.log", .{ c.cfg.log_spool_dir, job.check_run_id }) catch break :spooled;
-        const file = std.Io.Dir.cwd().createFile(c.io, path, .{ .read = true }) catch |e| {
-            try c.err.print("job {d}: no log spool in {s} ({s}); the job's log is kept in memory\n", .{ job.check_run_id, c.cfg.log_spool_dir, @errorName(e) });
-            break :spooled;
-        };
-        spool = .{ .file = file, .io = c.io };
-        collect.collect.spool = &spool;
-        spool_path = path;
-    }
-    defer if (spool_path) |path| {
-        spool.file.close(c.io);
-        std.Io.Dir.cwd().deleteFile(c.io, path) catch {};
-    };
+    var spool = try openSpool(c, job);
+    if (spool) |*sp| collect.collect.spool = &sp.spool;
+    defer if (spool) |*sp| sp.close(c.io);
     // The job, live in GitHub's UI: its steps as they run and their lines as they are logged.
     var live = try Live.init(c.gpa, c.arena, c.io, &job, c.log);
     collect.collect.listener = live.listener();
@@ -484,57 +468,143 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
     // For the runner's own console and database only: the job's log starts as GitHub's does.
     try c.log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job acquired: {d} steps", .{job.steps.len}));
 
-    var reporter: ?Reporter = null;
     const job_started_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
-    if (c.store) |st| {
-        const run_id = std.fmt.parseInt(u64, job.github.run_id, 10) catch 0;
-        if (run_id != 0 and job.check_run_id != 0) {
-            reporter = .{ .store = st, .arena = c.arena, .io = c.io, .job_id = job.check_run_id, .run_id = run_id };
-            reporter.?.jobStarted(job, c.name, job_started_ms);
-        } else try c.err.writeAll("run state not recorded: the job has no run id or job id\n");
-    }
+    var reporter = try startReporter(c, job, job_started_ms);
+    const result = try runJobSteps(c, job, log, &cancel, &live, if (reporter) |*r| r else null);
 
-    var result: dagger.Result = undefined;
-    // Fail the job up front rather than run steps that would fail in confusing ways without them.
+    const completion = try logCompleteJob(c, job, log, &live, result, job_started_ms);
+    if (reporter) |*r| {
+        r.jobFinished(job, c.name, reporterConclusion(result), job_started_ms, std.Io.Clock.real.now(c.io).toMilliseconds());
+        if (r.failures > 0) try c.err.print("run state: {d} database write(s) failed (last: {s})\n", .{ r.failures, r.last_error });
+    }
+    try reportCacheAndKeys(c, job, log, result);
+    const shown = try shownSteps(c.arena, live.ids, job, result, job_started_ms, completion);
+    try uploadLogs(c, job, shown, log.collect.collected(c.arena), result.summaries, log.currentSecrets());
+    // The live view ends with the steps as completejob reports them.
+    live_done = true;
+    collect.collect.listener = null;
+    live.finish(try liveFinals(c.arena, shown));
+
+    const conclusion: runservice.Conclusion = if (result.cancelled) .canceled else if (result.succeeded) .succeeded else .failed;
+    if (try completeJobWithRetry(c, jr, job, conclusion, shown, result)) |failed| return failed;
+    try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job {s}", .{@tagName(conclusion)}));
+    return .{ .job = result.succeeded };
+}
+
+/// The job's log on disk while it runs, rather than in memory until it ends: it is then bounded by
+/// the spool and survives the process (see `sink.Spool`). Best effort — a directory the runner cannot
+/// write to is said once and the lines stay in memory, because logging must not fail a job. Null when
+/// no spool directory is configured or the file could not be made. The caller points the collector
+/// at it once it is stored, so the pointer is to something that stays put.
+const JobSpool = struct {
+    spool: sink.Spool,
+    path: []const u8,
+
+    fn close(sp: *JobSpool, io: std.Io) void {
+        sp.spool.file.close(io);
+        std.Io.Dir.cwd().deleteFile(io, sp.path) catch {};
+    }
+};
+
+fn openSpool(c: Context, job: job_mod.Job) !?JobSpool {
+    if (c.cfg.log_spool_dir.len == 0) return null;
+    const path = std.fmt.allocPrint(c.arena, "{s}/zig-runner-job-{d}.log", .{ c.cfg.log_spool_dir, job.check_run_id }) catch return null;
+    const file = std.Io.Dir.cwd().createFile(c.io, path, .{ .read = true }) catch |e| {
+        try c.err.print("job {d}: no log spool in {s} ({s}); the job's log is kept in memory\n", .{ job.check_run_id, c.cfg.log_spool_dir, @errorName(e) });
+        return null;
+    };
+    return .{ .spool = .{ .file = file, .io = c.io }, .path = path };
+}
+
+/// The job's conclusion as the run-state database records it.
+fn reporterConclusion(result: dagger.Result) []const u8 {
+    if (result.cancelled) return "cancelled";
+    return if (result.succeeded) "success" else "failure";
+}
+
+/// Run state in the database, when there is one and the job can be identified. The reporter is
+/// returned by value and the caller keeps it, because the spool pointer into `collect` is set here.
+fn startReporter(c: Context, job: job_mod.Job, job_started_ms: i64) !?Reporter {
+    const st = c.store orelse return null;
+    const run_id = std.fmt.parseInt(u64, job.github.run_id, 10) catch 0;
+    if (run_id == 0 or job.check_run_id == 0) {
+        try c.err.writeAll("run state not recorded: the job has no run id or job id\n");
+        return null;
+    }
+    var reporter: Reporter = .{
+        .store = st,
+        .arena = c.arena,
+        .io = c.io,
+        .job_id = job.check_run_id,
+        .run_id = run_id,
+    };
+    reporter.jobStarted(job, c.name, job_started_ms);
+    return reporter;
+}
+
+/// The steps, through Dagger — or, for a job whose `container:` or `services:` the runner does not
+/// support, failed up front rather than run in ways that would fail confusingly without them.
+fn runJobSteps(
+    c: Context,
+    job: job_mod.Job,
+    log: *sink.LogSink,
+    cancel: *dagger.Cancel,
+    live: *Live,
+    reporter: ?*Reporter,
+) !dagger.Result {
     const unsupported: ?[]const u8 = job.container_error orelse job.services_error;
     if (unsupported) |why| {
         const step_results = try c.arena.alloc(dagger.StepResult, job.steps.len);
         @memset(step_results, .{});
         try log.append(job.check_run_id, 0, .stderr, why);
-        result = .{ .steps = step_results, .engine_error = null, .succeeded = false };
-    } else {
-        result = try dagger.run(c.arena, c.io, c.environ, .{
-            .dagger_cmd = c.cfg.dagger_cmd,
-            .image = c.cfg.image,
-            .js_runtime = c.cfg.js_runtime,
-            .engine = c.cfg.engineEndpoint(),
-            .gpa = c.gpa,
-            .nesting = c.cfg.dagger_nesting,
-            .package_caches = c.cfg.package_caches,
-            .step_cache = c.cfg.step_cache,
-            .step_user = c.cfg.step_user,
-            // Skipped for a repository whose jobs spend too long on them (see `SlowOutputs`).
-            .output_keys = c.cfg.output_keys and (if (c.slow_outputs) |so| so.spent(job.github.repository) == null else true),
-            .output_keys_days = c.cfg.output_keys_days,
-            .cancel = &cancel,
-            .observer = observer: {
-                live.next = if (reporter) |*r| r.observer() else null;
-                break :observer live.observer();
-            },
-            .sink_job_id = job.check_run_id,
-            .runner_name = c.name,
-        }, job, log);
-        // A cancel can also end the job through a query it cut short (past the grace period).
-        if (cancel.requested.load(.acquire)) {
-            result.cancelled = true;
-            result.succeeded = false;
-        }
-        if (result.engine_error) |msg| if (!result.cancelled) {
-            try log.append(job.check_run_id, 0, .stderr, "dagger failed before running the steps:");
-            try log.append(job.check_run_id, 0, .stderr, msg);
-        };
+        return .{ .steps = step_results, .engine_error = null, .succeeded = false };
     }
-    // "Complete job", as GitHub's runner ends a job (the job's containers went with its session).
+    var result = try dagger.run(c.arena, c.io, c.environ, .{
+        .dagger_cmd = c.cfg.dagger_cmd,
+        .image = c.cfg.image,
+        .js_runtime = c.cfg.js_runtime,
+        .engine = c.cfg.engineEndpoint(),
+        .gpa = c.gpa,
+        .nesting = c.cfg.dagger_nesting,
+        .package_caches = c.cfg.package_caches,
+        .step_cache = c.cfg.step_cache,
+        .step_user = c.cfg.step_user,
+        // Skipped for a repository whose jobs spend too long on them (see `SlowOutputs`).
+        .output_keys = c.cfg.output_keys and (if (c.slow_outputs) |so| so.spent(job.github.repository) == null else true),
+        .output_keys_days = c.cfg.output_keys_days,
+        .cancel = cancel,
+        .observer = observer: {
+            live.next = if (reporter) |r| r.observer() else null;
+            break :observer live.observer();
+        },
+        .sink_job_id = job.check_run_id,
+        .runner_name = c.name,
+    }, job, log);
+    // A cancel can also end the job through a query it cut short (past the grace period).
+    if (cancel.requested.load(.acquire)) {
+        result.cancelled = true;
+        result.succeeded = false;
+    }
+    if (result.engine_error) |msg| if (!result.cancelled) {
+        try log.append(job.check_run_id, 0, .stderr, "dagger failed before running the steps:");
+        try log.append(job.check_run_id, 0, .stderr, msg);
+    };
+    return result;
+}
+
+/// Where "Complete job" sits in the log and when it ran, for `shownSteps`.
+const CompleteStep = struct { log_step: u32, started_ms: i64, completed_ms: i64 };
+
+/// "Complete job", as GitHub's runner ends a job (the job's containers went with its session).
+/// Returns where that step sits, for `shownSteps`.
+fn logCompleteJob(
+    c: Context,
+    job: job_mod.Job,
+    log: *sink.LogSink,
+    live: *Live,
+    result: dagger.Result,
+    job_started_ms: i64,
+) !CompleteStep {
     const complete_started = std.Io.Clock.real.now(c.io).toMilliseconds();
     const complete_step: u32 = if (result.next_log_step > 0) result.next_log_step else @intCast(job.steps.len + 1);
     if (result.set_up_failed) {
@@ -547,12 +617,16 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
     for (result.output_lines) |l| try log.append(job.check_run_id, complete_step, .stdout, l);
     try log.append(job.check_run_id, complete_step, .stdout, "Cleaning up orphan processes");
     try log.flush();
-    if (reporter) |*r| {
-        r.jobFinished(job, c.name, if (result.cancelled) "cancelled" else if (result.succeeded) "success" else "failure", job_started_ms, std.Io.Clock.real.now(c.io).toMilliseconds());
-        if (r.failures > 0) try c.err.print("run state: {d} database write(s) failed (last: {s})\n", .{ r.failures, r.last_error });
-    }
-    // How many steps the engine served from cache, as the step logs say (`dagger.reused_note`):
-    // what step caching saved this job, next to what output keys cost it.
+    return .{
+        .log_step = complete_step,
+        .started_ms = complete_started,
+        .completed_ms = std.Io.Clock.real.now(c.io).toMilliseconds(),
+    };
+}
+
+/// On the runner's own console: how many steps the engine served from cache, as the step logs say
+/// (`dagger.reused_note`) — what step caching saved this job, next to what output keys cost it.
+fn reportCacheAndKeys(c: Context, job: job_mod.Job, log: *sink.LogSink, result: dagger.Result) !void {
     if (c.cfg.step_cache and job.steps.len > 0) {
         var replayed: usize = 0;
         for (log.collect.collected(c.arena)) |l| {
@@ -561,42 +635,49 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
         try c.err.print("job {d}: {d} of {d} steps replayed from the cache\n", .{ job.check_run_id, replayed, job.steps.len });
     }
     const ok = result.output_keys;
-    if (ok.applied + ok.fell_back > 0) {
-        try c.err.print("job {d}: output keys: {d} of {d} always-run steps applied", .{ job.check_run_id, ok.applied, ok.applied + ok.fell_back });
-        const ms: u64 = @intCast(@max(ok.ms, 0));
-        try c.err.print(" in {d}.{d} s", .{ ms / 1000, ms % 1000 / 100 });
-        if (ok.fell_back > 0) try c.err.print("; {d} fell back (last: {s})", .{ ok.fell_back, ok.last_reason });
-        try c.err.writeAll("\n");
-        // Over the limit: the rest of this repository's jobs do without them (see `SlowOutputs`).
-        const cap = c.cfg.output_keys_max_ms;
-        if (cap > 0 and ok.ms > cap and job.github.repository.len > 0) if (c.slow_outputs) |so| {
-            if (so.record(job.github.repository, ok.ms))
-                try c.err.print("job {d}: output keys: {d}.{d} s is over the {d}.{d} s limit, so {s}'s later jobs skip them (RUNNER_OUTPUT_KEYS_MAX_MS)\n", .{ job.check_run_id, ms / 1000, ms % 1000 / 100, cap / 1000, cap % 1000 / 100, job.github.repository });
-        };
-    }
-    const shown = try shownSteps(c.arena, live.ids, job, result, job_started_ms, .{ .log_step = complete_step, .started_ms = complete_started, .completed_ms = std.Io.Clock.real.now(c.io).toMilliseconds() });
-    try uploadLogs(c, job, shown, log.collect.collected(c.arena), result.summaries, log.currentSecrets());
-    {
-        // The live view ends with the steps as completejob reports them.
-        const finals = try c.arena.alloc(Live.Final, shown.len);
-        for (shown, finals) |sh, *f| f.* = .{ .id = sh.id, .number = sh.number, .name = sh.name, .conclusion = liveConclusion(sh.conclusion), .started_ms = sh.started_ms, .completed_ms = sh.completed_ms };
-        live_done = true;
-        collect.collect.listener = null;
-        live.finish(finals);
-    }
+    if (ok.applied + ok.fell_back == 0) return;
+    try c.err.print("job {d}: output keys: {d} of {d} always-run steps applied", .{ job.check_run_id, ok.applied, ok.applied + ok.fell_back });
+    const ms: u64 = @intCast(@max(ok.ms, 0));
+    try c.err.print(" in {d}.{d} s", .{ ms / 1000, ms % 1000 / 100 });
+    if (ok.fell_back > 0) try c.err.print("; {d} fell back (last: {s})", .{ ok.fell_back, ok.last_reason });
+    try c.err.writeAll("\n");
+    // Over the limit: the rest of this repository's jobs do without them (see `SlowOutputs`).
+    const cap = c.cfg.output_keys_max_ms;
+    if (cap > 0 and ok.ms > cap and job.github.repository.len > 0) if (c.slow_outputs) |so| {
+        if (so.record(job.github.repository, ok.ms))
+            try c.err.print("job {d}: output keys: {d}.{d} s is over the {d}.{d} s limit, so {s}'s later jobs skip them (RUNNER_OUTPUT_KEYS_MAX_MS)\n", .{ job.check_run_id, ms / 1000, ms % 1000 / 100, cap / 1000, cap % 1000 / 100, job.github.repository });
+    };
+}
 
-    const conclusion: runservice.Conclusion = if (result.cancelled) .canceled else if (result.succeeded) .succeeded else .failed;
+/// The steps as completejob reports them, for the live view's last update.
+fn liveFinals(arena: std.mem.Allocator, shown: []const Shown) ![]const Live.Final {
+    const finals = try arena.alloc(Live.Final, shown.len);
+    for (shown, finals) |sh, *f| f.* = .{ .id = sh.id, .number = sh.number, .name = sh.name, .conclusion = liveConclusion(sh.conclusion), .started_ms = sh.started_ms, .completed_ms = sh.completed_ms };
+    return finals;
+}
+
+/// completejob with the step results and annotations, and once more without them if GitHub refuses:
+/// a held job blocks the run for minutes, so it is always finished. Returns the failed Cycle when
+/// even that did not succeed.
+fn completeJobWithRetry(
+    c: Context,
+    jr: runservice.JobRequest,
+    job: job_mod.Job,
+    conclusion: runservice.Conclusion,
+    shown: []const Shown,
+    result: dagger.Result,
+) !?Cycle {
     const step_json = try stepResultsJson(c.arena, shown);
     const annotations_json = try annotationsJson(c.arena, shown, result.annotations);
-    var done = completeJob(c, jr, job, conclusion, step_json, result.outputs, annotations_json) catch |e| return fail(c, "completejob", e);
+    var done = completeJob(c, jr, job, conclusion, step_json, result.outputs, annotations_json) catch |e|
+        return try fail(c, "completejob", e);
     if (done.status.class() != .success) {
-        // A held job blocks the run for minutes, so always finish it: retry without step details.
         try c.err.print("completejob with step results and annotations failed (HTTP {d}: {s}); retrying without them\n", .{ @backingInt(done.status), done.body[0..@min(done.body.len, 200)] });
-        done = completeJob(c, jr, job, conclusion, "[]", result.outputs, "[]") catch |e| return fail(c, "completejob", e);
-        if (done.status.class() != .success) return failBody(c, "completejob", done);
+        done = completeJob(c, jr, job, conclusion, "[]", result.outputs, "[]") catch |e|
+            return try fail(c, "completejob", e);
+        if (done.status.class() != .success) return try failBody(c, "completejob", done);
     }
-    try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job {s}", .{@tagName(conclusion)}));
-    return .{ .job = result.succeeded };
+    return null;
 }
 
 /// completejob, tried again (after 2, 5 and 10 s) when the request fails or GitHub answers 5xx:
@@ -771,7 +852,7 @@ test "timeSpanMs reads GitHub's cancel timeout" {
 /// `pre` scripts, the job's steps, their `post` scripts, "Complete job". GitHub lists only the job's
 /// own steps; its runner adds the others with ids of their own, and so does this one.
 /// `ids`: GitHub's id of each log step (see `Live.ids`), the same the live view used.
-pub fn shownSteps(arena: Allocator, ids: []const []const u8, job: job_mod.Job, result: dagger.Result, job_started_ms: i64, complete: struct { log_step: u32, started_ms: i64, completed_ms: i64 }) ![]Shown {
+pub fn shownSteps(arena: Allocator, ids: []const []const u8, job: job_mod.Job, result: dagger.Result, job_started_ms: i64, complete: CompleteStep) ![]Shown {
     var out: std.ArrayList(Shown) = .empty;
     var first_started: i64 = complete.started_ms;
     for (result.steps) |r| if (r.started_ms > 0 and r.started_ms < first_started) {
