@@ -13,6 +13,36 @@ says why the first figure cannot be trusted:
 So the 1–2 s column is measured and the 21 s is not. This is the last claim the register marks
 unverified, and the only one of the original eight that was a real measurement nobody had made.
 
+## The answer
+
+```
+  root          n=6  median  2.500 s  (baseline)
+  user          n=6  median 19.000 s  difference 16.500  95% CI [14.000, 22.000]  effect
+  root-control  n=6  median  2.000 s  difference -0.500  95% CI [-2.000,  1.000]  no_effect_found
+```
+
+**It holds.** `owner:` costs **16.5 s** on a new 234 MB directory of 20,000 files — interval
+[14.0, 22.0], excluding zero and more than three times the 5 s threshold pre-registered before the
+harness ran. The step takes 19.0 s with it and 2.5 s without, against the study's 21 s and 1-2 s:
+its figures sit inside this interval.
+
+**So the study's number was right and its self-criticism was wrong.** Its method note said the probe
+"measured a cached ownership pass and understated what a new directory costs", implying the true
+cost was *higher* than 21 s. With every file new, it is 19 s — the figure it recorded and doubted.
+That is a fourth way a claim in this register has turned out wrong: not the number, but the apology
+attached to it.
+
+The negative control is how the gate is known to have worked. Its interval is **±2 s** here against
+**±7 s** in the ungated series, which is the difference between an instrument that can see a 5 s
+effect and one that cannot.
+
+### Six readings, not eight, and why that is enough
+
+The gated run was interrupted after 6 of 8 rounds. Re-dimensioning on what it produced asks for
+**4** repetitions of the `user` arm (sd 4.49) and 3 of each other — so 6 is already past what the
+spread requires, and running the missing two would be repetitions by habit, which §3.2.5 exists to
+prevent. The shortfall is recorded here rather than quietly re-run.
+
 ## Why it is worth measuring rather than withdrawing
 
 Unlike E2.7 and E5.6, which were withdrawn, this cost is **live**. `withDirectory` with `owner:` is
