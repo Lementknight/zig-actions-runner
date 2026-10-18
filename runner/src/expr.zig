@@ -538,10 +538,7 @@ fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
 
 fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: Scope) Error!Value {
     const eql = std.ascii.eqlIgnoreCase;
-    if (eql(name, "success")) return .{ .boolean = !scope.job_failed and !scope.cancelled };
-    if (eql(name, "always")) return .{ .boolean = true };
-    if (eql(name, "cancelled")) return .{ .boolean = scope.cancelled };
-    if (eql(name, "failure")) return .{ .boolean = scope.job_failed and !scope.cancelled };
+    if (statusFunction(name, scope)) |v| return v;
     if (eql(name, "hashFiles") and scope.hash_files == null) {
         if (scope.diag) |d| d.* = "hashFiles() is not supported here";
         return error.Unsupported;
@@ -550,31 +547,8 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
     const args = try arena.alloc(Value, arg_nodes.len);
     for (arg_nodes, args) |an, *out| out.* = try eval(arena, an, scope);
 
-    if (eql(name, "hashFiles")) {
-        if (args.len < 1) return scope.fail("hashFiles() takes at least 1 argument", .{}, arena);
-        const patterns = try arena.alloc([]const u8, args.len);
-        for (args, patterns) |a, *dst| dst.* = try toStr(arena, a);
-        const hf = scope.hash_files.?;
-        return switch (try hf.hashFn(hf.ptr, arena, patterns)) {
-            .ok => |hex| .{ .string = hex },
-            .failed => |why| scope.fail("hashFiles({s}) failed: {s}", .{ try std.mem.join(arena, ", ", patterns), why }, arena),
-        };
-    }
-
-    if (eql(name, "contains")) {
-        if (args.len != 2) return scope.fail("contains() takes 2 arguments", .{}, arena);
-        switch (args[0]) {
-            .array => |a| {
-                for (a) |e| if (looseEquals(e, args[1])) return .{ .boolean = true };
-                return .{ .boolean = false };
-            },
-            else => {
-                const hay = try toStr(arena, args[0]);
-                const needle = try toStr(arena, args[1]);
-                return .{ .boolean = std.ascii.findIgnoreCase(hay, needle) != null };
-            },
-        }
-    }
+    if (eql(name, "hashFiles")) return callHashFiles(arena, args, scope);
+    if (eql(name, "contains")) return callContains(arena, args, scope);
     if (eql(name, "startsWith") or eql(name, "endsWith")) {
         if (args.len != 2) return scope.fail("{s}() takes 2 arguments", .{name}, arena);
         const s = try toStr(arena, args[0]);
@@ -585,35 +559,77 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
         if (args.len < 1) return scope.fail("format() needs a format string", .{}, arena);
         return .{ .string = try formatString(arena, try toStr(arena, args[0]), args[1..], scope) };
     }
-    if (eql(name, "join")) {
-        if (args.len < 1 or args.len > 2) return scope.fail("join() takes 1 or 2 arguments", .{}, arena);
-        const sep = if (args.len == 2) try toStr(arena, args[1]) else ",";
-        switch (args[0]) {
-            .array => |a| {
-                var out: std.ArrayList(u8) = .empty;
-                for (a, 0..) |e, i| {
-                    if (i > 0) try out.appendSlice(arena, sep);
-                    try out.appendSlice(arena, try toStr(arena, e));
-                }
-                return .{ .string = out.items };
-            },
-            else => return .{ .string = try toStr(arena, args[0]) },
-        }
-    }
-    if (eql(name, "toJSON")) {
-        if (args.len != 1) return scope.fail("toJSON() takes 1 argument", .{}, arena);
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        writeJson(&aw.writer, args[0], 0) catch return error.OutOfMemory; // Allocating writer: only OOM
-        return .{ .string = aw.written() };
-    }
-    if (eql(name, "fromJSON")) {
-        if (args.len != 1) return scope.fail("fromJSON() takes 1 argument", .{}, arena);
-        const text = try toStr(arena, args[0]);
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch
-            return scope.fail("fromJSON(): invalid JSON", .{}, arena);
-        return fromJsonValue(arena, parsed);
-    }
+    if (eql(name, "join")) return callJoin(arena, args, scope);
+    if (eql(name, "toJSON")) return callToJson(arena, args, scope);
+    if (eql(name, "fromJSON")) return callFromJson(arena, args, scope);
     return scope.fail("unknown function '{s}'", .{name}, arena);
+}
+
+/// `success()`, `always()`, `cancelled()`, `failure()`: the job's state, no arguments evaluated.
+fn statusFunction(name: []const u8, scope: Scope) ?Value {
+    const eql = std.ascii.eqlIgnoreCase;
+    if (eql(name, "success")) return .{ .boolean = !scope.job_failed and !scope.cancelled };
+    if (eql(name, "always")) return .{ .boolean = true };
+    if (eql(name, "cancelled")) return .{ .boolean = scope.cancelled };
+    if (eql(name, "failure")) return .{ .boolean = scope.job_failed and !scope.cancelled };
+    return null;
+}
+
+fn callHashFiles(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
+    if (args.len < 1) return scope.fail("hashFiles() takes at least 1 argument", .{}, arena);
+    const patterns = try arena.alloc([]const u8, args.len);
+    for (args, patterns) |a, *dst| dst.* = try toStr(arena, a);
+    const hf = scope.hash_files.?;
+    return switch (try hf.hashFn(hf.ptr, arena, patterns)) {
+        .ok => |hex| .{ .string = hex },
+        .failed => |why| scope.fail("hashFiles({s}) failed: {s}", .{ try std.mem.join(arena, ", ", patterns), why }, arena),
+    };
+}
+
+fn callContains(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
+    if (args.len != 2) return scope.fail("contains() takes 2 arguments", .{}, arena);
+    switch (args[0]) {
+        .array => |a| {
+            for (a) |e| if (looseEquals(e, args[1])) return .{ .boolean = true };
+            return .{ .boolean = false };
+        },
+        else => {
+            const hay = try toStr(arena, args[0]);
+            const needle = try toStr(arena, args[1]);
+            return .{ .boolean = std.ascii.findIgnoreCase(hay, needle) != null };
+        },
+    }
+}
+
+fn callJoin(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
+    if (args.len < 1 or args.len > 2) return scope.fail("join() takes 1 or 2 arguments", .{}, arena);
+    const sep = if (args.len == 2) try toStr(arena, args[1]) else ",";
+    switch (args[0]) {
+        .array => |a| {
+            var out: std.ArrayList(u8) = .empty;
+            for (a, 0..) |e, i| {
+                if (i > 0) try out.appendSlice(arena, sep);
+                try out.appendSlice(arena, try toStr(arena, e));
+            }
+            return .{ .string = out.items };
+        },
+        else => return .{ .string = try toStr(arena, args[0]) },
+    }
+}
+
+fn callToJson(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
+    if (args.len != 1) return scope.fail("toJSON() takes 1 argument", .{}, arena);
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    writeJson(&aw.writer, args[0], 0) catch return error.OutOfMemory; // Allocating writer: only OOM
+    return .{ .string = aw.written() };
+}
+
+fn callFromJson(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
+    if (args.len != 1) return scope.fail("fromJSON() takes 1 argument", .{}, arena);
+    const text = try toStr(arena, args[0]);
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch
+        return scope.fail("fromJSON(): invalid JSON", .{}, arena);
+    return fromJsonValue(arena, parsed);
 }
 
 fn formatString(arena: Allocator, fmt: []const u8, args: []const Value, scope: Scope) Error![]const u8 {
