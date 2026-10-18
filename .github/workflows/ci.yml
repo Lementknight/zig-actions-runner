@@ -43,6 +43,12 @@ jobs:
         working-directory: runner
         run: zig fmt --check .
 
+      # SPEC.md §10's function and line length limits, as a ratchet against the committed baseline:
+      # this fails only when something gets worse, so the refactor queue does not make CI red.
+      - name: Conventions
+        working-directory: runner
+        run: zig build conventions
+
       # The workflow YAML of this repository, with the parser the runner uses (tools/check_workflows.zig).
       - name: Check workflow YAML
         working-directory: runner
