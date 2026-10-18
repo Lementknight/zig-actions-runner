@@ -3677,7 +3677,15 @@ const Exec = struct {
     /// `step_env` and `step_secret` are its evaluated `env:`, which its steps inherit.
     /// `nested`: a step of a composite action (loaded here, not with the job's own steps). Recursive
     /// through composite actions' `uses:` steps, hence `anyerror`.
-    fn runAction(x: *Exec, num: u32, u: job_mod.Uses, caller: expr.Scope, step_env: []const job_mod.EnvVar, step_secret: []const SecretRef, nested: bool) anyerror!ActionOut {
+    fn runAction(
+        x: *Exec,
+        num: u32,
+        u: job_mod.Uses,
+        caller: expr.Scope,
+        step_env: []const job_mod.EnvVar,
+        step_secret: []const SecretRef,
+        nested: bool,
+    ) anyerror!ActionOut {
         const arena = x.arena;
         const ev = x.ev;
         const loaded = if (!nested) try x.loadFor(num, u) else if (u.local) try x.loadLocal(u) else try x.loadAction(u);
@@ -3714,139 +3722,263 @@ const Exec = struct {
             ev.github = saved_github;
             ev.job_failed = saved_failed;
         }
-        const repository = act.repository;
-        ev.steps = .empty;
-        ev.inputs = .{ .object = inputs };
-        ev.github = try withEntries(arena, ev.github, &.{
-            .{ .key = "action_path", .value = .{ .string = act.path } },
-            .{ .key = "action_repository", .value = .{ .string = repository } },
-            .{ .key = "action_ref", .value = .{ .string = act.ref } },
-        });
-        ev.job_failed = false;
-        const action_env = [_]job_mod.EnvVar{
-            .{ .name = "GITHUB_ACTION_PATH", .value = act.path },
-            .{ .name = "GITHUB_ACTION_REPOSITORY", .value = repository },
-            .{ .name = "GITHUB_ACTION_REF", .value = act.ref },
-        };
+        try x.enterAction(act, inputs);
 
-        var failed = false;
-        var exit_code: i32 = 0;
-        for (steps, 1..) |st, i| {
-            const ctx_id = st.id orelse try std.fmt.allocPrint(arena, "__{d}", .{i});
-            ev.diag = "";
-            // The step's env is evaluated with the `uses:` step's env visible, then added to it.
-            const sc_env = try ev.scope(step_env);
-            var nested_env: std.ArrayList(job_mod.EnvVar) = .empty;
-            var env_error: ?[]const u8 = null;
-            for (st.env) |e| {
-                const v = expr.interpolate(arena, e.value, sc_env) catch {
-                    env_error = try std.fmt.allocPrint(arena, "could not evaluate env '{s}': {s}", .{ e.name, ev.diag });
-                    break;
-                };
-                try nested_env.append(arena, .{ .name = e.name, .value = v });
-            }
-            const all_env = try std.mem.concat(arena, job_mod.EnvVar, &.{ step_env, nested_env.items });
-            const sc = try ev.scope(all_env);
-            var display = if (st.name) |nm| (expr.interpolate(arena, nm, sc) catch nm) else if (st.run) |r| firstLine(r) else st.uses orelse "";
-            if (env_error) |msg| {
-                try x.nestedFailed(num, ctx_id, display, msg, &failed, &exit_code);
-                continue;
-            }
-
-            const cond = st.condition orelse "success()";
-            const go = expr.evalCondition(arena, cond, sc) catch {
-                try x.nestedFailed(num, ctx_id, display, try std.fmt.allocPrint(arena, "could not evaluate the condition '{s}': {s}", .{ cond, ev.diag }), &failed, &exit_code);
-                continue;
-            };
-            if (!go) {
-                try ev.steps.append(arena, .{ .id = ctx_id, .outcome = "skipped", .conclusion = "skipped", .outputs = &.{} });
-                continue;
-            }
-            const coe = if (st.continue_on_error) |c| std.mem.eql(u8, expr.interpolate(arena, c, sc) catch "false", "true") else false;
-            const run_text = st.run orelse {
-                // `uses:`: its `with:` is evaluated here, in the action's scope; it inherits the env.
-                var with: std.ArrayList(job_mod.Input) = .empty;
-                for (st.with) |kv| {
-                    const v = expr.interpolate(arena, kv.value, sc) catch {
-                        env_error = try std.fmt.allocPrint(arena, "could not evaluate input '{s}': {s}", .{ kv.name, ev.diag });
-                        break;
-                    };
-                    try with.append(arena, .{ .name = kv.name, .value = .{ .lit = v } });
-                }
-                if (env_error) |msg| {
-                    try x.nestedFailed(num, ctx_id, display, msg, &failed, &exit_code);
-                    continue;
-                }
-                var plain: std.ArrayList(job_mod.EnvVar) = .empty;
-                var secret: std.ArrayList(SecretRef) = .empty;
-                try plain.appendSlice(arena, step_env);
-                try secret.appendSlice(arena, step_secret);
-                splitEnv(arena, x.transport, x.job.*, &x.secret_counter, nested_env.items, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
-                const out = try x.runNested(num, ctx_id, st.uses.?, with.items, sc, plain.items, secret.items);
-                const ok = !out.failed;
-                try ev.steps.append(arena, .{ .id = ctx_id, .outcome = if (ok) "success" else "failure", .conclusion = if (ok or coe) "success" else "failure", .outputs = out.outputs });
-                if (!ok and !coe) {
-                    failed = true;
-                    ev.job_failed = true;
-                    if (exit_code == 0) exit_code = if (out.exit_code != 0) out.exit_code else 1;
-                }
-                continue;
-            };
-            const script = expr.interpolate(arena, run_text, sc) catch {
-                try x.nestedFailed(num, ctx_id, display, try std.fmt.allocPrint(arena, "could not evaluate the script: {s}", .{ev.diag}), &failed, &exit_code);
-                continue;
-            };
-            // Without a name, the step is shown by its command as it will run.
-            if (st.name == null) display = firstLine(script);
-            const shell = expr.interpolate(arena, st.shell.?, sc) catch st.shell.?;
-            if (!job_mod.validShell(shell)) {
-                try x.nestedFailed(num, ctx_id, display, try job_mod.unsupportedShell(arena, shell), &failed, &exit_code);
-                continue;
-            }
-            const wd: ?[]const u8 = if (st.working_directory) |d| (expr.interpolate(arena, d, sc) catch d) else null;
-
-            // Env that carries a secret goes in as a Dagger secret, the rest in the script.
-            var plain: std.ArrayList(job_mod.EnvVar) = .empty;
-            var secret: std.ArrayList(SecretRef) = .empty;
-            try plain.appendSlice(arena, step_env);
-            try secret.appendSlice(arena, step_secret);
-            splitEnv(arena, x.transport, x.job.*, &x.secret_counter, nested_env.items, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
-            try plain.appendSlice(arena, &action_env);
-
-            // As the official runner does: the command, folded away, then its output.
-            x.sh.append(num, try std.fmt.allocPrint(arena, "##[group]Run {s}", .{display}));
-            var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, script, "\n"), '\n');
-            while (lines.next()) |l| x.sh.append(num, l);
-            x.sh.append(num, try shellLine(arena, shell));
-            const shown_env = try envContext(arena, ev.job_env.items, all_env);
-            if (shown_env.len > 0) {
-                x.sh.append(num, "env:");
-                for (shown_env) |e| x.sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ e.name, firstLine(e.value) }));
-            }
-            x.sh.append(num, "##[endgroup]");
-
-            // The action's files are mounted once per job; its steps may change them, as on GitHub.
-            const mounted = x.mounted_actions.contains(act.mount);
-            const m = [_]Mount{.{ .dir = .{ .path = act.mount, .id = act.dir, .owner = x.dir_owner } }};
-            const fc = x.next_fc;
-            x.next_fc += 1;
-            const out = try x.execScript(num, fc, .{ .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = plain.items } }, ctx_id, secret.items, if (mounted) &.{} else &m);
-            try x.mounted_actions.put(arena, act.mount, {});
-            if (out.code != 0) logExitCode(x.sh, num, out.code);
-            const ok = out.code == 0;
-            try ev.steps.append(arena, .{ .id = ctx_id, .outcome = if (ok) "success" else "failure", .conclusion = if (ok or coe) "success" else "failure", .outputs = out.outputs });
-            if (!ok and !coe) {
-                failed = true;
-                ev.job_failed = true;
-                if (exit_code == 0) exit_code = out.code;
-            }
-        }
+        var outcome: CompositeOutcome = .{};
+        const composite = CompositeRun{ .act = act, .step_env = step_env, .step_secret = step_secret };
+        for (steps, 1..) |st, i| try x.runCompositeStep(num, composite, st, i, &outcome);
 
         // The action's outputs, evaluated against its own steps.
         const sc_out = try ev.scope(step_env);
         const outputs = try arena.alloc(job_mod.EnvVar, act.meta.outputs.len);
         for (act.meta.outputs, outputs) |o, *dst| dst.* = .{ .name = o.name, .value = expr.interpolate(arena, o.value, sc_out) catch "" };
-        return .{ .failed = failed, .exit_code = exit_code, .outputs = outputs };
+        return .{ .failed = outcome.failed, .exit_code = outcome.exit_code, .outputs = outputs };
+    }
+
+    /// Points the evaluator at a composite action: its `inputs`, an empty `steps`, and the
+    /// `github.action_*` entries. The caller saves and restores what this replaces.
+    fn enterAction(x: *Exec, act: Loaded, inputs: []const expr.Value.Entry) !void {
+        const ev = x.ev;
+        ev.steps = .empty;
+        ev.inputs = .{ .object = inputs };
+        ev.github = try withEntries(x.arena, ev.github, &.{
+            .{ .key = "action_path", .value = .{ .string = act.path } },
+            .{ .key = "action_repository", .value = .{ .string = act.repository } },
+            .{ .key = "action_ref", .value = .{ .string = act.ref } },
+        });
+        ev.job_failed = false;
+    }
+
+    /// What a composite action's steps run under: the action, and the `uses:` step's evaluated env,
+    /// which they inherit.
+    const CompositeRun = struct {
+        act: Loaded,
+        step_env: []const job_mod.EnvVar,
+        step_secret: []const SecretRef,
+    };
+
+    /// Whether any step of a composite action failed without `continue-on-error`, and the first
+    /// non-zero exit code — what the action reports as its own.
+    const CompositeOutcome = struct {
+        failed: bool = false,
+        exit_code: i32 = 0,
+
+        /// A step's result: recorded in the action's `steps` context, and in the outcome unless the
+        /// step continues on error.
+        fn record(
+            o: *CompositeOutcome,
+            ev: *Evaluator,
+            arena: Allocator,
+            ctx_id: []const u8,
+            ok: bool,
+            coe: bool,
+            outputs: []const job_mod.EnvVar,
+            code: i32,
+        ) !void {
+            try ev.steps.append(arena, .{
+                .id = ctx_id,
+                .outcome = if (ok) "success" else "failure",
+                .conclusion = if (ok or coe) "success" else "failure",
+                .outputs = outputs,
+            });
+            if (!ok and !coe) {
+                o.failed = true;
+                ev.job_failed = true;
+                if (o.exit_code == 0) o.exit_code = code;
+            }
+        }
+    };
+
+    /// One step of a composite action, as part of step `num`: its env and condition evaluated in the
+    /// action's scope, then run as a nested `uses:` or as a script.
+    fn runCompositeStep(
+        x: *Exec,
+        num: u32,
+        comp: CompositeRun,
+        st: action.Step,
+        i: usize,
+        outcome: *CompositeOutcome,
+    ) !void {
+        const arena = x.arena;
+        const ev = x.ev;
+        const ctx_id = st.id orelse try std.fmt.allocPrint(arena, "__{d}", .{i});
+        ev.diag = "";
+        // The step's env is evaluated with the `uses:` step's env visible, then added to it.
+        const sc_env = try ev.scope(comp.step_env);
+        var nested_env: std.ArrayList(job_mod.EnvVar) = .empty;
+        var env_error: ?[]const u8 = null;
+        for (st.env) |e| {
+            const v = expr.interpolate(arena, e.value, sc_env) catch {
+                env_error = try std.fmt.allocPrint(arena, "could not evaluate env '{s}': {s}", .{ e.name, ev.diag });
+                break;
+            };
+            try nested_env.append(arena, .{ .name = e.name, .value = v });
+        }
+        const all_env = try std.mem.concat(arena, job_mod.EnvVar, &.{ comp.step_env, nested_env.items });
+        const sc = try ev.scope(all_env);
+        const display = if (st.name) |nm|
+            (expr.interpolate(arena, nm, sc) catch nm)
+        else if (st.run) |r|
+            firstLine(r)
+        else
+            st.uses orelse "";
+        if (env_error) |msg| return x.nestedFailed(num, ctx_id, display, msg, &outcome.failed, &outcome.exit_code);
+
+        const cond = st.condition orelse "success()";
+        const go = expr.evalCondition(arena, cond, sc) catch {
+            const msg = try std.fmt.allocPrint(arena, "could not evaluate the condition '{s}': {s}", .{ cond, ev.diag });
+            return x.nestedFailed(num, ctx_id, display, msg, &outcome.failed, &outcome.exit_code);
+        };
+        if (!go) {
+            try ev.steps.append(arena, .{ .id = ctx_id, .outcome = "skipped", .conclusion = "skipped", .outputs = &.{} });
+            return;
+        }
+        const coe = if (st.continue_on_error) |c|
+            std.mem.eql(u8, expr.interpolate(arena, c, sc) catch "false", "true")
+        else
+            false;
+        const step = NestedStep{
+            .ctx_id = ctx_id,
+            .display = display,
+            .sc = sc,
+            .all_env = all_env,
+            .nested_env = nested_env.items,
+            .coe = coe,
+        };
+        if (st.run) |run_text| {
+            try x.runNestedScript(num, comp, st, step, run_text, outcome);
+        } else {
+            try x.runNestedUses(num, comp, st, step, outcome);
+        }
+    }
+
+    /// A composite step once its env and condition are settled: its id in the `steps` context, how
+    /// it is shown, the scope it is evaluated in, its env, and whether it continues on error.
+    const NestedStep = struct {
+        ctx_id: []const u8,
+        display: []const u8,
+        sc: expr.Scope,
+        all_env: []const job_mod.EnvVar,
+        nested_env: []const job_mod.EnvVar,
+        coe: bool,
+    };
+
+    /// The `uses:` step's env, split into plain variables and Dagger secrets, on top of the composite
+    /// step's own.
+    fn nestedEnv(
+        x: *Exec,
+        comp: CompositeRun,
+        nested_env: []const job_mod.EnvVar,
+        plain: *std.ArrayList(job_mod.EnvVar),
+        secret: *std.ArrayList(SecretRef),
+    ) !void {
+        const arena = x.arena;
+        try plain.appendSlice(arena, comp.step_env);
+        try secret.appendSlice(arena, comp.step_secret);
+        splitEnv(arena, x.transport, x.job.*, &x.secret_counter, nested_env, plain, secret, &x.err_msg) catch return error.EngineFailed;
+    }
+
+    /// A composite action's `uses:` step: its `with:` is evaluated here, in the action's scope; it
+    /// inherits the env.
+    fn runNestedUses(
+        x: *Exec,
+        num: u32,
+        comp: CompositeRun,
+        st: action.Step,
+        step: NestedStep,
+        outcome: *CompositeOutcome,
+    ) !void {
+        const arena = x.arena;
+        const ev = x.ev;
+        var with: std.ArrayList(job_mod.Input) = .empty;
+        for (st.with) |kv| {
+            const v = expr.interpolate(arena, kv.value, step.sc) catch {
+                const msg = try std.fmt.allocPrint(arena, "could not evaluate input '{s}': {s}", .{ kv.name, ev.diag });
+                return x.nestedFailed(num, step.ctx_id, step.display, msg, &outcome.failed, &outcome.exit_code);
+            };
+            try with.append(arena, .{ .name = kv.name, .value = .{ .lit = v } });
+        }
+        var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+        var secret: std.ArrayList(SecretRef) = .empty;
+        try x.nestedEnv(comp, step.nested_env, &plain, &secret);
+        const out = try x.runNested(num, step.ctx_id, st.uses.?, with.items, step.sc, plain.items, secret.items);
+        const code: i32 = if (out.exit_code != 0) out.exit_code else 1;
+        try outcome.record(ev, arena, step.ctx_id, !out.failed, step.coe, out.outputs, code);
+    }
+
+    /// A composite action's `run:` step: the script, shell and working directory evaluated, its
+    /// header logged as the official runner logs it, then run with the action's files mounted.
+    fn runNestedScript(
+        x: *Exec,
+        num: u32,
+        comp: CompositeRun,
+        st: action.Step,
+        step: NestedStep,
+        run_text: []const u8,
+        outcome: *CompositeOutcome,
+    ) !void {
+        const arena = x.arena;
+        const ev = x.ev;
+        const act = comp.act;
+        const script = expr.interpolate(arena, run_text, step.sc) catch {
+            const msg = try std.fmt.allocPrint(arena, "could not evaluate the script: {s}", .{ev.diag});
+            return x.nestedFailed(num, step.ctx_id, step.display, msg, &outcome.failed, &outcome.exit_code);
+        };
+        // Without a name, the step is shown by its command as it will run.
+        const display = if (st.name == null) firstLine(script) else step.display;
+        const shell = expr.interpolate(arena, st.shell.?, step.sc) catch st.shell.?;
+        if (!job_mod.validShell(shell)) {
+            const msg = try job_mod.unsupportedShell(arena, shell);
+            return x.nestedFailed(num, step.ctx_id, display, msg, &outcome.failed, &outcome.exit_code);
+        }
+        const wd: ?[]const u8 = if (st.working_directory) |d| (expr.interpolate(arena, d, step.sc) catch d) else null;
+
+        // Env that carries a secret goes in as a Dagger secret, the rest in the script.
+        var plain: std.ArrayList(job_mod.EnvVar) = .empty;
+        var secret: std.ArrayList(SecretRef) = .empty;
+        try x.nestedEnv(comp, step.nested_env, &plain, &secret);
+        try plain.appendSlice(arena, &[_]job_mod.EnvVar{
+            .{ .name = "GITHUB_ACTION_PATH", .value = act.path },
+            .{ .name = "GITHUB_ACTION_REPOSITORY", .value = act.repository },
+            .{ .name = "GITHUB_ACTION_REF", .value = act.ref },
+        });
+        try x.logNestedRunHeader(num, display, script, shell, step.all_env);
+
+        // The action's files are mounted once per job; its steps may change them, as on GitHub.
+        const mounted = x.mounted_actions.contains(act.mount);
+        const m = [_]Mount{.{ .dir = .{ .path = act.mount, .id = act.dir, .owner = x.dir_owner } }};
+        const fc = x.next_fc;
+        x.next_fc += 1;
+        const resolved: Resolved = .{
+            .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = plain.items },
+        };
+        const mounts: []const Mount = if (mounted) &.{} else &m;
+        const out = try x.execScript(num, fc, resolved, step.ctx_id, secret.items, mounts);
+        try x.mounted_actions.put(arena, act.mount, {});
+        if (out.code != 0) logExitCode(x.sh, num, out.code);
+        try outcome.record(ev, arena, step.ctx_id, out.code == 0, step.coe, out.outputs, out.code);
+    }
+
+    /// As the official runner does: the command, folded away, then its shell and env.
+    fn logNestedRunHeader(
+        x: *Exec,
+        num: u32,
+        display: []const u8,
+        script: []const u8,
+        shell: []const u8,
+        all_env: []const job_mod.EnvVar,
+    ) !void {
+        const arena = x.arena;
+        x.sh.append(num, try std.fmt.allocPrint(arena, "##[group]Run {s}", .{display}));
+        var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, script, "\n"), '\n');
+        while (lines.next()) |l| x.sh.append(num, l);
+        x.sh.append(num, try shellLine(arena, shell));
+        const shown_env = try envContext(arena, x.ev.job_env.items, all_env);
+        if (shown_env.len > 0) {
+            x.sh.append(num, "env:");
+            for (shown_env) |e| x.sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ e.name, firstLine(e.value) }));
+        }
+        x.sh.append(num, "##[endgroup]");
     }
 
     /// A composite action's `uses:` step, run as part of step `num` like a step of the job: the built-in
