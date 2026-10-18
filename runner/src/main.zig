@@ -57,34 +57,18 @@ pub fn main(init: std.process.Init) !u8 {
     defer err.flush() catch {};
 
     const args = try init.minimal.args.toSlice(arena);
-
-    // Before the configuration, so that asking which binary this is never needs a token: the
-    // question is usually asked of a machine whose behaviour is a surprise, where every other
-    // answer is in doubt.
-    for (args[1..]) |arg| if (std.mem.eql(u8, arg, "--version")) {
-        var out_buf: [256]u8 = undefined;
-        var w: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
-        try w.interface.print("zig-runner {s} (runner protocol {s}, Dagger {s})\n", .{ build_version.string, broker.version, engine.client_version });
-        try w.interface.flush();
-        return @backingInt(Exit.done);
-    };
+    if (try printVersionIfAsked(io, args)) return @backingInt(Exit.done);
 
     const cfg = Config.load(init.environ_map, args) catch |e| {
         try err.print("config error: {s}\n", .{@errorName(e)});
         return @backingInt(Exit.config);
     };
-    var secret_buf: [2][]const u8 = undefined;
-    const base_secrets = cfg.secrets(&secret_buf);
-
     // Where logs and run state go: DATABASE_URL / PG* when set, else stdout only.
     const pg_cfg = cfg.pgConfig(arena, init.environ_map) catch |e| {
         try err.print("config error: invalid database settings ({s})\n", .{@errorName(e)});
         return @backingInt(Exit.config);
     };
-    var secrets_list: std.ArrayList([]const u8) = .empty;
-    try secrets_list.appendSlice(arena, base_secrets);
-    if (pg_cfg) |p| if (p.password.len > 0) try secrets_list.append(arena, p.password);
-    const secrets = secrets_list.items;
+    const secrets = try allSecrets(arena, &cfg, pg_cfg);
 
     var out_buf: [4096]u8 = undefined;
     var out_w: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
@@ -96,33 +80,7 @@ pub fn main(init: std.process.Init) !u8 {
     var store: ?db.Store = null;
     const live = !cfg.dry_run and !cfg.inspect and cfg.exec_job == null and !cfg.db_check;
     if (pg_cfg) |dbcfg| if (live) {
-        // Dialled once here so a wrong password or a stopped database is in the journal at startup
-        // rather than at the first job — but never fatal. The database holds logs and run state,
-        // both of which the runner is documented to treat as a logging concern and never as a job
-        // failure (SPEC §5.1); refusing to start made an optional subsystem able to take CI down,
-        // and with systemd's restart policy it crash-looped with jobs queued behind it. The store
-        // and the log sink both dial again as work arrives, so this recovers on its own.
-        store = db.Store.open(init.gpa, io, dbcfg, null) catch |e| lazy: {
-            try err.writeAll("database unavailable, logging to the console and retrying: ");
-            try redact.write(err, @errorName(e), secrets);
-            try err.writeByte('\n');
-            // Flushed here, not left to the `defer`: this is the first message the runner writes
-            // that is followed by the process *continuing*, and without the flush it sat in the
-            // buffer for the life of the pool. A warning nobody can read is the silent failure the
-            // probe exists to prevent (checked on the Pi: the line was missing from the journal).
-            try err.flush();
-            break :lazy .init(init.gpa, io, dbcfg, null);
-        };
-        db_sink = .{ .postgres = .{
-            .gpa = init.gpa,
-            .io = io,
-            .cfg = dbcfg,
-            .inner = &console,
-            .secrets = secrets,
-            .flush_lines = cfg.log_flush_lines,
-            .flush_ms = cfg.log_flush_ms,
-        } };
-        try db_sink.postgres.startFlusher();
+        try openDatabase(init, dbcfg, &cfg, &console, secrets, err, &db_sink, &store);
         log = &db_sink;
     };
     defer if (store != null) {
@@ -130,32 +88,18 @@ pub fn main(init: std.process.Init) !u8 {
         store.?.close();
     };
 
-    var suffix: [4]u8 = undefined;
-    io.random(&suffix);
-    const name = try std.fmt.allocPrint(arena, "{s}-{x}", .{ cfg.name_prefix, suffix });
+    const name = try runnerName(arena, io, cfg.name_prefix);
 
     if (cfg.db_check) return dbCheck(init, pg_cfg, secrets, &out_w.interface, err);
     if (cfg.exec_job) |path| return execJobFile(init, &cfg, path, log, err);
-
-    if (cfg.dry_run) {
-        try log.append(0, 0, .stdout, try std.fmt.allocPrint(arena, "dry run: would register runner '{s}' with labels '{s}'", .{ name, cfg.labels }));
-        return @backingInt(Exit.done);
-    }
-
-    if (cfg.inspect) {
-        const code = try inspect.run(arena, io, &cfg, name, &out_w.interface);
-        return code;
-    }
+    if (cfg.dry_run) return dryRun(arena, log, name, cfg.labels);
+    if (cfg.inspect) return inspect.run(arena, io, &cfg, name, &out_w.interface);
 
     // One HTTP client for every runner (see `github/http.zig`).
     var http_client: std.http.Client = .{ .allocator = init.gpa, .io = io, .write_buffer_size = 16 * 1024 };
     defer http_client.deinit();
     http.shared = &http_client;
-
-    // SIGTERM / SIGINT stop the runners gracefully (see `loop.stop_signals`); a second one exits.
-    const act: std.posix.Sigaction = .{ .handler = .{ .handler = onStopSignal }, .mask = std.posix.sigemptyset(), .flags = std.posix.SA.RESTART };
-    std.posix.sigaction(.TERM, &act, null);
-    std.posix.sigaction(.INT, &act, null);
+    installStopSignals();
 
     return @backingInt(try loop.pool(.{
         .arena = arena,
@@ -169,6 +113,96 @@ pub fn main(init: std.process.Init) !u8 {
         .name = name,
         .store = if (store) |*st| st else null,
     }, cfg.runners));
+}
+
+/// `--version`, answered before the configuration is read, so that asking which binary this is
+/// never needs a token: the question is usually asked of a machine whose behaviour is a surprise,
+/// where every other answer is in doubt. True when it was asked and answered.
+fn printVersionIfAsked(io: std.Io, args: []const [:0]const u8) !bool {
+    for (args[1..]) |arg| if (std.mem.eql(u8, arg, "--version")) {
+        var out_buf: [256]u8 = undefined;
+        var w: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
+        try w.interface.print("zig-runner {s} (runner protocol {s}, Dagger {s})\n", .{ build_version.string, broker.version, engine.client_version });
+        try w.interface.flush();
+        return true;
+    };
+    return false;
+}
+
+/// Everything that must never appear in output: the configuration's secrets, and the database
+/// password when there is one.
+fn allSecrets(arena: std.mem.Allocator, cfg: *const Config, pg_cfg: ?pg.Config) ![]const []const u8 {
+    var secret_buf: [2][]const u8 = undefined;
+    var list: std.ArrayList([]const u8) = .empty;
+    try list.appendSlice(arena, cfg.secrets(&secret_buf));
+    if (pg_cfg) |p| if (p.password.len > 0) try list.append(arena, p.password);
+    return list.items;
+}
+
+/// The database, for logs and run state. Dialled once here so a wrong password or a stopped
+/// database is in the journal at startup rather than at the first job — but never fatal. The
+/// database holds logs and run state, both of which the runner is documented to treat as a logging
+/// concern and never as a job failure (SPEC §5.1); refusing to start made an optional subsystem
+/// able to take CI down, and with systemd's restart policy it crash-looped with jobs queued behind
+/// it. The store and the log sink both dial again as work arrives, so this recovers on its own.
+/// `db_sink` and `store` are the caller's, because the caller's `log` points at the sink.
+fn openDatabase(
+    init: std.process.Init,
+    dbcfg: pg.Config,
+    cfg: *const Config,
+    console: *sink.LogSink,
+    secrets: []const []const u8,
+    err: *std.Io.Writer,
+    db_sink: *sink.LogSink,
+    store: *?db.Store,
+) !void {
+    const io = init.io;
+    store.* = db.Store.open(init.gpa, io, dbcfg, null) catch |e| lazy: {
+        try err.writeAll("database unavailable, logging to the console and retrying: ");
+        try redact.write(err, @errorName(e), secrets);
+        try err.writeByte('\n');
+        // Flushed here, not left to the `defer`: this is the first message the runner writes
+        // that is followed by the process *continuing*, and without the flush it sat in the
+        // buffer for the life of the pool. A warning nobody can read is the silent failure the
+        // probe exists to prevent (checked on the Pi: the line was missing from the journal).
+        try err.flush();
+        break :lazy .init(init.gpa, io, dbcfg, null);
+    };
+    db_sink.* = .{ .postgres = .{
+        .gpa = init.gpa,
+        .io = io,
+        .cfg = dbcfg,
+        .inner = console,
+        .secrets = secrets,
+        .flush_lines = cfg.log_flush_lines,
+        .flush_ms = cfg.log_flush_ms,
+    } };
+    try db_sink.postgres.startFlusher();
+}
+
+/// The registration name: the configured prefix and a random suffix, new for every process.
+fn runnerName(arena: std.mem.Allocator, io: std.Io, prefix: []const u8) ![]const u8 {
+    var suffix: [4]u8 = undefined;
+    io.random(&suffix);
+    return std.fmt.allocPrint(arena, "{s}-{x}", .{ prefix, suffix });
+}
+
+/// `--dry-run`: the configuration was valid; say what would have been registered, and stop.
+fn dryRun(arena: std.mem.Allocator, log: *sink.LogSink, name: []const u8, labels: []const u8) !u8 {
+    const line = try std.fmt.allocPrint(arena, "dry run: would register runner '{s}' with labels '{s}'", .{ name, labels });
+    try log.append(0, 0, .stdout, line);
+    return @backingInt(Exit.done);
+}
+
+/// SIGTERM / SIGINT stop the runners gracefully (see `loop.stop_signals`); a second one exits.
+fn installStopSignals() void {
+    const act: std.posix.Sigaction = .{
+        .handler = .{ .handler = onStopSignal },
+        .mask = std.posix.sigemptyset(),
+        .flags = std.posix.SA.RESTART,
+    };
+    std.posix.sigaction(.TERM, &act, null);
+    std.posix.sigaction(.INT, &act, null);
 }
 
 /// Dev helper: runs a saved acquirejob response through the Dagger executor.
