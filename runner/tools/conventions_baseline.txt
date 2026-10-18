@@ -2,7 +2,6 @@
 # Every function over 70 lines, with its length, and every file's count of
 # lines over 100 columns. The check fails when anything here gets worse.
 fn tools/measure.zig cmdRun 159
-fn src/main.zig main 123
 fn tools/measure.zig cmdAnalyse 108
 fn src/dagger.zig hashFiles 106
 fn src/dagger.zig runJsScript 105
