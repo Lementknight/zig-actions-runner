@@ -63,7 +63,12 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "regex", .module = regex_mod }},
         }),
     });
-    b.installArtifact(regex_diff);
+    // A step of its own, and deliberately *not* part of the default install: the Dockerfile copies
+    // only build.zig and src/, so an artifact in the default step makes the image fail to build on
+    // a missing tools/ — which is how the first version of this broke the release image. `zig build
+    // test` installs nothing either, so CI runs this step before driving regex_diff.py.
+    b.step("regex-diff", "Build the regex comparison tool that tools/regex_diff.py drives")
+        .dependOn(&b.addInstallArtifact(regex_diff, .{}).step);
 
     // The measurement harness (docs/MEASURE.md stage 2). Its statistics decide verdicts, so they
     // are unit-tested with the rest of the suite; `zig build measure -- run ...` drives it.

@@ -65,6 +65,7 @@ jobs:
       - name: Regex, against Python and perl
         working-directory: runner
         run: |
+          zig build regex-diff
           for seed in 1 2 3 4 5; do
             python3 tools/regex_diff.py --random 400 --seed "$seed"
           done
