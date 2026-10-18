@@ -121,8 +121,8 @@ frompath_steps=$(
           : "trial ${{ inputs.token }}"
           cat > /tmp/fp.json <<'JSON'
           { "problemMatcher": [ { "owner": "proj-probe", "pattern": [
-            { "regexp": "^Building (.+\.proj)$", "fromPath": 1 },
-            { "regexp": "^(.+)\((\d+),(\d+)\): (error|warning) ([A-Z]+\d+): (.*)$",
+            { "regexp": "^Building (.+\\.proj)$", "fromPath": 1 },
+            { "regexp": "^(.+)\\((\\d+),(\\d+)\\): (error|warning) ([A-Z]+\\d+): (.*)$",
               "file": 1, "line": 2, "column": 3, "severity": 4, "code": 5, "message": 6,
               "loop": true } ] } ] }
           JSON
