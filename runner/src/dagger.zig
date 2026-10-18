@@ -2393,6 +2393,103 @@ fn writeJobEnv(
     return writeEnvNodes(w, plain.items, secret.items);
 }
 
+/// A `run:` step's script, shell and working directory, evaluated, with its header logged as GitHub
+/// logs it. Null when evaluation failed: the step has been failed and recorded, and the loop moves
+/// on.
+fn prepareScript(
+    x: *Exec,
+    step: job_mod.Step,
+    res: *StepResult,
+    num: u32,
+    coe: bool,
+    sc1: expr.Scope,
+    step_env: []const job_mod.EnvVar,
+    plain_step_env: []const job_mod.EnvVar,
+    sc: @FieldType(job_mod.Action, "script"),
+) !?Resolved {
+    const arena = x.arena;
+    const ev = x.ev;
+    const script = ev.render(sc.script, sc1) catch {
+        const msg = try std.fmt.allocPrint(arena, "could not evaluate the script: {s}", .{ev.diag});
+        try failStep(ev, x.sh, x.observer, step, res, num, msg, coe);
+        return null;
+    };
+    const shell: ?[]const u8 = if (sc.shell) |t| (ev.render(t, sc1) catch null) else null;
+    if (shell) |sh_name| if (!job_mod.validShell(sh_name)) {
+        try failStep(ev, x.sh, x.observer, step, res, num, try job_mod.unsupportedShell(arena, sh_name), coe);
+        return null;
+    };
+    const wd: ?[]const u8 = if (sc.working_directory) |t| (ev.render(t, sc1) catch null) else null;
+    try logRunHeader(arena, x.sh, num, script, shell, try envContext(arena, ev.job_env.items, step_env));
+    return .{ .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = plain_step_env } };
+}
+
+/// The built-in checkout: its inputs evaluated and logged as GitHub logs an action's, then the
+/// repository fetched. Null when the inputs could not be evaluated, were unsupported, or the fetch
+/// failed: the step has been failed and recorded, and the loop moves on.
+fn prepareCheckout(
+    x: *Exec,
+    step: job_mod.Step,
+    res: *StepResult,
+    num: u32,
+    coe: bool,
+    sc1: expr.Scope,
+    step_env: []const job_mod.EnvVar,
+    inputs: []const job_mod.Input,
+) !?Fetched {
+    const arena = x.arena;
+    const ev = x.ev;
+    const sh = x.sh;
+    const rendered = ev.renderEnv(inputs, sc1) catch {
+        const msg = try std.fmt.allocPrint(arena, "could not evaluate the checkout inputs: {s}", .{ev.diag});
+        try failStep(ev, sh, x.observer, step, res, num, msg, coe);
+        return null;
+    };
+    try logCheckoutHeader(x, num, step, rendered, step_env);
+    const co = switch (try job_mod.checkoutFromInputs(arena, rendered)) {
+        .ok => |c| c,
+        .unsupported => |why| {
+            try failStep(ev, sh, x.observer, step, res, num, why, coe);
+            return null;
+        },
+    };
+    const f = try fetchCheckout(arena, x.transport, x.job.*, co, x.gitAuth());
+    if (f.result == .failed) {
+        try failStep(ev, sh, x.observer, step, res, num, f.result.failed, coe);
+        return null;
+    }
+    return f;
+}
+
+/// As GitHub opens an action's log: the action, the inputs the workflow gave it, then
+/// actions/checkout's defaults (the same in v4 to v6), then the env.
+fn logCheckoutHeader(
+    x: *Exec,
+    num: u32,
+    step: job_mod.Step,
+    rendered: []const job_mod.EnvVar,
+    step_env: []const job_mod.EnvVar,
+) !void {
+    const arena = x.arena;
+    const sh = x.sh;
+    const uses = if (step.uses.len > 0) step.uses else "actions/checkout";
+    sh.append(num, try std.fmt.allocPrint(arena, "##[group]Run {s}", .{uses}));
+    sh.append(num, "with:");
+    for (rendered) |in| sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ in.name, firstLine(in.value) }));
+    for (checkout_defaults) |d| {
+        const given = for (rendered) |in| (if (std.mem.eql(u8, in.name, d[0])) break true) else false;
+        if (given) continue;
+        const value = if (std.mem.eql(u8, d[0], "repository")) x.job.github.repository else d[1];
+        sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ d[0], value }));
+    }
+    const co_env = try envContext(arena, x.ev.job_env.items, step_env);
+    if (co_env.len > 0) {
+        sh.append(num, "env:");
+        for (co_env) |e| sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ e.name, firstLine(e.value) }));
+    }
+    sh.append(num, "##[endgroup]");
+}
+
 fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *Shared, results: []StepResult, transport: Transport) !Result {
     var ev = try Evaluator.init(arena, &job);
     ev.runner_name = opts.runner_name;
@@ -2604,53 +2701,10 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
                 continue;
             },
             .script => |sc| {
-                const script = ev.render(sc.script, sc1) catch {
-                    try failStep(&ev, sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the script: {s}", .{ev.diag}), coe);
-                    continue;
-                };
-                const shell: ?[]const u8 = if (sc.shell) |t| (ev.render(t, sc1) catch null) else null;
-                if (shell) |sh_name| if (!job_mod.validShell(sh_name)) {
-                    try failStep(&ev, sh, opts.observer, step, res, num, try job_mod.unsupportedShell(arena, sh_name), coe);
-                    continue;
-                };
-                const wd: ?[]const u8 = if (sc.working_directory) |t| (ev.render(t, sc1) catch null) else null;
-                resolved = .{ .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = plain_step_env.items } };
-                try logRunHeader(arena, sh, num, script, shell, try envContext(arena, ev.job_env.items, step_env));
+                resolved = try prepareScript(&x, step, res, num, coe, sc1, step_env, plain_step_env.items, sc) orelse continue;
             },
             .checkout => |inputs| {
-                const rendered = ev.renderEnv(inputs, sc1) catch {
-                    try failStep(&ev, sh, opts.observer, step, res, num, try std.fmt.allocPrint(arena, "could not evaluate the checkout inputs: {s}", .{ev.diag}), coe);
-                    continue;
-                };
-                // As GitHub opens an action's log: the action and the inputs the workflow gave it.
-                sh.append(num, try std.fmt.allocPrint(arena, "##[group]Run {s}", .{if (step.uses.len > 0) step.uses else "actions/checkout"}));
-                // The given inputs, then actions/checkout's defaults (the same in v4 to v6), as GitHub shows them.
-                sh.append(num, "with:");
-                for (rendered) |in| sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ in.name, firstLine(in.value) }));
-                for (checkout_defaults) |d| {
-                    const given = for (rendered) |in| (if (std.mem.eql(u8, in.name, d[0])) break true) else false;
-                    if (given) continue;
-                    const value = if (std.mem.eql(u8, d[0], "repository")) job.github.repository else d[1];
-                    sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ d[0], value }));
-                }
-                const co_env = try envContext(arena, ev.job_env.items, step_env);
-                if (co_env.len > 0) {
-                    sh.append(num, "env:");
-                    for (co_env) |e| sh.append(num, try std.fmt.allocPrint(arena, "  {s}: {s}", .{ e.name, firstLine(e.value) }));
-                }
-                sh.append(num, "##[endgroup]");
-                const co = switch (try job_mod.checkoutFromInputs(arena, rendered)) {
-                    .ok => |c| c,
-                    .unsupported => |why| {
-                        try failStep(&ev, sh, opts.observer, step, res, num, why, coe);
-                        continue;
-                    },
-                };
-                const f = try fetchCheckout(arena, transport, job, co, x.gitAuth());
-                if (f.result == .failed) {
-                    try failStep(&ev, sh, opts.observer, step, res, num, f.result.failed, coe);
-                    continue;
-                }
+                const f = try prepareCheckout(&x, step, res, num, coe, sc1, step_env, inputs) orelse continue;
                 resolved = .{ .checkout = f };
                 mount_buf[0] = .{ .dir = .{ .path = f.mount, .id = f.result.dir, .owner = x.dir_owner } };
                 mounts = &mount_buf;
