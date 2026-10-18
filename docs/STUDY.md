@@ -618,7 +618,9 @@ So `GOGC=400` does save engine CPU once a job has many steps, which is what it w
 
 **Selection is a bad trade here, and the reason is the tracing.** Running tests under testmon costs about four times what running them plainly does, so the moment a change touches something widely used — 79% of the suite for one core module — selection costs 4.5 times the full run it was meant to replace. It wins only when almost nothing is affected, and that is precisely the case the step cache already handles for nothing: a re-run replays the whole step (experiment 2, and §2's ripgrep row, "3 of 3 steps replayed"). Tool-level selection pays four times over to discover what the runner already knew.
 
-**One row is inconclusive** (*unverified*, CLAIMS.md E8.3)**.** Changing a leaf module selected the same 62 tests as changing nothing, which means either testmon missed it or the function the edit landed in is covered by no test. Without checking which, it cannot be read as evidence that testmon is wrong, so it is not.
+~~**One row is inconclusive**~~ **— checked on 2026-10-17** (CLAIMS.md E8.3, [measurements/e8.3/](../measurements/e8.3/README.md))**.** Changing a leaf module selected the same 62 tests as changing nothing, which meant either testmon missed it or the function the edit landed in is covered by no test. It is the second: editing a function `test/base/test_utils.py` calls directly selects 25 tests and runs them, while editing an uncovered function in the same file selects the same 62 and runs none. 29 of `langhelpers.py`'s 141 functions are never executed by this suite, so the edit had a one-in-five chance of landing where it did. The refusal above to read the row as evidence against testmon was right.
+
+**And the 62 never run.** `62 selected` is followed by `6097 deselected` and no pass count, so the unchanged case is 7.5 s to collect 9,380 tests and execute none of them. The column header "Tests chosen" is accurate; "62 of 9,380" reads as though 62 ran. This makes selection's best case more clearly a no-op than the table suggests, which is the direction the finding below already points.
 
 **Findings.**
 

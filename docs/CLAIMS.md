@@ -9,7 +9,7 @@ measured, on what, against what, how many times, and how to run it again — and
 one be marked unverified and not used to justify a change. This is that register, built by reading
 STUDY.md against §3.2 after the fact.
 
-**70 claims: 22 verified, 33 under-powered, 4 unverified, 4 superseded, 2 proved, 1 withdrawn, 2
+**70 claims: 23 verified, 33 under-powered, 3 unverified, 4 superseded, 2 proved, 1 withdrawn, 2
 refuted, 1 no effect found, 1 not measurable as framed.** Sixty-three came from reading STUDY.md
 against §3.2; the seven in §S came
 from measuring this machine instead, and are the first here that the study never made. The first
@@ -192,7 +192,7 @@ are unaffected. What falls is one sentence of comparison, and the habit that pro
 |---|---|---|---|---|
 | E8.1 | running under `pytest-testmon` costs ~4× a plain run (227.0 s against 58.5 s) | sqlalchemy, 9,300 tests · Pi | 2 × 1 | under-powered |
 | E8.2 | a core-module change selects 79% of the suite and costs 261.8 s, 4.5× the full run it replaces | as above | 1 × 1 | under-powered |
-| E8.3 | a leaf-module change selected the same 62 tests as no change | as above | 1 × 1 | **unverified** — the text says so: either testmon missed it or no test covers the edit, and which was never checked |
+| E8.3 | a leaf-module change selected the same 62 tests as no change | as above | 1 × 1, then 4 arms × 1 | **verified, and the ambiguity resolved** (2026-10-17, [measurements/e8.3/](../measurements/e8.3/README.md)) — the row reproduces exactly, and **testmon did not miss the edit**: editing a function `test/base/test_utils.py` calls selects 25 tests and runs them, editing an uncovered function in the same file selects the same 62 and runs none. 29 of that file's 141 functions are never executed by the suite, so the study's edit landed in uncovered code. Also: those 62 never run — `62 selected` is followed by no pass count — so the unchanged case is cheaper than "62 tests" suggests |
 | E8.4 | the runner should do nothing about test selection | decision from E8.1–E8.3 | — | **superseded** in framing — [RELATED.md](RELATED.md) argues (Herzig's THEO) that this is an economic question answered with a mechanics measurement; the mechanics stand, the conclusion does not follow from them alone |
 
 ## §S Storage and concurrency — the first claims that did not come from the study
@@ -290,7 +290,7 @@ differ without the machine being touched at all.
 
 ## What this says to do next
 
-1. **Stop citing the four unverified claims** until they are re-checked: E2.7, E5.4, E5.6, E8.3. (W.5 was the fifth; it has been re-checked and is **refuted**.) None is now load-bearing outside the study: the one that was — E6.4 in [SPEC.md](SPEC.md) §6, "faster than GitHub's" — **has been re-checked and is refuted**, and the sentence is gone rather than softened. **E7.7 has also been re-checked and holds**; the measurements are in `measurements/E7.7-gogc-measured.jsonl` and `measurements/E6.4-uv-measured.jsonl`.
+1. **Stop citing the three unverified claims** until they are re-checked: E2.7, E5.4, E5.6. (W.5 was re-checked and is **refuted**; E8.3 was re-checked and **holds**, with the mechanism it was ambiguous about now settled.) Of the three left, E2.7 and E5.6 are not measurements — E2.7 is a guess in prose with no workload, E5.6 a break-even figure derived from single samples about a feature E5.5 already shelved — so the honest end for both is probably withdrawal rather than a series. E5.4 is a real measurement and the only one of the three worth running. None is now load-bearing outside the study: the one that was — E6.4 in [SPEC.md](SPEC.md) §6, "faster than GitHub's" — **has been re-checked and is refuted**, and the sentence is gone rather than softened. **E7.7 has also been re-checked and holds**; the measurements are in `measurements/E7.7-gogc-measured.jsonl` and `measurements/E6.4-uv-measured.jsonl`.
 2. ~~**E7.7 first**, because it is the only unverified claim that currently decides a deployed setting.~~ **Done**, and so is **E3.4**, the other claim that decided one: it does not hold as stated, and what replaced it (E3.4b) says why output keys stay opt-in and why `RUNNER_OUTPUT_KEYS_MAX_MS` is the right shape of answer. The pilot put a 40-step job's engine CPU at 6.2 s with sd 0.29, so dimensioning asked for three repetitions rather than the nineteen a warm-up round's provisioning made it look like; three interleaved rounds an arm, each recreating the engine, settled it in 13 minutes.
 3. ~~**Then E6.4 and W.5**, the two "faster than a hosted runner" claims.~~ **Both are done and both are refuted** — E6.4 on 2026-10-17 and W.5 the same day, the second by exactly the method the first suggested: make both arms do the same work, then measure. Neither needed more repetitions; each needed its arms to be doing the same thing. **Nothing in the documentation now claims this runner beats a hosted one**, and the honest summary of what the Pi buys is in [SPEC.md](SPEC.md) §6: replays and warm caches, not raw speed.
 4. **The harness before the rest.** Four commands in this repository cover a handful of the 62 claims; re-checking any of the others means writing the measurement again from the prose. That is MEASURE.md stage 2, and E7.6 and E3.5 are what to validate it against, their answers being known.

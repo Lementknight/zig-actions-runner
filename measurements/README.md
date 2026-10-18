@@ -184,3 +184,23 @@ Two things this one added that E6.4 did not:
 `pi-control` carries one oddity: `sd 0.351` against `pi`'s `0.019`, from two readings near 3.9 s on
 the same machine running the same command. It did not change the verdict — both are still above
 every hosted reading — but nothing here explains it.
+
+## E8.3, the one that is not a measurement
+
+Settled by inspection rather than by a series, because the question was *which of two mechanisms*
+produced an observation — and the answer is a selection count, which does not depend on the machine.
+`e8.3/reproduce.sh` runs sqlalchemy's suite four times locally, in about four minutes.
+
+| | Tests selected | Tests actually run |
+|---|---|---|
+| again, nothing changed | **62** | **0** |
+| after editing a function `test/base/test_utils.py` calls | **25** | **25** |
+| after editing an uncovered function in the same file | **62** | **0** |
+
+**testmon did not miss the edit.** The study's row reproduces exactly, and what explains it is
+sqlalchemy's coverage: 29 of `langhelpers.py`'s 141 functions are never executed by that suite. In
+place of a negative control, the experiment has two arms whose answers are known and opposite.
+
+A second thing fell out of it: the 62 never run. `62 selected` is followed by no pass count, so the
+unchanged case collects 9,380 tests and executes none — which the study's "62 of 9,380" does not
+convey, and which strengthens rather than disturbs its conclusion.
