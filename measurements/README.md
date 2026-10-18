@@ -25,6 +25,8 @@ whatever `--environment` printed. `note` says where a line came from when it was
 | `S.1-runners-pilot2.jsonl` | S.1, superseded: total contended copying by `RUNNER_COUNT` | **measured** on the Pi, 2026-10-17, by `concurrency/superseded/arm.sh` |
 | `S.1-runners-pilot.jsonl` | S.1's first instrument, makespan, which could not resolve it | **measured** on the Pi, 2026-10-17, by `concurrency/superseded/arm.sh` |
 | `S.1-runners-aborted.jsonl` | S.1's confirmation, abandoned after trials went from 2 to 35 minutes | **measured** on the Pi, 2026-10-17; four warm-ups, one reading, two failures |
+| `W.5-install-measured.jsonl` | W.5, an editable install from a warm package cache, here against hosted | **measured** 2026-10-17, by `w5/arm.sh` |
+| `W.5-install-pilot.jsonl` | W.5's pilot, which chose its repetitions | **measured** 2026-10-17, by `w5/arm.sh` |
 | `E6.4-uv-measured.jsonl` | E6.4, a warm `uv sync` here against a hosted runner | **measured** 2026-10-17, by `e6.4/arm.sh` |
 | `E6.4-uv-pilot.jsonl` | E6.4's pilot, which chose its repetitions | **measured** 2026-10-17, by `e6.4/arm.sh` |
 | `E3.4-outputkeys-measured.jsonl` | E3.4/E3.4b, what output keys cost on a first run | **measured** on the Pi, 2026-10-16, by `e3.4/arm-outputkeys.sh` |
@@ -147,3 +149,38 @@ The pilot is kept because it shows the other half of this. At n=3 the Pi's media
 `sd 0.019`, and the difference looked like 3×; at n=12 the median is 0.015 s with `sd 0.002` and the
 difference is 27%. The direction was right from the pilot — the two arms' readings never
 overlapped — and the size was not.
+
+## W.5, refuted — and that is both of them
+
+The second refutation, the same day as the first, and the study's other "faster than a hosted
+runner" claim. `w5/` holds it, in the same four pieces as `e6.4/`.
+
+```
+  pi          n=10  median 3.073 s  (baseline)
+  hosted      n=10  median 2.154 s  difference -0.919  95% CI [-1.538, -0.881]  effect
+  pi-control  n=10  median 3.064 s  difference -0.009  95% CI [-0.031,  0.374]  no_effect_found
+```
+
+The study said sqlalchemy's install was 21.0 s here against 28.2 s hosted. Give both machines a warm
+package cache and it is **3.073 s here against 2.154 s** — the hosted runner faster by 30%, with the
+arms not overlapping anywhere: every hosted reading is below every Pi reading.
+
+**It failed the same way E6.4 did, and the study said so without noticing.** The sentence explaining
+why the Pi won — the registry is warm here "while the hosted runner downloads from PyPI each time" —
+is a description of the arms doing different work. Removing the downloads removes 90% of the
+quantity: the install is 2-3 s on either machine, so the 7.2 s margin was never about installing.
+
+Two things this one added that E6.4 did not:
+
+- **The pre-registration was committed before the harness ran** (`be87bdf`), so "written before any
+  number existed" can be checked rather than taken on trust. Two of its statements then turned out
+  wrong — it predicted a Cython compile that does not happen, and expected a quantity ten times
+  larger than the real one — and both corrections are in the history rather than quietly edited in.
+- **The Pi arm failed first, on this runner's own feature.** The workload deleted `.venv` to force a
+  fresh install, but here `.venv` is a symlink into uv's cache volume, so that removed the link and
+  left the environment. It deletes the symlink's target instead. A measurement of a runner has to
+  know what the runner does to the thing being measured.
+
+`pi-control` carries one oddity: `sd 0.351` against `pi`'s `0.019`, from two readings near 3.9 s on
+the same machine running the same command. It did not change the verdict — both are still above
+every hosted reading — but nothing here explains it.

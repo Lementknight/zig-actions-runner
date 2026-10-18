@@ -35,6 +35,35 @@ same thing, then measure, rather than adding repetitions to the old comparison.
   machine. Its answer is known — it must come out as no effect against `pi`. If the harness calls
   that pair an effect, the suite is wrong and the hosted arm's answer does not matter.
 
+## The answer
+
+```
+  pi          n=10  median 3.073 s  (baseline)
+  hosted      n=10  median 2.154 s  difference -0.919  95% CI [-1.538, -0.881]  effect
+  pi-control  n=10  median 3.064 s  difference -0.009  95% CI [-0.031,  0.374]  no_effect_found
+```
+
+**Refuted in direction.** The hosted runner is faster by 0.92 s — **30%** of the Pi's time, with the
+interval running from 29% to 50% and excluding zero, against a pre-registered threshold of 20%. The
+negative control came out as known, which is what licenses reading the third line at all.
+
+The arms do not overlap anywhere: every hosted reading (max 2.400 s) is below every Pi reading (min
+3.063 s). Re-dimensioning at n=10 asks for 17 repetitions on the hosted arm for a ±0.2 s half-width,
+which this is short of — but a separation with no overlap does not depend on the interval's width,
+and the direction is what the claim asserted.
+
+So **both** of the study's "faster than a hosted runner" claims are now refuted, and for the same
+reason each time: the Pi was measured with its caches warm against a hosted runner with its caches
+cold. W.5's 7.2 s margin was a slice of PyPI download time. With nothing to download, the whole
+install is 2-3 s and the Pi is the slower machine — which is what W.7 ("~2.5× slower at compiling")
+would have predicted for any CPU-and-disk-bound quantity.
+
+One oddity worth recording: `pi-control` has `sd 0.351` against `pi`'s `0.019`, from two readings of
+3.985 s and 3.807 s in rounds 2 and 6. Same machine, same command, nothing else running — so the
+Pi's install occasionally takes 25% longer for a reason this measurement does not identify. It did
+not change the verdict (both outliers are still above every hosted reading) but it is the kind of
+variance that S.6's write collapse also showed, and it is in the sample file for anyone who wants it.
+
 ## What "warm on both" has to mean here, and why it is not E6.4's warm
 
 E6.4 measured a warm `uv sync`: an environment that is already correct being reconciled, which is

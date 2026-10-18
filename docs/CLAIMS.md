@@ -9,12 +9,16 @@ measured, on what, against what, how many times, and how to run it again — and
 one be marked unverified and not used to justify a change. This is that register, built by reading
 STUDY.md against §3.2 after the fact.
 
-**70 claims: 22 verified, 33 under-powered, 5 unverified, 4 superseded, 2 proved, 1 withdrawn, 1
+**70 claims: 22 verified, 33 under-powered, 4 unverified, 4 superseded, 2 proved, 1 withdrawn, 2
 refuted, 1 no effect found, 1 not measurable as framed.** Sixty-three came from reading STUDY.md
 against §3.2; the seven in §S came
 from measuring this machine instead, and are the first here that the study never made. The first
 refutation is E6.4, and it was refuted in *direction*, not merely in size: a
-warm `uv sync` is slower here than on a hosted runner, where the study said faster. The
+warm `uv sync` is slower here than on a hosted runner, where the study said faster. **W.5 went the
+same way for the same reason**, and between them they were both of the study's "faster than a hosted
+runner" claims — each measured the Pi with its caches warm against a hosted runner with its caches
+cold, so each reported a margin made mostly of downloads the Pi had already done. Neither was a
+sample-size problem, which is why neither was fixed by repetition. The
 one-line summary still holds otherwise: *little here is wrong, and little is measured to the
 standard MEASURE.md sets.* The
 large effects — 135× on uv's install, 20× on a re-run, 37× on a warm Go job — are far beyond any
@@ -73,7 +77,7 @@ independently by arithmetic. The samples are in [measurements/](../measurements/
 | W.2 | ripgrep on a hosted runner: 36 s, then 34 s again (nothing to replay) | ripgrep · `ubuntu-latest` | 1 × 2 | under-powered |
 | W.3 | clap: 229 s here against 85 s hosted; leaves 996 MB of `target/` and 925 MB of registry cache | clap · Pi, hosted | 1 × 1 | under-powered |
 | W.4 | hugo `go mod download` 35.8 s → 0.2 s, `go build ./...` 195.3 s → 8.7 s with warm volumes | hugo, 192 packages · Pi | cold vs warm × 1 | under-powered |
-| W.5 | sqlalchemy install 21.0 s here against 28.2 s hosted ("faster than a hosted runner") | sqlalchemy · Pi, hosted | 1 × 1 | **unverified** |
+| W.5 | sqlalchemy install 21.0 s here against 28.2 s hosted ("faster than a hosted runner") | sqlalchemy · Pi, hosted | 3 × 10 | **refuted** (2026-10-17, [measurements/w5/](../measurements/w5/README.md)) — the hosted runner is **faster**: medians 2.154 s against 3.073 s, difference 0.919 s, 95% CI [0.881, 1.538], 30% of the baseline, negative control at 0.009 s, and the arms do not overlap (every hosted reading below every Pi reading). Same defect as E6.4: the study's own sentence says the Pi's registry was warm "while the hosted runner downloads from PyPI each time". With both package caches warm the install is 2-3 s, so the 7.2 s margin was download time |
 | W.6 | sqlalchemy's 9,300 tests 81.2 s here against 42.7 s hosted | sqlalchemy · Pi, hosted | 1 × 1 | under-powered |
 | W.7 | the Pi is ~2.5× slower at compiling and ~7× faster on a re-run | derived from W.1–W.3 | — | under-powered |
 
@@ -286,8 +290,8 @@ differ without the machine being touched at all.
 
 ## What this says to do next
 
-1. **Stop citing the five unverified claims** until they are re-checked: W.5, E2.7, E5.4, E5.6, E8.3. None is now load-bearing outside the study: the one that was — E6.4 in [SPEC.md](SPEC.md) §6, "faster than GitHub's" — **has been re-checked and is refuted**, and the sentence is gone rather than softened. **E7.7 has also been re-checked and holds**; the measurements are in `measurements/E7.7-gogc-measured.jsonl` and `measurements/E6.4-uv-measured.jsonl`.
+1. **Stop citing the four unverified claims** until they are re-checked: E2.7, E5.4, E5.6, E8.3. (W.5 was the fifth; it has been re-checked and is **refuted**.) None is now load-bearing outside the study: the one that was — E6.4 in [SPEC.md](SPEC.md) §6, "faster than GitHub's" — **has been re-checked and is refuted**, and the sentence is gone rather than softened. **E7.7 has also been re-checked and holds**; the measurements are in `measurements/E7.7-gogc-measured.jsonl` and `measurements/E6.4-uv-measured.jsonl`.
 2. ~~**E7.7 first**, because it is the only unverified claim that currently decides a deployed setting.~~ **Done**, and so is **E3.4**, the other claim that decided one: it does not hold as stated, and what replaced it (E3.4b) says why output keys stay opt-in and why `RUNNER_OUTPUT_KEYS_MAX_MS` is the right shape of answer. The pilot put a 40-step job's engine CPU at 6.2 s with sd 0.29, so dimensioning asked for three repetitions rather than the nineteen a warm-up round's provisioning made it look like; three interleaved rounds an arm, each recreating the engine, settled it in 13 minutes.
-3. ~~**Then E6.4 and W.5**, the two "faster than a hosted runner" claims.~~ **E6.4 is done and refuted**, which leaves **W.5** (sqlalchemy's install, 21.0 s here against 28.2 s hosted) as the last "faster than a hosted runner" claim standing on one sample per machine. E6.4 is the reason to doubt it: the failure there was not the sample size but that the two arms were given different work, and W.5 compares an install here against an install on a machine whose cache state was never recorded. Re-check it the same way — make both arms do the same thing, then measure — rather than by adding repetitions to the old comparison.
+3. ~~**Then E6.4 and W.5**, the two "faster than a hosted runner" claims.~~ **Both are done and both are refuted** — E6.4 on 2026-10-17 and W.5 the same day, the second by exactly the method the first suggested: make both arms do the same work, then measure. Neither needed more repetitions; each needed its arms to be doing the same thing. **Nothing in the documentation now claims this runner beats a hosted one**, and the honest summary of what the Pi buys is in [SPEC.md](SPEC.md) §6: replays and warm caches, not raw speed.
 4. **The harness before the rest.** Four commands in this repository cover a handful of the 62 claims; re-checking any of the others means writing the measurement again from the prose. That is MEASURE.md stage 2, and E7.6 and E3.5 are what to validate it against, their answers being known.
 5. **Nothing here asks for a design change.** No verdict moved a conclusion: the two decisions resting on unverified numbers (`GOGC=400`, and "faster than a hosted runner" in the docs) are a setting and a sentence, not an architecture. The findings carrying real weight — E6.1's filesystem split, E2.2's secret rule, E5.5's declared-inputs cost — are proved, verified, or very large.
