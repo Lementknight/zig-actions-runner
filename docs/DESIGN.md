@@ -17,7 +17,7 @@ This project is to CI runners what Gitea is to GitHub: something you can run you
 
 ## 3. Non-goals
 
-- Windows or macOS jobs, PowerShell, or .NET: Linux containers and bash only.
+- Windows or macOS jobs, PowerShell, or .NET: Linux containers, and bash as the priority shell (`sh` and `python` run too — SPEC.md §6 — but nothing that needs .NET).
 - Hostile, multi-tenant workloads. The Dagger engine runs privileged and is root-equivalent on its machine, so the runner is for workflows its operator trusts.
 - Auto-updating the runner binary.
 
