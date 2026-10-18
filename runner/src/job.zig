@@ -192,29 +192,8 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
     const steps = try arena.alloc(Step, steps_v.array.items.len);
     for (steps_v.array.items, steps) |sv, *out| out.* = try parseStep(arena, sv);
 
-    var services: []const Service = &.{};
-    var services_error: ?[]const u8 = null;
-    if (root.object.get("jobServiceContainers")) |sc| if (sc != .null) {
-        services = parseServices(arena, sc) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Unsupported => blk: {
-                services_error = "services: could not be read (written as an expression, or in a form the runner does not know)";
-                break :blk &.{};
-            },
-        };
-    };
-
-    var container: ?Service = null;
-    var container_error: ?[]const u8 = null;
-    if (root.object.get("jobContainer")) |jc| if (jc != .null) {
-        container = parseService(arena, "job", jc) catch |e| switch (e) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Unsupported => blk: {
-                container_error = "container: could not be read (written as an expression, or in a form the runner does not know)";
-                break :blk null;
-            },
-        };
-    };
+    const services = try jobServices(arena, root);
+    const container = try jobContainer(arena, root);
 
     return .{
         .plan_id = path(root, &.{ "plan", "planId" }) orelse return error.MalformedJob,
@@ -235,21 +214,54 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
         .env = try jobEnv(arena, root),
         .context_data = root.object.get("contextData") orelse .null,
         .display_name = path(root, &.{"jobDisplayName"}) orelse "",
-        .container = container,
-        .container_error = container_error,
-        .services = services,
-        .services_error = services_error,
+        .container = container.container,
+        .container_error = container.err,
+        .services = services.services,
+        .services_error = services.err,
         .token_permissions = variable(root, "system.github.token.permissions") orelse "",
-        .outputs = blk: {
-            const jo = root.object.get("jobOutputs") orelse break :blk &.{};
-            if (jo == .null) break :blk &.{};
-            break :blk mappingInputs(arena, jo) catch |e| switch (e) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.Unsupported => &.{},
-            };
-        },
+        .outputs = try jobOutputs(arena, root),
         .runner_group = variable(root, "system.runnerGroupName") orelse "",
         .steps = steps,
+    };
+}
+
+const JobServices = struct { services: []const Service = &.{}, err: ?[]const u8 = null };
+
+/// `jobServiceContainers`, or why it could not be read (the job still runs; the error is reported).
+fn jobServices(arena: Allocator, root: Value) Allocator.Error!JobServices {
+    const sc = root.object.get("jobServiceContainers") orelse return .{};
+    if (sc == .null) return .{};
+    const services = parseServices(arena, sc) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unsupported => return .{
+            .err = "services: could not be read (written as an expression, or in a form the runner does not know)",
+        },
+    };
+    return .{ .services = services };
+}
+
+const JobContainer = struct { container: ?Service = null, err: ?[]const u8 = null };
+
+/// `jobContainer`, or why it could not be read.
+fn jobContainer(arena: Allocator, root: Value) Allocator.Error!JobContainer {
+    const jc = root.object.get("jobContainer") orelse return .{};
+    if (jc == .null) return .{};
+    const container = parseService(arena, "job", jc) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unsupported => return .{
+            .err = "container: could not be read (written as an expression, or in a form the runner does not know)",
+        },
+    };
+    return .{ .container = container };
+}
+
+/// `jobOutputs`; an unreadable mapping counts as none.
+fn jobOutputs(arena: Allocator, root: Value) Allocator.Error![]const Input {
+    const jo = root.object.get("jobOutputs") orelse return &.{};
+    if (jo == .null) return &.{};
+    return mappingInputs(arena, jo) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Unsupported => &.{},
     };
 }
 
