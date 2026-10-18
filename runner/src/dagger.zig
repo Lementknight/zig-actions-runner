@@ -1907,38 +1907,7 @@ pub fn run(
 
     const results = try arena.alloc(StepResult, job.steps.len);
     @memset(results, .{});
-    // Per log step: the job's steps, then their `pre` and `post` scripts (see `ExtraStep`).
-    const live = try arena.alloc(std.atomic.Value(u32), logSteps(job.steps.len));
-    const ended = try arena.alloc(std.atomic.Value(bool), logSteps(job.steps.len));
-    for (live, ended) |*l, *e| {
-        l.* = .init(0);
-        e.* = .init(false);
-    }
-    const replayed_steps = try arena.alloc(bool, logSteps(job.steps.len));
-    @memset(replayed_steps, false);
-    const step_commands = try arena.alloc(Shared.StepCommands, logSteps(job.steps.len));
-    @memset(step_commands, .{});
-    const line_counts = try arena.alloc(u32, logSteps(job.steps.len));
-    @memset(line_counts, 0);
-    const service_logs = try arena.alloc(std.ArrayList([]const u8), job.services.len);
-    @memset(service_logs, .empty);
-    const service_dropped = try arena.alloc(u32, job.services.len);
-    @memset(service_dropped, 0);
-    var sh: Shared = .{
-        .io = io,
-        .arena = arena,
-        .log = log,
-        .sink_job_id = opts.sink_job_id,
-        .live_lines = live,
-        .ended = ended,
-        .commands = step_commands,
-        .replayed_steps = replayed_steps,
-        .line_counts = line_counts,
-        .service_logs = service_logs,
-        .service_dropped = service_dropped,
-        .step_debug = stepDebug(arena, job),
-        .workspace = try jobWorkspace(arena, job),
-    };
+    var sh = try sharedFor(arena, io, opts, job, log);
 
     if (opts.engine) |ep| if (opts.test_transport == null) return runDirect(arena, io, opts, job, &sh, results, ep);
 
@@ -1960,23 +1929,87 @@ pub fn run(
         sh.flush();
     }
 
-    // First line of the child's stdout: "<port> <token>".
-    var first: [512]u8 = undefined;
-    var out_reader = child.stdout.?.readerStreaming(io, &first);
-    const line = (out_reader.interface.takeDelimiter('\n') catch null) orelse {
-        return fail(&sh, results, "could not start a Dagger session (is the Docker daemon running?)");
-    };
-    var parts = std.mem.tokenizeScalar(u8, line, ' ');
-    const port = parts.next() orelse return fail(&sh, results, "Dagger session did not report a port");
-    const token = parts.next() orelse return fail(&sh, results, "Dagger session did not report a token");
-
-    var http: HttpTransport = .{
-        .io = io,
-        .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{s}/query", .{port}),
-        .auth = try std.fmt.allocPrint(arena, "Basic {s}", .{try base64Encode(arena, try std.fmt.allocPrint(arena, "{s}:", .{token}))}),
+    var http = switch (try sessionTransport(arena, io, &child, &sh, results)) {
+        .failed => |result| return result,
+        .transport => |t| t,
     };
     const transport: Transport = opts.test_transport orelse .{ .ptr = &http, .sendFn = HttpTransport.send };
     return runSteps(arena, io, opts, job, &sh, results, transport);
+}
+
+/// What every task of a job shares: the log, and one slot per log step — the job's steps, then their
+/// `pre` and `post` scripts (see `ExtraStep`) — for live lines, endings, commands, replays and counts,
+/// plus a buffer per service for its output.
+fn sharedFor(
+    arena: Allocator,
+    io: std.Io,
+    opts: Options,
+    job: job_mod.Job,
+    log: *sink.LogSink,
+) !Shared {
+    const n = logSteps(job.steps.len);
+    const live = try arena.alloc(std.atomic.Value(u32), n);
+    const ended = try arena.alloc(std.atomic.Value(bool), n);
+    for (live, ended) |*l, *e| {
+        l.* = .init(0);
+        e.* = .init(false);
+    }
+    const replayed_steps = try arena.alloc(bool, n);
+    @memset(replayed_steps, false);
+    const step_commands = try arena.alloc(Shared.StepCommands, n);
+    @memset(step_commands, .{});
+    const line_counts = try arena.alloc(u32, n);
+    @memset(line_counts, 0);
+    const service_logs = try arena.alloc(std.ArrayList([]const u8), job.services.len);
+    @memset(service_logs, .empty);
+    const service_dropped = try arena.alloc(u32, job.services.len);
+    @memset(service_dropped, 0);
+    return .{
+        .io = io,
+        .arena = arena,
+        .log = log,
+        .sink_job_id = opts.sink_job_id,
+        .live_lines = live,
+        .ended = ended,
+        .commands = step_commands,
+        .replayed_steps = replayed_steps,
+        .line_counts = line_counts,
+        .service_logs = service_logs,
+        .service_dropped = service_dropped,
+        .step_debug = stepDebug(arena, job),
+        .workspace = try jobWorkspace(arena, job),
+    };
+}
+
+/// The session's HTTP endpoint, or the failed Result the job ends with when the session never
+/// reported one.
+const SessionStart = union(enum) { transport: HttpTransport, failed: Result };
+
+/// From the first line of `dagger run`'s child: "<port> <token>".
+fn sessionTransport(
+    arena: Allocator,
+    io: std.Io,
+    child: *std.process.Child,
+    sh: *Shared,
+    results: []StepResult,
+) !SessionStart {
+    var first: [512]u8 = undefined;
+    var out_reader = child.stdout.?.readerStreaming(io, &first);
+    const line = (out_reader.interface.takeDelimiter('\n') catch null) orelse {
+        const why = "could not start a Dagger session (is the Docker daemon running?)";
+        return .{ .failed = try fail(sh, results, why) };
+    };
+    var parts = std.mem.tokenizeScalar(u8, line, ' ');
+    const port = parts.next() orelse
+        return .{ .failed = try fail(sh, results, "Dagger session did not report a port") };
+    const token = parts.next() orelse
+        return .{ .failed = try fail(sh, results, "Dagger session did not report a token") };
+    const basic = try std.fmt.allocPrint(arena, "{s}:", .{token});
+    return .{ .transport = .{
+        .io = io,
+        .url = try std.fmt.allocPrint(arena, "http://127.0.0.1:{s}/query", .{port}),
+        .auth = try std.fmt.allocPrint(arena, "Basic {s}", .{try base64Encode(arena, basic)}),
+    } };
 }
 
 /// A job's session held by this process (`engine.zig`), with no `dagger run` child: queries go over
