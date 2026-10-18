@@ -3523,45 +3523,73 @@ const Exec = struct {
 
     /// Stores an output (`layer_id`, a Directory, whose content digest is `digest`) and returns the
     /// container the next step starts from: `base` with the output copied in by digest, as `user`.
-    fn storeAndApply(x: *Exec, num: u32, base: []const u8, user: []const u8, layer_id: []const u8, digest: []const u8, target: OutputTarget) !?[]const u8 {
-        const arena = x.arena;
+    fn storeAndApply(
+        x: *Exec,
+        num: u32,
+        base: []const u8,
+        user: []const u8,
+        layer_id: []const u8,
+        digest: []const u8,
+        target: OutputTarget,
+    ) !?[]const u8 {
         var t = std.Io.Clock.awake.now(x.io).toMilliseconds();
-        const debug = struct {
-            fn line(ex: *Exec, n: u32, comptime fmt: []const u8, args: anytype) void {
-                if (ex.sh.step_debug) ex.sh.appendFmt(n, "##[debug]" ++ fmt, args);
-            }
-        }.line;
         if (digest.len == 0 or std.mem.indexOfNone(u8, digest, "0123456789abcdef") != null) return null;
-        var msg: []const u8 = "";
         const busybox = (try x.busyboxFile(num)) orelse return null;
-        const volume = x.outputs_volume orelse vol: {
-            const data = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ cacheVolume(key:{f}) {{ id }} }}", .{std.json.fmt(x.output_keys.?, .{})}), &msg) catch {
-                x.outputsFallback(num, "no store: {s}", .{msg});
-                return null;
-            };
-            const id = jsonFindString(data, "id") orelse return null;
-            x.outputs_volume = id;
-            break :vol id;
-        };
+        const volume = (try x.outputsVolume(num)) orelse return null;
+        if (!try x.storeOutput(num, busybox, volume, layer_id, digest)) return null;
+        x.outputsPhase(num, "storing it", &t);
+        const script = try x.applyScript(digest, target);
+        const id = (try x.applyOutput(num, base, user, busybox, volume, script)) orelse return null;
+        x.outputsPhase(num, "copying it into the next container", &t);
+        x.debugApplied(num, digest, target);
+        return id;
+    }
 
-        // Store it under its digest unless it is there. Another job may store the same digest at the
-        // same time: `mv -T` onto an existing directory fails and leaves it as it was. Each store
-        // copies to its own temporary name (the run's nonce is shared by its matrix jobs).
+    /// The cache volume outputs are stored in, asked for once per job. Null, with the fallback
+    /// noted, when the engine would not give one.
+    fn outputsVolume(x: *Exec, num: u32) !?[]const u8 {
+        if (x.outputs_volume) |v| return v;
+        const arena = x.arena;
+        var msg: []const u8 = "";
+        const key = std.json.fmt(x.output_keys.?, .{});
+        const query = try std.fmt.allocPrint(arena, "{{ cacheVolume(key:{f}) {{ id }} }}", .{key});
+        const data = gql(arena, x.transport, query, &msg) catch {
+            x.outputsFallback(num, "no store: {s}", .{msg});
+            return null;
+        };
+        const id = jsonFindString(data, "id") orelse return null;
+        x.outputs_volume = id;
+        return id;
+    }
+
+    /// Stores the output under its digest unless it is there. Another job may store the same digest
+    /// at the same time: `mv -T` onto an existing directory fails and leaves it as it was. Each
+    /// store copies to its own temporary name (the run's nonce is shared by its matrix jobs).
+    ///
+    /// The directory's time is when a step last produced it (this runs whenever one does, and is
+    /// never replayed). Outputs not produced for `outputs_days` days go, and copies left half made
+    /// for a day. Removing one is always safe: a replayed step does not read the store, and when the
+    /// copy into a next step has to run and finds nothing, that falls back to the step's own
+    /// container. False, with the fallback noted, when the store exec failed.
+    fn storeOutput(
+        x: *Exec,
+        num: u32,
+        busybox: []const u8,
+        volume: []const u8,
+        layer_id: []const u8,
+        digest: []const u8,
+    ) !bool {
+        const arena = x.arena;
         var tmp_raw: [8]u8 = undefined;
         x.io.random(&tmp_raw);
         const tmp_name = std.fmt.bytesToHex(tmp_raw, .lower);
-        //
-        // The directory's time is when a step last produced it (this runs whenever one does, and is
-        // never replayed). Outputs not produced for `outputs_days` days go, and copies left half
-        // made for a day. Removing one is always safe: a replayed step does not read the store, and
-        // when the copy into a next step has to run and finds nothing, that falls back to the step's
-        // own container.
         const store_script = try std.fmt.allocPrint(arena,
             \\/bin/busybox find /store -mindepth 1 -maxdepth 1 \( -name '*.tmp.*' -mtime +0 -o -mtime +{d} \) -exec /bin/busybox rm -rf {{}} +
             \\d=/store/{s}; test -d "$d" && {{ /bin/busybox touch "$d"; exit 0; }}
             \\t="$d.tmp.{s}"; /bin/busybox rm -rf "$t"; /bin/busybox cp -a /in/. "$t" || exit 1
             \\/bin/busybox mv -T "$t" "$d" 2>/dev/null || /bin/busybox rm -rf "$t"; test -d "$d" && /bin/busybox touch "$d"
         , .{ x.outputs_days, digest, &tmp_name });
+        var msg: []const u8 = "";
         _ = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ container {{ withFile(path:\"/bin/busybox\",source:{f},permissions:493) {{ withMountedCache(path:\"/store\",cache:{f}) {{ withMountedDirectory(path:\"/in\",source:{f}) {{ withExec(args:{f}) {{ exitCode }} }} }} }} }} }}", .{
             std.json.fmt(busybox, .{}),
             std.json.fmt(volume, .{}),
@@ -3569,12 +3597,17 @@ const Exec = struct {
             std.json.fmt([_][]const u8{ "/bin/busybox", "sh", "-c", store_script }, .{}),
         }), &msg) catch {
             x.outputsFallback(num, "could not store the step's output: {s}", .{msg});
-            return null;
+            return false;
         };
-        x.outputsPhase(num, "storing it", &t);
+        return true;
+    }
 
-        // The next step's container: the digest and removed paths are the exec's arguments, so they
-        // are what its key depends on.
+    /// The shell that puts a stored output into the next step's container: over the whole
+    /// filesystem with the removed paths deleted (a step's changes), or as the whole contents of one
+    /// directory (a Docker action's workspace). The digest and removed paths are the exec's
+    /// arguments, so they are what its key depends on.
+    fn applyScript(x: *Exec, digest: []const u8, target: OutputTarget) ![]const u8 {
+        const arena = x.arena;
         var apply: std.Io.Writer.Allocating = .init(arena);
         const aw = &apply.writer;
         try aw.writeAll("set -e\ncd /\n");
@@ -3605,26 +3638,46 @@ const Exec = struct {
                 }
             },
         }
+        return apply.written();
+    }
+
+    /// The next step's container: `base` with the store and busybox mounted, the apply script run as
+    /// root now (exitCode, so a failure falls back here rather than failing the next step), then the
+    /// step user restored and the mounts removed. Null, with the fallback noted, when that failed.
+    fn applyOutput(
+        x: *Exec,
+        num: u32,
+        base: []const u8,
+        user: []const u8,
+        busybox: []const u8,
+        volume: []const u8,
+        script: []const u8,
+    ) !?[]const u8 {
+        const arena = x.arena;
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
         try w.print("{{ loadContainerFromID(id:{f}) {{ ", .{std.json.fmt(base, .{})});
         try w.print("withMountedCache(path:\"" ++ outputs_store ++ "\",cache:{f}) {{ withMountedFile(path:\"" ++ outputs_busybox ++ "\",source:{f}) {{ ", .{ std.json.fmt(volume, .{}), std.json.fmt(busybox, .{}) });
-        // Run now (exitCode), so a failure falls back here rather than failing the next step.
-        try w.print("withUser(name:\"root\") {{ withExec(args:{f}) {{ exitCode ", .{std.json.fmt([_][]const u8{ outputs_busybox, "sh", "-c", apply.written() }, .{})});
+        try w.print("withUser(name:\"root\") {{ withExec(args:{f}) {{ exitCode ", .{std.json.fmt([_][]const u8{ outputs_busybox, "sh", "-c", script }, .{})});
         if (user.len > 0) try w.print("withUser(name:{f}) {{ ", .{std.json.fmt(user, .{})}) else try w.writeAll("withoutUser { ");
         try w.writeAll("withoutMount(path:\"" ++ outputs_store ++ "\") { withoutMount(path:\"" ++ outputs_busybox ++ "\") { id");
         for (0..5 + 4) |_| try w.writeAll(" }");
+        var msg: []const u8 = "";
         const next = gql(arena, x.transport, doc.written(), &msg) catch {
             x.outputsFallback(num, "could not copy the step's output into the next container: {s}", .{msg});
             return null;
         };
-        x.outputsPhase(num, "copying it into the next container", &t);
-        const id = jsonFindString(next, "id") orelse return null;
+        return jsonFindString(next, "id");
+    }
+
+    /// Under step debug: what the next steps start from.
+    fn debugApplied(x: *Exec, num: u32, digest: []const u8, target: OutputTarget) void {
+        if (!x.sh.step_debug) return;
+        const short = digest[0..@min(12, digest.len)];
         switch (target) {
-            .changes => |removed| debug(x, num, "Output keys: the next steps start from this step's output, sha256:{s} ({d} removed paths)", .{ digest[0..@min(12, digest.len)], removed.len }),
-            .replace_dir => |dir| debug(x, num, "Output keys: the next steps start from this step's {s}, sha256:{s}", .{ dir, digest[0..@min(12, digest.len)] }),
+            .changes => |removed| x.sh.appendFmt(num, "##[debug]Output keys: the next steps start from this step's output, sha256:{s} ({d} removed paths)", .{ short, removed.len }),
+            .replace_dir => |dir| x.sh.appendFmt(num, "##[debug]Output keys: the next steps start from this step's {s}, sha256:{s}", .{ dir, short }),
         }
-        return id;
     }
 
     /// Several execs can log as one step (a composite action's steps, a JavaScript action's pre, main
