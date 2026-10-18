@@ -9,7 +9,7 @@ measured, on what, against what, how many times, and how to run it again — and
 one be marked unverified and not used to justify a change. This is that register, built by reading
 STUDY.md against §3.2 after the fact.
 
-**70 claims: 23 verified, 33 under-powered, 3 unverified, 4 superseded, 2 proved, 1 withdrawn, 2
+**70 claims: 23 verified, 33 under-powered, 1 unverified, 4 superseded, 2 proved, 3 withdrawn, 2
 refuted, 1 no effect found, 1 not measurable as framed.** Sixty-three came from reading STUDY.md
 against §3.2; the seven in §S came
 from measuring this machine instead, and are the first here that the study never made. The first
@@ -34,8 +34,12 @@ that is where two deployed settings were decided.
   *size* as approximate and the direction as sound.
 - **Unverified** — the evidence does not support the claim as stated: the effect is within plausible
   variance, or an uncontrolled difference could account for it. **Per §3.1 these may not be used to
-  justify a change** until re-checked. Each of the eight says what is wrong with it.
-- **Withdrawn** — run and recorded, but not comparable to what it was compared against. One: E7.2.
+  justify a change** until re-checked. Each says what is wrong with it. Eight started here; **E5.4 is the only one left**, the rest having been verified, refuted or withdrawn.
+- **Withdrawn** — taken out of the study's prose rather than queued for a series, for one of two
+  reasons. Either it was run and recorded but is not comparable to what it was compared against
+  (E7.2), or it was never a measurement in the first place: a mechanism offered in prose with no
+  arms (E2.7), or arithmetic on single samples about a feature that has since been shelved (E5.6).
+  A claim that cannot be measured as written should say so, not sit in a queue. Three.
 - **Superseded** — a later experiment overturned it. Kept because it is still cited.
 - **Proved** — not a measurement at all: a property established in `proofs/`.
 
@@ -100,7 +104,7 @@ independently by arithmetic. The samples are in [measurements/](../measurements/
 | E2.4 | finer keys would save ~33% of check-step time (241 of 735 s) | computed from the 21-commit series | not an experiment | **superseded** — E5.5 measured the opposite; it costed step times only, not what handing a container its inputs costs |
 | E2.5 | in a container job the package caches were missed: `go mod download` 35–54 s, fixed to 0–1 s; jobs ~3× faster, engine CPU halved | same 6 jobs, `container: golang:1.26` · Pi | before vs after × 6 | under-powered — a blocked before/after across a code change, not interleaved |
 | E2.6 | a cache's path can be part of another cache's key: moving Go's module cache invalidated every compiled dependency (96 s `go vet`, 313 s engine CPU) | as above · Pi | 2 paths × 1 | under-powered |
-| E2.7 | the other half of that warm-up "probably comes from a different Go patch version" | — | — | **unverified** — stated as unverified in the text, and it still is |
+| E2.7 | the other half of that warm-up "probably comes from a different Go patch version" | — | — | **withdrawn** (2026-10-17) — never a measurement: it names no quantity, has no arms, and the thing it is about (one image's Go against `setup-go`'s, at that date) has moved on both sides, so there is nothing left to compare. Measuring it would mean pinning two patch versions and rebuilding a cache state the study did not record. Nothing rests on it: the actionable half of that paragraph is E2.6, which is recorded on its own |
 
 ## §7 Experiment 3 — output-addressed keys
 
@@ -139,7 +143,7 @@ independently by arithmetic. The samples are in [measurements/](../measurements/
 | E5.3 | Dagger keys files from a git checkout on their content, and a step's output on how it was made | 4-arm probe · Pi | 4 × 2 sessions | **verified** — the one experiment whose negative control caught its own error (three invalid rounds, `$RANDOM` in a subshell) |
 | E5.4 | `withDirectory` with `owner:` costs 21 s on a new 200–240 MB directory, then 1–2 s while the source is unchanged | ~20,000 files · Pi | 4 × 1 | **unverified** as the *new-directory* cost: the probe reused one source directory, so it measured the cached pass; the real runs showed the cost |
 | E5.5 | declared inputs cost more than they save: flask 734 s (v3) against 575 s control; go-task 476 s against 258 s | flask 12 commits, go-task 6 · Pi | 4 configurations × 1 series each | under-powered — single series per arm, but +28% and +85% against the control is far outside plausible variance, and the direction is the decision |
-| E5.6 | the feature would need about three commits in five to leave the expensive step's inputs alone | derived from per-commit figures of E5.5 | — | **unverified** — an estimate from single samples; the per-commit saves and costs (22 s, 31 s) have no interval |
+| E5.6 | the feature would need about three commits in five to leave the expensive step's inputs alone | derived from per-commit figures of E5.5 | — | **withdrawn** (2026-10-17) — arithmetic on two single readings (22 s saved, 31 s cost), so the ratio has no interval either, and it is a break-even point for a mechanism that is **not running**: E5.5 decided against declared inputs at +28% and +85% against the control, and the feature is shelved. If it is ever revived, the break-even has to come from a measured per-commit distribution rather than from this number |
 | E5.7 | v1 → v2 → v3: building a declared container fell from 25–65 s to 1–3 s, applying an output from 2–28 s to under 2 s | flask · Pi | 3 × 1 series | under-powered |
 
 ## §10 Experiment 6 — cache volumes and installers that hardlink
@@ -290,7 +294,7 @@ differ without the machine being touched at all.
 
 ## What this says to do next
 
-1. **Stop citing the three unverified claims** until they are re-checked: E2.7, E5.4, E5.6. (W.5 was re-checked and is **refuted**; E8.3 was re-checked and **holds**, with the mechanism it was ambiguous about now settled.) Of the three left, E2.7 and E5.6 are not measurements — E2.7 is a guess in prose with no workload, E5.6 a break-even figure derived from single samples about a feature E5.5 already shelved — so the honest end for both is probably withdrawal rather than a series. E5.4 is a real measurement and the only one of the three worth running. None is now load-bearing outside the study: the one that was — E6.4 in [SPEC.md](SPEC.md) §6, "faster than GitHub's" — **has been re-checked and is refuted**, and the sentence is gone rather than softened. **E7.7 has also been re-checked and holds**; the measurements are in `measurements/E7.7-gogc-measured.jsonl` and `measurements/E6.4-uv-measured.jsonl`.
+1. **One unverified claim is left: E5.4.** Of the original eight, E7.7 and E8.3 were re-checked and hold, E3.4 was re-checked and did not hold as stated, E6.4 and W.5 are **refuted**, and E2.7 and E5.6 are **withdrawn** — neither was measurable as written, one being a mechanism offered in prose and the other arithmetic on single samples about a shelved feature. E5.4 is the only one that is a real measurement nobody has made: `withDirectory` with `owner:` on a *new* directory, where the original probe reused one source directory and so timed the cached pass. None is now load-bearing outside the study: the one that was — E6.4 in [SPEC.md](SPEC.md) §6, "faster than GitHub's" — **has been re-checked and is refuted**, and the sentence is gone rather than softened. **E7.7 has also been re-checked and holds**; the measurements are in `measurements/E7.7-gogc-measured.jsonl` and `measurements/E6.4-uv-measured.jsonl`.
 2. ~~**E7.7 first**, because it is the only unverified claim that currently decides a deployed setting.~~ **Done**, and so is **E3.4**, the other claim that decided one: it does not hold as stated, and what replaced it (E3.4b) says why output keys stay opt-in and why `RUNNER_OUTPUT_KEYS_MAX_MS` is the right shape of answer. The pilot put a 40-step job's engine CPU at 6.2 s with sd 0.29, so dimensioning asked for three repetitions rather than the nineteen a warm-up round's provisioning made it look like; three interleaved rounds an arm, each recreating the engine, settled it in 13 minutes.
 3. ~~**Then E6.4 and W.5**, the two "faster than a hosted runner" claims.~~ **Both are done and both are refuted** — E6.4 on 2026-10-17 and W.5 the same day, the second by exactly the method the first suggested: make both arms do the same work, then measure. Neither needed more repetitions; each needed its arms to be doing the same thing. **Nothing in the documentation now claims this runner beats a hosted one**, and the honest summary of what the Pi buys is in [SPEC.md](SPEC.md) §6: replays and warm caches, not raw speed.
 4. **The harness before the rest.** Four commands in this repository cover a handful of the 62 claims; re-checking any of the others means writing the measurement again from the prose. That is MEASURE.md stage 2, and E7.6 and E3.5 are what to validate it against, their answers being known.
