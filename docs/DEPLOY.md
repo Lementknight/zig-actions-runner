@@ -165,7 +165,16 @@ The engine keeps its index of cached results in memory, so restarting it (an upg
 
 Image updaters restart the containers they update. The labels above keep [WUD](https://github.com/getwud/wud) (`wud.watch=false`) and Watchtower away from the engine. WUD compares version tags, so it would otherwise move the engine to the next Dagger release, which the runner does not speak; Watchtower restarts it only if its tag is republished. Upgrade the engine together with the runner.
 
-The runner itself is rarely the limit. What jobs need is CPU, memory and disk in the engine (their containers, images and caches), so set `RUNNER_COUNT` by what the machine can run at once.
+The runner itself is rarely the limit. What jobs need is CPU, memory and disk in the engine (their
+containers, images and caches), so set `RUNNER_COUNT` by what the machine can run at once.
+
+**On a machine like the reference Pi, that number is small, and the reason is measured.** Storage is
+the bottleneck end to end: CPU sits 85-97% idle-waiting during a job (S.4), so giving the engine CPU
+priority arbitrates nothing, and no I/O scheduler earned its change (S.5-S.6). Running three jobs at
+once instead of one buys about **1.1×** on an I/O-bound workload (S.2) — concurrency is close to
+free, and close to pointless, because the disk is already saturated. Raise `RUNNER_COUNT` for
+*latency* (a job not waiting for a runner) rather than for throughput, and keep it low enough that
+the machine's other work survives. [CLAIMS.md](CLAIMS.md) §S has the numbers and what each refutes.
 
 ## Security
 
@@ -175,5 +184,6 @@ The runner itself is rarely the limit. What jobs need is CPU, memory and disk in
 
 ## Not supported yet
 
-- Windows and macOS jobs, and shells other than bash and sh.
+- Windows and macOS jobs, and shells other than bash, sh and python (`shell: python` runs as GitHub
+  runs it — SPEC.md §6; PowerShell is a deliberate non-goal, since it needs .NET).
 - Steps can't be stopped at their timeout, or on cancel, with `RUNNER_ENGINE=cli`.

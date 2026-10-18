@@ -1,11 +1,20 @@
 # Zig Actions Runner
 
-A lightweight, self-hosted GitHub Actions runner in Zig. One small process runs many runners, each job's steps run in a Dagger engine that caches them, and workflows written for GitHub's hosted runners run unchanged, with their logs in GitHub's UI. A Raspberry Pi is the reference machine.
+A lightweight, self-hosted GitHub Actions runner in Zig. One small process runs many runners, each job's steps run in a Dagger engine that caches them, and workflows written for GitHub's hosted runners run as they are, with their logs in GitHub's UI. A Raspberry Pi is the reference machine.
+
+It is not a drop-in clone. Where being correct and being identical to GitHub's runner disagree, this picks correct, turns it on by default, and writes the difference down: [SPEC.md](docs/SPEC.md) §9 lists every divergence and what it buys.
 
 - [Design](docs/DESIGN.md): goals, architecture and the decisions behind them
 - [Spec sheet](docs/SPEC.md): configuration, the GitHub protocol, what workflows can use
 - [Deploying the runner](docs/DEPLOY.md): Docker Compose, systemd, or a plain binary, and sizing
 - Optional: run state and logs in Postgres ([`db/`](db/README.md)), a read API ([`api/`](api/README.md)) and a frontend ([`web/`](web/README.md))
+
+Claims about this runner are meant to be checkable, so they are kept apart from the design:
+
+- [Claims](docs/CLAIMS.md): every claim with a verdict — verified, under-powered, refuted or withdrawn — and what it rests on
+- [Study](docs/STUDY.md) and [how to measure](docs/MEASURE.md): what was measured, and the protocol a new claim has to meet
+- [Proofs](proofs/README.md) and [properties](properties/README.md): what the step cache must *be*, in Agda, and the same obligations checked against a real engine
+- [Measurements](measurements/README.md) and [comparisons](comparisons/README.md): one JSON line per trial, and the workloads that run the same job here and on a hosted runner
 
 Quick start, on a Linux machine with Docker:
 
