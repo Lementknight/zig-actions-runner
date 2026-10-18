@@ -50,6 +50,24 @@ pub fn build(b: *std.Build) void {
     check.addPassthruArgs();
     b.step("check-workflows", "Check workflow YAML (this repository's, plus any paths after --)").dependOn(&check.step);
 
+    // SPEC.md §10's two measurable conventions — functions at most 70 lines, lines at most 100
+    // columns — as a ratchet against tools/conventions_baseline.txt: it fails only when something
+    // gets worse than the baseline, so the existing refactor queue does not make CI red.
+    // `zig build conventions -- --update-baseline` tightens the baseline after a refactor.
+    const conventions = b.addExecutable(.{
+        .name = "conventions",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/conventions.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const conv = b.addRunArtifact(conventions);
+    conv.stdio = .inherit;
+    conv.addArgs(&.{ "--baseline", "tools/conventions_baseline.txt", "src", "tools" });
+    conv.addPassthruArgs();
+    b.step("conventions", "Check SPEC.md §10's function and line length limits against the baseline").dependOn(&conv.step);
+
     // Exposes the regex matcher so another implementation can be compared against it
     // (`tools/regex_diff.py` drives this against Python's `re`). Writing our own matcher is only
     // defensible if something else agrees with it.

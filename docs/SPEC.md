@@ -535,6 +535,55 @@ hatch. Each divergence is listed here with what it buys.
 
 ## 10. Conventions
 
-- Zig: `zig fmt`, no allocations in the log hot path beyond the buffer, errors returned not panicked.
-- Commits: small, one component each; update SPEC.md with any contract change.
-- Secrets never logged; `GH_TOKEN` and `DATABASE_URL` redacted from all output.
+Written down on 2026-10-18, when the code had grown too dense to read — 19,578 lines, 22 functions
+over 70 lines and thirteen over 100, the longest 453 — and three bullets were not a convention. Most of what follows the code
+already did (635 of 635 functions are camelCase; 32 of 33 files open with a `//!` comment); the two
+rules it did not follow, on function and line length, are the ones that make it dense. They are
+taken from [TigerBeetle's style](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md)
+and the [Zig style guide](https://ziglang.org/documentation/master/#Style-Guide), and `zig build
+conventions` checks the two that a tool can check.
+
+**Shape**
+
+- **A function is at most 70 lines**, brace to brace. Keep the branching in the parent and move the
+  straight-line work into helpers named after it (`readSector`, `readSectorCallback`) — TigerBeetle's
+  "push `if`s up and `for`s down". 22 functions exceeded this when the rule was written (measured from the
+  AST, not by counting braces — GraphQL text is full of them, and a brace count had put one function
+  at 677 lines that is in fact short); they are the refactor queue, listed in
+  `runner/tools/conventions_baseline.txt`, and nothing new joins it. `test` blocks are not
+  functions and are exempt: a long test is a table of cases.
+- **A line is at most 100 columns.** `zig fmt` will not wrap it for you; break the expression. The
+  one exception is a string literal or URL that cannot be split. 9% of lines exceeded this when the
+  rule was written, 13% in `dagger.zig`.
+- **No cap on file length.** TigerBeetle, zls and Ghostty all carry files of 8,000-20,000 lines.
+  Split a file when its sections stop sharing state, not when it is long; until then, `// ---`
+  section markers name the seams (there are 36).
+- Recursion only with a stated bound (`max_composite_depth`); the regex VM is iterative for this
+  reason. Braces on every `if` that does not fit on one line. State conditions positively where it
+  reads naturally.
+
+**Names**, as the Zig style guide: `camelCaseFunction`, `TitleCaseType`, `snake_case` for everything
+else; a function returning a `type` is `TitleCase`; a file is `TitleCase` only when it has top-level
+fields. Do not repeat a namespace in a name (`json.Value`, not `json.JsonValue`). Do not abbreviate
+except where the abbreviation is the name (`gpa`, `io`, `fc` for file commands is at the edge).
+
+**Comments**
+
+- Every file opens with `//!` saying what it is and, where it is not obvious, why it exists.
+- `///` on every public declaration, omitting what the name already says.
+- A comment is a sentence: a capital letter and a full stop. It says *why*, and when it rests on
+  something measured or observed it says so, with the claim ID where there is one (CLAIMS.md). A
+  comment that asserts a cause must be the comment that has the evidence — see `warnUnlocked` for
+  the one that did not.
+
+**Order**: in a struct, fields, then types, then methods. In a file, the public surface and
+constants near the top, tests at the bottom under `// --- tests ---`.
+
+**What is deliberately not adopted.** TigerBeetle's two-assertions-per-function. This process runs
+many jobs; one job's malformed input must fail that job, not the process, so errors are returned, not
+panicked, and there are no `assert`s. Its `snake_case` function names: Zig's own guide says
+`camelCase`, and so does every function here.
+
+**Still true from before**: no allocations in the log hot path beyond the buffer. Commits small, one
+component each; SPEC.md updated in the same PR as any contract change. Secrets never logged;
+`GH_TOKEN` and `DATABASE_URL` redacted from all output.
