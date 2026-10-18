@@ -98,4 +98,46 @@ EOF
 )
 emit matcher-check "$matcher_steps" > "$out/matcher-check.yml"
 
-echo "wrote $out/shell-python.yml and $out/matcher-check.yml" >&2
+# `fromPath`, which is the one matcher property with no real action shipping it that this runner
+# would meet — .NET's matcher is its canonical user, and .NET is a non-goal. That makes a comparison
+# *more* valuable rather than less: the implementation was written from the specification, so the
+# only way to know it resolves paths the way GitHub does is to ask GitHub.
+#
+# The files have to exist in the repository. GitHub's annotation payload falls back to the workflow
+# file for a path that is not in the commit — which is why the comparison above shows `.github` on
+# the hosted side — so a probe tree is written here and committed with the workflows. Without it
+# both arms would report a fallback and the comparison would show nothing.
+mkdir -p "$out/probe/app/sub" "$out/probe/shared"
+echo "a project file; the matcher captures this path with fromPath" > "$out/probe/app/app.proj"
+for f in probe/app/Program.cs probe/app/sub/Other.cs probe/shared/Util.cs; do
+	echo "// a file the matcher must resolve to: $f" > "$out/$f"
+done
+
+frompath_steps=$(
+	cat <<'EOF'
+      - uses: actions/checkout@v4
+      - name: register a matcher that uses fromPath
+        run: |
+          : "trial ${{ inputs.token }}"
+          cat > /tmp/fp.json <<'JSON'
+          { "problemMatcher": [ { "owner": "proj-probe", "pattern": [
+            { "regexp": "^Building (.+\.proj)$", "fromPath": 1 },
+            { "regexp": "^(.+)\((\d+),(\d+)\): (error|warning) ([A-Z]+\d+): (.*)$",
+              "file": 1, "line": 2, "column": 3, "severity": 4, "code": 5, "message": 6,
+              "loop": true } ] } ] }
+          JSON
+          echo "::add-matcher::/tmp/fp.json"
+      - name: diagnostics with paths relative to the project file
+        run: |
+          : "trial ${{ inputs.token }}"
+          # Each path below is relative to probe/app/, not to the workspace. Resolved correctly all
+          # three name a file that exists; resolved wrongly they name nothing.
+          echo "Building probe/app/app.proj"
+          echo "Program.cs(12,5): error PP0001: resolves to probe/app/Program.cs"
+          echo "sub/Other.cs(3,1): warning PP0002: resolves to probe/app/sub/Other.cs"
+          echo "../shared/Util.cs(7,2): error PP0003: dot-dot, resolves to probe/shared/Util.cs"
+EOF
+)
+emit matcher-frompath "$frompath_steps" > "$out/matcher-frompath.yml"
+
+echo "wrote $out/shell-python.yml, $out/matcher-check.yml, $out/matcher-frompath.yml and $out/probe/" >&2
