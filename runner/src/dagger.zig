@@ -4716,34 +4716,21 @@ const Exec = struct {
         const started = std.Io.Clock.real.now(x.io).toMilliseconds();
         var ok = true;
         x.startExtra(.initialize, ls, "Initialize containers", started);
-        defer x.addExtra(.{ .kind = .initialize, .name = "Initialize containers", .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() }) catch {};
+        defer x.addExtra(.{
+            .kind = .initialize,
+            .name = "Initialize containers",
+            .log_step = ls,
+            .outcome = if (ok) .success else .failure,
+            .started_ms = started,
+            .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds(),
+        }) catch {};
         ev.diag = "";
         const sc = try ev.scope(&.{});
         if (x.job.container) |jc| {
-            // The job's own container (built with the job, see `runSteps`): what it was pulled as,
-            // and whether it is musl-based, for JavaScript actions' runtime.
-            x.sh.append(ls, "##[group]Starting job container");
-            x.sh.append(ls, try std.fmt.allocPrint(arena, "Pulling {s}", .{x.job_image}));
-            var auth_msg: []const u8 = "";
-            const head = try std.fmt.allocPrint(arena, "{{ container {{ {s}from(address:{f}) {{ ", .{ (try registryAuthNode(arena, ev, x.transport, &x.secret_counter, jc, x.job_image, &auth_msg)) orelse "", std.json.fmt(x.job_image, .{}) });
-            const closing = if (std.mem.indexOf(u8, head, "withRegistryAuth") != null) " } } } }" else " } } }";
-            var msg: []const u8 = "";
-            const cfg = gql(arena, x.transport, try std.mem.concat(arena, u8, &.{ head, "imageRef", closing }), &msg) catch {
-                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to pull {s}: {s}", .{ x.job_image, msg }));
-                x.sh.append(ls, "##[endgroup]");
+            if (!try x.pullJobContainer(ls, jc)) {
                 ok = false;
                 return false;
-            };
-            if (jsonFindString(cfg, "imageRef")) |ref| if (std.mem.indexOf(u8, ref, "@sha256:")) |at| {
-                x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{ref[at + 1 ..]}));
-            };
-            // No /lib (a scratch image) is not musl.
-            if (gql(arena, x.transport, try std.mem.concat(arena, u8, &.{ head, "directory(path:\"/lib\") { entries }", closing }), &msg)) |lib| {
-                if (jsonFind(lib, "entries")) |entries| if (entries == .array) for (entries.array.items) |e| {
-                    if (e == .string and std.mem.startsWith(u8, e.string, "ld-musl-")) x.musl = true;
-                };
-            } else |_| {}
-            x.sh.append(ls, "##[endgroup]");
+            }
             if (x.job.services.len == 0) return true;
         }
         // Each service starts through busybox's sh, which names the service's log (see below).
@@ -4754,145 +4741,261 @@ const Exec = struct {
         for (x.job.services, 0..) |svc, svc_index| {
             x.sh.append(ls, try std.fmt.allocPrint(arena, "##[group]Starting {s} service container", .{svc.name}));
             defer x.sh.append(ls, "##[endgroup]");
-            const image = ev.render(svc.image, sc) catch "";
-            if (image.len == 0) {
-                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "The service '{s}' has no image: {s}", .{ svc.name, ev.diag }));
+            if (!try x.startService(ls, sc, svc, svc_index, busybox)) {
                 ok = false;
                 return false;
             }
-            const env = ev.renderEnv(svc.env, sc) catch {
-                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Could not evaluate the env of service '{s}': {s}", .{ svc.name, ev.diag }));
-                ok = false;
-                return false;
-            };
-            var ports: std.ArrayList(ServicePort) = .empty;
-            for (svc.ports) |t| {
-                const text = ev.render(t, sc) catch "";
-                const port = parseServicePort(text) orelse {
-                    x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Unsupported port '{s}' for service '{s}' (TCP ports only: 'container', 'host:container' or 'ip:host:container')", .{ text, svc.name }));
-                    ok = false;
-                    return false;
-                };
-                try ports.append(arena, port);
-            }
-            x.sh.append(ls, try std.fmt.allocPrint(arena, "Image: {s}", .{image}));
-            if (svc.options) |t| {
-                const ignored = try ignoredServiceOptions(arena, ev.render(t, sc) catch "");
-                if (ignored.len > 0) x.sh.append(ls, try std.fmt.allocPrint(arena, "##[warning]Service options not supported and ignored: {s}", .{ignored}));
-            }
-            if (svc.volumes.len > 0) x.sh.append(ls, "##[warning]Service volumes are not supported and were ignored.");
-
-            // `container {` and, for a private registry, its credentials, as both queries start.
-            var head: std.Io.Writer.Allocating = .init(arena);
-            var head_braces: usize = 2;
-            try head.writer.writeAll("{ container { ");
-            if (svc.username) |ut| if (svc.password) |pt| {
-                const user = ev.render(ut, sc) catch "";
-                const pass = ev.render(pt, sc) catch "";
-                if (user.len > 0 and pass.len > 0) {
-                    const secret = newSecret(arena, x.transport, &x.secret_counter, pass, &x.err_msg) catch {
-                        x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Could not register the credentials of service '{s}': {s}", .{ svc.name, x.err_msg }));
-                        ok = false;
-                        return false;
-                    };
-                    const hw = &head.writer;
-                    try hw.writeAll("withRegistryAuth(address:");
-                    try std.json.Stringify.value(registryHost(image), .{}, hw);
-                    try hw.writeAll(",username:");
-                    try std.json.Stringify.value(user, .{}, hw);
-                    try hw.writeAll(",secret:");
-                    try std.json.Stringify.value(secret, .{}, hw);
-                    try hw.writeAll(") { ");
-                    head_braces += 1;
-                }
-            };
-            try head.writer.writeAll("from(address:");
-            try std.json.Stringify.value(image, .{}, &head.writer);
-            try head.writer.writeAll(") { ");
-            head_braces += 1;
-
-            // The image's configuration first: its entrypoint and command (the service runs them),
-            // and the digest it resolved to, as GitHub's runner logs its `docker pull`.
-            x.sh.append(ls, try std.fmt.allocPrint(arena, "Pulling {s}", .{image}));
-            var cfg_doc: std.Io.Writer.Allocating = .init(arena);
-            try cfg_doc.writer.writeAll(head.written());
-            try cfg_doc.writer.writeAll("entrypoint defaultArgs imageRef");
-            for (0..head_braces) |_| try cfg_doc.writer.writeAll(" }");
-            const cfg = gql(arena, x.transport, cfg_doc.written(), &x.err_msg) catch {
-                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to pull {s} for service {s}: {s}", .{ image, svc.name, x.err_msg }));
-                ok = false;
-                return false;
-            };
-            if (jsonFindString(cfg, "imageRef")) |ref| if (std.mem.indexOf(u8, ref, "@sha256:")) |at| {
-                x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{ref[at + 1 ..]}));
-            };
-            const entrypoint = try jsonStrings(arena, jsonFind(cfg, "entrypoint"));
-            const cmd = try jsonStrings(arena, jsonFind(cfg, "defaultArgs"));
-            if (entrypoint.len + cmd.len == 0) {
-                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "The image {s} of service {s} has no entrypoint or command to run", .{ image, svc.name }));
-                ok = false;
-                return false;
-            }
-
-            var doc: std.Io.Writer.Allocating = .init(arena);
-            const w = &doc.writer;
-            try w.writeAll(head.written());
-            var braces = head_braces;
-            try w.writeAll("withFile(path:\"" ++ busybox_path ++ "\",permissions:493,source:");
-            try std.json.Stringify.value(busybox, .{}, w);
-            try w.writeAll(") { ");
-            braces += 1;
-            // The services started before this one, by name, as on a shared network. (A service
-            // cannot reach one started after it: a binding needs the service to exist.)
-            braces += try x.writeServiceBindings(w);
-            // As GitHub's runner sets them for service containers.
-            const defaults = [_]job_mod.EnvVar{ .{ .name = "GITHUB_ACTIONS", .value = "true" }, .{ .name = "CI", .value = "true" } };
-            for (&defaults) |e| {
-                try w.print("withEnvVariable(name:\"{s}\",value:\"{s}\") {{ ", .{ e.name, e.value });
-                braces += 1;
-            }
-            for (env) |e| {
-                try w.writeAll("withEnvVariable(name:");
-                try std.json.Stringify.value(e.name, .{}, w);
-                try w.writeAll(",value:");
-                try std.json.Stringify.value(e.value, .{}, w);
-                try w.writeAll(") { ");
-                braces += 1;
-            }
-            for (ports.items) |p| {
-                try w.print("withExposedPort(port:{d}) {{ ", .{p.container});
-                braces += 1;
-            }
-            // The image's entrypoint and command, started by a shell that first prints the marker
-            // that names this service's output. `start` waits until the exposed ports accept
-            // connections, which is when servers such as Postgres are ready (during its first-run
-            // setup it listens on no TCP port).
-            var args: std.ArrayList([]const u8) = .empty;
-            try args.appendSlice(arena, &.{ busybox_path, "sh", "-c", try std.fmt.allocPrint(arena, "echo '{s}service {d}'; exec \"$@\"", .{ marker, svc_index }), "zig-service" });
-            try args.appendSlice(arena, entrypoint);
-            try args.appendSlice(arena, cmd);
-            try w.writeAll("asService(args:");
-            try std.json.Stringify.value(args.items, .{}, w);
-            try w.writeAll(") { start }");
-            for (0..braces) |_| try w.writeAll(" }");
-            const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch {
-                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to start service container {s}: {s}", .{ svc.name, x.err_msg }));
-                ok = false;
-                return false;
-            };
-            const id = jsonFindString(data, "start") orelse {
-                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to start service container {s}", .{svc.name}));
-                ok = false;
-                return false;
-            };
-            for (ports.items) |p| x.sh.append(ls, try std.fmt.allocPrint(arena, "{d}/tcp -> localhost:{d}", .{ p.container, p.host }));
-            try x.services.append(arena, .{ .name = svc.name, .id = id, .ports = ports.items });
         }
         x.sh.append(ls, "##[group]Waiting for all services to be ready");
         for (x.services.items) |r| x.sh.append(ls, try std.fmt.allocPrint(arena, "{s} service is healthy.", .{r.name}));
         x.sh.append(ls, "##[endgroup]");
+        if (!try x.bindServicesToJob(ls, busybox)) {
+            ok = false;
+            return false;
+        }
+        x.forward_prelude = try forwardPrelude(arena, x.services.items);
+        try ev.setServices(x.services.items);
+        return true;
+    }
 
-        // The job's container: the services under their names, and busybox for the forwarders.
+    /// The job's own container (built with the job, see `runSteps`): what it was pulled as, and
+    /// whether it is musl-based, for JavaScript actions' runtime. False when the pull failed.
+    fn pullJobContainer(x: *Exec, ls: u32, jc: job_mod.Service) !bool {
+        const arena = x.arena;
+        const ev = x.ev;
+        x.sh.append(ls, "##[group]Starting job container");
+        x.sh.append(ls, try std.fmt.allocPrint(arena, "Pulling {s}", .{x.job_image}));
+        var auth_msg: []const u8 = "";
+        const auth_node = try registryAuthNode(arena, ev, x.transport, &x.secret_counter, jc, x.job_image, &auth_msg);
+        const auth = auth_node orelse "";
+        const image_json = std.json.fmt(x.job_image, .{});
+        const head = try std.fmt.allocPrint(arena, "{{ container {{ {s}from(address:{f}) {{ ", .{ auth, image_json });
+        const closing = if (std.mem.indexOf(u8, head, "withRegistryAuth") != null) " } } } }" else " } } }";
+        var msg: []const u8 = "";
+        const cfg = gql(arena, x.transport, try std.mem.concat(arena, u8, &.{ head, "imageRef", closing }), &msg) catch {
+            x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to pull {s}: {s}", .{ x.job_image, msg }));
+            x.sh.append(ls, "##[endgroup]");
+            return false;
+        };
+        if (jsonFindString(cfg, "imageRef")) |ref| if (std.mem.indexOf(u8, ref, "@sha256:")) |at| {
+            x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{ref[at + 1 ..]}));
+        };
+        // No /lib (a scratch image) is not musl.
+        if (gql(arena, x.transport, try std.mem.concat(arena, u8, &.{ head, "directory(path:\"/lib\") { entries }", closing }), &msg)) |lib| {
+            if (jsonFind(lib, "entries")) |entries| if (entries == .array) for (entries.array.items) |e| {
+                if (e == .string and std.mem.startsWith(u8, e.string, "ld-musl-")) x.musl = true;
+            };
+        } else |_| {}
+        x.sh.append(ls, "##[endgroup]");
+        return true;
+    }
+
+    /// One service: its spec evaluated, its image's configuration pulled, the container started as
+    /// a service, and recorded under its name. False when any of that failed (logged).
+    fn startService(
+        x: *Exec,
+        ls: u32,
+        sc: expr.Scope,
+        svc: job_mod.Service,
+        svc_index: usize,
+        busybox: []const u8,
+    ) !bool {
+        const spec = (try x.serviceSpec(ls, sc, svc)) orelse return false;
+        const head = (try x.serviceHead(ls, sc, svc, spec.image)) orelse return false;
+        const cfg = (try x.pullServiceConfig(ls, svc, spec.image, head)) orelse return false;
+        const id = (try x.startServiceContainer(ls, svc, svc_index, spec, head, cfg, busybox)) orelse
+            return false;
+        for (spec.ports) |p| {
+            x.sh.append(ls, try std.fmt.allocPrint(x.arena, "{d}/tcp -> localhost:{d}", .{ p.container, p.host }));
+        }
+        try x.services.append(x.arena, .{ .name = svc.name, .id = id, .ports = spec.ports });
+        return true;
+    }
+
+    /// A service's `image`, `env` and `ports` as written, evaluated; its unsupported options noted.
+    const ServiceSpec = struct {
+        image: []const u8,
+        env: []const job_mod.EnvVar,
+        ports: []const ServicePort,
+    };
+
+    fn serviceSpec(x: *Exec, ls: u32, sc: expr.Scope, svc: job_mod.Service) !?ServiceSpec {
+        const arena = x.arena;
+        const ev = x.ev;
+        const image = ev.render(svc.image, sc) catch "";
+        if (image.len == 0) {
+            x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "The service '{s}' has no image: {s}", .{ svc.name, ev.diag }));
+            return null;
+        }
+        const env = ev.renderEnv(svc.env, sc) catch {
+            x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Could not evaluate the env of service '{s}': {s}", .{ svc.name, ev.diag }));
+            return null;
+        };
+        var ports: std.ArrayList(ServicePort) = .empty;
+        for (svc.ports) |t| {
+            const text = ev.render(t, sc) catch "";
+            const port = parseServicePort(text) orelse {
+                x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Unsupported port '{s}' for service '{s}' (TCP ports only: 'container', 'host:container' or 'ip:host:container')", .{ text, svc.name }));
+                return null;
+            };
+            try ports.append(arena, port);
+        }
+        x.sh.append(ls, try std.fmt.allocPrint(arena, "Image: {s}", .{image}));
+        if (svc.options) |t| {
+            const ignored = try ignoredServiceOptions(arena, ev.render(t, sc) catch "");
+            if (ignored.len > 0) x.sh.append(ls, try std.fmt.allocPrint(arena, "##[warning]Service options not supported and ignored: {s}", .{ignored}));
+        }
+        if (svc.volumes.len > 0) x.sh.append(ls, "##[warning]Service volumes are not supported and were ignored.");
+        return .{ .image = image, .env = env, .ports = ports.items };
+    }
+
+    /// `{ container {` and, for a private registry, its credentials, then `from(address:) {` — how
+    /// both of a service's queries start — and how many braces that opened.
+    const ServiceHead = struct { text: []const u8, braces: usize };
+
+    fn serviceHead(
+        x: *Exec,
+        ls: u32,
+        sc: expr.Scope,
+        svc: job_mod.Service,
+        image: []const u8,
+    ) !?ServiceHead {
+        const arena = x.arena;
+        const ev = x.ev;
+        var head: std.Io.Writer.Allocating = .init(arena);
+        var head_braces: usize = 2;
+        try head.writer.writeAll("{ container { ");
+        if (svc.username) |ut| if (svc.password) |pt| {
+            const user = ev.render(ut, sc) catch "";
+            const pass = ev.render(pt, sc) catch "";
+            if (user.len > 0 and pass.len > 0) {
+                const secret = newSecret(arena, x.transport, &x.secret_counter, pass, &x.err_msg) catch {
+                    x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Could not register the credentials of service '{s}': {s}", .{ svc.name, x.err_msg }));
+                    return null;
+                };
+                const hw = &head.writer;
+                try hw.writeAll("withRegistryAuth(address:");
+                try std.json.Stringify.value(registryHost(image), .{}, hw);
+                try hw.writeAll(",username:");
+                try std.json.Stringify.value(user, .{}, hw);
+                try hw.writeAll(",secret:");
+                try std.json.Stringify.value(secret, .{}, hw);
+                try hw.writeAll(") { ");
+                head_braces += 1;
+            }
+        };
+        try head.writer.writeAll("from(address:");
+        try std.json.Stringify.value(image, .{}, &head.writer);
+        try head.writer.writeAll(") { ");
+        head_braces += 1;
+        return .{ .text = head.written(), .braces = head_braces };
+    }
+
+    /// The image's configuration first: its entrypoint and command (the service runs them), and the
+    /// digest it resolved to, as GitHub's runner logs its `docker pull`.
+    const ServiceConfig = struct {
+        entrypoint: []const []const u8,
+        cmd: []const []const u8,
+    };
+
+    fn pullServiceConfig(
+        x: *Exec,
+        ls: u32,
+        svc: job_mod.Service,
+        image: []const u8,
+        head: ServiceHead,
+    ) !?ServiceConfig {
+        const arena = x.arena;
+        x.sh.append(ls, try std.fmt.allocPrint(arena, "Pulling {s}", .{image}));
+        var cfg_doc: std.Io.Writer.Allocating = .init(arena);
+        try cfg_doc.writer.writeAll(head.text);
+        try cfg_doc.writer.writeAll("entrypoint defaultArgs imageRef");
+        for (0..head.braces) |_| try cfg_doc.writer.writeAll(" }");
+        const cfg = gql(arena, x.transport, cfg_doc.written(), &x.err_msg) catch {
+            x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to pull {s} for service {s}: {s}", .{ image, svc.name, x.err_msg }));
+            return null;
+        };
+        if (jsonFindString(cfg, "imageRef")) |ref| if (std.mem.indexOf(u8, ref, "@sha256:")) |at| {
+            x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{ref[at + 1 ..]}));
+        };
+        const entrypoint = try jsonStrings(arena, jsonFind(cfg, "entrypoint"));
+        const cmd = try jsonStrings(arena, jsonFind(cfg, "defaultArgs"));
+        if (entrypoint.len + cmd.len == 0) {
+            x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "The image {s} of service {s} has no entrypoint or command to run", .{ image, svc.name }));
+            return null;
+        }
+        return .{ .entrypoint = entrypoint, .cmd = cmd };
+    }
+
+    /// Starts the service: busybox for its marker, the services before it bound by name, GitHub's
+    /// defaults and its env, its ports exposed, and its entrypoint and command under a shell that
+    /// first prints the marker naming this service's output. Returns the started service's id.
+    fn startServiceContainer(
+        x: *Exec,
+        ls: u32,
+        svc: job_mod.Service,
+        svc_index: usize,
+        spec: ServiceSpec,
+        head: ServiceHead,
+        cfg: ServiceConfig,
+        busybox: []const u8,
+    ) !?[]const u8 {
+        const arena = x.arena;
+        var doc: std.Io.Writer.Allocating = .init(arena);
+        const w = &doc.writer;
+        try w.writeAll(head.text);
+        var braces = head.braces;
+        try w.writeAll("withFile(path:\"" ++ busybox_path ++ "\",permissions:493,source:");
+        try std.json.Stringify.value(busybox, .{}, w);
+        try w.writeAll(") { ");
+        braces += 1;
+        // The services started before this one, by name, as on a shared network. (A service
+        // cannot reach one started after it: a binding needs the service to exist.)
+        braces += try x.writeServiceBindings(w);
+        // As GitHub's runner sets them for service containers.
+        const defaults = [_]job_mod.EnvVar{ .{ .name = "GITHUB_ACTIONS", .value = "true" }, .{ .name = "CI", .value = "true" } };
+        for (&defaults) |e| {
+            try w.print("withEnvVariable(name:\"{s}\",value:\"{s}\") {{ ", .{ e.name, e.value });
+            braces += 1;
+        }
+        for (spec.env) |e| {
+            try w.writeAll("withEnvVariable(name:");
+            try std.json.Stringify.value(e.name, .{}, w);
+            try w.writeAll(",value:");
+            try std.json.Stringify.value(e.value, .{}, w);
+            try w.writeAll(") { ");
+            braces += 1;
+        }
+        for (spec.ports) |p| {
+            try w.print("withExposedPort(port:{d}) {{ ", .{p.container});
+            braces += 1;
+        }
+        // The image's entrypoint and command, started by a shell that first prints the marker
+        // that names this service's output. `start` waits until the exposed ports accept
+        // connections, which is when servers such as Postgres are ready (during its first-run
+        // setup it listens on no TCP port).
+        var args: std.ArrayList([]const u8) = .empty;
+        const sh_c = try std.fmt.allocPrint(arena, "echo '{s}service {d}'; exec \"$@\"", .{ marker, svc_index });
+        try args.appendSlice(arena, &.{ busybox_path, "sh", "-c", sh_c, "zig-service" });
+        try args.appendSlice(arena, cfg.entrypoint);
+        try args.appendSlice(arena, cfg.cmd);
+        try w.writeAll("asService(args:");
+        try std.json.Stringify.value(args.items, .{}, w);
+        try w.writeAll(") { start }");
+        for (0..braces) |_| try w.writeAll(" }");
+        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch {
+            x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to start service container {s}: {s}", .{ svc.name, x.err_msg }));
+            return null;
+        };
+        return jsonFindString(data, "start") orelse {
+            x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to start service container {s}", .{svc.name}));
+            return null;
+        };
+    }
+
+    /// The job's container: the services under their names, and busybox for the forwarders.
+    fn bindServicesToJob(x: *Exec, ls: u32, busybox: []const u8) !bool {
+        const arena = x.arena;
         var doc: std.Io.Writer.Allocating = .init(arena);
         const w = &doc.writer;
         try w.writeAll("{ loadContainerFromID(id:");
@@ -4905,15 +5008,9 @@ const Exec = struct {
         for (0..braces) |_| try w.writeAll(" }");
         const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch {
             x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Could not bind the services to the job: {s}", .{x.err_msg}));
-            ok = false;
             return false;
         };
-        x.container_id = jsonFindString(data, "id") orelse {
-            ok = false;
-            return false;
-        };
-        x.forward_prelude = try forwardPrelude(arena, x.services.items);
-        try ev.setServices(x.services.items);
+        x.container_id = jsonFindString(data, "id") orelse return false;
         return true;
     }
 
