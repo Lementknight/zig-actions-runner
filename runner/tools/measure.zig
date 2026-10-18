@@ -464,7 +464,41 @@ pub fn parseReading(out: []const u8) ?f64 {
 // Analysing
 
 fn cmdAnalyse(arena: Allocator, io: std.Io, args: []const []const u8) !u8 {
-    if (args.len < 1) return usage();
+    const o = parseAnalyseOpts(args) catch |e| switch (e) {
+        error.Usage => return usage(),
+        error.BadArgs => return 2,
+    };
+    const samples = readSamples(arena, io, o.path) catch |e| switch (e) {
+        error.BadSample => return 1,
+        else => return e,
+    };
+    if (samples.names.items.len == 0) {
+        std.debug.print("measure: no usable samples in {s}.\n", .{o.path});
+        return 1;
+    }
+    const base_idx = baselineIndex(samples, o.baseline) orelse return 1;
+    std.debug.print("claim {s} · {s} · {d} warmup samples excluded, {d} failed\n\n", .{ samples.claim, samples.quantity, samples.excluded, samples.failed });
+    const verdicts_bad = try printVerdicts(arena, samples, base_idx, o.min_effect, o.relative);
+    std.debug.print(
+        \\
+        \\An interval that spans zero is "no effect found at this size", not a trend (§3.2.6).
+        \\
+    , .{});
+    return if (verdicts_bad > 0) 1 else 0;
+}
+
+const AnalyseOpts = struct {
+    path: []const u8,
+    min_effect: f64,
+    relative: bool = false,
+    baseline: ?[]const u8 = null,
+};
+
+/// `measure analyse`'s arguments. `error.Usage` when they do not parse; `error.BadArgs` when the
+/// criterion is missing, which has its own complaint: a result is read as an effect only against a
+/// threshold said in advance (§3.2.1).
+fn parseAnalyseOpts(args: []const []const u8) error{ Usage, BadArgs }!AnalyseOpts {
+    if (args.len < 1) return error.Usage;
     var min_effect: ?f64 = null;
     var relative = false;
     var baseline: ?[]const u8 = null;
@@ -473,103 +507,103 @@ fn cmdAnalyse(arena: Allocator, io: std.Io, args: []const []const u8) !u8 {
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--min-effect") and i + 1 < args.len) {
             i += 1;
-            min_effect = std.fmt.parseFloat(f64, args[i]) catch return usage();
+            min_effect = std.fmt.parseFloat(f64, args[i]) catch return error.Usage;
         } else if (std.mem.eql(u8, args[i], "--relative")) relative = true //
         else if (std.mem.eql(u8, args[i], "--baseline") and i + 1 < args.len) {
             i += 1;
             baseline = args[i];
         } else if (!std.mem.startsWith(u8, args[i], "--")) path = args[i];
     }
-    if (min_effect == null) {
+    const effect = min_effect orelse {
         std.debug.print("measure: --min-effect is required to read a result as an effect.\n", .{});
-        return 2;
-    }
+        return error.BadArgs;
+    };
+    return .{ .path = path, .min_effect = effect, .relative = relative, .baseline = baseline };
+}
 
+/// A sample file read back: the readings grouped by arm, in the order the arms first appeared, with
+/// what was set aside — warm-up rounds, and trials that failed or whose window did not hold.
+const Samples = struct {
+    names: std.ArrayList([]const u8) = .empty,
+    values: std.ArrayList(std.ArrayList(f64)) = .empty,
+    claim: []const u8 = "",
+    quantity: []const u8 = "",
+    excluded: usize = 0,
+    failed: usize = 0,
+};
+
+fn readSamples(arena: Allocator, io: std.Io, path: []const u8) !Samples {
     const text = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 * 1024 * 1024));
-    var names: std.ArrayList([]const u8) = .empty;
-    var values: std.ArrayList(std.ArrayList(f64)) = .empty;
-    var claim: []const u8 = "";
-    var quantity: []const u8 = "";
-    var excluded: usize = 0;
-    var failed: usize = 0;
-
+    var out: Samples = .{};
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (std.mem.trim(u8, line, " \r\t").len == 0) continue;
         const parsed = std.json.parseFromSlice(Sample, arena, line, .{ .ignore_unknown_fields = true }) catch |e| {
             std.debug.print("measure: {s}: cannot read a sample ({s}): {s}\n", .{ path, @errorName(e), line });
-            return 1;
+            return error.BadSample;
         };
         const s = parsed.value;
-        if (claim.len == 0) claim = s.claim;
-        if (quantity.len == 0) quantity = s.quantity;
+        if (out.claim.len == 0) out.claim = s.claim;
+        if (out.quantity.len == 0) out.quantity = s.quantity;
         if (s.warmup) {
-            excluded += 1;
+            out.excluded += 1;
             continue;
         }
         if (s.failed or s.value == null) {
-            failed += 1;
+            out.failed += 1;
             continue;
         }
         // A reading has to lie in its own trial's window, or it belongs to another trial.
         if (s.ended_ms < s.started_ms) {
             std.debug.print("measure: a sample's window ends before it starts; discarded.\n", .{});
-            failed += 1;
+            out.failed += 1;
             continue;
         }
-        var idx: ?usize = null;
-        for (names.items, 0..) |n, k| if (std.mem.eql(u8, n, s.arm)) {
-            idx = k;
-        };
-        if (idx == null) {
-            try names.append(arena, s.arm);
-            try values.append(arena, .empty);
-            idx = names.items.len - 1;
-        }
-        try values.items[idx.?].append(arena, s.value.?);
+        try out.values.items[try armIndex(arena, &out, s.arm)].append(arena, s.value.?);
     }
+    return out;
+}
 
-    if (names.items.len == 0) {
-        std.debug.print("measure: no usable samples in {s}.\n", .{path});
-        return 1;
-    }
-    var base_idx: usize = 0;
-    if (baseline) |b| {
-        var found = false;
-        for (names.items, 0..) |n, k| if (std.mem.eql(u8, n, b)) {
-            base_idx = k;
-            found = true;
-        };
-        if (!found) {
-            std.debug.print("measure: --baseline '{s}' is not an arm in these samples.\n", .{b});
-            return 1;
-        }
-    }
+/// The arm's slot, made on first sight.
+fn armIndex(arena: Allocator, out: *Samples, arm: []const u8) !usize {
+    for (out.names.items, 0..) |n, k| if (std.mem.eql(u8, n, arm)) return k;
+    try out.names.append(arena, arm);
+    try out.values.append(arena, .empty);
+    return out.names.items.len - 1;
+}
 
-    std.debug.print("claim {s} · {s} · {d} warmup samples excluded, {d} failed\n\n", .{ claim, quantity, excluded, failed });
-    const base = values.items[base_idx].items;
-    std.debug.print("  {s: <16} n={d: <3} median {d:.3}  (baseline)\n", .{ names.items[base_idx], base.len, median(values.items[base_idx].items) });
+/// Which arm the others are compared against: `--baseline` when given (and it must be an arm, with
+/// a complaint when it is not), else the first arm seen.
+fn baselineIndex(samples: Samples, baseline: ?[]const u8) ?usize {
+    const b = baseline orelse return 0;
+    for (samples.names.items, 0..) |n, k| if (std.mem.eql(u8, n, b)) return k;
+    std.debug.print("measure: --baseline '{s}' is not an arm in these samples.\n", .{b});
+    return null;
+}
+
+/// One line per arm: the baseline's median, then each other arm's median, its difference from the
+/// baseline, the bootstrap interval of that difference, and the verdict. Returns how many arms had
+/// too few samples for a verdict — an interval from one or two samples is arithmetic, not evidence,
+/// so it is not shown.
+fn printVerdicts(arena: Allocator, samples: Samples, base_idx: usize, min_effect: f64, relative: bool) !usize {
+    const names = samples.names.items;
+    const base = samples.values.items[base_idx].items;
+    std.debug.print("  {s: <16} n={d: <3} median {d:.3}  (baseline)\n", .{ names[base_idx], base.len, median(base) });
     var verdicts_bad: usize = 0;
-    for (names.items, 0..) |n, k| {
+    for (names, 0..) |n, k| {
         if (k == base_idx) continue;
-        const arm = values.items[k].items;
+        const arm = samples.values.items[k].items;
         const ci = try bootstrapDifference(arena, base, arm, 10_000, 1, 0.95);
-        const v = verdictOf(values.items[base_idx].items, values.items[k].items, ci, min_effect.?, relative);
-        // An interval from one or two samples is arithmetic, not evidence, so it is not shown.
-        const diff = median(values.items[k].items) - median(values.items[base_idx].items);
+        const v = verdictOf(base, arm, ci, min_effect, relative);
+        const diff = median(arm) - median(base);
         if (v == .not_enough_samples) {
-            std.debug.print("  {s: <16} n={d: <3} median {d:.3}  difference {d:.3}  95% CI --  {s}\n", .{ n, arm.len, median(values.items[k].items), diff, @tagName(v) });
+            std.debug.print("  {s: <16} n={d: <3} median {d:.3}  difference {d:.3}  95% CI --  {s}\n", .{ n, arm.len, median(arm), diff, @tagName(v) });
+            verdicts_bad += 1;
         } else {
-            std.debug.print("  {s: <16} n={d: <3} median {d:.3}  difference {d:.3}  95% CI [{d:.3}, {d:.3}]  {s}\n", .{ n, arm.len, median(values.items[k].items), diff, ci.low, ci.high, @tagName(v) });
+            std.debug.print("  {s: <16} n={d: <3} median {d:.3}  difference {d:.3}  95% CI [{d:.3}, {d:.3}]  {s}\n", .{ n, arm.len, median(arm), diff, ci.low, ci.high, @tagName(v) });
         }
-        if (v == .not_enough_samples) verdicts_bad += 1;
     }
-    std.debug.print(
-        \\
-        \\An interval that spans zero is "no effect found at this size", not a trend (§3.2.6).
-        \\
-    , .{});
-    return if (verdicts_bad > 0) 1 else 0;
+    return verdicts_bad;
 }
 
 fn cmdDimension(arena: Allocator, io: std.Io, args: []const []const u8) !u8 {
