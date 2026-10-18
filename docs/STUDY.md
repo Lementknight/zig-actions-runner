@@ -49,11 +49,11 @@ The larger Go and Python projects were added for two questions the smaller ones 
 | hugo, 192 packages: `go mod download` | 35.8 s | **0.2 s** | 7.0 s |
 | hugo: `go build ./...` | 195.3 s | **8.7 s** | 132.1 s |
 | hugo: `go vet ./...` | — | 109.0 s | — |
-| sqlalchemy: install, editable with test deps | 21.0 s | — | 28.2 s |
+| sqlalchemy: install, editable with test deps | 21.0 s | — | 28.2 s **(refuted — see below)** |
 | sqlalchemy: 9,300 tests (`test/base test/sql`) | 81.2 s | — | 42.7 s |
 
 - **The package cache volumes are worth most on a big build.** hugo's module download went 35.8 s → 0.2 s and its build 195 s → 8.7 s once the Go module and build caches were warm, which is the whole point of keeping them per repository. The module cache alone is 1.1 GB for this one project.
-- **Installing took less time here than on a hosted runner** (21.0 s against 28.2 s; one sample each, so *unverified* — CLAIMS.md W.5): the environment lives in uv's cache volume so uv hardlinks into it (experiment 6), and the registry is warm, while the hosted runner downloads from PyPI each time.
+- ~~**Installing took less time here than on a hosted runner**~~ **— refuted, 2026-10-17** (CLAIMS.md W.5, [measurements/w5/](../measurements/w5/README.md)). The reading was 21.0 s against 28.2 s, and the explanation given for it was also the reason it could not be compared: the registry here was warm "while the hosted runner downloads from PyPI each time". Give both machines a warm package cache and the install is 2-3 s on either, of which the Pi takes **3.073 s against a hosted runner's 2.154 s** — 30% slower, 10 trials each, the arms not overlapping anywhere. So the 7.2 s margin was download time the Pi had already paid on an earlier job, and what is left when that is removed runs the other way.
 - **Tests dominate a large Python job, where they did not in a small one:** 81 s of sqlalchemy's 205 s, against 3 s for flask's whole suite. That is the workload the test-selection question needs.
 - **hugo's own test suite is not usable as a workload:** `go test ./...` fails on a hosted runner as well as here (`TestNPMGlobalInstalls` and others want npm and more tooling installed), and takes over 40 minutes on the Pi. The study measures its build and `vet` instead.
 
@@ -504,7 +504,7 @@ and devices. Those measure syncs that do real work and stand as recorded.
 1. **The cache volumes make hardlink-based installers slow,** by a factor of 135 for uv and 12 for pnpm on the Pi. It is the runner's design doing it, not the tools.
 2. **npm, Go and Cargo are unaffected:** they copy from their caches anyway, and a bulk copy of the same 68 MB takes 1.5 s. The penalty is not "copying is slow" but that uv and pnpm copy file by file, with verification, down a path they do not expect to take.
 3. **The runner cannot stage a cache into the job.** That needs an exec that reads the volume, and Dagger keys an exec on its recipe, not on a mounted volume's content, so the exec would either be cached and serve a stale copy for ever, or carry a per-job value and change every step's cache key after it.
-4. **It can move the install target into the cache, where one exists** (10.1): uv's environment now lives there by default, which made a warm `uv sync` faster than a GitHub-hosted runner's, and the symlink kept every way a workflow reaches `.venv` working. Where the target must stay in the workspace, as pnpm's `node_modules` must, only the workflow can avoid the cost.
+4. **It can move the install target into the cache, where one exists** (10.1): uv's environment now lives there by default, which brought a warm `uv sync` from fifty times slower than a GitHub-hosted runner's into the same range — ~~faster than~~ **behind it by 27% of this runner's time**, measured properly on 2026-10-17 (CLAIMS.md E6.4), which is still the difference between unusable and unremarkable. The symlink kept every way a workflow reaches `.venv` working. Where the target must stay in the workspace, as pnpm's `node_modules` must, only the workflow can avoid the cost.
 5. **Two designs failed first, for one reason:** on Dagger, being on the container's filesystem means being in the cache key, and persisting means being a mount, which means another device. Any fix has to live on one side of that line.
 
 ### 10.2 Against a hosted runner's own cache

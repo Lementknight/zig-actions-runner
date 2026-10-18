@@ -63,12 +63,16 @@ reading.
 ./gen-workflows.sh /tmp/e64          # then install both in the test repository
 cd ../../runner
 zig build measure -- run --claim E6.4 --quantity "warm uv sync s" \
-    --min-effect 0.20 --relative --baseline pi --control pi-control \
+    --min-effect 0.20 --relative --control pi-control \
     --reps 3 --warmup 1 --out ../measurements/E6.4-uv-pilot.jsonl \
     --arm "pi=../measurements/e6.4/arm.sh <repo> pi" \
     --arm "pi-control=../measurements/e6.4/arm.sh <repo> pi" \
     --arm "hosted=../measurements/e6.4/arm.sh <repo> hosted"
 ```
+
+`--baseline` belongs to `analyse`, not `run` — `run` takes the first `--arm` as the baseline. This
+command carried it for a while and would have exited 2 for anyone who copied it; W.5's run is how
+that was found.
 
 The warm-up round is where both machines' caches become warm: this runner's project environment is
 created in the cache volume on first use, and the hosted arm's uv cache is restored by `setup-uv`
