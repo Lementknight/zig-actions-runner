@@ -453,9 +453,8 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
     var collect: sink.LogSink = .{ .collect = .{ .arena = c.arena, .io = c.io, .inner = c.log } };
     collect.setSecrets(try std.mem.concat(c.arena, []const u8, &.{ c.secrets, job.secrets }));
     const log = &collect;
-    var spool = try openSpool(c, job);
-    if (spool) |*sp| collect.collect.spool = &sp.spool;
-    defer if (spool) |*sp| sp.close(c.io);
+    const spool = try openSpool(c, job, &collect);
+    defer if (spool) |sp| sp.close(c.io);
     // The job, live in GitHub's UI: its steps as they run and their lines as they are logged.
     var live = try Live.init(c.gpa, c.arena, c.io, &job, c.log);
     collect.collect.listener = live.listener();
@@ -494,8 +493,9 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
 /// The job's log on disk while it runs, rather than in memory until it ends: it is then bounded by
 /// the spool and survives the process (see `sink.Spool`). Best effort — a directory the runner cannot
 /// write to is said once and the lines stay in memory, because logging must not fail a job. Null when
-/// no spool directory is configured or the file could not be made. The caller points the collector
-/// at it once it is stored, so the pointer is to something that stays put.
+/// no spool directory is configured or the file could not be made. It lives on the cycle's arena so
+/// the collector can be pointed at it here, where it cannot be forgotten: the first extraction of
+/// handleJob dropped that one line, and only an unused-parameter error caught it.
 const JobSpool = struct {
     spool: sink.Spool,
     path: []const u8,
@@ -506,14 +506,17 @@ const JobSpool = struct {
     }
 };
 
-fn openSpool(c: Context, job: job_mod.Job) !?JobSpool {
+fn openSpool(c: Context, job: job_mod.Job, collect: *sink.LogSink) !?*JobSpool {
     if (c.cfg.log_spool_dir.len == 0) return null;
     const path = std.fmt.allocPrint(c.arena, "{s}/zig-runner-job-{d}.log", .{ c.cfg.log_spool_dir, job.check_run_id }) catch return null;
     const file = std.Io.Dir.cwd().createFile(c.io, path, .{ .read = true }) catch |e| {
         try c.err.print("job {d}: no log spool in {s} ({s}); the job's log is kept in memory\n", .{ job.check_run_id, c.cfg.log_spool_dir, @errorName(e) });
         return null;
     };
-    return .{ .spool = .{ .file = file, .io = c.io }, .path = path };
+    const js = try c.arena.create(JobSpool);
+    js.* = .{ .spool = .{ .file = file, .io = c.io }, .path = path };
+    collect.collect.spool = &js.spool;
+    return js;
 }
 
 /// The job's conclusion as the run-state database records it.
@@ -839,6 +842,72 @@ pub fn timeSpanMs(text: []const u8) ?i64 {
     const sec = std.fmt.parseFloat(f64, parts.next() orelse return null) catch return null;
     if (parts.next() != null) return null;
     return ((days * 24 + h) * 60 + m) * 60_000 + @as(i64, @intFromFloat(sec * 1000));
+}
+
+test "the job's log is spooled, and the spool file goes when the job ends" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const arena = a.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try std.fs.path.join(arena, &.{ ".zig-cache", "tmp", &tmp.sub_path });
+
+    var out_buf: [1024]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&out_buf);
+    var inner: sink.LogSink = .{ .stdout = .{ .writer = &out } };
+    var err_buf: [1024]u8 = undefined;
+    var err: std.Io.Writer = .fixed(&err_buf);
+    var cfg: Config = .{ .gh_token = "", .scope = undefined, .log_spool_dir = dir };
+    const c: Context = .{
+        .arena = arena,
+        .gpa = std.testing.allocator,
+        .io = io,
+        .environ = undefined,
+        .cfg = &cfg,
+        .log = &inner,
+        .err = &err,
+        .secrets = &.{},
+        .name = "t",
+    };
+    const job: job_mod.Job = .{
+        .plan_id = "p",
+        .job_id = "j",
+        .job_token = "t",
+        .check_run_id = 7,
+        .secrets = &.{},
+        .steps = &.{},
+    };
+
+    // Opening the spool points the collector at it; handleJob has nothing to remember.
+    var collect: sink.LogSink = .{ .collect = .{ .arena = arena, .io = io, .inner = &inner } };
+    const spool = try openSpool(c, job, &collect);
+    try std.testing.expect(spool != null);
+    try std.testing.expect(collect.collect.spool == &spool.?.spool);
+    const path = spool.?.path;
+    try std.testing.expect(std.mem.endsWith(u8, path, "/zig-runner-job-7.log"));
+
+    // A logged line is on disk, not in memory, and comes back from the file.
+    try collect.append(7, 1, .stdout, "spooled");
+    try std.testing.expectEqual(@as(usize, 0), collect.collect.lines.items.len);
+    const back = collect.collect.collected(arena);
+    try std.testing.expectEqual(@as(usize, 1), back.len);
+    try std.testing.expectEqualStrings("spooled", back[0].text);
+
+    // Closing deletes the file: a finished job leaves nothing in the spool directory.
+    spool.?.close(io);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openFile(io, path, .{}));
+
+    // No spool directory configured: no spool, nothing said.
+    cfg.log_spool_dir = "";
+    try std.testing.expect((try openSpool(c, job, &collect)) == null);
+    try std.testing.expectEqual(@as(usize, 0), err.buffered().len);
+
+    // A directory the runner cannot write to: said once, and the job carries on without a spool.
+    cfg.log_spool_dir = try std.fs.path.join(arena, &.{ dir, "not-a-directory" });
+    try std.testing.expect((try openSpool(c, job, &collect)) == null);
+    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "no log spool in") != null);
+    try std.testing.expect(std.mem.indexOf(u8, err.buffered(), "kept in memory") != null);
 }
 
 test "timeSpanMs reads GitHub's cancel timeout" {
