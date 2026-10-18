@@ -89,75 +89,118 @@ pub fn parse(arena: Allocator, text: []const u8) Allocator.Error!Parsed {
 
     var m: Metadata = .{ .runs = undefined };
     if (root.get("name")) |n| m.name = n.text() orelse "";
-
-    if (root.get("inputs")) |ins| if (ins == .map) {
-        const out = try arena.alloc(InputDef, ins.map.len);
-        for (ins.map, out) |e, *o| {
-            o.* = .{ .name = e.key };
-            if (e.value.get("default")) |d| o.default = scalar(d) orelse return invalid(arena, "input '{s}' has a default that is not a string", .{e.key});
-            if (e.value.get("required")) |r| o.required = isTrue(scalar(r) orelse "");
-        }
-        m.inputs = out;
+    m.inputs = switch (try parseInputs(arena, root)) {
+        .invalid => |why| return .{ .invalid = why },
+        .ok => |defs| defs,
     };
-
-    if (root.get("outputs")) |outs| if (outs == .map) {
-        var list: std.ArrayList(OutputDef) = .empty;
-        for (outs.map) |e| {
-            // JavaScript and Docker actions set outputs themselves and have no `value`.
-            const v = e.value.get("value") orelse continue;
-            try list.append(arena, .{ .name = e.key, .value = scalar(v) orelse return invalid(arena, "output '{s}' has a value that is not a string", .{e.key}) });
-        }
-        m.outputs = list.items;
+    m.outputs = switch (try parseOutputs(arena, root)) {
+        .invalid => |why| return .{ .invalid = why },
+        .ok => |defs| defs,
     };
-
     const runs = root.get("runs") orelse return .{ .invalid = "has no 'runs' section" };
-    const using_raw = (runs.get("using") orelse return .{ .invalid = "has no 'runs.using'" }).text() orelse return .{ .invalid = "has no 'runs.using'" };
-    const using = try std.ascii.allocLowerString(arena, using_raw);
-    if (std.mem.eql(u8, using, "composite")) {
-        const steps_n = runs.get("steps") orelse return .{ .invalid = "is a composite action without 'runs.steps'" };
-        if (steps_n != .seq) return .{ .invalid = "has 'runs.steps' that is not a list" };
-        const steps = try arena.alloc(Step, steps_n.seq.len);
-        for (steps_n.seq, steps, 1..) |sn, *st, i| {
-            st.* = switch (try compositeStep(arena, sn, i)) {
-                .ok => |s| s,
-                .invalid => |why| return .{ .invalid = why },
-            };
-        }
-        m.runs = .{ .composite = steps };
-    } else if (std.mem.startsWith(u8, using, "node")) {
-        const main = (runs.get("main") orelse return .{ .invalid = "is a JavaScript action without 'runs.main'" }).text() orelse return .{ .invalid = "has 'runs.main' that is not a string" };
-        m.runs = .{ .node = .{
-            .using = using,
-            .main = main,
-            .pre = if (runs.get("pre")) |v| v.text() else null,
-            .post = if (runs.get("post")) |v| v.text() else null,
-            .pre_if = if (runs.get("pre-if")) |v| v.text() else null,
-            .post_if = if (runs.get("post-if")) |v| v.text() else null,
-        } };
-    } else if (std.mem.eql(u8, using, "docker")) {
-        const image = (runs.get("image") orelse return .{ .invalid = "is a Docker action without 'runs.image'" }).text() orelse return .{ .invalid = "has 'runs.image' that is not a string" };
-        var args: ?[]const []const u8 = null;
-        if (runs.get("args")) |an| {
-            if (an != .seq) return .{ .invalid = "has 'runs.args' that is not a list" };
-            const list = try arena.alloc([]const u8, an.seq.len);
-            for (an.seq, list) |item, *dst| dst.* = scalar(item) orelse return .{ .invalid = "has 'runs.args' with an item that is not a string" };
-            args = list;
-        }
-        const env = if (runs.get("env")) |en| (try keyValues(arena, en)) orelse return .{ .invalid = "has 'runs.env' that is not a mapping of strings" } else &.{};
-        m.runs = .{ .docker = .{
-            .image = image,
-            .entrypoint = if (runs.get("entrypoint")) |v| v.text() else null,
-            .args = args,
-            .env = env,
-            .pre_entrypoint = if (runs.get("pre-entrypoint")) |v| v.text() else null,
-            .post_entrypoint = if (runs.get("post-entrypoint")) |v| v.text() else null,
-            .pre_if = if (runs.get("pre-if")) |v| v.text() else null,
-            .post_if = if (runs.get("post-if")) |v| v.text() else null,
-        } };
-    } else {
-        return invalid(arena, "has an unknown 'runs.using' value '{s}'", .{using_raw});
-    }
+    m.runs = switch (try parseRuns(arena, runs)) {
+        .invalid => |why| return .{ .invalid = why },
+        .ok => |r| r,
+    };
     return .{ .ok = m };
+}
+
+/// A section's result: what it defines, or why the file cannot be used.
+fn Section(comptime T: type) type {
+    return union(enum) { ok: T, invalid: []const u8 };
+}
+
+/// `inputs:` — each with its default (a string) and whether it is required. Absent or not a mapping
+/// means none.
+fn parseInputs(arena: Allocator, root: yaml.Node) Allocator.Error!Section([]const InputDef) {
+    const ins = root.get("inputs") orelse return .{ .ok = &.{} };
+    if (ins != .map) return .{ .ok = &.{} };
+    const out = try arena.alloc(InputDef, ins.map.len);
+    for (ins.map, out) |e, *o| {
+        o.* = .{ .name = e.key };
+        if (e.value.get("default")) |d| o.default = scalar(d) orelse
+            return .{ .invalid = try std.fmt.allocPrint(arena, "input '{s}' has a default that is not a string", .{e.key}) };
+        if (e.value.get("required")) |r| o.required = isTrue(scalar(r) orelse "");
+    }
+    return .{ .ok = out };
+}
+
+/// `outputs:` — the ones with a `value`; JavaScript and Docker actions set outputs themselves and
+/// have none.
+fn parseOutputs(arena: Allocator, root: yaml.Node) Allocator.Error!Section([]const OutputDef) {
+    const outs = root.get("outputs") orelse return .{ .ok = &.{} };
+    if (outs != .map) return .{ .ok = &.{} };
+    var list: std.ArrayList(OutputDef) = .empty;
+    for (outs.map) |e| {
+        const v = e.value.get("value") orelse continue;
+        const value = scalar(v) orelse
+            return .{ .invalid = try std.fmt.allocPrint(arena, "output '{s}' has a value that is not a string", .{e.key}) };
+        try list.append(arena, .{ .name = e.key, .value = value });
+    }
+    return .{ .ok = list.items };
+}
+
+/// `runs:` by `using`: a composite action's steps, a JavaScript action's scripts, or a Docker
+/// action's image and command.
+fn parseRuns(arena: Allocator, runs: yaml.Node) Allocator.Error!Section(Runs) {
+    const using_raw = (runs.get("using") orelse return .{ .invalid = "has no 'runs.using'" }).text() orelse
+        return .{ .invalid = "has no 'runs.using'" };
+    const using = try std.ascii.allocLowerString(arena, using_raw);
+    if (std.mem.eql(u8, using, "composite")) return compositeRuns(arena, runs);
+    if (std.mem.startsWith(u8, using, "node")) return nodeRuns(runs, using);
+    if (std.mem.eql(u8, using, "docker")) return dockerRuns(arena, runs);
+    return .{ .invalid = try std.fmt.allocPrint(arena, "has an unknown 'runs.using' value '{s}'", .{using_raw}) };
+}
+
+fn compositeRuns(arena: Allocator, runs: yaml.Node) Allocator.Error!Section(Runs) {
+    const steps_n = runs.get("steps") orelse return .{ .invalid = "is a composite action without 'runs.steps'" };
+    if (steps_n != .seq) return .{ .invalid = "has 'runs.steps' that is not a list" };
+    const steps = try arena.alloc(Step, steps_n.seq.len);
+    for (steps_n.seq, steps, 1..) |sn, *st, i| {
+        st.* = switch (try compositeStep(arena, sn, i)) {
+            .ok => |s| s,
+            .invalid => |why| return .{ .invalid = why },
+        };
+    }
+    return .{ .ok = .{ .composite = steps } };
+}
+
+fn nodeRuns(runs: yaml.Node, using: []const u8) Section(Runs) {
+    const main_n = runs.get("main") orelse return .{ .invalid = "is a JavaScript action without 'runs.main'" };
+    const main = main_n.text() orelse return .{ .invalid = "has 'runs.main' that is not a string" };
+    return .{ .ok = .{ .node = .{
+        .using = using,
+        .main = main,
+        .pre = if (runs.get("pre")) |v| v.text() else null,
+        .post = if (runs.get("post")) |v| v.text() else null,
+        .pre_if = if (runs.get("pre-if")) |v| v.text() else null,
+        .post_if = if (runs.get("post-if")) |v| v.text() else null,
+    } } };
+}
+
+fn dockerRuns(arena: Allocator, runs: yaml.Node) Allocator.Error!Section(Runs) {
+    const image_n = runs.get("image") orelse return .{ .invalid = "is a Docker action without 'runs.image'" };
+    const image = image_n.text() orelse return .{ .invalid = "has 'runs.image' that is not a string" };
+    var args: ?[]const []const u8 = null;
+    if (runs.get("args")) |an| {
+        if (an != .seq) return .{ .invalid = "has 'runs.args' that is not a list" };
+        const list = try arena.alloc([]const u8, an.seq.len);
+        for (an.seq, list) |item, *dst| dst.* = scalar(item) orelse
+            return .{ .invalid = "has 'runs.args' with an item that is not a string" };
+        args = list;
+    }
+    const env = if (runs.get("env")) |en| (try keyValues(arena, en)) orelse
+        return .{ .invalid = "has 'runs.env' that is not a mapping of strings" } else &.{};
+    return .{ .ok = .{ .docker = .{
+        .image = image,
+        .entrypoint = if (runs.get("entrypoint")) |v| v.text() else null,
+        .args = args,
+        .env = env,
+        .pre_entrypoint = if (runs.get("pre-entrypoint")) |v| v.text() else null,
+        .post_entrypoint = if (runs.get("post-entrypoint")) |v| v.text() else null,
+        .pre_if = if (runs.get("pre-if")) |v| v.text() else null,
+        .post_if = if (runs.get("post-if")) |v| v.text() else null,
+    } } };
 }
 
 const StepParsed = union(enum) { ok: Step, invalid: []const u8 };
