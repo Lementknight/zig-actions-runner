@@ -101,6 +101,14 @@ fn walk(arena: Allocator, io: std.Io, path: []const u8, found: *Findings) !void 
     }
 }
 
+/// A line's width in columns, which is what the rule is about: code points, not bytes. An em dash
+/// is three bytes and one column, and a 99-column comment with one in it was the first "regression"
+/// this tool reported. Invalid UTF-8 falls back to the byte count. Tabs count one; `zig fmt` emits
+/// none.
+fn columns(line: []const u8) usize {
+    return std.unicode.utf8CountCodepoints(line) catch line.len;
+}
+
 fn checkFile(arena: Allocator, io: std.Io, path: []const u8, found: *Findings) !void {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 << 20)) catch |e| {
         std.debug.print("{s}: cannot read it ({s})\n", .{ path, @errorName(e) });
@@ -111,7 +119,7 @@ fn checkFile(arena: Allocator, io: std.Io, path: []const u8, found: *Findings) !
     var long: usize = 0;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |l| {
-        if (l.len > max_line_cols) long += 1;
+        if (columns(l) > max_line_cols) long += 1;
     }
     if (long > 0) try found.long_lines.put(arena, path, long);
 
