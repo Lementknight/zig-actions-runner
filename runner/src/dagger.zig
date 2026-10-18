@@ -3197,44 +3197,19 @@ const Exec = struct {
 
     /// Runs one script in the job's container, logging as step `num`, and applies its file
     /// commands. `error.EngineFailed` (with `err_msg`) when Dagger itself failed.
-    fn execScript(x: *Exec, num: u32, fc: u32, resolved_in: Resolved, action_name: []const u8, secret_env_in: []const SecretRef, mounts: []const Mount) !ExecOut {
+    fn execScript(
+        x: *Exec,
+        num: u32,
+        fc: u32,
+        resolved_in: Resolved,
+        action_name: []const u8,
+        secret_env_in: []const SecretRef,
+        mounts: []const Mount,
+    ) !ExecOut {
         const arena = x.arena;
-        const ev = x.ev;
-        // Secret variables are for scripts only; they reach them through aliases (`secretAlias`).
-        var resolved = resolved_in;
-        var secret_env: []const SecretRef = if (resolved == .run) secret_env_in else &.{};
-        if (resolved == .run) {
-            const uses_secrets = secret_env.len > 0 or x.job_secret_env or containsSecret(x.job.*, resolved.run.script);
-            // With `id-token: write`, every step can request OIDC tokens, as on GitHub (`curl
-            // "$ACTIONS_ID_TOKEN_REQUEST_URL"` in a script, `core.getIDToken()` in an action).
-            const oidc = try x.idToken();
-            if (oidc) |t| {
-                resolved.run.env = try std.mem.concat(arena, job_mod.EnvVar, &.{ resolved.run.env, &.{t.url} });
-                secret_env = try std.mem.concat(arena, SecretRef, &.{ secret_env, &.{t.token} });
-            }
-            const names = try arena.alloc([]const u8, secret_env.len);
-            for (secret_env, names) |s, *n| n.* = s.name;
-            resolved.run.secret_env = names;
-            resolved.run.write_event = x.event_from_env;
-            // A step that uses secrets (a deploy, a publish) must not be skipped because an earlier run
-            // had the same inputs, and one that reads run-specific values must not replay an earlier
-            // run's; every step after it then runs too. One that can get OIDC tokens may publish or
-            // deploy without any secret (npm's trusted publishing, cloud logins), so it runs too.
-            if (x.step_cache) {
-                const reason: ?[]const u8 = if (uses_secrets)
-                    "it uses secrets"
-                else if (oidc != null)
-                    "it can request OIDC tokens (id-token: write)"
-                else if (readsRunSpecific(resolved.run.script))
-                    "it reads run- or commit-specific values"
-                else
-                    null;
-                if (reason) |r| resolved.run.always_run = try std.fmt.allocPrint(arena, "zig-runner runs this step every time: {s} (run {s})", .{ r, x.run_nonce })
-                    // A step that is replayable must not be given a value that differs between runs,
-                    // because it can read one without the runner being able to tell (`volatile_sentinel`).
-                else resolved.run.withhold_volatile = x.enforce_volatile;
-            }
-        }
+        const step_run = try x.resolveRunStep(resolved_in, secret_env_in);
+        const resolved = step_run.resolved;
+        const secret_env = step_run.secret_env;
         const script = try std.mem.concat(arena, u8, &.{ x.forward_prelude, try stepScriptFc(arena, num, fc, resolved, action_name) });
         const before = x.container_id;
         var doc: std.Io.Writer.Allocating = .init(arena);
@@ -3244,29 +3219,104 @@ const Exec = struct {
         try w.writeAll(") { ");
         const env_start = doc.written().len;
         var braces: usize = 2; // query + loadContainerFromID
-        // Variables and PATH entries the previous steps asked for through $GITHUB_ENV / $GITHUB_PATH.
+        const env_braces = try x.writePendingEnv(w);
+        braces += env_braces;
+        // The variables earlier steps set, which the container before this step lacks.
+        const env_nodes = try arena.dupe(u8, doc.written()[env_start..]);
+        var mount_doc: std.Io.Writer.Allocating = .init(arena);
+        try writeMounts(&mount_doc.writer, mounts);
+        braces += try writeActionSecrets(arena, w, secret_env);
+        try w.writeAll(mount_doc.written());
+        braces += mounts.len;
+        try x.writeScriptExec(w, script, fc, secret_env);
+        for (0..braces) |_| try w.writeAll(" }");
+
+        x.beginExec(num);
+        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch return error.EngineFailed;
+        if (jsonFindString(data, "id")) |id| x.container_id = id;
+        const out = try x.collect(num, data);
+        // Any `::add-matcher::` this step emitted: read the files from the container it just
+        // produced, which is where the paths it printed are valid.
+        x.loadPendingMatchers(num);
+        if (x.output_keys != null and resolved == .run and resolved.run.always_run != null and out.code == 0) {
+            const pre = try std.mem.concat(arena, u8, &.{ env_nodes, mount_doc.written() });
+            const started = std.Io.Clock.awake.now(x.io).toMilliseconds();
+            if (x.countOutputKeyed(num, started, try x.outputKeyed(num, before, pre, env_braces + mounts.len, x.container_id))) |id| x.container_id = id;
+        }
+        return out;
+    }
+
+    /// A step as it will run: the script's secret aliases and OIDC token set, and under step
+    /// caching its always-run reason or its volatile withholding decided.
+    const ScriptRun = struct { resolved: Resolved, secret_env: []const SecretRef };
+
+    /// Secret variables are for scripts only; they reach them through aliases (`secretAlias`). With
+    /// `id-token: write`, every step can request OIDC tokens, as on GitHub (`curl
+    /// "$ACTIONS_ID_TOKEN_REQUEST_URL"` in a script, `core.getIDToken()` in an action).
+    fn resolveRunStep(x: *Exec, resolved_in: Resolved, secret_env_in: []const SecretRef) !ScriptRun {
+        const arena = x.arena;
+        var resolved = resolved_in;
+        if (resolved != .run) return .{ .resolved = resolved, .secret_env = &.{} };
+        var secret_env: []const SecretRef = secret_env_in;
+        const uses_secrets = secret_env.len > 0 or x.job_secret_env or containsSecret(x.job.*, resolved.run.script);
+        const oidc = try x.idToken();
+        if (oidc) |t| {
+            resolved.run.env = try std.mem.concat(arena, job_mod.EnvVar, &.{ resolved.run.env, &.{t.url} });
+            secret_env = try std.mem.concat(arena, SecretRef, &.{ secret_env, &.{t.token} });
+        }
+        const names = try arena.alloc([]const u8, secret_env.len);
+        for (secret_env, names) |s, *n| n.* = s.name;
+        resolved.run.secret_env = names;
+        resolved.run.write_event = x.event_from_env;
+        // A step that uses secrets (a deploy, a publish) must not be skipped because an earlier run
+        // had the same inputs, and one that reads run-specific values must not replay an earlier
+        // run's; every step after it then runs too. One that can get OIDC tokens may publish or
+        // deploy without any secret (npm's trusted publishing, cloud logins), so it runs too.
+        if (x.step_cache) {
+            const reason: ?[]const u8 = if (uses_secrets)
+                "it uses secrets"
+            else if (oidc != null)
+                "it can request OIDC tokens (id-token: write)"
+            else if (readsRunSpecific(resolved.run.script))
+                "it reads run- or commit-specific values"
+            else
+                null;
+            if (reason) |r| resolved.run.always_run = try std.fmt.allocPrint(arena, "zig-runner runs this step every time: {s} (run {s})", .{ r, x.run_nonce })
+                // A step that is replayable must not be given a value that differs between runs,
+                // because it can read one without the runner being able to tell (`volatile_sentinel`).
+            else resolved.run.withhold_volatile = x.enforce_volatile;
+        }
+        return .{ .resolved = resolved, .secret_env = secret_env };
+    }
+
+    /// Variables and PATH entries the previous steps asked for through $GITHUB_ENV / $GITHUB_PATH,
+    /// written and then forgotten: the container after this step has them. How many braces opened.
+    fn writePendingEnv(x: *Exec, w: *std.Io.Writer) !usize {
+        const arena = x.arena;
+        const ev = x.ev;
+        var opened: usize = 0;
         for (ev.pending_env.items) |e| {
             try w.writeAll("withEnvVariable(name:");
             try std.json.Stringify.value(e.name, .{}, w);
             try w.writeAll(",value:");
             try std.json.Stringify.value(e.value, .{}, w);
             try w.writeAll(") { ");
-            braces += 1;
+            opened += 1;
         }
         if (ev.pending_path.items.len > 0) {
             const joined = try std.mem.join(arena, ":", ev.pending_path.items);
             try w.writeAll("withEnvVariable(name:\"PATH\",value:");
             try std.json.Stringify.value(try std.fmt.allocPrint(arena, "{s}:$PATH", .{joined}), .{}, w);
             try w.writeAll(",expand:true) { ");
-            braces += 1;
+            opened += 1;
         }
         ev.pending_env.clearRetainingCapacity();
         ev.pending_path.clearRetainingCapacity();
-        // The variables earlier steps set, which the container before this step lacks.
-        const env_nodes = try arena.dupe(u8, doc.written()[env_start..]);
-        const env_braces = braces - 2;
-        var mount_doc: std.Io.Writer.Allocating = .init(arena);
-        const mw = &mount_doc.writer;
+        return opened;
+    }
+
+    /// Each mount as its node, open; the caller counts one brace per mount.
+    fn writeMounts(mw: *std.Io.Writer, mounts: []const Mount) !void {
         for (mounts) |m| {
             switch (m) {
                 .dir => |d| {
@@ -3296,23 +3346,17 @@ const Exec = struct {
             }
             try mw.writeAll(") { ");
         }
-        for (secret_env, 0..) |sr, i| {
-            try w.writeAll("withSecretVariable(name:");
-            try std.json.Stringify.value(try secretAlias(arena, i), .{}, w);
-            try w.writeAll(",secret:");
-            try std.json.Stringify.value(sr.id, .{}, w);
-            try w.writeAll(") { ");
-            braces += 1;
-        }
-        try w.writeAll(mount_doc.written());
-        braces += mounts.len;
+    }
+
+    /// The exec itself and what is read back: exit code and output, the combined file commands, and
+    /// the container id — taken after the step's secrets are removed, so the next step starts without
+    /// them. Nesting gives the step's `dagger` CLI a session on this engine, sharing its cache.
+    fn writeScriptExec(x: *Exec, w: *std.Io.Writer, script: []const u8, fc: u32, secret_env: []const SecretRef) !void {
+        const arena = x.arena;
         try w.writeAll("withExec(args:");
         try std.json.Stringify.value([_][]const u8{ "sh", "-c", script }, .{}, w);
-        // Nesting gives the step's `dagger` CLI a session on this engine, sharing its cache. The
-        // container id is read after the step's secrets are removed (below).
         try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
         try w.print(" fc_all: file(path:\"{s}\") {{ contents }}", .{try fcPath(arena, "all", fc)});
-        // The next step starts from this container without the step's secrets.
         for (secret_env, 0..) |_, i| {
             try w.writeAll(" withoutSecretVariable(name:");
             try std.json.Stringify.value(try secretAlias(arena, i), .{}, w);
@@ -3321,21 +3365,6 @@ const Exec = struct {
         try w.writeAll(" id");
         for (secret_env) |_| try w.writeAll(" }");
         try w.writeAll(" }");
-        for (0..braces) |_| try w.writeAll(" }");
-
-        x.beginExec(num);
-        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch return error.EngineFailed;
-        if (jsonFindString(data, "id")) |id| x.container_id = id;
-        const out = try x.collect(num, data);
-        // Any `::add-matcher::` this step emitted: read the files from the container it just
-        // produced, which is where the paths it printed are valid.
-        x.loadPendingMatchers(num);
-        if (x.output_keys != null and resolved == .run and resolved.run.always_run != null and out.code == 0) {
-            const pre = try std.mem.concat(arena, u8, &.{ env_nodes, mount_doc.written() });
-            const started = std.Io.Clock.awake.now(x.io).toMilliseconds();
-            if (x.countOutputKeyed(num, started, try x.outputKeyed(num, before, pre, env_braces + mounts.len, x.container_id))) |id| x.container_id = id;
-        }
-        return out;
     }
 
     /// Reads the matcher files a step asked for, and registers what they define.
