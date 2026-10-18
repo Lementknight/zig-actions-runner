@@ -27,6 +27,7 @@ const build_version = @import("version.zig");
 const expr = @import("expr.zig");
 const context = @import("context.zig");
 const commands = @import("commands.zig");
+const matcher = @import("matcher.zig");
 const action = @import("action.zig");
 const config = @import("config.zig");
 const engine = @import("engine.zig");
@@ -1547,6 +1548,17 @@ const Shared = struct {
     /// `::error`/`::warning`/`::notice` lines and the runner's own errors, sent with completejob so
     /// GitHub shows them on the run (guarded by `mu`).
     annotations: std.ArrayList(Annotation) = .empty,
+    /// Problem matchers in force for the job (`::add-matcher::`, see matcher.zig), and the files a
+    /// step asked for but which have not been read yet (guarded by `mu`).
+    ///
+    /// Reading the file needs a Dagger query, and this runs in the log path under `mu`: blocking
+    /// output on a round trip would stall the live feed. So a path is queued here and loaded
+    /// between steps, where the transport is at hand — which means a matcher takes effect from the
+    /// *next* step rather than part-way through the one that registered it. In practice that is
+    /// where it is wanted: `setup-node` registers tsc's matcher in its own step and the compiler
+    /// runs in a later one. SPEC.md §9 records the difference.
+    matchers: matcher.Set = .{},
+    pending_matchers: std.ArrayList([]const u8) = .empty,
     /// Each service's output (index = service), printed in "Stop containers" as GitHub's runner
     /// prints `docker logs` (guarded by `mu`); lines past `max_service_log_lines` are counted.
     service_logs: []std.ArrayList([]const u8) = &.{},
@@ -1586,7 +1598,11 @@ const Shared = struct {
         const line = if (std.mem.indexOf(u8, text, "::") != null) sh.arena.dupe(u8, text) catch return else text;
         const cmd = commands.parseWorkflow(sh.arena, line, st.stop_token) catch return sh.appendLocked(step, line);
         switch (cmd) {
-            .none => sh.appendLocked(step, text),
+            // Not a command: log it, then let the problem matchers see it.
+            .none => {
+                sh.appendLocked(step, text);
+                sh.matchLocked(step, text);
+            },
             .add_mask => |value| sh.addMask(value),
             .group => |title| sh.appendFmt(step, "##[group]{s}", .{title}),
             .endgroup => sh.appendLocked(step, "##[endgroup]"),
@@ -1597,6 +1613,9 @@ const Shared = struct {
                 sh.annotateLocked(step, an);
             },
             .debug => |msg| if (sh.step_debug) sh.appendFmt(step, "##[debug]{s}", .{msg}),
+            // GitHub logs nothing for either; the file is read between steps (see `pending_matchers`).
+            .add_matcher => |path| sh.pending_matchers.append(sh.arena, path) catch {},
+            .remove_matcher => |owner| sh.matchers.removeOwner(owner),
             .stop => |token| st.stop_token = token,
             .resume_commands => st.stop_token = null,
             .set_output => |kv| st.outputs.append(sh.arena, kv) catch {},
@@ -1620,6 +1639,57 @@ const Shared = struct {
     fn errorLineLocked(sh: *Shared, step: u32, msg: []const u8) void {
         sh.appendFmt(step, "##[error]{s}", .{msg});
         sh.annotateLocked(step, .{ .level = "error", .message = msg });
+    }
+
+    /// The matcher files steps have asked for, emptied. Called off the log path.
+    fn takePendingMatchers(sh: *Shared) []const []const u8 {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        const out = sh.pending_matchers.items;
+        sh.pending_matchers = .empty;
+        return out;
+    }
+
+    fn addMatchers(sh: *Shared, matchers: []const matcher.Matcher) void {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        sh.matchers.add(sh.arena, matchers) catch {};
+    }
+
+    /// A warning from off the log path. `appendFmt` reaches `appendLocked`, which mutates the log
+    /// and the per-step line counts that the live-output task also writes — so it needs `mu`, and
+    /// the first version of `loadPendingMatchers` called it without. That is a data race on the
+    /// log, and the runner segfaulted on an unrelated job because of it.
+    fn warnUnlocked(sh: *Shared, step: u32, text: []const u8) void {
+        sh.mu.lockUncancelable(sh.io);
+        defer sh.mu.unlock(sh.io);
+        sh.appendLocked(step, text);
+    }
+
+    /// Offers a line to the problem matchers and annotates whatever they complete. Called with `mu`
+    /// held, straight after the line was logged, so `annotateLocked` can point an annotation
+    /// without a file at the line it came from.
+    fn matchLocked(sh: *Shared, step: u32, text: []const u8) void {
+        if (sh.matchers.count() == 0) return;
+        // **The line must be duplicated first.** Everything a match captures is a slice of it, and
+        // a direct session's line lives only as long as its log record — the same reason the
+        // command path above dupes a line containing `::`. Storing an annotation that points into
+        // a freed record corrupts the heap, and because every runner in this process shares it, the
+        // crash surfaces in whatever job is unlucky: this cost a segfault in a hugo build that had
+        // no matchers at all, while another job's matcher was matching.
+        const line = sh.arena.dupe(u8, std.mem.trimEnd(u8, text, "\r")) catch return;
+        const found = sh.matchers.feed(sh.arena, line) catch return;
+        for (found) |f| sh.annotateLocked(step, .{
+            .level = f.level,
+            .message = f.message,
+            .file = f.file,
+            .line = f.line,
+            .end_line = f.end_line,
+            .col = f.col,
+            .end_column = f.end_column,
+            // GitHub shows a matcher's `code` as the annotation's title.
+            .title = f.code,
+        });
     }
 
     /// Keeps an annotation for completejob. Like GitHub's runner, at most `max_annotations` of each
@@ -2924,12 +2994,54 @@ const Exec = struct {
         const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch return error.EngineFailed;
         if (jsonFindString(data, "id")) |id| x.container_id = id;
         const out = try x.collect(num, data);
+        // Any `::add-matcher::` this step emitted: read the files from the container it just
+        // produced, which is where the paths it printed are valid.
+        x.loadPendingMatchers(num);
         if (x.output_keys != null and resolved == .run and resolved.run.always_run != null and out.code == 0) {
             const pre = try std.mem.concat(arena, u8, &.{ env_nodes, mount_doc.written() });
             const started = std.Io.Clock.awake.now(x.io).toMilliseconds();
             if (x.countOutputKeyed(num, started, try x.outputKeyed(num, before, pre, env_braces + mounts.len, x.container_id))) |id| x.container_id = id;
         }
         return out;
+    }
+
+    /// Reads the matcher files a step asked for, and registers what they define.
+    ///
+    /// The paths come from the step's own output, so they are absolute in *its* container — the one
+    /// this has just finished building, which is why the read happens here rather than in the log
+    /// path. A file that cannot be read, or holds nothing this engine can compile, warns in the
+    /// step's log and is otherwise ignored: an action that ships an exotic pattern should lose its
+    /// annotations, not its job.
+    fn warnMatcher(x: *Exec, num: u32, comptime fmt: []const u8, args: anytype) void {
+        const text = std.fmt.allocPrint(x.arena, "##[warning]" ++ fmt, args) catch return;
+        x.sh.warnUnlocked(num, text);
+    }
+
+    fn loadPendingMatchers(x: *Exec, num: u32) void {
+        const pending = x.sh.takePendingMatchers();
+        for (pending) |path| {
+            const q = std.fmt.allocPrint(
+                x.arena,
+                "{{ loadContainerFromID(id:{f}) {{ file(path:{f}) {{ contents }} }} }}",
+                .{ std.json.fmt(x.container_id, .{}), std.json.fmt(path, .{}) },
+            ) catch continue;
+            var msg: []const u8 = "";
+            const data = gql(x.arena, x.transport, q, &msg) catch {
+                x.warnMatcher(num, "Could not read the problem matcher '{s}'", .{path});
+                continue;
+            };
+            const text = jsonFindString(data, "contents") orelse {
+                x.warnMatcher(num, "Could not read the problem matcher '{s}'", .{path});
+                continue;
+            };
+            const loaded = matcher.load(x.arena, text) catch {
+                x.warnMatcher(num, "'{s}' is not a problem matcher file", .{path});
+                continue;
+            };
+            for (loaded.refused) |r|
+                x.warnMatcher(num, "Problem matcher '{s}' is ignored: its pattern needs {s} ({s})", .{ r.owner, r.why, r.pattern });
+            x.sh.addMatchers(loaded.matchers);
+        }
     }
 
     /// Where a step's changes are stored, and where the next step's container mounts the store and

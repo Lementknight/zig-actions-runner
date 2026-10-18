@@ -152,6 +152,11 @@ pub const Workflow = union(enum) {
     disabled: []const u8,
     /// `::echo::on|off` only changes whether commands are echoed; this runner never echoes them.
     echo,
+    /// `::add-matcher::<path>`: register the problem matchers in that file (see matcher.zig). The
+    /// path is relative to the workspace, or to an action's own directory inside one.
+    add_matcher: []const u8,
+    /// `::remove-matcher owner=<name>::`: withdraw the matchers an owner registered.
+    remove_matcher: []const u8,
 };
 
 /// `::error file=a.js,line=3,endLine=4,col=1,endColumn=9,title=T::message`. The properties are as
@@ -188,6 +193,15 @@ pub fn parseWorkflow(arena: Allocator, line: []const u8, stopped_token: ?[]const
     const eql = std.ascii.eqlIgnoreCase;
 
     if (eql(name, "add-mask")) return .{ .add_mask = try unescape(arena, data, false) };
+    if (eql(name, "add-matcher")) {
+        const path = try unescape(arena, data, false);
+        return if (path.len > 0) .{ .add_matcher = path } else .none;
+    }
+    if (eql(name, "remove-matcher")) {
+        // The owner is a property, not the data: `::remove-matcher owner=eslint-stylish::`.
+        const owner = try property(arena, props, "owner");
+        return if (owner) |o| (if (o.len > 0) .{ .remove_matcher = o } else .none) else .none;
+    }
     if (eql(name, "group")) return .{ .group = try unescape(arena, data, false) };
     if (eql(name, "endgroup")) return .endgroup;
     if (eql(name, "debug")) return .{ .debug = try unescape(arena, data, false) };
@@ -276,4 +290,26 @@ test "workflow commands" {
     try std.testing.expect(try parseWorkflow(ar, "::stop-commands::", null) == .none);
     try std.testing.expect(try parseWorkflow(ar, "::add-mask::x", "tok123") == .none);
     try std.testing.expect(try parseWorkflow(ar, "::tok123::", "tok123") == .resume_commands);
+}
+
+test "add-matcher and remove-matcher" {
+    var a: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer a.deinit();
+    const ar = a.allocator();
+
+    // As actions/setup-node writes it, path relative to the action's own directory.
+    const add = try parseWorkflow(ar, "::add-matcher::/home/runner/work/_actions/actions/setup-node/v4/.github/tsc.json", null);
+    try std.testing.expectEqualStrings("/home/runner/work/_actions/actions/setup-node/v4/.github/tsc.json", add.add_matcher);
+
+    // The owner is a property of the command, not its data.
+    const remove = try parseWorkflow(ar, "::remove-matcher owner=eslint-stylish::", null);
+    try std.testing.expectEqualStrings("eslint-stylish", remove.remove_matcher);
+
+    // Neither without what it needs.
+    try std.testing.expect(try parseWorkflow(ar, "::add-matcher::", null) == .none);
+    try std.testing.expect(try parseWorkflow(ar, "::remove-matcher::", null) == .none);
+    try std.testing.expect(try parseWorkflow(ar, "::remove-matcher owner=::", null) == .none);
+
+    // And not while commands are stopped.
+    try std.testing.expect(try parseWorkflow(ar, "::add-matcher::x.json", "tok") == .none);
 }

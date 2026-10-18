@@ -1,0 +1,109 @@
+{
+ "plan": {
+  "planId": "p"
+ },
+ "jobId": "j",
+ "jobContainer": null,
+ "variables": {
+  "MY_SECRET": {
+   "value": "s3cr3t-value",
+   "isSecret": true
+  }
+ },
+ "resources": {
+  "endpoints": [
+   {
+    "authorization": {
+     "parameters": {
+      "AccessToken": "local-job-token"
+     }
+    }
+   }
+  ]
+ },
+ "contextData": {
+  "github": {
+   "t": 2,
+   "d": [
+    {
+     "k": "repository",
+     "v": "o/r"
+    }
+   ]
+  }
+ },
+ "steps": [
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "s1",
+   "contextName": "reg",
+   "name": "__run",
+   "condition": "success()",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "lit": "script"
+      },
+      "Value": {
+       "lit": "cat > /tmp/m.json <<'JSON'\n{\"problemMatcher\": [{\"owner\": \"zig-check\", \"pattern\": [{\"regexp\": \"^([^\\\\s].*)\\\\((\\\\d+),(\\\\d+)\\\\): (error|warning) ZC(\\\\d+): (.*)$\", \"file\": 1, \"line\": 2, \"column\": 3, \"severity\": 4, \"code\": 5, \"message\": 6}]}]}\nJSON\necho '::add-matcher::/tmp/m.json'\necho 'registered'\n"
+      }
+     }
+    ]
+   },
+   "displayName": "register"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "s2",
+   "contextName": "emit",
+   "name": "__run",
+   "condition": "success()",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "lit": "script"
+      },
+      "Value": {
+       "lit": "echo \"src/alpha.ts(12,5): error ZC2304: Cannot find name 'alpha'.\"\necho \"src/beta.ts(7,19): warning ZC6133: 'beta' is declared but never read.\"\necho 'not a diagnostic line'\n"
+      }
+     }
+    ]
+   },
+   "displayName": "emit"
+  },
+  {
+   "type": "action",
+   "reference": {
+    "type": "script"
+   },
+   "id": "s3",
+   "contextName": "after",
+   "name": "__run",
+   "condition": "success()",
+   "inputs": {
+    "type": 2,
+    "map": [
+     {
+      "Key": {
+       "lit": "script"
+      },
+      "Value": {
+       "lit": "echo '::remove-matcher owner=zig-check::'\necho \"src/gamma.ts(1,1): error ZC9999: after removal there should be no annotation.\"\n"
+      }
+     }
+    ]
+   },
+   "displayName": "after"
+  }
+ ]
+}
