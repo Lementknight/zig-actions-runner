@@ -71,8 +71,10 @@ pub fn main(init: std.process.Init) !u8 {
     const secrets = try allSecrets(arena, &cfg, pg_cfg);
 
     var out_buf: [4096]u8 = undefined;
-    var out_w: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
-    var console: sink.LogSink = .{ .stdout = .{ .writer = &out_w.interface, .secrets = secrets, .io = io } };
+    var stdout: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
+    var console: sink.LogSink = .{
+        .stdout = .{ .writer = &stdout.interface, .secrets = secrets, .io = io },
+    };
     defer console.close();
 
     var db_sink: sink.LogSink = undefined;
@@ -90,28 +92,44 @@ pub fn main(init: std.process.Init) !u8 {
 
     const name = try runnerName(arena, io, cfg.name_prefix);
 
-    if (cfg.db_check) return dbCheck(init, pg_cfg, secrets, &out_w.interface, err);
+    if (cfg.db_check) return dbCheck(init, pg_cfg, secrets, &stdout.interface, err);
     if (cfg.exec_job) |path| return execJobFile(init, &cfg, path, log, err);
     if (cfg.dry_run) return dryRun(arena, log, name, cfg.labels);
-    if (cfg.inspect) return inspect.run(arena, io, &cfg, name, &out_w.interface);
+    if (cfg.inspect) return inspect.run(arena, io, &cfg, name, &stdout.interface);
 
     // One HTTP client for every runner (see `github/http.zig`).
-    var http_client: std.http.Client = .{ .allocator = init.gpa, .io = io, .write_buffer_size = 16 * 1024 };
-    defer http_client.deinit();
-    http.shared = &http_client;
-    installStopSignals();
-
-    return @backingInt(try loop.pool(.{
-        .arena = arena,
-        .gpa = init.gpa,
+    var client: std.http.Client = .{
+        .allocator = init.gpa,
         .io = io,
+        .write_buffer_size = 16 * 1024,
+    };
+    defer client.deinit();
+    http.shared = &client;
+    installStopSignals();
+    return runPool(init, &cfg, log, err, secrets, name, if (store) |*st| st else null);
+}
+
+/// The runners, until a stop signal: `cfg.runners` of them in one process (see `loop.pool`).
+fn runPool(
+    init: std.process.Init,
+    cfg: *const Config,
+    log: *sink.LogSink,
+    err: *std.Io.Writer,
+    secrets: []const []const u8,
+    name: []const u8,
+    store: ?*db.Store,
+) !u8 {
+    return @backingInt(try loop.pool(.{
+        .arena = init.arena.allocator(),
+        .gpa = init.gpa,
+        .io = init.io,
         .environ = init.environ_map,
-        .cfg = &cfg,
+        .cfg = cfg,
         .log = log,
         .err = err,
         .secrets = secrets,
         .name = name,
-        .store = if (store) |*st| st else null,
+        .store = store,
     }, cfg.runners));
 }
 
@@ -122,7 +140,10 @@ fn printVersionIfAsked(io: std.Io, args: []const [:0]const u8) !bool {
     for (args[1..]) |arg| if (std.mem.eql(u8, arg, "--version")) {
         var out_buf: [256]u8 = undefined;
         var w: std.Io.File.Writer = .initStreaming(.stdout(), io, &out_buf);
-        try w.interface.print("zig-runner {s} (runner protocol {s}, Dagger {s})\n", .{ build_version.string, broker.version, engine.client_version });
+        try w.interface.print(
+            "zig-runner {s} (runner protocol {s}, Dagger {s})\n",
+            .{ build_version.string, broker.version, engine.client_version },
+        );
         try w.interface.flush();
         return true;
     };
@@ -131,7 +152,11 @@ fn printVersionIfAsked(io: std.Io, args: []const [:0]const u8) !bool {
 
 /// Everything that must never appear in output: the configuration's secrets, and the database
 /// password when there is one.
-fn allSecrets(arena: std.mem.Allocator, cfg: *const Config, pg_cfg: ?pg.Config) ![]const []const u8 {
+fn allSecrets(
+    arena: std.mem.Allocator,
+    cfg: *const Config,
+    pg_cfg: ?pg.Config,
+) ![]const []const u8 {
     var secret_buf: [2][]const u8 = undefined;
     var list: std.ArrayList([]const u8) = .empty;
     try list.appendSlice(arena, cfg.secrets(&secret_buf));
@@ -189,7 +214,11 @@ fn runnerName(arena: std.mem.Allocator, io: std.Io, prefix: []const u8) ![]const
 
 /// `--dry-run`: the configuration was valid; say what would have been registered, and stop.
 fn dryRun(arena: std.mem.Allocator, log: *sink.LogSink, name: []const u8, labels: []const u8) !u8 {
-    const line = try std.fmt.allocPrint(arena, "dry run: would register runner '{s}' with labels '{s}'", .{ name, labels });
+    const line = try std.fmt.allocPrint(
+        arena,
+        "dry run: would register runner '{s}' with labels '{s}'",
+        .{ name, labels },
+    );
     try log.append(0, 0, .stdout, line);
     return @backingInt(Exit.done);
 }
@@ -210,10 +239,21 @@ fn onStopSignal(_: std.posix.SIG) callconv(.c) void {
     if (loop.stop_signals.fetchAdd(1, .acq_rel) >= 1) std.process.exit(130);
 }
 
-fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log: *sink.LogSink, err: *std.Io.Writer) !u8 {
+fn execJobFile(
+    init: std.process.Init,
+    cfg: *const Config,
+    path: []const u8,
+    log: *sink.LogSink,
+    err: *std.Io.Writer,
+) !u8 {
     const arena = init.arena.allocator();
     const io = init.io;
-    const json = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(16 * 1024 * 1024)) catch |e| {
+    const json = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        path,
+        arena,
+        .limited(16 * 1024 * 1024),
+    ) catch |e| {
         try err.print("cannot read {s}: {s}\n", .{ path, @errorName(e) });
         return @backingInt(Exit.config);
     };
@@ -238,7 +278,10 @@ fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log
         .sink_job_id = job.check_run_id,
     }, job, log);
     for (res.steps, job.steps, 1..) |r, st, n| {
-        try err.print("step {d} [{s}] {s}: {s} (exit {d})\n", .{ n, st.name, @tagName(st.action), @tagName(r.outcome), r.exit_code });
+        try err.print(
+            "step {d} [{s}] {s}: {s} (exit {d})\n",
+            .{ n, st.name, @tagName(st.action), @tagName(r.outcome), r.exit_code },
+        );
     }
     // The annotations too: they are what `::error`, `::warning` and the problem matchers produce,
     // they go to GitHub with completejob, and without them printed here there is no way to see from
@@ -258,13 +301,20 @@ fn execJobFile(init: std.process.Init, cfg: *const Config, path: []const u8, log
 
 /// `--db-check`: connect with the configured settings and report what is there. Prints no
 /// credentials and no host name (CI logs of public repositories are public).
-fn dbCheck(init: std.process.Init, pg_cfg: ?pg.Config, secrets: []const []const u8, out: *std.Io.Writer, err: *std.Io.Writer) !u8 {
+fn dbCheck(
+    init: std.process.Init,
+    pg_cfg: ?pg.Config,
+    secrets: []const []const u8,
+    out: *std.Io.Writer,
+    err: *std.Io.Writer,
+) !u8 {
     const arena = init.arena.allocator();
     const io = init.io;
     defer out.flush() catch {};
 
     const cfg = pg_cfg orelse {
-        try err.writeAll("no database configured: set DATABASE_URL or PGHOST/PGUSER/PGDATABASE (and PGPASSWORD, PGSSLMODE)\n");
+        try err.writeAll("no database configured: set DATABASE_URL or PGHOST/PGUSER/PGDATABASE " ++
+            "(and PGPASSWORD, PGSSLMODE)\n");
         return @backingInt(Exit.config);
     };
     const c = pg.Client.connect(init.gpa, io, cfg) catch |e| {
@@ -275,19 +325,45 @@ fn dbCheck(init: std.process.Init, pg_cfg: ?pg.Config, secrets: []const []const 
     };
     defer c.close();
 
-    try out.print("connected (TLS {s}, sslmode={s})\n", .{ if (c.tls != null) "on" else "off", @tagName(cfg.sslmode) });
+    try out.print(
+        "connected (TLS {s}, sslmode={s})\n",
+        .{ if (c.tls != null) "on" else "off", @tagName(cfg.sslmode) },
+    );
     const version = (try c.query(arena, "select version()"))[0][0] orelse "?";
-    try out.print("server: {s}\n", .{version[0 .. std.mem.indexOf(u8, version, " on ") orelse version.len]});
-    const ts = try c.query(arena, "select extversion from pg_extension where extname = 'timescaledb'");
+    const server = version[0 .. std.mem.indexOf(u8, version, " on ") orelse version.len];
+    try out.print("server: {s}\n", .{server});
+    const ts = try c.query(
+        arena,
+        "select extversion from pg_extension where extname = 'timescaledb'",
+    );
     try out.print("timescaledb: {s}\n", .{if (ts.len > 0) ts[0][0].? else "not installed"});
 
-    const tables = try c.query(arena, "select string_agg(tablename, ' ' order by tablename) from pg_tables where schemaname = current_schema() and tablename in ('runs','jobs','steps','job_logs')");
-    try out.print("tables in the default schema: {s}\n", .{if (tables.len > 0 and tables[0][0] != null) tables[0][0].? else "none (apply db/migrations/001_init.sql)"});
+    const tables = try c.query(
+        arena,
+        "select string_agg(tablename, ' ' order by tablename) from pg_tables " ++
+            "where schemaname = current_schema() and " ++
+            "tablename in ('runs','jobs','steps','job_logs')",
+    );
+    const listed: ?[]const u8 = if (tables.len > 0) tables[0][0] else null;
+    try out.print(
+        "tables in the default schema: {s}\n",
+        .{listed orelse "none (apply db/migrations/001_init.sql)"},
+    );
     if (ts.len > 0) {
-        const ht = try c.query(arena, "select count(*) from timescaledb_information.hypertables where hypertable_schema = current_schema() and hypertable_name = 'job_logs'");
-        try out.print("job_logs is a hypertable: {s}\n", .{if (std.mem.eql(u8, ht[0][0].?, "1")) "yes" else "no"});
+        const ht = try c.query(
+            arena,
+            "select count(*) from timescaledb_information.hypertables " ++
+                "where hypertable_schema = current_schema() and hypertable_name = 'job_logs'",
+        );
+        try out.print(
+            "job_logs is a hypertable: {s}\n",
+            .{if (std.mem.eql(u8, ht[0][0].?, "1")) "yes" else "no"},
+        );
     }
-    const leftovers = try c.query(arena, "select count(*) from information_schema.schemata where schema_name like 'zig\\_it\\_%'");
+    const leftovers = try c.query(
+        arena,
+        "select count(*) from information_schema.schemata where schema_name like 'zig\\_it\\_%'",
+    );
     try out.print("leftover test schemas (zig_it_*): {s}\n", .{leftovers[0][0].?});
     return @backingInt(Exit.done);
 }

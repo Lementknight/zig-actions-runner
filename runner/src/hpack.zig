@@ -1,5 +1,6 @@
-//! An HPACK decoder (RFC 7541), for the request headers of the gRPC calls the Dagger engine makes to
-//! its client (`engine.zig`). Only decoding: responses are encoded as literals, which needs no state.
+//! An HPACK decoder (RFC 7541), for the request headers of the gRPC calls the Dagger engine makes
+//! to its client (`engine.zig`). Only decoding: responses are encoded as literals, which needs no
+//! state.
 const std = @import("std");
 const tables = @import("hpack_tables.zig");
 const Allocator = std.mem.Allocator;
@@ -23,7 +24,12 @@ pub const Decoder = struct {
 
     /// Decodes one header block, calling `on(ctx, name, value)` for each field. Names and values
     /// are valid during the call only.
-    pub fn decode(d: *Decoder, block: []const u8, ctx: anytype, comptime on: fn (@TypeOf(ctx), []const u8, []const u8) void) Error!void {
+    pub fn decode(
+        d: *Decoder,
+        block: []const u8,
+        ctx: anytype,
+        comptime on: fn (@TypeOf(ctx), []const u8, []const u8) void,
+    ) Error!void {
         var arena_state: std.heap.ArenaAllocator = .init(d.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
@@ -51,7 +57,13 @@ pub const Decoder = struct {
         }
     }
 
-    fn literal(d: *Decoder, arena: Allocator, block: []const u8, i: *usize, comptime prefix: u3) Error![2][]const u8 {
+    fn literal(
+        d: *Decoder,
+        arena: Allocator,
+        block: []const u8,
+        i: *usize,
+        comptime prefix: u3,
+    ) Error![2][]const u8 {
         const idx = try int(block, i, prefix);
         const name = if (idx == 0) try string(arena, block, i) else (try d.field(idx))[0];
         return .{ name, try string(arena, block, i) };

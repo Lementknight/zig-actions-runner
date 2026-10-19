@@ -6,7 +6,8 @@
 //! general driver: no extended protocol, no prepared statements, no binary formats.
 //!
 //! Values are inserted with `quote()`d literals (standard_conforming_strings is on by default, so a
-//! backslash is an ordinary character and only `'` needs doubling) or sent through COPY's text format.
+//! backslash is an ordinary character and only `'` needs doubling) or sent through COPY's text
+//! format.
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -35,8 +36,8 @@ pub const Config = struct {
 
 pub const ParseError = error{ InvalidUrl, InvalidSslMode, OutOfMemory };
 
-/// `postgres://user:password@host:port/database?sslmode=require|disable|no-verify`. User and password
-/// may be percent-encoded. A missing sslmode means `require`.
+/// `postgres://user:password@host:port/database?sslmode=require|disable|no-verify`. User and
+/// password may be percent-encoded. A missing sslmode means `require`.
 pub fn parseUrl(arena: Allocator, url: []const u8) ParseError!Config {
     var rest = url;
     inline for (.{ "postgresql://", "postgres://" }) |scheme| {
@@ -77,7 +78,13 @@ pub fn parseUrl(arena: Allocator, url: []const u8) ParseError!Config {
     }
     if (host.len == 0) return error.InvalidUrl;
 
-    var cfg: Config = .{ .host = host, .port = port, .user = user, .password = password, .database = try percentDecode(arena, database) };
+    var cfg: Config = .{
+        .host = host,
+        .port = port,
+        .user = user,
+        .password = password,
+        .database = try percentDecode(arena, database),
+    };
     var params = std.mem.splitScalar(u8, query, '&');
     while (params.next()) |p| {
         const eq = std.mem.indexOfScalar(u8, p, '=') orelse continue;
@@ -88,7 +95,8 @@ pub fn parseUrl(arena: Allocator, url: []const u8) ParseError!Config {
 
 pub fn parseSslMode(s: []const u8) ParseError!SslMode {
     if (std.mem.eql(u8, s, "disable")) return .disable;
-    if (std.mem.eql(u8, s, "require") or std.mem.eql(u8, s, "verify-full") or std.mem.eql(u8, s, "verify-ca")) return .require;
+    if (std.mem.eql(u8, s, "require") or std.mem.eql(u8, s, "verify-full") or
+        std.mem.eql(u8, s, "verify-ca")) return .require;
     if (std.mem.eql(u8, s, "no-verify")) return .no_verify;
     return error.InvalidSslMode;
 }
@@ -101,7 +109,8 @@ pub fn fromEnv(env: *const std.process.Environ.Map) ParseError!?Config {
     const database = env.get("PGDATABASE") orelse return null;
     return .{
         .host = host,
-        .port = if (env.get("PGPORT")) |p| std.fmt.parseInt(u16, p, 10) catch return error.InvalidUrl else 5432,
+        .port = if (env.get("PGPORT")) |p| std.fmt.parseInt(u16, p, 10) catch
+            return error.InvalidUrl else 5432,
         .user = user,
         .password = env.get("PGPASSWORD") orelse "",
         .database = database,
@@ -124,8 +133,9 @@ fn percentDecode(arena: Allocator, s: []const u8) ParseError![]const u8 {
     return out.items;
 }
 
-/// A SQL string literal: single-quoted with `'` doubled. NUL bytes (which Postgres text cannot hold)
-/// and invalid UTF-8 are replaced with U+FFFD. Safe only with standard_conforming_strings = on.
+/// A SQL string literal: single-quoted with `'` doubled. NUL bytes (which Postgres text cannot
+/// hold) and invalid UTF-8 are replaced with U+FFFD. Safe only with standard_conforming_strings =
+/// on.
 pub fn quote(w: *Io.Writer, s: []const u8) Io.Writer.Error!void {
     try w.writeByte('\'');
     try writeSanitized(w, s, .quote);
@@ -134,7 +144,8 @@ pub fn quote(w: *Io.Writer, s: []const u8) Io.Writer.Error!void {
 
 const Escape = enum { quote, copy };
 
-/// Writes `s` as valid UTF-8 (bad bytes and NUL become U+FFFD) with the escapes of the given context.
+/// Writes `s` as valid UTF-8 (bad bytes and NUL become U+FFFD) with the escapes of the given
+/// context.
 fn writeSanitized(w: *Io.Writer, s: []const u8, mode: Escape) Io.Writer.Error!void {
     var i: usize = 0;
     while (i < s.len) {
@@ -142,7 +153,11 @@ fn writeSanitized(w: *Io.Writer, s: []const u8, mode: Escape) Io.Writer.Error!vo
         if (c < 0x80) {
             i += 1;
             switch (mode) {
-                .quote => if (c == '\'') try w.writeAll("''") else if (c == 0) try w.writeAll("\u{FFFD}") else try w.writeByte(c),
+                .quote => switch (c) {
+                    '\'' => try w.writeAll("''"),
+                    0 => try w.writeAll("\u{FFFD}"),
+                    else => try w.writeByte(c),
+                },
                 .copy => switch (c) {
                     0 => try w.writeAll("\u{FFFD}"),
                     '\\' => try w.writeAll("\\\\"),
@@ -202,7 +217,10 @@ pub fn parseErrorFields(body: []const u8) ServerError {
 }
 
 /// A DataRow body: int16 column count, then each column as int32 length (-1 = NULL) and bytes.
-pub fn parseDataRow(arena: Allocator, body: []const u8) (error{BadMessage} || Allocator.Error)![]const ?[]const u8 {
+pub fn parseDataRow(
+    arena: Allocator,
+    body: []const u8,
+) (error{BadMessage} || Allocator.Error)![]const ?[]const u8 {
     if (body.len < 2) return error.BadMessage;
     const n = std.mem.readInt(u16, body[0..2], .big);
     const cols = try arena.alloc(?[]const u8, n);
@@ -229,17 +247,26 @@ const Hmac = std.crypto.auth.hmac.sha2.HmacSha256;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
 pub const Scram = struct {
-    /// The SCRAM user name. PostgreSQL ignores it (it uses the startup user), so it is empty on the wire.
+    /// The SCRAM user name. PostgreSQL ignores it (it uses the startup user), so it is empty on the
+    /// wire.
     username: []const u8 = "",
     client_nonce: []const u8,
     /// `n=<user>,r=<nonce>`
     client_first_bare: []const u8,
 
-    pub fn init(arena: Allocator, username: []const u8, client_nonce: []const u8) Allocator.Error!Scram {
+    pub fn init(
+        arena: Allocator,
+        username: []const u8,
+        client_nonce: []const u8,
+    ) Allocator.Error!Scram {
         return .{
             .username = username,
             .client_nonce = client_nonce,
-            .client_first_bare = try std.fmt.allocPrint(arena, "n={s},r={s}", .{ username, client_nonce }),
+            .client_first_bare = try std.fmt.allocPrint(
+                arena,
+                "n={s},r={s}",
+                .{ username, client_nonce },
+            ),
         };
     }
 
@@ -254,9 +281,19 @@ pub const Scram = struct {
         expected_server_final: []const u8,
     };
 
-    pub const ScramError = error{ BadServerFirst, BadNonce, BadSalt, BadIterations } || Allocator.Error || error{ WeakParameters, OutputTooLong };
+    pub const ScramError = error{
+        BadServerFirst,
+        BadNonce,
+        BadSalt,
+        BadIterations,
+    } || Allocator.Error || error{ WeakParameters, OutputTooLong };
 
-    pub fn clientFinal(s: Scram, arena: Allocator, password: []const u8, server_first: []const u8) ScramError!Final {
+    pub fn clientFinal(
+        s: Scram,
+        arena: Allocator,
+        password: []const u8,
+        server_first: []const u8,
+    ) ScramError!Final {
         var nonce: ?[]const u8 = null;
         var salt_b64: ?[]const u8 = null;
         var iterations: ?u32 = null;
@@ -266,7 +303,8 @@ pub const Scram = struct {
             switch (p[0]) {
                 'r' => nonce = p[2..],
                 's' => salt_b64 = p[2..],
-                'i' => iterations = std.fmt.parseInt(u32, p[2..], 10) catch return error.BadIterations,
+                'i' => iterations = std.fmt.parseInt(u32, p[2..], 10) catch
+                    return error.BadIterations,
                 else => {},
             }
         }
@@ -276,7 +314,8 @@ pub const Scram = struct {
         const iters = iterations orelse return error.BadServerFirst;
 
         const dec = std.base64.standard.Decoder;
-        const salt = try arena.alloc(u8, dec.calcSizeForSlice(salt_text) catch return error.BadSalt);
+        const salt = try arena.alloc(u8, dec.calcSizeForSlice(salt_text) catch
+            return error.BadSalt);
         dec.decode(salt, salt_text) catch return error.BadSalt;
 
         var salted: [32]u8 = undefined;
@@ -288,7 +327,11 @@ pub const Scram = struct {
         Sha256.hash(&client_key, &stored_key, .{});
 
         const without_proof = try std.fmt.allocPrint(arena, "c=biws,r={s}", .{combined});
-        const auth_message = try std.fmt.allocPrint(arena, "{s},{s},{s}", .{ s.client_first_bare, server_first, without_proof });
+        const auth_message = try std.fmt.allocPrint(
+            arena,
+            "{s},{s},{s}",
+            .{ s.client_first_bare, server_first, without_proof },
+        );
 
         var client_sig: [32]u8 = undefined;
         Hmac.create(&client_sig, auth_message, &stored_key);
@@ -414,7 +457,12 @@ pub const Client = struct {
             c.ca_bundle.rescan(c.gpa, c.io, now) catch return error.TlsFailed;
             var lock: Io.RwLock = .init;
             opts.host = .{ .explicit = cfg.host };
-            opts.ca = .{ .bundle = .{ .gpa = c.gpa, .io = c.io, .lock = &lock, .bundle = &c.ca_bundle } };
+            opts.ca = .{ .bundle = .{
+                .gpa = c.gpa,
+                .io = c.io,
+                .lock = &lock,
+                .bundle = &c.ca_bundle,
+            } };
         }
         c.tls = TlsClient.init(c.r, c.w, opts) catch return error.TlsFailed;
         c.r = &c.tls.?.reader;
@@ -446,7 +494,11 @@ pub const Client = struct {
 
     fn remember(c: *Client, body: []const u8) void {
         const e = parseErrorFields(body);
-        c.last_error = std.fmt.bufPrint(&c.error_buf, "{s} {s}: {s}", .{ e.severity, e.code, e.message }) catch c.error_buf[0..0];
+        c.last_error = std.fmt.bufPrint(
+            &c.error_buf,
+            "{s} {s}: {s}",
+            .{ e.severity, e.code, e.message },
+        ) catch c.error_buf[0..0];
     }
 
     /// A readable form of the last server error ("ERROR 42P01: relation ... does not exist").
@@ -502,7 +554,13 @@ pub const Client = struct {
 
     /// One Authentication message, by kind: Ok, cleartext, MD5, or the three SASL steps of
     /// SCRAM-SHA-256. Anything else the server could ask for is unsupported.
-    fn authenticate(c: *Client, arena: std.mem.Allocator, cfg: Config, body: []const u8, auth: *AuthState) !void {
+    fn authenticate(
+        c: *Client,
+        arena: std.mem.Allocator,
+        cfg: Config,
+        body: []const u8,
+        auth: *AuthState,
+    ) !void {
         if (body.len < 4) return error.BadMessage;
         const kind = std.mem.readInt(u32, body[0..4], .big);
         switch (kind) {
@@ -517,12 +575,14 @@ pub const Client = struct {
                 try c.flush();
             },
             10 => { // SASL: pick SCRAM-SHA-256
-                if (std.mem.indexOf(u8, body[4..], "SCRAM-SHA-256") == null) return error.UnsupportedAuthentication;
+                if (std.mem.indexOf(u8, body[4..], "SCRAM-SHA-256") == null)
+                    return error.UnsupportedAuthentication;
                 auth.scram = try c.saslFirst(arena);
             },
             11 => { // SASLContinue: server-first-message
                 const s = auth.scram orelse return error.UnexpectedMessage;
-                const fin = s.clientFinal(arena, cfg.password, body[4..]) catch return error.AuthenticationFailed;
+                const fin = s.clientFinal(arena, cfg.password, body[4..]) catch
+                    return error.AuthenticationFailed;
                 try c.sendMessage('p', fin.message);
                 try c.flush();
                 auth.expected_final = fin.expected_server_final;
@@ -596,11 +656,15 @@ pub const Client = struct {
         while (true) {
             const m = try c.readMessage(arena);
             switch (m.tag) {
-                'D' => rows.append(arena, parseDataRow(arena, m.body) catch return error.BadMessage) catch return error.OutOfMemory,
+                'D' => rows.append(
+                    arena,
+                    parseDataRow(arena, m.body) catch return error.BadMessage,
+                ) catch return error.OutOfMemory,
                 'T' => rows.clearRetainingCapacity(), // a new result set starts
                 'E' => {
                     c.remember(m.body);
-                    failed = true; // keep reading until ReadyForQuery so the connection stays usable
+                    // Keep reading until ReadyForQuery, so the connection stays usable.
+                    failed = true;
                 },
                 'Z' => {
                     if (failed) return error.ServerError;
@@ -611,7 +675,8 @@ pub const Client = struct {
         }
     }
 
-    /// `sql` must be `COPY ... FROM STDIN` in text format. Returns the number of rows the server stored.
+    /// `sql` must be `COPY ... FROM STDIN` in text format. Returns the number of rows the server
+    /// stored.
     pub fn copyIn(c: *Client, sql: []const u8, data: []const u8) Error!u64 {
         var arena_state: std.heap.ArenaAllocator = .init(c.gpa);
         defer arena_state.deinit();
@@ -652,7 +717,8 @@ pub const Client = struct {
             switch (m.tag) {
                 'C' => { // CommandComplete: "COPY <n>"
                     const tag = std.mem.sliceTo(m.body, 0);
-                    if (std.mem.startsWith(u8, tag, "COPY ")) copied = std.fmt.parseInt(u64, tag[5..], 10) catch 0;
+                    if (std.mem.startsWith(u8, tag, "COPY "))
+                        copied = std.fmt.parseInt(u64, tag[5..], 10) catch 0;
                 },
                 'E' => {
                     c.remember(m.body);
@@ -784,8 +850,8 @@ test "SCRAM-SHA-256 matches the RFC 7677 test vector" {
     try std.testing.expectError(error.BadNonce, s.clientFinal(arena, "pencil", "r=someoneelse,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"));
 }
 
-/// Integration tests run only when PG* variables (or ZIG_TEST_PG_URL) point at a database; the local
-/// development container and the CI workflow set them. Otherwise they are skipped.
+/// Integration tests run only when PG* variables (or ZIG_TEST_PG_URL) point at a database; the
+/// local development container and the CI workflow set them. Otherwise they are skipped.
 fn testConfig(arena: Allocator) !Config {
     var env = try std.testing.environ.createMap(arena);
     if (env.get("ZIG_TEST_PG_URL")) |url| return parseUrl(arena, url);

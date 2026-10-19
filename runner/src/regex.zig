@@ -153,7 +153,11 @@ pub const Regex = struct {
         try c.compileAlts(alts);
         try c.emit(.{ .save = 1 });
         try c.emit(.match);
-        return .{ .prog = c.prog.items, .group_count = p.groups, .slot_count = c.loop_slot_base + c.loops };
+        return .{
+            .prog = c.prog.items,
+            .group_count = p.groups,
+            .slot_count = c.loop_slot_base + c.loops,
+        };
     }
 
     /// The leftmost match at or after `from`, as .NET's `Regex.Match` finds it: start offsets are
@@ -226,12 +230,17 @@ const Parser = struct {
                 p.i += 1;
             },
             '{' => {
-                const close = std.mem.indexOfScalarPos(u8, p.src, p.i, '}') orelse return atom; // a literal '{'
+                const close = std.mem.indexOfScalarPos(u8, p.src, p.i, '}') orelse
+                    return atom; // a literal '{'
                 const body = p.src[p.i + 1 .. close];
                 if (body.len == 0) return atom;
                 if (std.mem.indexOfScalar(u8, body, ',')) |cm| {
                     min = std.fmt.parseInt(u32, body[0..cm], 10) catch return atom;
-                    max = if (cm + 1 == body.len) std.math.maxInt(u32) else std.fmt.parseInt(u32, body[cm + 1 ..], 10) catch return atom;
+                    max = if (cm + 1 == body.len) std.math.maxInt(u32) else std.fmt.parseInt(
+                        u32,
+                        body[cm + 1 ..],
+                        10,
+                    ) catch return atom;
                 } else {
                     min = std.fmt.parseInt(u32, body, 10) catch return atom; // `{a}` is literal
                     max = min;
@@ -543,15 +552,27 @@ const Vm = struct {
             if (vm.steps > step_budget) return error.TooComplex;
             const advance: ?struct { pc: usize, pos: usize } = switch (vm.prog[pc]) {
                 .match => return true,
-                .char => |b| if (pos < vm.input.len and vm.input[pos] == b) .{ .pc = pc + 1, .pos = pos + 1 } else null,
-                .any => if (pos < vm.input.len and vm.input[pos] != '\n') .{ .pc = pc + 1, .pos = pos + 1 } else null,
-                .class => |cl| if (pos < vm.input.len and classMatches(cl, vm.input[pos])) .{ .pc = pc + 1, .pos = pos + 1 } else null,
+                .char => |b| if (pos < vm.input.len and vm.input[pos] == b) .{
+                    .pc = pc + 1,
+                    .pos = pos + 1,
+                } else null,
+                .any => if (pos < vm.input.len and vm.input[pos] != '\n') .{
+                    .pc = pc + 1,
+                    .pos = pos + 1,
+                } else null,
+                .class => |cl| if (pos < vm.input.len and classMatches(cl, vm.input[pos])) .{
+                    .pc = pc + 1,
+                    .pos = pos + 1,
+                } else null,
                 .bol => if (pos == 0) .{ .pc = pc + 1, .pos = pos } else null,
                 .eol => if (pos == vm.input.len) .{ .pc = pc + 1, .pos = pos } else null,
                 .jmp => |t| .{ .pc = t, .pos = pos },
                 .split => |s| blk: {
                     if (vm.stack.items.len >= max_backtrack) return error.TooComplex;
-                    try vm.stack.append(vm.arena, .{ .pc = s.b, .pos = pos, .trail = vm.trail.items.len });
+                    try vm.stack.append(
+                        vm.arena,
+                        .{ .pc = s.b, .pos = pos, .trail = vm.trail.items.len },
+                    );
                     break :blk .{ .pc = s.a, .pos = pos };
                 },
                 .mark => |slot| blk: {
@@ -612,7 +633,12 @@ fn caps(arena: Allocator, pattern: []const u8, input: []const u8) !?[]const ?[]c
     return out;
 }
 
-fn expectGroups(arena: Allocator, pattern: []const u8, input: []const u8, want: []const ?[]const u8) !void {
+fn expectGroups(
+    arena: Allocator,
+    pattern: []const u8,
+    input: []const u8,
+    want: []const ?[]const u8,
+) !void {
     const got = (try caps(arena, pattern, input)) orelse return error.NoMatch;
     try testing.expectEqual(want.len, got.len);
     for (want, got) |w, g| {

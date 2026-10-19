@@ -11,14 +11,24 @@ const timefmt = @import("timefmt.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub fn run(arena: Allocator, io: std.Io, cfg: *const Config, name: []const u8, out: *std.Io.Writer) !u8 {
+pub fn run(
+    arena: Allocator,
+    io: std.Io,
+    cfg: *const Config,
+    name: []const u8,
+    out: *std.Io.Writer,
+) !u8 {
     broker.trace = true;
     const jit = (try registerAndShow(arena, io, cfg, name, out)) orelse return 2;
     defer cleanup(arena, io, cfg, jit.runner_id, out);
     const token = (try exchangeToken(arena, io, jit, out)) orelse return 2;
 
     const settings = try broker.parseSettings(arena, jit.files);
-    const base = try std.fmt.allocPrint(arena, "{s}{s}", .{ settings.broker_url, if (std.mem.endsWith(u8, settings.broker_url, "/")) "" else "/" });
+    const base = try std.fmt.allocPrint(
+        arena,
+        "{s}{s}",
+        .{ settings.broker_url, if (std.mem.endsWith(u8, settings.broker_url, "/")) "" else "/" },
+    );
     const sid = (try openSession(arena, io, settings, base, token, out)) orelse return 0;
     try pollForMessage(arena, io, out, base, sid, token);
     const q = try std.fmt.allocPrint(arena, "{s}session?sessionId={s}", .{ base, sid });
@@ -39,10 +49,16 @@ fn registerAndShow(
     var status: std.http.Status = .ok;
     var message: []const u8 = "";
     const jit = jitconfig.generate(arena, io, cfg, name, &status, &message) catch |e| {
-        try out.print("generate-jitconfig failed: {s} (HTTP {d})\n", .{ @errorName(e), @backingInt(status) });
+        try out.print(
+            "generate-jitconfig failed: {s} (HTTP {d})\n",
+            .{ @errorName(e), @backingInt(status) },
+        );
         return null;
     };
-    try out.print("registered runner '{s}' id={d}, {d} files\n", .{ jit.runner_name, jit.runner_id, jit.files.len });
+    try out.print(
+        "registered runner '{s}' id={d}, {d} files\n",
+        .{ jit.runner_name, jit.runner_id, jit.files.len },
+    );
     for (jit.files) |f| {
         try out.print("\n== {s} ({d} bytes)\n", .{ f.name, f.content.len });
         const show_values = std.mem.eql(u8, f.name, ".runner");
@@ -74,10 +90,16 @@ fn exchangeToken(
     const jwt = try auth.buildJwt(arena, creds, now, jti_hex);
     var status: std.http.Status = .ok;
     const token = auth.fetchAccessToken(arena, io, creds, jwt, &status) catch |e| {
-        try out.print("\nOAuth token exchange failed: {s} (HTTP {d})\n", .{ @errorName(e), @backingInt(status) });
+        try out.print(
+            "\nOAuth token exchange failed: {s} (HTTP {d})\n",
+            .{ @errorName(e), @backingInt(status) },
+        );
         return null;
     };
-    try out.print("\nOAuth token exchange: HTTP {d}, access_token {d} chars\n", .{ @backingInt(status), token.len });
+    try out.print(
+        "\nOAuth token exchange: HTTP {d}, access_token {d} chars\n",
+        .{ @backingInt(status), token.len },
+    );
     return token;
 }
 
@@ -103,7 +125,12 @@ fn openSession(
         try out.print("  body: {s}\n", .{resp.body[0..@min(resp.body.len, 600)]});
         return null;
     }
-    if (parsed) |v| try shape(out, v, 1, false) else try out.print("  (non-JSON, {d} bytes)\n", .{resp.body.len});
+    if (parsed) |v| try shape(
+        out,
+        v,
+        1,
+        false,
+    ) else try out.print("  (non-JSON, {d} bytes)\n", .{resp.body.len});
     const v = parsed orelse return null;
     if (v != .object) return null;
     const sid = v.object.get("sessionId") orelse return null;
@@ -124,8 +151,18 @@ fn pollForMessage(
     while (polls < 6) : (polls += 1) {
         try out.print("GET message (poll {d}, long-poll ~50s) ...\n", .{polls + 1});
         try out.flush();
-        const m = try broker.call(arena, io, .GET, try broker.messageUrl(arena, base, sid, "Online"), token, null);
-        try out.print("GET message -> HTTP {d}, {d} body bytes\n", .{ @backingInt(m.status), m.body.len });
+        const m = try broker.call(
+            arena,
+            io,
+            .GET,
+            try broker.messageUrl(arena, base, sid, "Online"),
+            token,
+            null,
+        );
+        try out.print(
+            "GET message -> HTTP {d}, {d} body bytes\n",
+            .{ @backingInt(m.status), m.body.len },
+        );
         if (m.status.class() != .success) {
             try out.print("  error body: {s}\n", .{m.body[0..@min(m.body.len, 400)]});
             return;
@@ -151,7 +188,9 @@ fn showMessage(
 ) !void {
     try shape(out, mv, 1, false);
     if (mv == .object) if (mv.object.get("body")) |bv| if (bv == .string) {
-        if (std.json.parseFromSliceLeaky(std.json.Value, arena, bv.string, .{}) catch null) |inner| {
+        if (std.json.parseFromSliceLeaky(std.json.Value, arena, bv.string, .{}) catch
+            null) |inner|
+        {
             try out.writeAll("  body (parsed):\n");
             try shape(out, inner, 2, false);
             if (inner == .object) if (inner.object.get("run_service_url")) |u| if (u == .string)
@@ -159,13 +198,25 @@ fn showMessage(
             try probeRunService(arena, io, out, token, bv.string);
         } else try out.writeAll("  body is not JSON\n");
     };
-    if (mv == .object) for ([_][]const u8{ "messageType", "MessageType" }) |k| if (mv.object.get(k)) |t| if (t == .string)
+    if (mv == .object) for ([_][]const u8{
+        "messageType",
+        "MessageType",
+    }) |k| if (mv.object.get(k)) |t| if (t == .string)
         try out.print("  message type: {s}\n", .{t.string});
 }
 
-fn cleanup(arena: Allocator, io: std.Io, cfg: *const Config, runner_id: u64, out: *std.Io.Writer) void {
+fn cleanup(
+    arena: Allocator,
+    io: std.Io,
+    cfg: *const Config,
+    runner_id: u64,
+    out: *std.Io.Writer,
+) void {
     const st = jitconfig.deleteRunner(arena, io, cfg, runner_id) catch |e| {
-        out.print("!! cleanup failed: {s}; delete runner id {d} manually\n", .{ @errorName(e), runner_id }) catch {};
+        out.print(
+            "!! cleanup failed: {s}; delete runner id {d} manually\n",
+            .{ @errorName(e), runner_id },
+        ) catch {};
         return;
     };
     out.print("cleanup: DELETE runner {d} -> HTTP {d}\n", .{ runner_id, @backingInt(st) }) catch {};
@@ -190,7 +241,8 @@ fn shape(w: *std.Io.Writer, v: std.json.Value, depth: usize, show: bool) !void {
         .array => |a| {
             try w.splatByteAll(0x20, depth * 2);
             try w.print("[{d} items]\n", .{a.items.len});
-            if (a.items.len > 0 and (a.items[0] == .object or a.items[0] == .array)) try shape(w, a.items[0], depth + 1, show);
+            if (a.items.len > 0 and (a.items[0] == .object or a.items[0] == .array))
+                try shape(w, a.items[0], depth + 1, show);
         },
         else => {},
     }
@@ -198,7 +250,10 @@ fn shape(w: *std.Io.Writer, v: std.json.Value, depth: usize, show: bool) !void {
 
 fn scalar(w: *std.Io.Writer, v: std.json.Value, show: bool) !void {
     switch (v) {
-        .string => |s| if (show) try w.print("\"{s}\"\n", .{hostOnly(s)}) else try w.print("string({d})\n", .{s.len}),
+        .string => |s| if (show) try w.print(
+            "\"{s}\"\n",
+            .{hostOnly(s)},
+        ) else try w.print("string({d})\n", .{s.len}),
         .integer => |i| if (show) try w.print("{d}\n", .{i}) else try w.writeAll("integer\n"),
         .bool => |b| if (show) try w.print("{}\n", .{b}) else try w.writeAll("bool\n"),
         .null => try w.writeAll("null\n"),
@@ -215,7 +270,13 @@ fn hostOnly(s: []const u8) []const u8 {
 
 /// Acknowledge, acquire and complete the job, printing only statuses and the shape of the response.
 /// Completes as `succeeded` without running anything: only for throwaway probe jobs.
-fn probeRunService(arena: Allocator, io: std.Io, out: *std.Io.Writer, token: []const u8, body: []const u8) !void {
+fn probeRunService(
+    arena: Allocator,
+    io: std.Io,
+    out: *std.Io.Writer,
+    token: []const u8,
+    body: []const u8,
+) !void {
     const jr = runservice.parseJobRequest(arena, body) catch |e| {
         try out.print("  parseJobRequest failed: {s}\n", .{@errorName(e)});
         return;
@@ -223,7 +284,10 @@ fn probeRunService(arena: Allocator, io: std.Io, out: *std.Io.Writer, token: []c
     // `acknowledge` is skipped: it needs an HMAC and acquirejob works without it (SPEC §3).
     try out.flush();
     const r = try runservice.acquire(arena, io, jr, token);
-    try out.print("POST acquirejob -> HTTP {d}, {d} body bytes\n", .{ @backingInt(r.status), r.body.len });
+    try out.print(
+        "POST acquirejob -> HTTP {d}, {d} body bytes\n",
+        .{ @backingInt(r.status), r.body.len },
+    );
     if (r.status.class() != .success) {
         try out.print("  error body: {s}\n", .{r.body[0..@min(r.body.len, 600)]});
         return;
@@ -240,7 +304,8 @@ fn probeRunService(arena: Allocator, io: std.Io, out: *std.Io.Writer, token: []c
     const plan_id = nestedString(job, &.{ "plan", "planId" }) orelse "";
     const job_id = nestedString(job, &.{"jobId"}) orelse "";
     try out.print("  planId {d} chars, jobId {d} chars\n", .{ plan_id.len, job_id.len });
-    if (firstStepScript(job)) |sc| try out.print("  step[0] script: {s} = {s}\n", .{ sc.key, sc.value });
+    if (firstStepScript(job)) |sc|
+        try out.print("  step[0] script: {s} = {s}\n", .{ sc.key, sc.value });
     // The run service authorizes later calls with the job-scoped token from the job's endpoints.
     const job_token = jobToken(job) orelse {
         try out.writeAll("  no job token in resources.endpoints\n");
@@ -250,22 +315,63 @@ fn probeRunService(arena: Allocator, io: std.Io, out: *std.Io.Writer, token: []c
     // The shape of `stepResults` is not documented: try candidates on this one acquired job until
     // completejob accepts one (a rejected attempt leaves the job held, so we can keep trying).
     const step_id = firstStepId(job) orelse "00000000-0000-0000-0000-000000000000";
-    const t1 = try timefmt.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds() - 2000);
-    const t2 = try timefmt.isoTime(arena, std.Io.Clock.real.now(io).toMilliseconds());
+    const candidates = try stepResultCandidates(arena, io, step_id);
+    try tryStepResultShapes(arena, io, out, jr, job_token, plan_id, job_id, candidates);
+}
+
+/// The `stepResults` shapes to try, from the most to the least detailed.
+fn stepResultCandidates(arena: Allocator, io: std.Io, step_id: []const u8) ![]const []const u8 {
+    const now_ms = std.Io.Clock.real.now(io).toMilliseconds();
+    const t1 = try timefmt.isoTime(arena, now_ms - 2000);
+    const t2 = try timefmt.isoTime(arena, now_ms);
     const secs_only = try std.fmt.allocPrint(arena, "{s}Z", .{t1[0 .. t1.len - 5]});
     const secs_only2 = try std.fmt.allocPrint(arena, "{s}Z", .{t2[0 .. t2.len - 5]});
+    const head = "[{{\"external_id\":\"{s}\",\"number\":1,\"name\":\"probe\",";
+    const done = "\"status\":\"completed\",\"conclusion\":\"succeeded\",";
+    const times = "\"started_at\":\"{s}\",\"completed_at\":\"{s}\"}}]";
     const candidates = [_][]const u8{
-        try std.fmt.allocPrint(arena, "[{{\"external_id\":\"{s}\",\"number\":1,\"name\":\"probe\",\"status\":\"completed\",\"conclusion\":\"succeeded\",\"started_at\":\"{s}\",\"completed_at\":\"{s}\"}}]", .{ step_id, t1, t2 }),
-        try std.fmt.allocPrint(arena, "[{{\"external_id\":\"{s}\",\"number\":1,\"name\":\"probe\",\"status\":\"completed\",\"conclusion\":\"succeeded\"}}]", .{step_id}),
-        try std.fmt.allocPrint(arena, "[{{\"external_id\":\"{s}\",\"number\":1,\"name\":\"probe\",\"status\":\"completed\",\"conclusion\":\"succeeded\",\"started_at\":\"{s}\",\"completed_at\":\"{s}\"}}]", .{ step_id, secs_only, secs_only2 }),
-        try std.fmt.allocPrint(arena, "[{{\"external_id\":\"{s}\",\"number\":1,\"name\":\"probe\",\"status\":\"completed\",\"conclusion\":\"success\"}}]", .{step_id}),
-        try std.fmt.allocPrint(arena, "[{{\"external_id\":\"{s}\",\"number\":1,\"name\":\"probe\",\"status\":\"Completed\",\"conclusion\":\"Succeeded\"}}]", .{step_id}),
-        try std.fmt.allocPrint(arena, "[{{\"external_id\":\"{s}\",\"number\":1,\"name\":\"probe\",\"status\":2,\"conclusion\":2}}]", .{step_id}),
+        try std.fmt.allocPrint(arena, head ++ done ++ times, .{ step_id, t1, t2 }),
+        try std.fmt.allocPrint(arena, head ++ "\"status\":\"completed\"," ++
+            "\"conclusion\":\"succeeded\"}}]", .{step_id}),
+        try std.fmt.allocPrint(arena, head ++ done ++ times, .{ step_id, secs_only, secs_only2 }),
+        try std.fmt.allocPrint(arena, head ++ "\"status\":\"completed\"," ++
+            "\"conclusion\":\"success\"}}]", .{step_id}),
+        try std.fmt.allocPrint(arena, head ++ "\"status\":\"Completed\"," ++
+            "\"conclusion\":\"Succeeded\"}}]", .{step_id}),
+        try std.fmt.allocPrint(arena, head ++ "\"status\":2,\"conclusion\":2}}]", .{step_id}),
         "[]",
     };
+    return try arena.dupe([]const u8, &candidates);
+}
+
+/// Offers each shape to completejob until one is accepted (a rejected attempt leaves the job held).
+fn tryStepResultShapes(
+    arena: Allocator,
+    io: std.Io,
+    out: *std.Io.Writer,
+    jr: runservice.JobRequest,
+    job_token: []const u8,
+    plan_id: []const u8,
+    job_id: []const u8,
+    candidates: []const []const u8,
+) !void {
     for (candidates, 0..) |cand, i| {
-        const c = try runservice.complete(arena, io, jr, job_token, plan_id, job_id, .succeeded, cand, &.{}, "[]");
-        try out.print("POST completejob (stepResults variant {d}) -> HTTP {d}\n", .{ i, @backingInt(c.status) });
+        const c = try runservice.complete(
+            arena,
+            io,
+            jr,
+            job_token,
+            plan_id,
+            job_id,
+            .succeeded,
+            cand,
+            &.{},
+            "[]",
+        );
+        try out.print(
+            "POST completejob (stepResults variant {d}) -> HTTP {d}\n",
+            .{ i, @backingInt(c.status) },
+        );
         if (c.status.class() == .success) {
             try out.print("  accepted shape: {s}\n", .{cand});
             break;
@@ -291,7 +397,8 @@ fn nestedString(v: std.json.Value, path: []const []const u8) ?[]const u8 {
 }
 
 fn jobToken(job: std.json.Value) ?[]const u8 {
-    const eps = (job.object.get("resources") orelse return null).object.get("endpoints") orelse return null;
+    const eps = (job.object.get("resources") orelse return null).object.get("endpoints") orelse
+        return null;
     if (eps != .array) return null;
     for (eps.array.items) |ep| {
         if (ep != .object) continue;
@@ -304,16 +411,19 @@ fn jobToken(job: std.json.Value) ?[]const u8 {
 
 const Script = struct { key: []const u8, value: []const u8 };
 
-/// `run:` steps arrive as an action step with reference.type "script" and a template-token map input.
+/// `run:` steps arrive as an action step with reference.type "script" and a template-token map
+/// input.
 fn firstStepScript(job: std.json.Value) ?Script {
     const steps = job.object.get("steps") orelse return null;
     if (steps != .array or steps.array.items.len == 0) return null;
-    const map = (steps.array.items[0].object.get("inputs") orelse return null).object.get("map") orelse return null;
+    const inputs = steps.array.items[0].object.get("inputs") orelse return null;
+    const map = inputs.object.get("map") orelse return null;
     if (map != .array or map.array.items.len == 0) return null;
     const kv = map.array.items[0];
     return .{
         .key = nestedString(kv.object.get("Key") orelse return null, &.{"lit"}) orelse return null,
-        .value = nestedString(kv.object.get("Value") orelse return null, &.{"lit"}) orelse return null,
+        .value = nestedString(kv.object.get("Value") orelse return null, &.{"lit"}) orelse
+            return null,
     };
 }
 
@@ -339,7 +449,8 @@ fn dumpWorkflowFacts(out: *std.Io.Writer, job: std.json.Value) !void {
         var it = vars.object.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.* != .object) continue;
-            if (e.value_ptr.object.get("isSecret")) |sec| if (sec == .bool and sec.bool) try out.print(" {s}", .{e.key_ptr.*});
+            if (e.value_ptr.object.get("isSecret")) |sec|
+                if (sec == .bool and sec.bool) try out.print(" {s}", .{e.key_ptr.*});
         }
         try out.writeByte('\n');
     };
@@ -358,10 +469,44 @@ fn dumpWorkflowFacts(out: *std.Io.Writer, job: std.json.Value) !void {
             defer buf.deinit();
             try std.json.Stringify.value(e.value_ptr.*, .{}, &buf.writer);
             const t = buf.written();
-            try out.print("  contextData.{s}: {s}{s}\n", .{ e.key_ptr.*, t[0..@min(t.len, 400)], if (t.len > 400) "..." else "" });
+            try out.print(
+                "  contextData.{s}: {s}{s}\n",
+                .{ e.key_ptr.*, t[0..@min(t.len, 400)], if (t.len > 400) "..." else "" },
+            );
         }
     };
-    const allow = [_][]const u8{ "repository", "sha", "ref", "ref_name", "ref_type", "server_url", "event_name", "repository_owner", "base_ref", "head_ref", "workspace", "api_url", "actor", "run_id", "run_number", "run_attempt", "job", "workflow", "event", "triggering_actor", "head_ref", "retention_days", "repository_id", "graphql_url", "action_path" };
+    try dumpGithubContext(out, job);
+}
+
+/// The `github` context's plain facts, by an allow list: nothing in it that could be a credential.
+fn dumpGithubContext(out: *std.Io.Writer, job: std.json.Value) !void {
+    const allow = [_][]const u8{
+        "repository",
+        "sha",
+        "ref",
+        "ref_name",
+        "ref_type",
+        "server_url",
+        "event_name",
+        "repository_owner",
+        "base_ref",
+        "head_ref",
+        "workspace",
+        "api_url",
+        "actor",
+        "run_id",
+        "run_number",
+        "run_attempt",
+        "job",
+        "workflow",
+        "event",
+        "triggering_actor",
+        "head_ref",
+        "retention_days",
+        "repository_id",
+        "graphql_url",
+        "action_path",
+    };
     const cd = job.object.get("contextData") orelse return;
     if (cd != .object) return;
     const gh = cd.object.get("github") orelse return;
@@ -381,11 +526,16 @@ fn dumpWorkflowFacts(out: *std.Io.Writer, job: std.json.Value) !void {
     try out.flush();
 }
 
-/// Prints the key names of a context-data dictionary (`{t:2, d:[{k, v}]}`) or object, without values.
+/// Prints the key names of a context-data dictionary (`{t:2, d:[{k, v}]}`) or object, without
+/// values.
 fn printKeyNames(out: *std.Io.Writer, v: std.json.Value) !void {
     if (v != .object) return out.writeAll("(not a dictionary)\n");
     if (v.object.get("d")) |d| if (d == .array) {
-        for (d.array.items) |e| if (e == .object) if (e.object.get("k")) |k| if (k == .string) try out.print("{s} ", .{k.string});
+        for (d.array.items) |e| {
+            if (e != .object) continue;
+            const k = e.object.get("k") orelse continue;
+            if (k == .string) try out.print("{s} ", .{k.string});
+        }
         return out.writeByte('\n');
     };
     var it = v.object.iterator();

@@ -16,7 +16,13 @@ pub const StdoutSink = struct {
     mu: std.Io.Mutex = .init,
 
     /// Buffered; never blocks on anything but the underlying writer.
-    pub fn append(s: *StdoutSink, job_id: u64, step_number: u32, stream: Stream, line: []const u8) Error!void {
+    pub fn append(
+        s: *StdoutSink,
+        job_id: u64,
+        step_number: u32,
+        stream: Stream,
+        line: []const u8,
+    ) Error!void {
         if (s.io) |io| s.mu.lockUncancelable(io);
         defer if (s.io) |io| s.mu.unlock(io);
         try s.writer.print("[job {d} step {d} {s}] ", .{ job_id, step_number, @tagName(stream) });
@@ -38,9 +44,9 @@ pub const StdoutSink = struct {
 };
 
 /// `seq` is the line's place in its step's output, counted from 1 and assigned when the line is
-/// logged rather than when it is sent. Everything downstream — the live feed's `startLine`, a retry,
-/// an upload — can then say where a line belongs without counting arrivals, which is what let the
-/// feed's numbering and the uploaded log's drift apart when a line was dropped at the cap.
+/// logged rather than when it is sent. Everything downstream — the live feed's `startLine`, a
+/// retry, an upload — can then say where a line belongs without counting arrivals, which is what
+/// let the feed's numbering and the uploaded log's drift apart when a line was dropped at the cap.
 pub const CollectedLine = struct { step: u32, seq: u64, ts_ms: i64, text: []const u8 };
 
 /// A job's log on disk, written as it is logged, so that the copy the upload reads is not the only
@@ -67,7 +73,10 @@ pub const Spool = struct {
     fn write(sp: *Spool, line: CollectedLine) void {
         if (sp.w == null) sp.w = sp.file.writerStreaming(sp.io, &sp.buf);
         const w = &sp.w.?.interface;
-        w.print("{d} {d} {d} {d}\n{s}\n", .{ line.step, line.seq, line.ts_ms, line.text.len, line.text }) catch {
+        w.print(
+            "{d} {d} {d} {d}\n{s}\n",
+            .{ line.step, line.seq, line.ts_ms, line.text.len, line.text },
+        ) catch {
             sp.broken = true;
             return;
         };
@@ -86,7 +95,8 @@ pub const Spool = struct {
         // not disturb it.
         var buf: [64 * 1024]u8 = undefined;
         var r = sp.file.reader(sp.io, &buf);
-        const all = r.interface.allocRemaining(arena, .limited(CollectSink.max_bytes)) catch return out.items;
+        const all = r.interface.allocRemaining(arena, .limited(CollectSink.max_bytes)) catch
+            return out.items;
         var rest = all;
         while (rest.len > 0) {
             const nl = std.mem.indexOfScalar(u8, rest, '\n') orelse break;
@@ -105,11 +115,11 @@ pub const Spool = struct {
     }
 };
 
-/// Redacts every line with the job's secrets, forwards it to `inner`, and keeps a timestamped copy so
-/// the job's logs can be uploaded to GitHub once it finishes — on disk when a `spool` is set, in
-/// memory otherwise. Either way it is capped; lines past the cap are forwarded and counted, not kept.
-/// Redacting here, not in `inner`, keeps the job's secrets (which live as long as the job) out of the
-/// runner's shared sinks.
+/// Redacts every line with the job's secrets, forwards it to `inner`, and keeps a timestamped copy
+/// so the job's logs can be uploaded to GitHub once it finishes — on disk when a `spool` is set, in
+/// memory otherwise. Either way it is capped; lines past the cap are forwarded and counted, not
+/// kept. Redacting here, not in `inner`, keeps the job's secrets (which live as long as the job)
+/// out of the runner's shared sinks.
 pub const CollectSink = struct {
     arena: std.mem.Allocator,
     io: std.Io,
@@ -118,8 +128,8 @@ pub const CollectSink = struct {
     lines: std.ArrayList(CollectedLine) = .empty,
     /// Where the lines go instead of `lines`, when the runner could open one.
     spool: ?*Spool = null,
-    /// The last result of `collected`, so reading the spool twice at the end of a job reads the file
-    /// once. Cleared by `append`, so a line logged in between is never missed.
+    /// The last result of `collected`, so reading the spool twice at the end of a job reads the
+    /// file once. Cleared by `append`, so a line logged in between is never missed.
     cache: ?[]const CollectedLine = null,
     /// The next sequence number for each step, indexed by step number.
     seqs: std.ArrayList(u64) = .empty,
@@ -143,7 +153,13 @@ pub const CollectSink = struct {
         return s.seqs.items[step];
     }
 
-    pub fn append(s: *CollectSink, job_id: u64, step_number: u32, stream: Stream, line: []const u8) Error!void {
+    pub fn append(
+        s: *CollectSink,
+        job_id: u64,
+        step_number: u32,
+        stream: Stream,
+        line: []const u8,
+    ) Error!void {
         var aw: std.Io.Writer.Allocating = .init(s.arena);
         try redact.write(&aw.writer, line, s.secrets);
         const text = aw.written();
@@ -205,7 +221,14 @@ pub const LogSink = union(enum) {
 
     /// As `append`, with the line's number in its own step where the caller knows it. Only
     /// `CollectSink` does; everything else logs through `append`.
-    pub fn appendStep(s: *LogSink, job_id: u64, step_number: u32, step_seq: ?u64, stream: Stream, line: []const u8) Error!void {
+    pub fn appendStep(
+        s: *LogSink,
+        job_id: u64,
+        step_number: u32,
+        step_seq: ?u64,
+        stream: Stream,
+        line: []const u8,
+    ) Error!void {
         return switch (s.*) {
             .postgres => |*p| p.appendStep(job_id, step_number, step_seq, stream, line),
             // The console and the collector show a line the same way whatever its number is.
@@ -213,7 +236,13 @@ pub const LogSink = union(enum) {
         };
     }
 
-    pub fn append(s: *LogSink, job_id: u64, step_number: u32, stream: Stream, line: []const u8) Error!void {
+    pub fn append(
+        s: *LogSink,
+        job_id: u64,
+        step_number: u32,
+        stream: Stream,
+        line: []const u8,
+    ) Error!void {
         switch (s.*) {
             inline else => |*impl| try impl.append(job_id, step_number, stream, line),
         }

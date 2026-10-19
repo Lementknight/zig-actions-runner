@@ -35,7 +35,11 @@ pub fn parseKeyValues(arena: Allocator, text: []const u8) Allocator.Error!Parsed
             const name = line[0..heredoc.?];
             const delim = line[heredoc.? + 2 ..];
             if (name.len == 0 or delim.len == 0)
-                return .{ .invalid = try std.fmt.allocPrint(arena, "invalid format '{s}' on line {d}: expected name<<DELIMITER", .{ line, line_no }) };
+                return .{ .invalid = try std.fmt.allocPrint(
+                    arena,
+                    "invalid format '{s}' on line {d}: expected name<<DELIMITER",
+                    .{ line, line_no },
+                ) };
             var value: std.ArrayList(u8) = .empty;
             var closed = false;
             var first = true;
@@ -50,12 +54,24 @@ pub fn parseKeyValues(arena: Allocator, text: []const u8) Allocator.Error!Parsed
                 try value.appendSlice(arena, body);
                 first = false;
             }
-            if (!closed) return .{ .invalid = try std.fmt.allocPrint(arena, "matching delimiter '{s}' not found for '{s}'", .{ delim, name }) };
+            if (!closed) return .{ .invalid = try std.fmt.allocPrint(
+                arena,
+                "matching delimiter '{s}' not found for '{s}'",
+                .{ delim, name },
+            ) };
             try out.append(arena, .{ .name = name, .value = value.items });
             continue;
         }
-        const e = eq orelse return .{ .invalid = try std.fmt.allocPrint(arena, "invalid format '{s}' on line {d}: expected name=value", .{ line, line_no }) };
-        if (e == 0) return .{ .invalid = try std.fmt.allocPrint(arena, "invalid format '{s}' on line {d}: the name is empty", .{ line, line_no }) };
+        const e = eq orelse return .{ .invalid = try std.fmt.allocPrint(
+            arena,
+            "invalid format '{s}' on line {d}: expected name=value",
+            .{ line, line_no },
+        ) };
+        if (e == 0) return .{ .invalid = try std.fmt.allocPrint(
+            arena,
+            "invalid format '{s}' on line {d}: the name is empty",
+            .{ line, line_no },
+        ) };
         try out.append(arena, .{ .name = line[0..e], .value = line[e + 1 ..] });
     }
     return .{ .ok = out.items };
@@ -74,7 +90,8 @@ pub fn parsePaths(arena: Allocator, text: []const u8) Allocator.Error![]const []
 
 /// GitHub does not let a step redefine its own default variables or ones that inject code.
 pub fn isProtectedEnvName(name: []const u8) bool {
-    if (std.mem.startsWith(u8, name, "GITHUB_") or std.mem.startsWith(u8, name, "RUNNER_")) return true;
+    if (std.mem.startsWith(u8, name, "GITHUB_") or std.mem.startsWith(u8, name, "RUNNER_"))
+        return true;
     return std.mem.eql(u8, name, "NODE_OPTIONS") or std.mem.eql(u8, name, "CI");
 }
 
@@ -175,7 +192,11 @@ pub const Annotation = struct {
 /// Parses one line of a step's output. `stopped_token` is the token of an active `stop-commands`.
 /// Leading and trailing whitespace is ignored, as in GitHub's runner; command names are
 /// case-insensitive.
-pub fn parseWorkflow(arena: Allocator, line: []const u8, stopped_token: ?[]const u8) Allocator.Error!Workflow {
+pub fn parseWorkflow(
+    arena: Allocator,
+    line: []const u8,
+    stopped_token: ?[]const u8,
+) Allocator.Error!Workflow {
     const t = std.mem.trim(u8, line, " \t\r");
     if (!std.mem.startsWith(u8, t, "::")) return .none;
     const rest = t[2..];
@@ -232,8 +253,20 @@ fn property(arena: Allocator, props: []const u8, key: []const u8) Allocator.Erro
     var it = std.mem.splitScalar(u8, props, ',');
     while (it.next()) |p| {
         const eq = std.mem.indexOfScalar(u8, p, '=') orelse continue;
-        if (std.mem.eql(u8, std.mem.trim(u8, p[0..eq], " "), key)) return try unescape(arena, p[eq + 1 ..], true);
+        if (std.mem.eql(u8, std.mem.trim(u8, p[0..eq], " "), key))
+            return try unescape(arena, p[eq + 1 ..], true);
     }
+    return null;
+}
+
+/// The byte an escape `%<code>` stands for, or null when it is not one GitHub defines.
+fn unescapedByte(code: []const u8, is_property: bool) ?u8 {
+    const eql = std.ascii.eqlIgnoreCase;
+    if (eql(code, "25")) return '%';
+    if (eql(code, "0D")) return '\r';
+    if (eql(code, "0A")) return '\n';
+    if (is_property and eql(code, "3A")) return ':';
+    if (is_property and eql(code, "2C")) return ',';
     return null;
 }
 
@@ -245,7 +278,7 @@ fn unescape(arena: Allocator, s: []const u8, is_property: bool) Allocator.Error!
     while (i < s.len) {
         if (s[i] == '%' and i + 3 <= s.len) {
             const code = s[i + 1 .. i + 3];
-            const c: ?u8 = if (std.ascii.eqlIgnoreCase(code, "25")) '%' else if (std.ascii.eqlIgnoreCase(code, "0D")) '\r' else if (std.ascii.eqlIgnoreCase(code, "0A")) '\n' else if (is_property and std.ascii.eqlIgnoreCase(code, "3A")) ':' else if (is_property and std.ascii.eqlIgnoreCase(code, "2C")) ',' else null;
+            const c = unescapedByte(code, is_property);
             if (c) |ch| {
                 try out.append(arena, ch);
                 i += 3;
