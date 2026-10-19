@@ -28,7 +28,8 @@ pub const client_version = "v0.21.10";
 /// Where the engine's API is reached.
 pub const Endpoint = struct {
     /// The engine's own listener, `tcp://host:port` or `unix:///path`, reached directly. Empty: go
-    /// through the engine container (`buildctl dial-stdio`, one process in the engine per connection).
+    /// through the engine container (`buildctl dial-stdio`, one process in the engine per
+    /// connection).
     host: []const u8 = "",
     /// Docker API socket.
     docker_socket: []const u8 = default_docker_socket,
@@ -173,10 +174,17 @@ pub const Head = struct {
     chunked: bool = false,
 };
 
-fn writeRequest(w: *Io.Writer, method: []const u8, path: []const u8, headers: []const [2][]const u8, body: []const u8) !void {
+fn writeRequest(
+    w: *Io.Writer,
+    method: []const u8,
+    path: []const u8,
+    headers: []const [2][]const u8,
+    body: []const u8,
+) !void {
     try w.print("{s} {s} HTTP/1.1\r\nHost: dagger\r\n", .{ method, path });
     for (headers) |h| try w.print("{s}: {s}\r\n", .{ h[0], h[1] });
-    if (body.len > 0 or std.mem.eql(u8, method, "POST")) try w.print("Content-Length: {d}\r\n", .{body.len});
+    if (body.len > 0 or std.mem.eql(u8, method, "POST"))
+        try w.print("Content-Length: {d}\r\n", .{body.len});
     try w.writeAll("\r\n");
     try w.writeAll(body);
     try w.flush();
@@ -186,15 +194,18 @@ pub fn readHead(in: *In) !Head {
     const status_line = (try in.takeLine()) orelse return error.EndOfStream;
     var parts = std.mem.tokenizeScalar(u8, status_line, ' ');
     _ = parts.next() orelse return error.BadResponse;
-    const code = std.fmt.parseInt(u16, parts.next() orelse return error.BadResponse, 10) catch return error.BadResponse;
+    const code = std.fmt.parseInt(u16, parts.next() orelse return error.BadResponse, 10) catch
+        return error.BadResponse;
     var head: Head = .{ .status = code };
     while (try in.takeLine()) |line| {
         if (line.len == 0) return head;
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
         const name = std.mem.trim(u8, line[0..colon], " ");
         const value = std.mem.trim(u8, line[colon + 1 ..], " ");
-        if (std.ascii.eqlIgnoreCase(name, "content-length")) head.content_length = std.fmt.parseInt(usize, value, 10) catch return error.BadResponse;
-        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding") and std.ascii.eqlIgnoreCase(value, "chunked")) head.chunked = true;
+        if (std.ascii.eqlIgnoreCase(name, "content-length"))
+            head.content_length = std.fmt.parseInt(usize, value, 10) catch return error.BadResponse;
+        if (std.ascii.eqlIgnoreCase(name, "transfer-encoding") and
+            std.ascii.eqlIgnoreCase(value, "chunked")) head.chunked = true;
     }
     return error.EndOfStream;
 }
@@ -236,7 +247,11 @@ pub const Chunked = struct {
         }
         if (c.left == 0) {
             const size_line = (try c.in.takeLine()) orelse return error.EndOfStream;
-            const hex = std.mem.trim(u8, size_line[0 .. std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len], " ");
+            const hex = std.mem.trim(
+                u8,
+                size_line[0 .. std.mem.indexOfScalar(u8, size_line, ';') orelse size_line.len],
+                " ",
+            );
             c.left = std.fmt.parseInt(usize, hex, 16) catch return error.BadResponse;
             if (c.left == 0) {
                 // Trailers, then the empty line.
@@ -314,7 +329,13 @@ pub const h2 = struct {
         @memcpy(block[0..response_headers.len], &response_headers);
         const status = statusBlock(code, message);
         @memcpy(block[response_headers.len..][0..status.len], &status);
-        try frame(w, headers, end_headers | end_stream, stream, block[0 .. response_headers.len + status.len]);
+        try frame(
+            w,
+            headers,
+            end_headers | end_stream,
+            stream,
+            block[0 .. response_headers.len + status.len],
+        );
     }
 
     /// `grpc-status` and, when given, `grpc-message` (plain ASCII, at most 64 bytes), as literals
@@ -322,10 +343,16 @@ pub const h2 = struct {
     fn statusBlock(comptime code: u8, comptime message: []const u8) [statusLen(code, message)]u8 {
         const digits = std.fmt.comptimePrint("{d}", .{code});
         var out: [statusLen(code, message)]u8 = undefined;
-        const head = [_]u8{ 0x00, 11 } ++ "grpc-status".* ++ [_]u8{digits.len} ++ digits[0..digits.len].*;
+        const head = [_]u8{
+            0x00,
+            11,
+        } ++ "grpc-status".* ++ [_]u8{digits.len} ++ digits[0..digits.len].*;
         @memcpy(out[0..head.len], &head);
         if (message.len > 0) {
-            const tail = [_]u8{ 0x00, 12 } ++ "grpc-message".* ++ [_]u8{message.len} ++ message[0..message.len].*;
+            const tail = [_]u8{
+                0x00,
+                12,
+            } ++ "grpc-message".* ++ [_]u8{message.len} ++ message[0..message.len].*;
             @memcpy(out[head.len..], &tail);
         }
         return out;
@@ -434,17 +461,23 @@ pub const h2 = struct {
             return reply(w, stream, &.{ 0x08, 0x01 });
         }
         if (std.mem.eql(u8, req.path, credentials)) return reply(w, stream, &.{});
-        if (!std.mem.eql(u8, req.path, diff_copy)) return fail(w, stream, unimplemented, "not supported by zig-runner");
+        if (!std.mem.eql(u8, req.path, diff_copy))
+            return fail(w, stream, unimplemented, "not supported by zig-runner");
         var arena_state: std.heap.ArenaAllocator = .init(gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
-        const opts_json = base64Decode(arena, req.import_opts) catch return fail(w, stream, not_found, "no such path");
-        const opts = std.json.parseFromSliceLeaky(std.json.Value, arena, opts_json, .{}) catch return fail(w, stream, not_found, "no such path");
+        const opts_json = base64Decode(arena, req.import_opts) catch
+            return fail(w, stream, not_found, "no such path");
+        const opts = std.json.parseFromSliceLeaky(std.json.Value, arena, opts_json, .{}) catch
+            return fail(w, stream, not_found, "no such path");
         const abs_only = if (field(opts, "get_abs_path_only")) |v| v == .bool and v.bool else false;
         if (!abs_only) return fail(w, stream, not_found, "no such path");
         // fsutil types.Stat{path}: field 1, length-delimited.
         const rel = if (field(opts, "path")) |v| (if (v == .string) v.string else ".") else ".";
-        const abs = if (std.mem.startsWith(u8, rel, "/")) rel else try std.fs.path.resolvePosix(arena, &.{ host_root, rel });
+        const abs = if (std.mem.startsWith(u8, rel, "/")) rel else try std.fs.path.resolvePosix(
+            arena,
+            &.{ host_root, rel },
+        );
         if (abs.len > 400) return fail(w, stream, not_found, "no such path");
         var msg: [512]u8 = undefined;
         msg[0] = 0x0a;
@@ -487,7 +520,13 @@ pub const Sse = struct {
     data: std.ArrayList(u8) = .empty,
 
     /// Feeds body bytes; calls `onData` with each complete event's data.
-    pub fn feed(s: *Sse, gpa: Allocator, bytes: []const u8, ctx: anytype, comptime onData: fn (@TypeOf(ctx), []const u8) void) !void {
+    pub fn feed(
+        s: *Sse,
+        gpa: Allocator,
+        bytes: []const u8,
+        ctx: anytype,
+        comptime onData: fn (@TypeOf(ctx), []const u8) void,
+    ) !void {
         for (bytes) |b| {
             if (b != '\n') {
                 try s.line.append(gpa, b);
@@ -531,28 +570,35 @@ pub fn eachLogRecord(arena: Allocator, json: []const u8, h: LogHandler) void {
                     if (v == .string) text = base64Decode(arena, v.string) catch continue;
                 }
                 var rec: LogRecord = .{ .span = "", .stream = 0, .text = text };
-                if (field(r, "attributes")) |attrs| if (attrs == .array) for (attrs.array.items) |a| {
-                    const key = field(a, "key") orelse continue;
-                    const val = field(a, "value") orelse continue;
-                    if (key != .string) continue;
-                    if (std.mem.eql(u8, key.string, "stdio.stream")) {
-                        if (field(val, "intValue")) |iv| rec.stream = switch (iv) {
-                            .integer => |i| @intCast(@min(@max(i, 0), 2)),
-                            .string => |str| std.fmt.parseInt(u8, str, 10) catch 0,
-                            else => 0,
-                        };
-                    } else if (std.mem.eql(u8, key.string, "dagger.io/logs.verbose")) {
-                        rec.verbose = if (field(val, "boolValue")) |b| b == .bool and b.bool else false;
-                    } else if (std.mem.eql(u8, key.string, "stdio.eof")) {
-                        rec.eof = if (field(val, "boolValue")) |b| b == .bool and b.bool else false;
-                    }
-                };
+                if (field(r, "attributes")) |attrs|
+                    if (attrs == .array) for (attrs.array.items) |a| {
+                        const key = field(a, "key") orelse continue;
+                        const val = field(a, "value") orelse continue;
+                        if (key != .string) continue;
+                        if (std.mem.eql(u8, key.string, "stdio.stream")) {
+                            if (field(val, "intValue")) |iv| rec.stream = switch (iv) {
+                                .integer => |i| @intCast(@min(@max(i, 0), 2)),
+                                .string => |str| std.fmt.parseInt(u8, str, 10) catch 0,
+                                else => 0,
+                            };
+                        } else if (std.mem.eql(u8, key.string, "dagger.io/logs.verbose")) {
+                            rec.verbose = boolField(val, "boolValue");
+                        } else if (std.mem.eql(u8, key.string, "stdio.eof")) {
+                            rec.eof = boolField(val, "boolValue");
+                        }
+                    };
                 if (rec.text.len == 0 and !rec.eof) continue;
                 rec.span = if (field(r, "spanId")) |v| (if (v == .string) v.string else "") else "";
                 h.onRecord(h.ptr, rec);
             }
         }
     }
+}
+
+/// A boolean field, false when absent or not a boolean.
+fn boolField(val: std.json.Value, name: []const u8) bool {
+    const b = field(val, name) orelse return false;
+    return b == .bool and b.bool;
 }
 
 fn field(v: std.json.Value, name: []const u8) ?std.json.Value {
@@ -602,13 +648,16 @@ pub const Conn = struct {
 
     /// Connects to `host:port` (a name is resolved). The Conn must not move afterwards.
     fn initTcp(c: *Conn, io: Io, host_port: []const u8) !void {
-        const colon = std.mem.lastIndexOfScalar(u8, host_port, ':') orelse return error.InvalidEngineHost;
-        const port = std.fmt.parseInt(u16, host_port[colon + 1 ..], 10) catch return error.InvalidEngineHost;
+        const colon = std.mem.lastIndexOfScalar(u8, host_port, ':') orelse
+            return error.InvalidEngineHost;
+        const port = std.fmt.parseInt(u16, host_port[colon + 1 ..], 10) catch
+            return error.InvalidEngineHost;
         const host = std.mem.trim(u8, host_port[0..colon], "[]");
         const stream = if (Io.net.IpAddress.parse(host, port)) |addr|
             try addr.connect(io, .{ .mode = .stream })
         else |_|
-            try (Io.net.HostName.init(host) catch return error.InvalidEngineHost).connect(io, port, .{ .mode = .stream });
+            try (Io.net.HostName.init(host) catch
+                return error.InvalidEngineHost).connect(io, port, .{ .mode = .stream });
         c.initStream(io, stream);
     }
 
@@ -633,9 +682,9 @@ pub const Conn = struct {
     }
 };
 
-/// A new connection to the engine's API: its own listener when `ep.host` names one, else
-/// `buildctl dial-stdio` in the engine container, through the Docker API (create an exec, then start
-/// it with the connection upgraded to a raw stream).
+/// A new connection to the engine's API: its own listener when `ep.host` names one, else `buildctl
+/// dial-stdio` in the engine container, through the Docker API (create an exec, then start it with
+/// the connection upgraded to a raw stream).
 pub fn dial(gpa: Allocator, io: Io, ep: Endpoint) !*Conn {
     if (ep.host.len > 0) {
         const c = try gpa.create(Conn);
@@ -656,14 +705,22 @@ pub fn dial(gpa: Allocator, io: Io, ep: Endpoint) !*Conn {
         defer gpa.destroy(c);
         try c.initUnix(io, ep.docker_socket);
         defer c.close();
-        const body = "{\"AttachStdin\":true,\"AttachStdout\":true,\"AttachStderr\":true,\"Cmd\":[\"buildctl\",\"dial-stdio\"]}";
-        try writeRequest(c.writer(), "POST", try std.fmt.allocPrint(arena, "/containers/{s}/exec", .{ep.container}), &.{.{ "Content-Type", "application/json" }}, body);
+        const body = "{\"AttachStdin\":true,\"AttachStdout\":true,\"AttachStderr\":true," ++
+            "\"Cmd\":[\"buildctl\",\"dial-stdio\"]}";
+        try writeRequest(
+            c.writer(),
+            "POST",
+            try std.fmt.allocPrint(arena, "/containers/{s}/exec", .{ep.container}),
+            &.{.{ "Content-Type", "application/json" }},
+            body,
+        );
         const head = try readHead(&c.in);
         const resp = try readBody(arena, &c.in, head);
         if (head.status == 404) return error.EngineContainerNotFound;
         if (head.status == 409) return error.EngineContainerNotRunning;
         if (head.status != 201) return error.DockerExecFailed;
-        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, resp, .{}) catch return error.DockerExecFailed;
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, resp, .{}) catch
+            return error.DockerExecFailed;
         const id = field(parsed, "Id") orelse return error.DockerExecFailed;
         if (id != .string) return error.DockerExecFailed;
         break :blk try arena.dupe(u8, id.string);
@@ -673,7 +730,11 @@ pub fn dial(gpa: Allocator, io: Io, ep: Endpoint) !*Conn {
     errdefer gpa.destroy(c);
     try c.initUnix(io, ep.docker_socket);
     errdefer c.close();
-    try writeRequest(c.writer(), "POST", try std.fmt.allocPrint(arena, "/exec/{s}/start", .{exec_id}), &.{
+    try writeRequest(c.writer(), "POST", try std.fmt.allocPrint(
+        arena,
+        "/exec/{s}/start",
+        .{exec_id},
+    ), &.{
         .{ "Content-Type", "application/json" },
         .{ "Connection", "Upgrade" },
         .{ "Upgrade", "tcp" },
@@ -700,7 +761,13 @@ pub fn startContainer(gpa: Allocator, io: Io, ep: Endpoint) !void {
     defer gpa.destroy(c);
     try c.initUnix(io, ep.docker_socket);
     defer c.close();
-    try writeRequest(c.writer(), "POST", try std.fmt.allocPrint(arena, "/containers/{s}/start", .{ep.container}), &.{}, "");
+    try writeRequest(
+        c.writer(),
+        "POST",
+        try std.fmt.allocPrint(arena, "/containers/{s}/start", .{ep.container}),
+        &.{},
+        "",
+    );
     const head = try readHead(&c.in);
     _ = try readBody(arena, &c.in, head);
     // 304: already running.
@@ -710,6 +777,33 @@ pub fn startContainer(gpa: Allocator, io: Io, ep: Endpoint) !void {
 // --- sessions ---
 
 /// One Dagger session (a client of the engine), as `dagger run` would hold for a job.
+/// The session's client metadata, as the Dagger CLI sends it (`client_stable_id` is the client id).
+fn metadataJson(
+    gpa: std.mem.Allocator,
+    client_id: []const u8,
+    session_id: []const u8,
+    secret: []const u8,
+) ![]const u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "{{\"client_id\":\"{s}\",\"client_version\":\"{s}\",\"session_id\":\"{s}\"," ++
+            "\"client_secret_token\":\"{s}\",\"client_hostname\":\"zig-runner\"," ++
+            "\"client_stable_id\":\"{s}\",\"do_not_track\":true}}",
+        .{ client_id, client_version, session_id, secret, client_id },
+    );
+}
+
+/// `Basic <base64(token:)>`: the session token as HTTP basic auth, with no password.
+fn basicAuth(gpa: std.mem.Allocator, token: []const u8) ![]const u8 {
+    const enc = std.base64.standard.Encoder;
+    const token_colon = try std.fmt.allocPrint(gpa, "{s}:", .{token});
+    defer gpa.free(token_colon);
+    const b64 = try gpa.alloc(u8, enc.calcSize(token_colon.len));
+    defer gpa.free(b64);
+    _ = enc.encode(b64, token_colon);
+    return std.fmt.allocPrint(gpa, "Basic {s}", .{b64});
+}
+
 pub const Session = struct {
     gpa: Allocator,
     io: Io,
@@ -739,18 +833,13 @@ pub const Session = struct {
     pub fn open(s: *Session, gpa: Allocator, io: Io, ep: Endpoint, log_handler: ?LogHandler) !void {
         var ids: [3][36]u8 = undefined;
         for (&ids) |*id| uuid(io, id);
-        const md_json = try std.fmt.allocPrint(gpa, "{{\"client_id\":\"{s}\",\"client_version\":\"{s}\",\"session_id\":\"{s}\",\"client_secret_token\":\"{s}\",\"client_hostname\":\"zig-runner\",\"client_stable_id\":\"{s}\",\"do_not_track\":true}}", .{ &ids[0], client_version, &ids[1], &ids[2], &ids[0] });
+        const md_json = try metadataJson(gpa, &ids[0], &ids[1], &ids[2]);
         defer gpa.free(md_json);
         const enc = std.base64.standard.Encoder;
         const md = try gpa.alloc(u8, enc.calcSize(md_json.len));
         errdefer gpa.free(md);
         _ = enc.encode(md, md_json);
-        const token_colon = try std.fmt.allocPrint(gpa, "{s}:", .{&ids[2]});
-        defer gpa.free(token_colon);
-        const auth_b64 = try gpa.alloc(u8, enc.calcSize(token_colon.len));
-        defer gpa.free(auth_b64);
-        _ = enc.encode(auth_b64, token_colon);
-        const auth = try std.fmt.allocPrint(gpa, "Basic {s}", .{auth_b64});
+        const auth = try basicAuth(gpa, &ids[2]);
         errdefer gpa.free(auth);
 
         var trace: [16]u8 = undefined;
@@ -770,11 +859,23 @@ pub const Session = struct {
             .{ "traceparent", &traceparent },
         }, "");
         const head = try readHead(&attach.in);
-        if (head.status != 101) return if (attach.in.lastStderr().len > 0) error.EngineUnreachable else error.SessionRefused;
+        const engine_spoke = attach.in.lastStderr().len > 0;
+        if (head.status != 101) {
+            return if (engine_spoke) error.EngineUnreachable else error.SessionRefused;
+        }
         try attach.writer().writeAll(&.{0});
         try attach.writer().flush();
 
-        s.* = .{ .gpa = gpa, .io = io, .ep = ep, .metadata = md, .auth = auth, .traceparent = traceparent, .attach = attach, .log_handler = log_handler };
+        s.* = .{
+            .gpa = gpa,
+            .io = io,
+            .ep = ep,
+            .metadata = md,
+            .auth = auth,
+            .traceparent = traceparent,
+            .attach = attach,
+            .log_handler = log_handler,
+        };
         s.health = try io.concurrent(serveHealth, .{s});
         errdefer s.close();
 
@@ -832,7 +933,13 @@ pub const Session = struct {
 
     /// One request on the session's query connection (opened on first use, kept alive).
     /// `error.QueryAborted` when `abort` ended it.
-    pub fn request(s: *Session, arena: Allocator, method: []const u8, path: []const u8, body: []const u8) !Response {
+    pub fn request(
+        s: *Session,
+        arena: Allocator,
+        method: []const u8,
+        path: []const u8,
+        body: []const u8,
+    ) !Response {
         var attempt: u8 = 0;
         while (true) : (attempt += 1) {
             if (s.query_conn == null) s.query_conn = try dial(s.gpa, s.io, s.ep);
@@ -864,7 +971,8 @@ pub const Session = struct {
                 s.gpa.destroy(c);
                 if (aborted) return error.QueryAborted;
                 // A connection the engine closed between requests: dial again, once.
-                if (attempt == 0 and (e == error.EndOfStream or e == error.BrokenPipe or e == error.ConnectionResetByPeer)) continue;
+                if (attempt == 0 and (e == error.EndOfStream or e == error.BrokenPipe or
+                    e == error.ConnectionResetByPeer)) continue;
                 return e;
             };
         }
@@ -903,9 +1011,12 @@ pub const Session = struct {
         defer arena_state.deinit();
         _ = s.request(arena_state.allocator(), "POST", "/shutdown", "") catch {};
         if (s.logs_task) |*t| {
-            // The engine ends the stream once the session is gone; don't wait forever if it doesn't.
+            // The engine ends the stream once the session is gone; don't wait forever if it
+            // doesn't.
             var waited: u32 = 0;
-            while (waited < 50 and !s.logs_ended.load(.acquire)) : (waited += 1) s.io.sleep(.fromMilliseconds(100), .awake) catch {};
+            while (waited < 50 and !s.logs_ended.load(.acquire)) : (waited += 1) {
+                s.io.sleep(.fromMilliseconds(100), .awake) catch {};
+            }
             s.logs_conn.?.shutdown();
             t.await(s.io);
             s.logs_conn.?.close();
@@ -930,7 +1041,11 @@ pub fn uuid(io: Io, out: *[36]u8) void {
     b[6] = (b[6] & 0x0f) | 0x40;
     b[8] = (b[8] & 0x3f) | 0x80;
     const hex = std.fmt.bytesToHex(b, .lower);
-    _ = std.fmt.bufPrint(out, "{s}-{s}-{s}-{s}-{s}", .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] }) catch unreachable;
+    _ = std.fmt.bufPrint(
+        out,
+        "{s}-{s}-{s}-{s}-{s}",
+        .{ hex[0..8], hex[8..12], hex[12..16], hex[16..20], hex[20..32] },
+    ) catch unreachable;
 }
 
 // --- tests ---

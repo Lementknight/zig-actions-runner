@@ -32,7 +32,11 @@ pub const Error = error{ ParseError, EvalError, Unsupported, OutOfMemory };
 /// Computes `hashFiles(patterns)` where the job's files are (the caller supplies it).
 pub const HashFiles = struct {
     ptr: *anyopaque,
-    hashFn: *const fn (ptr: *anyopaque, arena: Allocator, patterns: []const []const u8) Allocator.Error!Result,
+    hashFn: *const fn (
+        ptr: *anyopaque,
+        arena: Allocator,
+        patterns: []const []const u8,
+    ) Allocator.Error!Result,
 
     /// The hex hash ("" when no file matched), or why it could not be computed.
     pub const Result = union(enum) { ok: []const u8, failed: []const u8 };
@@ -45,8 +49,8 @@ pub const Scope = struct {
     /// True once a step failed without continue-on-error (drives `success()` / `failure()`).
     job_failed: bool = false,
     cancelled: bool = false,
-    /// Contexts that exist in GitHub but that this runner cannot provide yet (for example `secrets`).
-    /// Referencing one is an error instead of silently evaluating to an empty value.
+    /// Contexts that exist in GitHub but that this runner cannot provide yet (for example
+    /// `secrets`). Referencing one is an error instead of silently evaluating to an empty value.
     unsupported_contexts: []const []const u8 = &.{},
     /// Receives a human-readable reason when an error is returned. Optional.
     diag: ?*[]const u8 = null,
@@ -84,6 +88,14 @@ const Tok = union(enum) {
     eof,
 };
 
+/// A character of a decimal number literal at `i`: digits, the point, an exponent, and the sign
+/// right after an exponent.
+fn isNumberChar(src: []const u8, i: usize) bool {
+    const c = src[i];
+    if (std.ascii.isDigit(c) or c == '.' or c == 'e' or c == 'E') return true;
+    return (c == '+' or c == '-') and (src[i - 1] == 'e' or src[i - 1] == 'E');
+}
+
 const Lexer = struct {
     src: []const u8,
     i: usize = 0,
@@ -91,7 +103,11 @@ const Lexer = struct {
     diag: ?*[]const u8,
 
     fn bad(l: *Lexer, comptime fmt: []const u8, args: anytype) Error {
-        if (l.diag) |d| d.* = std.fmt.allocPrint(l.arena, fmt ++ " (in expression: {s})", args ++ .{l.src}) catch "invalid expression";
+        if (l.diag) |d| d.* = std.fmt.allocPrint(
+            l.arena,
+            fmt ++ " (in expression: {s})",
+            args ++ .{l.src},
+        ) catch "invalid expression";
         return error.ParseError;
     }
 
@@ -120,10 +136,12 @@ const Lexer = struct {
             '\'' => return l.string(),
             else => {},
         }
-        if (std.ascii.isDigit(c) or (c == '-' and !prev_is_value and l.i + 1 < l.src.len and std.ascii.isDigit(l.src[l.i + 1]))) return l.number();
+        if (std.ascii.isDigit(c) or (c == '-' and !prev_is_value and l.i + 1 < l.src.len and
+            std.ascii.isDigit(l.src[l.i + 1]))) return l.number();
         if (std.ascii.isAlphabetic(c) or c == '_') {
             const start = l.i;
-            while (l.i < l.src.len and (std.ascii.isAlphanumeric(l.src[l.i]) or l.src[l.i] == '_' or l.src[l.i] == '-')) l.i += 1;
+            while (l.i < l.src.len and (std.ascii.isAlphanumeric(l.src[l.i]) or l.src[l.i] == '_' or
+                l.src[l.i] == '-')) l.i += 1;
             return .{ .ident = l.src[start..l.i] };
         }
         return l.bad("unexpected character '{c}'", .{c});
@@ -157,18 +175,20 @@ const Lexer = struct {
     fn number(l: *Lexer) Error!Tok {
         const start = l.i;
         if (l.src[l.i] == '-') l.i += 1;
-        if (l.i + 1 < l.src.len and l.src[l.i] == '0' and (l.src[l.i + 1] == 'x' or l.src[l.i + 1] == 'X')) {
+        if (l.i + 1 < l.src.len and l.src[l.i] == '0' and
+            (l.src[l.i + 1] == 'x' or l.src[l.i + 1] == 'X'))
+        {
             l.i += 2;
             while (l.i < l.src.len and std.ascii.isHex(l.src[l.i])) l.i += 1;
         } else {
-            while (l.i < l.src.len and (std.ascii.isDigit(l.src[l.i]) or l.src[l.i] == '.' or l.src[l.i] == 'e' or l.src[l.i] == 'E' or
-                ((l.src[l.i] == '+' or l.src[l.i] == '-') and (l.src[l.i - 1] == 'e' or l.src[l.i - 1] == 'E')))) l.i += 1;
+            while (l.i < l.src.len and isNumberChar(l.src, l.i)) l.i += 1;
         }
         const text = l.src[start..l.i];
         const neg = text[0] == '-';
         const body = if (neg) text[1..] else text;
         const v: f64 = if (body.len > 2 and (body[1] == 'x' or body[1] == 'X'))
-            @floatFromInt(std.fmt.parseInt(i64, body[2..], 16) catch return l.bad("invalid number '{s}'", .{text}))
+            @floatFromInt(std.fmt.parseInt(i64, body[2..], 16) catch
+                return l.bad("invalid number '{s}'", .{text}))
         else
             std.fmt.parseFloat(f64, body) catch return l.bad("invalid number '{s}'", .{text});
         return .{ .number = if (neg) -v else v };
@@ -216,7 +236,8 @@ const Parser = struct {
     }
 
     fn expectEnd(p: *Parser) Error!void {
-        if (p.cur != .eof) return p.lex.bad("unexpected token after the end of the expression", .{});
+        if (p.cur != .eof)
+            return p.lex.bad("unexpected token after the end of the expression", .{});
     }
 
     fn parseOr(p: *Parser) Error!*Node {
@@ -332,15 +353,20 @@ const Parser = struct {
                             break;
                         }
                     }
-                    if (p.cur != .rparen) return p.lex.bad("expected ')' after the arguments of {s}()", .{name});
+                    if (p.cur != .rparen)
+                        return p.lex.bad("expected ')' after the arguments of {s}()", .{name});
                     try p.advance();
                     return p.node(.{ .call = .{ .name = name, .args = args.items } });
                 }
-                if (std.ascii.eqlIgnoreCase(name, "true")) return p.node(.{ .literal = .{ .boolean = true } });
-                if (std.ascii.eqlIgnoreCase(name, "false")) return p.node(.{ .literal = .{ .boolean = false } });
+                if (std.ascii.eqlIgnoreCase(name, "true"))
+                    return p.node(.{ .literal = .{ .boolean = true } });
+                if (std.ascii.eqlIgnoreCase(name, "false"))
+                    return p.node(.{ .literal = .{ .boolean = false } });
                 if (std.ascii.eqlIgnoreCase(name, "null")) return p.node(.{ .literal = .null });
-                if (std.ascii.eqlIgnoreCase(name, "nan")) return p.node(.{ .literal = .{ .number = std.math.nan(f64) } });
-                if (std.ascii.eqlIgnoreCase(name, "infinity")) return p.node(.{ .literal = .{ .number = std.math.inf(f64) } });
+                if (std.ascii.eqlIgnoreCase(name, "nan"))
+                    return p.node(.{ .literal = .{ .number = std.math.nan(f64) } });
+                if (std.ascii.eqlIgnoreCase(name, "infinity"))
+                    return p.node(.{ .literal = .{ .number = std.math.inf(f64) } });
                 return p.node(.{ .ident = name });
             },
             else => return p.lex.bad("unexpected token", .{}),
@@ -376,7 +402,8 @@ pub fn toNumber(v: Value) f64 {
             const t = std.mem.trim(u8, s, " \t\r\n");
             if (t.len == 0) break :blk 0;
             if (t.len > 2 and t[0] == '0' and (t[1] == 'x' or t[1] == 'X'))
-                break :blk @floatFromInt(std.fmt.parseInt(i64, t[2..], 16) catch break :blk std.math.nan(f64));
+                break :blk @floatFromInt(std.fmt.parseInt(i64, t[2..], 16) catch
+                    break :blk std.math.nan(f64));
             break :blk std.fmt.parseFloat(f64, t) catch std.math.nan(f64);
         },
         .array, .object => std.math.nan(f64),
@@ -397,7 +424,8 @@ pub fn toStr(arena: Allocator, v: Value) Allocator.Error![]const u8 {
 fn numberToString(arena: Allocator, n: f64) Allocator.Error![]const u8 {
     if (std.math.isNan(n)) return "NaN";
     if (std.math.isInf(n)) return if (n > 0) "Infinity" else "-Infinity";
-    if (@floor(n) == n and @abs(n) < 1e15) return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
+    if (@floor(n) == n and @abs(n) < 1e15)
+        return std.fmt.allocPrint(arena, "{d}", .{@as(i64, @intFromFloat(n))});
     return std.fmt.allocPrint(arena, "{d}", .{n});
 }
 
@@ -496,7 +524,11 @@ fn eval(arena: Allocator, n: *const Node, scope: Scope) Error!Value {
         .literal => |v| return v,
         .ident => |name| {
             for (scope.unsupported_contexts) |u| if (std.ascii.eqlIgnoreCase(u, name)) {
-                if (scope.diag) |d| d.* = std.fmt.allocPrint(arena, "the '{s}' context is not supported yet", .{name}) catch "unsupported context";
+                if (scope.diag) |d| d.* = std.fmt.allocPrint(
+                    arena,
+                    "the '{s}' context is not supported yet",
+                    .{name},
+                ) catch "unsupported context";
                 return error.Unsupported;
             };
             return lookupEntry(scope.contexts, name) orelse .null;
@@ -553,7 +585,10 @@ fn callFunction(arena: Allocator, name: []const u8, arg_nodes: []*Node, scope: S
         if (args.len != 2) return scope.fail("{s}() takes 2 arguments", .{name}, arena);
         const s = try toStr(arena, args[0]);
         const t = try toStr(arena, args[1]);
-        return .{ .boolean = if (eql(name, "startsWith")) std.ascii.startsWithIgnoreCase(s, t) else std.ascii.endsWithIgnoreCase(s, t) };
+        return .{ .boolean = if (eql(name, "startsWith")) std.ascii.startsWithIgnoreCase(
+            s,
+            t,
+        ) else std.ascii.endsWithIgnoreCase(s, t) };
     }
     if (eql(name, "format")) {
         if (args.len < 1) return scope.fail("format() needs a format string", .{}, arena);
@@ -582,7 +617,11 @@ fn callHashFiles(arena: Allocator, args: []const Value, scope: Scope) Error!Valu
     const hf = scope.hash_files.?;
     return switch (try hf.hashFn(hf.ptr, arena, patterns)) {
         .ok => |hex| .{ .string = hex },
-        .failed => |why| scope.fail("hashFiles({s}) failed: {s}", .{ try std.mem.join(arena, ", ", patterns), why }, arena),
+        .failed => |why| scope.fail(
+            "hashFiles({s}) failed: {s}",
+            .{ try std.mem.join(arena, ", ", patterns), why },
+            arena,
+        ),
     };
 }
 
@@ -602,7 +641,8 @@ fn callContains(arena: Allocator, args: []const Value, scope: Scope) Error!Value
 }
 
 fn callJoin(arena: Allocator, args: []const Value, scope: Scope) Error!Value {
-    if (args.len < 1 or args.len > 2) return scope.fail("join() takes 1 or 2 arguments", .{}, arena);
+    if (args.len < 1 or args.len > 2)
+        return scope.fail("join() takes 1 or 2 arguments", .{}, arena);
     const sep = if (args.len == 2) try toStr(arena, args[1]) else ",";
     switch (args[0]) {
         .array => |a| {
@@ -632,7 +672,12 @@ fn callFromJson(arena: Allocator, args: []const Value, scope: Scope) Error!Value
     return fromJsonValue(arena, parsed);
 }
 
-fn formatString(arena: Allocator, fmt: []const u8, args: []const Value, scope: Scope) Error![]const u8 {
+fn formatString(
+    arena: Allocator,
+    fmt: []const u8,
+    args: []const Value,
+    scope: Scope,
+) Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
     var i: usize = 0;
     while (i < fmt.len) {
@@ -643,9 +688,13 @@ fn formatString(arena: Allocator, fmt: []const u8, args: []const Value, scope: S
                 i += 2;
                 continue;
             }
-            const close = std.mem.indexOfScalarPos(u8, fmt, i, '}') orelse return scope.fail("format(): unterminated '{{' in '{s}'", .{fmt}, arena);
-            const idx = std.fmt.parseInt(usize, fmt[i + 1 .. close], 10) catch return scope.fail("format(): invalid placeholder '{s}'", .{fmt[i .. close + 1]}, arena);
-            if (idx >= args.len) return scope.fail("format(): placeholder {{{d}}} has no argument", .{idx}, arena);
+            const close = std.mem.indexOfScalarPos(u8, fmt, i, '}') orelse
+                return scope.fail("format(): unterminated '{{' in '{s}'", .{fmt}, arena);
+            const placeholder = fmt[i .. close + 1];
+            const idx = std.fmt.parseInt(usize, fmt[i + 1 .. close], 10) catch
+                return scope.fail("format(): invalid placeholder '{s}'", .{placeholder}, arena);
+            if (idx >= args.len)
+                return scope.fail("format(): placeholder {{{d}}} has no argument", .{idx}, arena);
             try out.appendSlice(arena, try toStr(arena, args[idx]));
             i = close + 1;
         } else if (c == '}') {
@@ -667,7 +716,10 @@ fn writeJson(w: *std.Io.Writer, v: Value, depth: usize) !void {
     switch (v) {
         .null => try w.writeAll("null"),
         .boolean => |b| try w.writeAll(if (b) "true" else "false"),
-        .number => |n| if (@floor(n) == n and @abs(n) < 1e15) try w.print("{d}", .{@as(i64, @intFromFloat(n))}) else try w.print("{d}", .{n}),
+        .number => |n| if (@floor(n) == n and @abs(n) < 1e15) try w.print(
+            "{d}",
+            .{@as(i64, @intFromFloat(n))},
+        ) else try w.print("{d}", .{n}),
         .string => |s| try std.json.Stringify.value(s, .{}, w),
         .array => |a| {
             if (a.len == 0) return w.writeAll("[]");
@@ -702,7 +754,8 @@ pub fn fromJsonValue(arena: Allocator, j: std.json.Value) Allocator.Error!Value 
         .bool => |b| return .{ .boolean = b },
         .integer => |i| return .{ .number = @floatFromInt(i) },
         .float => |f| return .{ .number = f },
-        .number_string => |s| return .{ .number = std.fmt.parseFloat(f64, s) catch std.math.nan(f64) },
+        .number_string => |s| return .{ .number = std.fmt.parseFloat(f64, s) catch
+            std.math.nan(f64) },
         .string => |s| return .{ .string = s },
         .array => |a| {
             const out = try arena.alloc(Value, a.items.len);
@@ -713,7 +766,10 @@ pub fn fromJsonValue(arena: Allocator, j: std.json.Value) Allocator.Error!Value 
             const out = try arena.alloc(Value.Entry, o.count());
             var it = o.iterator();
             var i: usize = 0;
-            while (it.next()) |e| : (i += 1) out[i] = .{ .key = e.key_ptr.*, .value = try fromJsonValue(arena, e.value_ptr.*) };
+            while (it.next()) |e| : (i += 1) out[i] = .{
+                .key = e.key_ptr.*,
+                .value = try fromJsonValue(arena, e.value_ptr.*),
+            };
             return .{ .object = out };
         },
     }
@@ -788,7 +844,8 @@ pub fn hasStatusFunction(arena: Allocator, text: []const u8) bool {
 fn nodeHasStatus(n: *const Node) bool {
     return switch (n.*) {
         .call => |c| blk: {
-            for ([_][]const u8{ "success", "always", "failure", "cancelled" }) |f| if (std.ascii.eqlIgnoreCase(c.name, f)) break :blk true;
+            for ([_][]const u8{ "success", "always", "failure", "cancelled" }) |f|
+                if (std.ascii.eqlIgnoreCase(c.name, f)) break :blk true;
             for (c.args) |a| if (nodeHasStatus(a)) break :blk true;
             break :blk false;
         },
@@ -805,7 +862,8 @@ fn nodeHasStatus(n: *const Node) bool {
 /// `success() && (<condition>)`, as in GitHub. `${{ }}` around the whole condition is optional.
 pub fn evalCondition(arena: Allocator, cond: []const u8, scope: Scope) Error!bool {
     var text = std.mem.trim(u8, cond, " \t\r\n");
-    if (std.mem.startsWith(u8, text, "${{") and std.mem.endsWith(u8, text, "}}")) text = std.mem.trim(u8, text[3 .. text.len - 2], " \t\r\n");
+    if (std.mem.startsWith(u8, text, "${{") and std.mem.endsWith(u8, text, "}}"))
+        text = std.mem.trim(u8, text[3 .. text.len - 2], " \t\r\n");
     if (text.len == 0) return !scope.job_failed and !scope.cancelled;
     const v = try evaluate(arena, text, scope);
     if (!hasStatusFunction(arena, text) and (scope.job_failed or scope.cancelled)) return false;
