@@ -25,17 +25,34 @@ pub const Error = error{
 
 fn runnersUrl(arena: Allocator, cfg: *const Config) Allocator.Error![]const u8 {
     return switch (cfg.scope) {
-        .repo => |r| std.fmt.allocPrint(arena, "https://api.github.com/repos/{s}/{s}/actions/runners", .{ r.owner, r.name }),
-        .org => |o| std.fmt.allocPrint(arena, "https://api.github.com/orgs/{s}/actions/runners", .{o}),
+        .repo => |r| std.fmt.allocPrint(
+            arena,
+            "https://api.github.com/repos/{s}/{s}/actions/runners",
+            .{ r.owner, r.name },
+        ),
+        .org => |o| std.fmt.allocPrint(
+            arena,
+            "https://api.github.com/orgs/{s}/actions/runners",
+            .{o},
+        ),
     };
 }
 
-/// Removes a registered runner (cleanup for runners that never ran a job).
-/// Goes through `broker.request`: GitHub answers 204 with no Content-Length, and `std.http.Client.fetch`
-/// then waits on the idle connection until GitHub closes it, which kept the runner from exiting for
+/// Removes a registered runner (cleanup for runners that never ran a job). Goes through
+/// `broker.request`: GitHub answers 204 with no Content-Length, and `std.http.Client.fetch` then
+/// waits on the idle connection until GitHub closes it, which kept the runner from exiting for
 /// minutes after its job.
-pub fn deleteRunner(arena: Allocator, io: std.Io, cfg: *const Config, runner_id: u64) !std.http.Status {
-    const url = try std.fmt.allocPrint(arena, "{s}/{d}", .{ try runnersUrl(arena, cfg), runner_id });
+pub fn deleteRunner(
+    arena: Allocator,
+    io: std.Io,
+    cfg: *const Config,
+    runner_id: u64,
+) !std.http.Status {
+    const url = try std.fmt.allocPrint(
+        arena,
+        "{s}/{d}",
+        .{ try runnersUrl(arena, cfg), runner_id },
+    );
     const r = try broker.request(arena, io, .DELETE, url, null, .{
         .token = cfg.gh_token,
         .extra_headers = &.{.{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" }},
@@ -54,7 +71,11 @@ pub fn generate(
     status_out: *std.http.Status,
     message_out: *[]const u8,
 ) Error!Jit {
-    const url = try std.fmt.allocPrint(arena, "{s}/generate-jitconfig", .{try runnersUrl(arena, cfg)});
+    const url = try std.fmt.allocPrint(
+        arena,
+        "{s}/generate-jitconfig",
+        .{try runnersUrl(arena, cfg)},
+    );
 
     var labels: std.ArrayList([]const u8) = .empty;
     var it = std.mem.tokenizeScalar(u8, cfg.labels, ',');
@@ -118,7 +139,12 @@ pub fn parseResponse(arena: Allocator, body: []const u8) Error!Jit {
         runner: struct { id: u64, name: []const u8 },
         encoded_jit_config: []const u8,
     };
-    const parsed = std.json.parseFromSliceLeaky(Resp, arena, body, .{ .ignore_unknown_fields = true }) catch |e| switch (e) {
+    const parsed = std.json.parseFromSliceLeaky(
+        Resp,
+        arena,
+        body,
+        .{ .ignore_unknown_fields = true },
+    ) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.BadResponse,
     };
@@ -132,13 +158,19 @@ pub fn parseResponse(arena: Allocator, body: []const u8) Error!Jit {
     };
 }
 
-/// `encoded_jit_config` is base64 JSON `{ "<filename>": "<base64 content>" }` (unverified against live GitHub).
+/// `encoded_jit_config` is base64 JSON `{ "<filename>": "<base64 content>" }` (unverified against
+/// live GitHub).
 pub fn decode(arena: Allocator, encoded: []const u8) ![]const File {
     const dec = std.base64.standard.Decoder;
     const json_bytes = try arena.alloc(u8, try dec.calcSizeForSlice(encoded));
     try dec.decode(json_bytes, encoded);
 
-    const map = try std.json.parseFromSliceLeaky(std.json.ArrayHashMap([]const u8), arena, json_bytes, .{});
+    const map = try std.json.parseFromSliceLeaky(
+        std.json.ArrayHashMap([]const u8),
+        arena,
+        json_bytes,
+        .{},
+    );
     const files = try arena.alloc(File, map.map.count());
     for (map.map.keys(), map.map.values(), files) |k, v, *f| {
         const content = try arena.alloc(u8, try dec.calcSizeForSlice(v));

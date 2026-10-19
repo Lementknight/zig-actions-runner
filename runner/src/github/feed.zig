@@ -106,7 +106,13 @@ pub fn writeFrame(io: std.Io, w: *std.Io.Writer, opcode: u4, fin: bool, payload:
     try writeFrameMasked(w, opcode, fin, payload, mask);
 }
 
-fn writeFrameMasked(w: *std.Io.Writer, opcode: u4, fin: bool, payload: []const u8, mask: [4]u8) !void {
+fn writeFrameMasked(
+    w: *std.Io.Writer,
+    opcode: u4,
+    fin: bool,
+    payload: []const u8,
+    mask: [4]u8,
+) !void {
     try w.writeByte(@as(u8, if (fin) 0x80 else 0) | opcode);
     if (payload.len < 126) {
         try w.writeByte(0x80 | @as(u8, @intCast(payload.len)));

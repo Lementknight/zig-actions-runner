@@ -2,18 +2,18 @@
 //! occasion that produced most of docs/CLAIMS.md's under-powered entries.
 //!
 //! It knows nothing about this runner. An **arm** is a command whose stdout contains a line
-//! `MEASURE <number>` — the reading — so the same harness measures a job's seconds, an engine's CPU,
-//! or anything else that can be printed. What it adds is the protocol, which is where every mistake
-//! in MEASURE.md §1 was made:
+//! `MEASURE <number>` — the reading — so the same harness measures a job's seconds, an engine's
+//! CPU, or anything else that can be printed. What it adds is the protocol, which is where every
+//! mistake in MEASURE.md §1 was made:
 //!
-//!   * **A refutation criterion first** (§3.2.1): `--min-effect` is required, so the smallest effect
-//!     worth acting on is written down before any number exists. Below it the answer is "no effect
-//!     found", never a trend.
+//!   * **A refutation criterion first** (§3.2.1): `--min-effect` is required, so the smallest
+//!     effect worth acting on is written down before any number exists. Below it the answer is "no
+//!     effect found", never a trend.
 //!   * **A negative control** (§3.2.2): `--control <arm>` names an arm whose answer is known to
 //!     match the baseline. If it comes out as an effect, the suite failed, whatever the other arms
 //!     say. Mistake 1 was caught by exactly this and nothing else.
-//!   * **Interleaved arms** (§3.2.3), in an order the recorded seed shuffles each round, so drift in
-//!     the machine cannot be read as a difference between arms.
+//!   * **Interleaved arms** (§3.2.3), in an order the recorded seed shuffles each round, so drift
+//!     in the machine cannot be read as a difference between arms.
 //!   * **A separated first round** (§3.2.4): `--warmup N` rounds are recorded and excluded.
 //!   * **A fresh trial token** (§3.3), generated here, asserted distinct, and handed to the command
 //!     in `$MEASURE_TOKEN` so it can be put where the system under test cannot ignore it — for this
@@ -101,7 +101,14 @@ pub const Interval = struct { low: f64, high: f64 };
 /// A percentile bootstrap interval for `median(b) − median(a)`, resampling each arm with
 /// replacement. The seed is a parameter and is recorded with the samples, so the interval is
 /// reproducible rather than merely plausible.
-pub fn bootstrapDifference(arena: Allocator, a: []const f64, b: []const f64, rounds: usize, seed: u64, level: f64) !Interval {
+pub fn bootstrapDifference(
+    arena: Allocator,
+    a: []const f64,
+    b: []const f64,
+    rounds: usize,
+    seed: u64,
+    level: f64,
+) !Interval {
     const diffs = try arena.alloc(f64, rounds);
     const ra = try arena.alloc(f64, a.len);
     const rb = try arena.alloc(f64, b.len);
@@ -116,7 +123,12 @@ pub fn bootstrapDifference(arena: Allocator, a: []const f64, b: []const f64, rou
     const tail = (1 - level) / 2;
     return .{
         .low = diffs[@intFromFloat(@floor(tail * @as(f64, @floatFromInt(rounds))))],
-        .high = diffs[@min(rounds - 1, @as(usize, @intFromFloat(@ceil((1 - tail) * @as(f64, @floatFromInt(rounds))))))],
+        .high = diffs[
+            @min(
+                rounds - 1,
+                @as(usize, @intFromFloat(@ceil((1 - tail) * @as(f64, @floatFromInt(rounds))))),
+            )
+        ],
     };
 }
 
@@ -209,14 +221,22 @@ const RunOpts = struct {
     arms: std.ArrayList(Arm) = .empty,
 };
 
-fn cmdRun(arena: Allocator, io: std.Io, environ: *const std.process.Environ.Map, args: []const []const u8) !u8 {
+fn cmdRun(
+    arena: Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    args: []const []const u8,
+) !u8 {
     const o = parseRunOpts(arena, args) catch |e| switch (e) {
         error.Usage => return usage(),
         error.BadArgs => return 2,
         else => return e,
     };
 
-    const seed = if (o.seed != 0) o.seed else @as(u64, @bitCast(@as(i64, @truncate(std.Io.Clock.real.now(io).toNanoseconds()))));
+    const seed = if (o.seed != 0) o.seed else @as(
+        u64,
+        @bitCast(@as(i64, @truncate(std.Io.Clock.real.now(io).toNanoseconds()))),
+    );
     var prng: std.Random.DefaultPrng = .init(seed);
     const rand = prng.random();
 
@@ -230,7 +250,10 @@ fn cmdRun(arena: Allocator, io: std.Io, environ: *const std.process.Environ.Map,
     for (order, 0..) |*x, k| x.* = k;
 
     const rounds = o.warmup + o.reps;
-    std.debug.print("measure: claim {s}, {d} arms, {d} warmup + {d} rounds, seed {d}\n", .{ o.claim, o.arms.items.len, o.warmup, o.reps, seed });
+    std.debug.print(
+        "measure: claim {s}, {d} arms, {d} warmup + {d} rounds, seed {d}\n",
+        .{ o.claim, o.arms.items.len, o.warmup, o.reps, seed },
+    );
     var round: u32 = 0;
     while (round < rounds) : (round += 1) {
         // Interleaved, and the order inside a round is shuffled: drift cannot line up with an arm.
@@ -238,7 +261,10 @@ fn cmdRun(arena: Allocator, io: std.Io, environ: *const std.process.Environ.Map,
         for (order) |idx| {
             const token = try std.fmt.allocPrint(arena, "m{x}", .{rand.int(u64)});
             for (state.tokens.items) |t| if (std.mem.eql(u8, t, token)) {
-                std.debug.print("measure: two trials got the same token ({s}); refusing to continue.\n", .{token});
+                std.debug.print(
+                    "measure: two trials got the same token ({s}); refusing to continue.\n",
+                    .{token},
+                );
                 return 1;
             };
             try state.tokens.append(arena, token);
@@ -246,7 +272,14 @@ fn cmdRun(arena: Allocator, io: std.Io, environ: *const std.process.Environ.Map,
             try runTrial(arena, io, environ, o, arm, round, token, &fw.interface, &state);
         }
     }
-    std.debug.print("measure: {d} samples written to {s}{s}\n", .{ rounds * o.arms.items.len, o.out, if (state.failures > 0) " (with failures above)" else "" });
+    std.debug.print(
+        "measure: {d} samples written to {s}{s}\n",
+        .{
+            rounds * o.arms.items.len,
+            o.out,
+            if (state.failures > 0) " (with failures above)" else "",
+        },
+    );
     return if (state.failures > 0) 1 else 0;
 }
 
@@ -258,27 +291,20 @@ fn parseRunOpts(arena: Allocator, args: []const []const u8) !RunOpts {
     var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        const next = struct {
-            fn get(idx: *usize, as: []const []const u8) ?[]const u8 {
-                if (idx.* + 1 >= as.len) return null;
-                idx.* += 1;
-                return as[idx.*];
-            }
-        }.get;
-        if (std.mem.eql(u8, a, "--claim")) o.claim = next(&i, args) orelse return error.Usage //
-        else if (std.mem.eql(u8, a, "--quantity")) o.quantity = next(&i, args) orelse return error.Usage //
-        else if (std.mem.eql(u8, a, "--min-effect")) o.min_effect = std.fmt.parseFloat(f64, next(&i, args) orelse return error.Usage) catch return error.Usage //
+        if (std.mem.eql(u8, a, "--claim")) o.claim = try strArg(&i, args) //
+        else if (std.mem.eql(u8, a, "--quantity")) o.quantity = try strArg(&i, args) //
+        else if (std.mem.eql(u8, a, "--min-effect")) o.min_effect = try floatArg(&i, args) //
         else if (std.mem.eql(u8, a, "--relative")) o.relative = true //
-        else if (std.mem.eql(u8, a, "--reps")) o.reps = std.fmt.parseInt(u32, next(&i, args) orelse return error.Usage, 10) catch return error.Usage //
-        else if (std.mem.eql(u8, a, "--warmup")) o.warmup = std.fmt.parseInt(u32, next(&i, args) orelse return error.Usage, 10) catch return error.Usage //
-        else if (std.mem.eql(u8, a, "--seed")) o.seed = std.fmt.parseInt(u64, next(&i, args) orelse return error.Usage, 10) catch return error.Usage //
-        else if (std.mem.eql(u8, a, "--out")) o.out = next(&i, args) orelse return error.Usage //
-        else if (std.mem.eql(u8, a, "--prepare")) o.prepare = next(&i, args) orelse return error.Usage //
-        else if (std.mem.eql(u8, a, "--identity")) o.identity = next(&i, args) orelse return error.Usage //
-        else if (std.mem.eql(u8, a, "--environment")) o.environment = next(&i, args) orelse return error.Usage //
-        else if (std.mem.eql(u8, a, "--control")) o.control = next(&i, args) orelse return error.Usage //
+        else if (std.mem.eql(u8, a, "--reps")) o.reps = try intArg(u32, &i, args) //
+        else if (std.mem.eql(u8, a, "--warmup")) o.warmup = try intArg(u32, &i, args) //
+        else if (std.mem.eql(u8, a, "--seed")) o.seed = try intArg(u64, &i, args) //
+        else if (std.mem.eql(u8, a, "--out")) o.out = try strArg(&i, args) //
+        else if (std.mem.eql(u8, a, "--prepare")) o.prepare = try strArg(&i, args) //
+        else if (std.mem.eql(u8, a, "--identity")) o.identity = try strArg(&i, args) //
+        else if (std.mem.eql(u8, a, "--environment")) o.environment = try strArg(&i, args) //
+        else if (std.mem.eql(u8, a, "--control")) o.control = try strArg(&i, args) //
         else if (std.mem.eql(u8, a, "--arm")) {
-            const spec = next(&i, args) orelse return error.Usage;
+            const spec = try strArg(&i, args);
             const eq = std.mem.indexOfScalar(u8, spec, '=') orelse {
                 std.debug.print("measure: --arm wants 'name=command', got '{s}'\n", .{spec});
                 return error.BadArgs;
@@ -293,11 +319,29 @@ fn parseRunOpts(arena: Allocator, args: []const []const u8) !RunOpts {
     return o;
 }
 
+/// The option's value, the argument after it; `error.Usage` when there is none.
+fn strArg(idx: *usize, args: []const []const u8) error{Usage}![]const u8 {
+    if (idx.* + 1 >= args.len) return error.Usage;
+    idx.* += 1;
+    return args[idx.*];
+}
+
+fn intArg(comptime T: type, idx: *usize, args: []const []const u8) error{Usage}!T {
+    return std.fmt.parseInt(T, try strArg(idx, args), 10) catch error.Usage;
+}
+
+fn floatArg(idx: *usize, args: []const []const u8) error{Usage}!f64 {
+    return std.fmt.parseFloat(f64, try strArg(idx, args)) catch error.Usage;
+}
+
 /// The protocol's preconditions on a run, each with its own complaint (MEASURE.md §3.2).
 fn runOptsValid(o: RunOpts) bool {
     // The criterion comes first, or there is no experiment (§3.2.1).
     if (o.min_effect == null) {
-        std.debug.print("measure: --min-effect is required: say what would refute the claim first.\n", .{});
+        std.debug.print(
+            "measure: --min-effect is required: say what would refute the claim first.\n",
+            .{},
+        );
         return false;
     }
     if (o.arms.items.len < 2) {
@@ -317,7 +361,10 @@ fn runOptsValid(o: RunOpts) bool {
             std.debug.print("measure: --control '{s}' is not one of the arms.\n", .{c});
             return false;
         }
-    } else std.debug.print("measure: warning: no --control, so nothing in this suite has a known answer (§3.2.2).\n", .{});
+    } else std.debug.print(
+        "measure: warning: no --control, so nothing in this suite has a known answer (§3.2.2).\n",
+        .{},
+    );
     return true;
 }
 
@@ -338,7 +385,15 @@ fn reportTrialFailure(arm: Arm, round: u32, res: Run, no_reading: bool) void {
         \\  stdout: {s}
         \\  stderr: {s}
         \\
-    , .{ arm.name, round, res.code, if (no_reading) ", no `MEASURE <n>` line" else "", arm.command, res.stdout, res.stderr });
+    , .{
+        arm.name,
+        round,
+        res.code,
+        if (no_reading) ", no `MEASURE <n>` line" else "",
+        arm.command,
+        res.stdout,
+        res.stderr,
+    });
 }
 
 /// One trial: `--prepare`, the arm's command timed, its `MEASURE <n>` read, `--identity` checked
@@ -357,7 +412,7 @@ fn runTrial(
     if (o.prepare) |p| {
         const pr = try shell(arena, io, environ, p, token);
         if (pr.code != 0) {
-            std.debug.print("measure: --prepare failed ({d}) before {s} round {d}\n{s}{s}\n", .{ pr.code, arm.name, round, pr.stdout, pr.stderr });
+            warnPrepare(arm, round, pr);
             state.failures += 1;
             return;
         }
@@ -380,7 +435,7 @@ fn runTrial(
         const got = std.mem.trim(u8, ir.stdout, " \n\r\t");
         identity = try arena.dupe(u8, got);
         if (state.last_identity) |prev| if (std.mem.eql(u8, prev, got)) {
-            std.debug.print("measure: {s} round {d}: identity did not advance ('{s}'): a stale reading.\n", .{ arm.name, round, got });
+            warnStale(arm, round, got);
             failed = true;
             state.failures += 1;
         };
@@ -410,14 +465,42 @@ fn runTrial(
         .seed = state.seed,
     });
     try w.flush();
-    std.debug.print("  round {d} {s}: {?d:.3} ({d} ms){s}\n", .{ round, arm.name, value, ended - started, if (round < o.warmup) " [warmup, excluded]" else "" });
+    logTrial(o, arm, round, value, ended - started);
+}
+
+fn warnPrepare(arm: Arm, round: u32, pr: Run) void {
+    std.debug.print(
+        "measure: --prepare failed ({d}) before {s} round {d}\n{s}{s}\n",
+        .{ pr.code, arm.name, round, pr.stdout, pr.stderr },
+    );
+}
+
+fn warnStale(arm: Arm, round: u32, got: []const u8) void {
+    std.debug.print(
+        "measure: {s} round {d}: identity did not advance ('{s}'): a stale reading.\n",
+        .{ arm.name, round, got },
+    );
+}
+
+fn logTrial(o: RunOpts, arm: Arm, round: u32, value: ?f64, ms: i64) void {
+    const note = if (round < o.warmup) " [warmup, excluded]" else "";
+    std.debug.print(
+        "  round {d} {s}: {?d:.3} ({d} ms){s}\n",
+        .{ round, arm.name, value, ms, note },
+    );
 }
 
 const Run = struct { code: u8, stdout: []const u8, stderr: []const u8 };
 
 /// Runs `command` under `sh -c` with `$MEASURE_TOKEN` set, and captures both streams. The exit code
 /// comes back as data, never as this program's control flow.
-fn shell(arena: Allocator, io: std.Io, environ: *const std.process.Environ.Map, command: []const u8, token: []const u8) !Run {
+fn shell(
+    arena: Allocator,
+    io: std.Io,
+    environ: *const std.process.Environ.Map,
+    command: []const u8,
+    token: []const u8,
+) !Run {
     // The caller's environment, so `ssh` and `gh` still find HOME, PATH and an agent.
     var env = try environ.clone(arena);
     try env.put("MEASURE_TOKEN", token);
@@ -477,7 +560,10 @@ fn cmdAnalyse(arena: Allocator, io: std.Io, args: []const []const u8) !u8 {
         return 1;
     }
     const base_idx = baselineIndex(samples, o.baseline) orelse return 1;
-    std.debug.print("claim {s} · {s} · {d} warmup samples excluded, {d} failed\n\n", .{ samples.claim, samples.quantity, samples.excluded, samples.failed });
+    std.debug.print(
+        "claim {s} · {s} · {d} warmup samples excluded, {d} failed\n\n",
+        .{ samples.claim, samples.quantity, samples.excluded, samples.failed },
+    );
     const verdicts_bad = try printVerdicts(arena, samples, base_idx, o.min_effect, o.relative);
     std.debug.print(
         \\
@@ -538,8 +624,16 @@ fn readSamples(arena: Allocator, io: std.Io, path: []const u8) !Samples {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (std.mem.trim(u8, line, " \r\t").len == 0) continue;
-        const parsed = std.json.parseFromSlice(Sample, arena, line, .{ .ignore_unknown_fields = true }) catch |e| {
-            std.debug.print("measure: {s}: cannot read a sample ({s}): {s}\n", .{ path, @errorName(e), line });
+        const parsed = std.json.parseFromSlice(
+            Sample,
+            arena,
+            line,
+            .{ .ignore_unknown_fields = true },
+        ) catch |e| {
+            std.debug.print(
+                "measure: {s}: cannot read a sample ({s}): {s}\n",
+                .{ path, @errorName(e), line },
+            );
             return error.BadSample;
         };
         const s = parsed.value;
@@ -585,10 +679,19 @@ fn baselineIndex(samples: Samples, baseline: ?[]const u8) ?usize {
 /// baseline, the bootstrap interval of that difference, and the verdict. Returns how many arms had
 /// too few samples for a verdict — an interval from one or two samples is arithmetic, not evidence,
 /// so it is not shown.
-fn printVerdicts(arena: Allocator, samples: Samples, base_idx: usize, min_effect: f64, relative: bool) !usize {
+fn printVerdicts(
+    arena: Allocator,
+    samples: Samples,
+    base_idx: usize,
+    min_effect: f64,
+    relative: bool,
+) !usize {
     const names = samples.names.items;
     const base = samples.values.items[base_idx].items;
-    std.debug.print("  {s: <16} n={d: <3} median {d:.3}  (baseline)\n", .{ names[base_idx], base.len, median(base) });
+    std.debug.print(
+        "  {s: <16} n={d: <3} median {d:.3}  (baseline)\n",
+        .{ names[base_idx], base.len, median(base) },
+    );
     var verdicts_bad: usize = 0;
     for (names, 0..) |n, k| {
         if (k == base_idx) continue;
@@ -597,10 +700,17 @@ fn printVerdicts(arena: Allocator, samples: Samples, base_idx: usize, min_effect
         const v = verdictOf(base, arm, ci, min_effect, relative);
         const diff = median(arm) - median(base);
         if (v == .not_enough_samples) {
-            std.debug.print("  {s: <16} n={d: <3} median {d:.3}  difference {d:.3}  95% CI --  {s}\n", .{ n, arm.len, median(arm), diff, @tagName(v) });
+            std.debug.print(
+                "  {s: <16} n={d: <3} median {d:.3}  difference {d:.3}  95% CI --  {s}\n",
+                .{ n, arm.len, median(arm), diff, @tagName(v) },
+            );
             verdicts_bad += 1;
         } else {
-            std.debug.print("  {s: <16} n={d: <3} median {d:.3}  difference {d:.3}  95% CI [{d:.3}, {d:.3}]  {s}\n", .{ n, arm.len, median(arm), diff, ci.low, ci.high, @tagName(v) });
+            std.debug.print(
+                "  {s: <16} n={d: <3} median {d:.3}  difference {d:.3}  " ++
+                    "95% CI [{d:.3}, {d:.3}]  {s}\n",
+                .{ n, arm.len, median(arm), diff, ci.low, ci.high, @tagName(v) },
+            );
         }
     }
     return verdicts_bad;
@@ -627,7 +737,12 @@ fn cmdDimension(arena: Allocator, io: std.Io, args: []const []const u8) !u8 {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (std.mem.trim(u8, line, " \r\t").len == 0) continue;
-        const parsed = std.json.parseFromSlice(Sample, arena, line, .{ .ignore_unknown_fields = true }) catch continue;
+        const parsed = std.json.parseFromSlice(
+            Sample,
+            arena,
+            line,
+            .{ .ignore_unknown_fields = true },
+        ) catch continue;
         const s = parsed.value;
         // Warm-up rounds are excluded here as in `analyse`: a first round's spread is provisioning,
         // not variability, and dimensioning from it asks for repetitions nothing needs.
@@ -643,10 +758,16 @@ fn cmdDimension(arena: Allocator, io: std.Io, args: []const []const u8) !u8 {
         }
         try values.items[idx.?].append(arena, s.value.?);
     }
-    std.debug.print("For a half-width of {d:.3} (§3.2.5, the single-level version):\n", .{target.?});
+    std.debug.print(
+        "For a half-width of {d:.3} (§3.2.5, the single-level version):\n",
+        .{target.?},
+    );
     for (names.items, 0..) |n, k| {
         const xs = values.items[k].items;
-        std.debug.print("  {s: <16} n={d: <3} sd {d:.3}  →  {d} repetitions\n", .{ n, xs.len, stddev(xs), repetitionsFor(xs, target.?) });
+        std.debug.print(
+            "  {s: <16} n={d: <3} sd {d:.3}  →  {d} repetitions\n",
+            .{ n, xs.len, stddev(xs), repetitionsFor(xs, target.?) },
+        );
     }
     return 0;
 }

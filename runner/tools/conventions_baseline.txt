@@ -10,14 +10,7 @@ long-lines src/main.zig 18
 long-lines src/dagger.zig 569
 long-lines src/action.zig 17
 long-lines src/engine.zig 34
-long-lines src/github/broker.zig 12
-long-lines src/github/http.zig 1
-long-lines src/github/rsa_sign.zig 3
-long-lines src/github/runservice.zig 7
-long-lines src/github/jitconfig.zig 9
-long-lines src/github/auth.zig 9
-long-lines src/github/results.zig 26
-long-lines src/github/feed.zig 1
+long-lines src/github/auth.zig 1
 long-lines src/live.zig 22
 long-lines src/sink.zig 11
 long-lines src/pgsink.zig 9
@@ -31,6 +24,3 @@ long-lines src/context.zig 6
 long-lines src/db.zig 14
 long-lines src/pg.zig 27
 long-lines src/matcher.zig 3
-long-lines tools/check_workflows.zig 4
-long-lines tools/regex_diff.zig 1
-long-lines tools/measure.zig 36
