@@ -29,7 +29,12 @@ pub fn main(init: std.process.Init) !u8 {
     var lines = std.mem.splitScalar(u8, all, '\n');
     while (lines.next()) |line| {
         if (std.mem.trim(u8, line, " \t\r").len == 0) continue;
-        const parsed = std.json.parseFromSlice(struct { pattern: []const u8, input: []const u8 }, arena, line, .{}) catch {
+        const parsed = std.json.parseFromSlice(
+            struct { pattern: []const u8, input: []const u8 },
+            arena,
+            line,
+            .{},
+        ) catch {
             try w.writeAll("{\"ok\":false,\"error\":\"BadRequest\"}\n");
             continue;
         };

@@ -18,7 +18,12 @@ pub const Settings = struct {
 
 pub fn parseSettings(arena: Allocator, files: []const jitconfig.File) !Settings {
     const json = auth.findFile(files, ".runner") orelse return error.MissingFile;
-    const R = struct { AgentId: []const u8, AgentName: []const u8, ServerUrlV2: []const u8, UseV2Flow: []const u8 };
+    const R = struct {
+        AgentId: []const u8,
+        AgentName: []const u8,
+        ServerUrlV2: []const u8,
+        UseV2Flow: []const u8,
+    };
     const r = try std.json.parseFromSliceLeaky(R, arena, json, .{ .ignore_unknown_fields = true });
     return .{
         .agent_id = try std.fmt.parseInt(u64, r.AgentId, 10),
@@ -45,7 +50,8 @@ pub fn call(
 }
 
 pub const RequestOptions = struct {
-    /// Sent as `Authorization: Bearer`. Leave null for signed URLs (blob storage rejects extra auth).
+    /// Sent as `Authorization: Bearer`. Leave null for signed URLs (blob storage rejects extra
+    /// auth).
     token: ?[]const u8 = null,
     content_type: []const u8 = "application/json",
     extra_headers: []const std.http.Header = &.{},
@@ -61,14 +67,17 @@ pub fn request(
 ) !Response {
     // A kept-alive connection the server had closed while it sat idle (seen on completejob after a
     // 16-minute step): no byte came back (HttpConnectionClosing), or the request could not even be
-    // written (WriteFailed, seen on log uploads to blob storage), so it was never processed, and the
-    // connection is dropped (see `requestOnce`). The pool can hold several such connections to the
-    // same host (six jobs finishing at once after minutes of quiet), so try again until a live or
-    // new connection answers.
+    // written (WriteFailed, seen on log uploads to blob storage), so it was never processed, and
+    // the connection is dropped (see `requestOnce`). The pool can hold several such connections to
+    // the same host (six jobs finishing at once after minutes of quiet), so try again until a live
+    // or new connection answers.
     var attempt: u32 = 0;
     while (true) : (attempt += 1) {
         return requestOnce(arena, io, method, url, payload, opts) catch |err| switch (err) {
-            error.HttpConnectionClosing, error.WriteFailed => if (attempt < max_stale_retries) continue else err,
+            error.HttpConnectionClosing, error.WriteFailed => if (attempt < max_stale_retries)
+                continue
+            else
+                err,
             else => err,
         };
     }
@@ -90,14 +99,21 @@ fn requestOnce(
     var scratch_state: std.heap.ArenaAllocator = .init(if (http.shared) |c| c.allocator else arena);
     defer scratch_state.deinit();
     const scratch = scratch_state.allocator();
-    const bearer: ?[]const u8 = if (opts.token) |t| try std.fmt.allocPrint(scratch, "Bearer {s}", .{t}) else null;
+    const bearer: ?[]const u8 = if (opts.token) |t| try std.fmt.allocPrint(
+        scratch,
+        "Bearer {s}",
+        .{t},
+    ) else null;
     const headers = try acceptJsonHeaders(scratch, opts.extra_headers);
     // The default 1 KiB write buffer is smaller than the ~1.6 KiB bearer token; requests stall.
     var local: std.http.Client = .{ .allocator = arena, .io = io, .write_buffer_size = 16 * 1024 };
     defer local.deinit();
     const client = http.client(&local);
 
-    if (trace) std.debug.print("trace: connecting {s} {s}\n", .{ @tagName(method), url[0 .. std.mem.indexOfScalarPos(u8, url, 8, '/') orelse url.len] });
+    if (trace) std.debug.print(
+        "trace: connecting {s} {s}\n",
+        .{ @tagName(method), url[0 .. std.mem.indexOfScalarPos(u8, url, 8, '/') orelse url.len] },
+    );
     var req = try client.request(method, try std.Uri.parse(url), .{
         .headers = .{
             .authorization = if (bearer) |b| .{ .override = b } else .default,
@@ -107,8 +123,8 @@ fn requestOnce(
     });
     defer req.deinit();
     // A connection a request failed on is not given back to the pool: one that failed while writing
-    // (the server had closed it) would otherwise fail every later request to that host, which is how
-    // every log upload of a runner failed from one moment on.
+    // (the server had closed it) would otherwise fail every later request to that host, which is
+    // how every log upload of a runner failed from one moment on.
     errdefer if (req.connection) |conn| {
         conn.closing = true;
     };
@@ -119,11 +135,13 @@ fn requestOnce(
 
     var response = try req.receiveHead(&.{});
     if (trace) std.debug.print("trace: head status={d} content_length={?d} chunked={}\n", .{
-        @backingInt(response.head.status), response.head.content_length, response.head.transfer_encoding == .chunked,
+        @backingInt(response.head.status),
+        response.head.content_length,
+        response.head.transfer_encoding == .chunked,
     });
 
-    // 204/304 carry no body. Without Content-Length, Request.deinit would wait on the socket for one,
-    // so mark the connection closing (deinit then skips draining it).
+    // 204/304 carry no body. Without Content-Length, Request.deinit would wait on the socket for
+    // one, so mark the connection closing (deinit then skips draining it).
     if (response.head.status == .no_content or response.head.status == .not_modified) {
         req.connection.?.closing = true;
         return .{ .status = response.head.status, .body = "" };
@@ -179,18 +197,28 @@ pub const arch = switch (@import("builtin").cpu.arch) {
 /// Prints request stages to stderr (never headers or bodies). Set while probing.
 pub var trace = false;
 
-pub fn messageUrl(arena: Allocator, base: []const u8, session_id: []const u8, status: []const u8) ![]const u8 {
+pub fn messageUrl(
+    arena: Allocator,
+    base: []const u8,
+    session_id: []const u8,
+    status: []const u8,
+) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
-        "{s}message?sessionId={s}&status={s}&runnerVersion={s}&os=Linux&architecture=" ++ arch ++ "&disableUpdate=true",
+        "{s}message?sessionId={s}&status={s}&runnerVersion={s}" ++
+            "&os=Linux&architecture=" ++ arch ++ "&disableUpdate=true",
         .{ base, session_id, status, version },
     );
 }
 
 pub fn sessionBody(arena: Allocator, s: Settings, owner: []const u8) ![]const u8 {
-    return std.fmt.allocPrint(arena,
-        \\{{"ownerName":"{s}","agent":{{"id":{d},"name":"{s}","version":"{s}","osDescription":"Linux","ephemeral":true,"disableUpdate":true}},"useFipsEncryption":false}}
-    , .{ owner, s.agent_id, s.agent_name, version });
+    return std.fmt.allocPrint(
+        arena,
+        "{{\"ownerName\":\"{s}\",\"agent\":{{\"id\":{d},\"name\":\"{s}\",\"version\":\"{s}\"," ++
+            "\"osDescription\":\"Linux\",\"ephemeral\":true,\"disableUpdate\":true}}," ++
+            "\"useFipsEncryption\":false}}",
+        .{ owner, s.agent_id, s.agent_name, version },
+    );
 }
 
 test "parseSettings" {

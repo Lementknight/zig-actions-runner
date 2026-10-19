@@ -17,7 +17,12 @@ pub const JobRequest = struct {
 };
 
 pub fn parseJobRequest(arena: Allocator, body: []const u8) !JobRequest {
-    return std.json.parseFromSliceLeaky(JobRequest, arena, body, .{ .ignore_unknown_fields = true });
+    return std.json.parseFromSliceLeaky(
+        JobRequest,
+        arena,
+        body,
+        .{ .ignore_unknown_fields = true },
+    );
 }
 
 pub fn endpoint(arena: Allocator, req: JobRequest, op: []const u8) Allocator.Error![]const u8 {
@@ -25,12 +30,28 @@ pub fn endpoint(arena: Allocator, req: JobRequest, op: []const u8) Allocator.Err
     return std.fmt.allocPrint(arena, "{s}/{s}?api-version={s}", .{ base, op, api_version });
 }
 
-fn post(arena: Allocator, io: std.Io, req: JobRequest, token: []const u8, op: []const u8, body: []const u8) !broker.Response {
+fn post(
+    arena: Allocator,
+    io: std.Io,
+    req: JobRequest,
+    token: []const u8,
+    op: []const u8,
+    body: []const u8,
+) !broker.Response {
     return broker.call(arena, io, .POST, try endpoint(arena, req, op), token, body);
 }
 
-pub fn acknowledge(arena: Allocator, io: std.Io, req: JobRequest, token: []const u8) !broker.Response {
-    const body = try std.fmt.allocPrint(arena, "{{\"runnerRequestId\":\"{s}\"}}", .{req.runner_request_id});
+pub fn acknowledge(
+    arena: Allocator,
+    io: std.Io,
+    req: JobRequest,
+    token: []const u8,
+) !broker.Response {
+    const body = try std.fmt.allocPrint(
+        arena,
+        "{{\"runnerRequestId\":\"{s}\"}}",
+        .{req.runner_request_id},
+    );
     return post(arena, io, req, token, "acknowledge", body);
 }
 
@@ -46,8 +67,19 @@ pub fn acquire(arena: Allocator, io: std.Io, req: JobRequest, token: []const u8)
 
 /// Renews the runner's hold on the job, as actions/runner does every 60 s while a job runs (its
 /// RenewJobRequest). Returns `{lockedUntil, ...}`.
-pub fn renew(arena: Allocator, io: std.Io, req: JobRequest, token: []const u8, plan_id: []const u8, job_id: []const u8) !broker.Response {
-    const body = try std.fmt.allocPrint(arena, "{{\"planId\":\"{s}\",\"jobId\":\"{s}\"}}", .{ plan_id, job_id });
+pub fn renew(
+    arena: Allocator,
+    io: std.Io,
+    req: JobRequest,
+    token: []const u8,
+    plan_id: []const u8,
+    job_id: []const u8,
+) !broker.Response {
+    const body = try std.fmt.allocPrint(
+        arena,
+        "{{\"planId\":\"{s}\",\"jobId\":\"{s}\"}}",
+        .{ plan_id, job_id },
+    );
     return post(arena, io, req, token, "renewjob", body);
 }
 
@@ -83,7 +115,8 @@ pub fn complete(
     try w.writeByte('}');
     const body = try std.fmt.allocPrint(
         arena,
-        "{{\"planId\":\"{s}\",\"jobId\":\"{s}\",\"conclusion\":\"{s}\",\"outputs\":{s},\"stepResults\":{s},\"annotations\":{s},\"telemetry\":[]}}",
+        "{{\"planId\":\"{s}\",\"jobId\":\"{s}\",\"conclusion\":\"{s}\",\"outputs\":{s}," ++
+            "\"stepResults\":{s},\"annotations\":{s},\"telemetry\":[]}}",
         .{ plan_id, job_id, @tagName(conclusion), out_json.written(), step_results, annotations },
     );
     return post(arena, io, req, token, "completejob", body);

@@ -16,7 +16,13 @@ pub const Credentials = struct {
     private_exponent: []const u8,
 };
 
-pub const Error = error{ MissingFile, BadCredentials, UnsupportedScheme, TokenRejected, BadTokenResponse } ||
+pub const Error = error{
+    MissingFile,
+    BadCredentials,
+    UnsupportedScheme,
+    TokenRejected,
+    BadTokenResponse,
+} ||
     Allocator.Error || std.http.Client.FetchError || rsa_sign.Error;
 
 pub fn findFile(files: []const jitconfig.File, name: []const u8) ?[]const u8 {
@@ -32,11 +38,21 @@ pub fn parseCredentials(arena: Allocator, files: []const jitconfig.File) Error!C
         Scheme: []const u8,
         Data: struct { ClientId: []const u8, AuthorizationUrl: []const u8 },
     };
-    const cred = std.json.parseFromSliceLeaky(Cred, arena, cred_json, .{ .ignore_unknown_fields = true }) catch return error.BadCredentials;
+    const cred = std.json.parseFromSliceLeaky(
+        Cred,
+        arena,
+        cred_json,
+        .{ .ignore_unknown_fields = true },
+    ) catch return error.BadCredentials;
     if (!std.ascii.eqlIgnoreCase(cred.Scheme, "OAuth")) return error.UnsupportedScheme;
 
     const Rsa = struct { modulus: []const u8, d: []const u8 };
-    const rsa = std.json.parseFromSliceLeaky(Rsa, arena, rsa_json, .{ .ignore_unknown_fields = true }) catch return error.BadCredentials;
+    const rsa = std.json.parseFromSliceLeaky(
+        Rsa,
+        arena,
+        rsa_json,
+        .{ .ignore_unknown_fields = true },
+    ) catch return error.BadCredentials;
 
     return .{
         .client_id = cred.Data.ClientId,
@@ -47,7 +63,10 @@ pub fn parseCredentials(arena: Allocator, files: []const jitconfig.File) Error!C
 }
 
 fn decodeB64(arena: Allocator, s: []const u8) Error![]u8 {
-    const buf = try arena.alloc(u8, b64.Decoder.calcSizeForSlice(s) catch return error.BadCredentials);
+    const buf = try arena.alloc(
+        u8,
+        b64.Decoder.calcSizeForSlice(s) catch return error.BadCredentials,
+    );
     b64.Decoder.decode(buf, s) catch return error.BadCredentials;
     return buf;
 }
@@ -57,7 +76,8 @@ pub fn buildJwt(arena: Allocator, creds: Credentials, now: i64, jti: []const u8)
     const header = "{\"alg\":\"RS256\",\"typ\":\"JWT\"}";
     const claims = try std.fmt.allocPrint(
         arena,
-        "{{\"sub\":\"{s}\",\"iss\":\"{s}\",\"aud\":\"{s}\",\"nbf\":{d},\"iat\":{d},\"exp\":{d},\"jti\":\"{s}\"}}",
+        "{{\"sub\":\"{s}\",\"iss\":\"{s}\",\"aud\":\"{s}\"," ++
+            "\"nbf\":{d},\"iat\":{d},\"exp\":{d},\"jti\":\"{s}\"}}",
         .{ creds.client_id, creds.client_id, creds.authorization_url, now, now, now + 300, jti },
     );
 
@@ -69,7 +89,12 @@ pub fn buildJwt(arena: Allocator, creds: Credentials, now: i64, jti: []const u8)
     _ = b64url.Encoder.encode(signing_input[h_len + 1 ..], claims);
 
     var sig_buf: [512]u8 = undefined;
-    const sig = try rsa_sign.signSha256(&sig_buf, creds.modulus, creds.private_exponent, signing_input);
+    const sig = try rsa_sign.signSha256(
+        &sig_buf,
+        creds.modulus,
+        creds.private_exponent,
+        signing_input,
+    );
 
     const sig_len = b64url.Encoder.calcSize(sig.len);
     const out = try arena.alloc(u8, signing_input.len + 1 + sig_len);
@@ -80,10 +105,18 @@ pub fn buildJwt(arena: Allocator, creds: Credentials, now: i64, jti: []const u8)
 }
 
 /// Exchanges the JWT for an access token (`client_credentials` + `jwt-bearer` assertion).
-pub fn fetchAccessToken(arena: Allocator, io: std.Io, creds: Credentials, jwt: []const u8, status_out: *std.http.Status) Error![]const u8 {
+pub fn fetchAccessToken(
+    arena: Allocator,
+    io: std.Io,
+    creds: Credentials,
+    jwt: []const u8,
+    status_out: *std.http.Status,
+) Error![]const u8 {
     const form = try std.fmt.allocPrint(
         arena,
-        "grant_type=client_credentials&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer&client_assertion={s}",
+        "grant_type=client_credentials" ++
+            "&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer" ++
+            "&client_assertion={s}",
         .{jwt},
     );
 
@@ -107,7 +140,12 @@ pub fn fetchAccessToken(arena: Allocator, io: std.Io, creds: Credentials, jwt: [
 
 pub fn parseTokenResponse(arena: Allocator, body: []const u8) Error![]const u8 {
     const R = struct { access_token: []const u8 };
-    const r = std.json.parseFromSliceLeaky(R, arena, body, .{ .ignore_unknown_fields = true }) catch return error.BadTokenResponse;
+    const r = std.json.parseFromSliceLeaky(
+        R,
+        arena,
+        body,
+        .{ .ignore_unknown_fields = true },
+    ) catch return error.BadTokenResponse;
     return r.access_token;
 }
 

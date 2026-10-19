@@ -31,7 +31,11 @@ pub fn main(init: std.process.Init) !u8 {
         var it = dir.iterate();
         while (try it.next(io)) |entry| {
             if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".yml") and !std.mem.endsWith(u8, entry.name, ".yaml")) continue;
+            if (!std.mem.endsWith(
+                u8,
+                entry.name,
+                ".yml",
+            ) and !std.mem.endsWith(u8, entry.name, ".yaml")) continue;
             const full = try std.fs.path.join(arena, &.{ path, entry.name });
             problems += try checkFile(arena, io, full);
             checked += 1;
@@ -53,7 +57,15 @@ fn checkFile(arena: std.mem.Allocator, io: std.Io, path: []const u8) !usize {
     var found: usize = 0;
     var diag: yaml.Diag = .{};
     if (yaml.parse(arena, text, &diag)) |_| {} else |e| {
-        std.debug.print("{s}:{d}: {s} ({s})\n", .{ path, diag.line, if (diag.message.len > 0) diag.message else "could not be parsed", @errorName(e) });
+        std.debug.print(
+            "{s}:{d}: {s} ({s})\n",
+            .{
+                path,
+                diag.line,
+                if (diag.message.len > 0) diag.message else "could not be parsed",
+                @errorName(e),
+            },
+        );
         found += 1;
     }
     found += plainScalarColons(path, text);
@@ -86,9 +98,13 @@ fn plainScalarColons(path: []const u8, text: []const u8) usize {
             block_indent = indent;
             continue;
         }
-        if (value[0] == '"' or value[0] == '\'' or value[0] == '{' or value[0] == '[' or value[0] == '#') continue;
+        if (std.mem.indexOfScalar(u8, "\"'{[#", value[0]) != null) continue;
         if (std.mem.indexOf(u8, value, ": ") != null) {
-            std.debug.print("{s}:{d}: a plain scalar cannot contain \": \" (YAML reads it as a mapping): quote the value or make it a `|` block\n", .{ path, number });
+            std.debug.print(
+                "{s}:{d}: a plain scalar cannot contain \": \" (YAML reads it as a mapping): " ++
+                    "quote the value or make it a `|` block\n",
+                .{ path, number },
+            );
             found += 1;
         }
     }
