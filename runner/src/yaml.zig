@@ -1,15 +1,15 @@
 //! A YAML subset, enough to read `action.yml` files.
 //!
-//! Supported: block mappings and sequences, plain / 'single' / "double" quoted scalars, block scalars
-//! (`|` and `>` with `-`, `+` and an indentation digit), plain scalars that continue on later lines,
-//! single-line flow sequences and mappings, comments, and a leading `---`.
+//! Supported: block mappings and sequences, plain / 'single' / "double" quoted scalars, block
+//! scalars (`|` and `>` with `-`, `+` and an indentation digit), plain scalars that continue on
+//! later lines, single-line flow sequences and mappings, comments, and a leading `---`.
 //!
 //! Every scalar is a string, except an empty value, `~` and `null`, which are null: callers turn
 //! strings into booleans or numbers where they need to (action inputs are strings anyway).
 //!
-//! Not supported, and reported as `UnsupportedYaml` instead of being misread: anchors, aliases, tags,
-//! merge keys, multiple documents, complex keys, and quoted or flow collections that span lines.
-//! Tab indentation is `InvalidYaml`.
+//! Not supported, and reported as `UnsupportedYaml` instead of being misread: anchors, aliases,
+//! tags, merge keys, multiple documents, complex keys, and quoted or flow collections that span
+//! lines. Tab indentation is `InvalidYaml`.
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
@@ -51,7 +51,8 @@ pub fn parse(arena: Allocator, source: []const u8, diag: ?*Diag) Error!Node {
         while (indent < full.len and full[indent] == ' ') indent += 1;
         const rest = full[indent..];
         if (rest.len > 0 and rest[0] == '\t') {
-            if (diag) |d| d.* = .{ .line = number, .message = "tabs are not allowed for indentation" };
+            if (diag) |d|
+                d.* = .{ .line = number, .message = "tabs are not allowed for indentation" };
             return error.InvalidYaml;
         }
         const trimmed = std.mem.trimEnd(u8, rest, " \t");
@@ -74,7 +75,8 @@ pub fn parse(arena: Allocator, source: []const u8, diag: ?*Diag) Error!Node {
     p.skipBlank();
     if (p.pos < p.lines.len) {
         const l = p.lines[p.pos];
-        if (std.mem.eql(u8, l.text, "---") or std.mem.eql(u8, l.text, "...")) return p.unsupported(l, "multiple documents");
+        if (std.mem.eql(u8, l.text, "---") or std.mem.eql(u8, l.text, "..."))
+            return p.unsupported(l, "multiple documents");
         return p.invalid(l, "unexpected content");
     }
     return root;
@@ -181,7 +183,9 @@ const Parser = struct {
                 const nx = p.peek();
                 if (nx != null and p.lines[nx.?].indent > indent) {
                     value = try p.node(indent + 1);
-                } else if (nx != null and p.lines[nx.?].indent == indent and isSeqItem(p.lines[nx.?].text)) {
+                } else if (nx != null and p.lines[nx.?].indent == indent and
+                    isSeqItem(p.lines[nx.?].text))
+                {
                     // `key:` followed by a sequence at the same indentation.
                     value = try p.seq(indent);
                 } else {
@@ -203,7 +207,8 @@ const Parser = struct {
         return .{ .map = entries.items };
     }
 
-    /// Index of the `:` that ends a mapping key on this line, or null if the line is not a mapping entry.
+    /// Index of the `:` that ends a mapping key on this line, or null if the line is not a mapping
+    /// entry.
     fn keyEnd(p: *Parser, l: Line) Error!?usize {
         const t = l.text;
         if (t.len == 0) return null;
@@ -215,7 +220,8 @@ const Parser = struct {
             return null;
         }
         if (t[0] == '[' or t[0] == '{') return null;
-        if (t[0] == '?' and (t.len == 1 or t[1] == ' ')) return p.unsupported(l, "complex mapping keys");
+        if (t[0] == '?' and (t.len == 1 or t[1] == ' '))
+            return p.unsupported(l, "complex mapping keys");
         var j: usize = 0;
         while (j < t.len) : (j += 1) {
             if (t[j] == ':' and (j + 1 == t.len or t[j + 1] == ' ')) return j;
@@ -228,7 +234,8 @@ const Parser = struct {
         const t = std.mem.trim(u8, raw, " ");
         if (t.len == 0) return p.invalid(l, "empty mapping key");
         if (t[0] == '"' or t[0] == '\'') return (try p.quoted(l, t)).value;
-        if (t[0] == '&' or t[0] == '*' or t[0] == '!') return p.unsupported(l, "anchors, aliases and tags");
+        if (t[0] == '&' or t[0] == '*' or t[0] == '!')
+            return p.unsupported(l, "anchors, aliases and tags");
         if (std.mem.eql(u8, t, "<<")) return p.unsupported(l, "merge keys");
         return t;
     }
@@ -238,19 +245,22 @@ const Parser = struct {
     fn inlineValue(p: *Parser, l: Line, rest_in: []const u8, parent_indent: isize) Error!Node {
         var rest = stripComment(rest_in);
         if (rest.len == 0) return .null;
-        if ((rest[0] == '"' or rest[0] == '\'') and quotedEnd(rest) == null) rest = try p.foldQuoted(l, rest, parent_indent);
+        if ((rest[0] == '"' or rest[0] == '\'') and quotedEnd(rest) == null)
+            rest = try p.foldQuoted(l, rest, parent_indent);
         switch (rest[0]) {
             '"', '\'' => {
                 const q = try p.quoted(l, rest);
                 const tail = std.mem.trim(u8, rest[q.end..], " ");
-                if (tail.len > 0 and tail[0] != '#') return p.invalid(l, "unexpected text after a quoted string");
+                if (tail.len > 0 and tail[0] != '#')
+                    return p.invalid(l, "unexpected text after a quoted string");
                 return .{ .string = q.value };
             },
             '[', '{' => {
                 var fp: Flow = .{ .p = p, .l = l, .s = rest };
                 const v = try fp.value();
                 fp.skipSpaces();
-                if (fp.i < rest.len and rest[fp.i] != '#') return p.invalid(l, "unexpected text after a flow collection");
+                if (fp.i < rest.len and rest[fp.i] != '#')
+                    return p.invalid(l, "unexpected text after a flow collection");
                 return v;
             },
             '&', '*', '!' => return p.unsupported(l, "anchors, aliases and tags"),
@@ -275,7 +285,8 @@ const Parser = struct {
     }
 
     /// A quoted scalar that continues on the following lines, folded onto one: each line break is a
-    /// space, and each blank line a newline. Continuation lines must be indented past `parent_indent`.
+    /// space, and each blank line a newline. Continuation lines must be indented past
+    /// `parent_indent`.
     fn foldQuoted(p: *Parser, l: Line, first: []const u8, parent_indent: isize) Error![]const u8 {
         var buf: std.ArrayList(u8) = .empty;
         try buf.appendSlice(p.arena, first);
@@ -301,7 +312,8 @@ const Parser = struct {
 
     /// A quoted scalar at the start of `t`; `end` is the index just past the closing quote.
     fn quoted(p: *Parser, l: Line, t: []const u8) Error!Quoted {
-        const close = quotedEnd(t) orelse return p.unsupported(l, "a quoted string that spans lines");
+        const close = quotedEnd(t) orelse
+            return p.unsupported(l, "a quoted string that spans lines");
         const body = t[1 .. close - 1];
         var out: std.ArrayList(u8) = .empty;
         if (t[0] == '\'') {
@@ -332,11 +344,13 @@ const Parser = struct {
                 ' ' => try out.append(p.arena, ' '),
                 'x', 'u' => |kind| {
                     const digits: usize = if (kind == 'x') 2 else 4;
-                    if (i + 1 + digits > body.len) return p.invalid(l, "bad escape in a double-quoted string");
+                    if (i + 1 + digits > body.len)
+                        return p.invalid(l, "bad escape in a double-quoted string");
                     const cp = std.fmt.parseInt(u21, body[i + 1 .. i + 1 + digits], 16) catch
                         return p.invalid(l, "bad escape in a double-quoted string");
                     var enc: [4]u8 = undefined;
-                    const n = std.unicode.utf8Encode(cp, &enc) catch return p.invalid(l, "bad escape in a double-quoted string");
+                    const n = std.unicode.utf8Encode(cp, &enc) catch
+                        return p.invalid(l, "bad escape in a double-quoted string");
                     try out.appendSlice(p.arena, enc[0..n]);
                     i += digits;
                 },
@@ -471,7 +485,8 @@ const Flow = struct {
                 var items: std.ArrayList(Node) = .empty;
                 while (true) {
                     f.skipSpaces();
-                    if (f.i >= f.s.len) return f.p.unsupported(f.l, "a flow collection that spans lines");
+                    if (f.i >= f.s.len)
+                        return f.p.unsupported(f.l, "a flow collection that spans lines");
                     if (f.s[f.i] == ']') {
                         f.i += 1;
                         break;
@@ -487,7 +502,8 @@ const Flow = struct {
                 var entries: std.ArrayList(Node.Entry) = .empty;
                 while (true) {
                     f.skipSpaces();
-                    if (f.i >= f.s.len) return f.p.unsupported(f.l, "a flow collection that spans lines");
+                    if (f.i >= f.s.len)
+                        return f.p.unsupported(f.l, "a flow collection that spans lines");
                     if (f.s[f.i] == '}') {
                         f.i += 1;
                         break;
@@ -512,13 +528,15 @@ const Flow = struct {
             },
             else => {
                 const t = try f.scalarText(false);
-                if (t.len == 0 or std.mem.eql(u8, t, "~") or std.mem.eql(u8, t, "null")) return .null;
+                if (t.len == 0 or std.mem.eql(u8, t, "~") or std.mem.eql(u8, t, "null"))
+                    return .null;
                 return .{ .string = t };
             },
         }
     }
 
-    /// A plain or quoted scalar inside a flow collection, ended by `,`, `]`, `}` (or `:` for a key).
+    /// A plain or quoted scalar inside a flow collection, ended by `,`, `]`, `}` (or `:` for a
+    /// key).
     fn scalarText(f: *Flow, is_key: bool) Error![]const u8 {
         f.skipSpaces();
         if (f.i < f.s.len and (f.s[f.i] == '"' or f.s[f.i] == '\'')) {
@@ -540,7 +558,8 @@ fn isSeqItem(t: []const u8) bool {
     return t.len > 0 and t[0] == '-' and (t.len == 1 or t[1] == ' ');
 }
 
-/// `|` or `>` followed only by chomping and indentation indicators (the comment is already removed).
+/// `|` or `>` followed only by chomping and indentation indicators (the comment is already
+/// removed).
 fn isBlockScalarHeader(t: []const u8) bool {
     if (t.len == 0 or (t[0] != '|' and t[0] != '>')) return false;
     for (t[1..]) |c| switch (c) {

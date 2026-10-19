@@ -2,7 +2,8 @@
 //!
 //! The runner is the only writer. It updates state at transitions only (job start, step start, step
 //! end, job end); every statement is an idempotent upsert on the primary key, so a retry or a crash
-//! halfway is harmless. `runs.created_at` is the first time a run was seen and is never overwritten.
+//! halfway is harmless. `runs.created_at` is the first time a run was seen and is never
+//! overwritten.
 const std = @import("std");
 const pg = @import("pg.zig");
 
@@ -51,7 +52,11 @@ fn text(w: *Io.Writer, v: ?[]const u8) Io.Writer.Error!void {
 }
 
 pub fn writeUpsertRun(w: *Io.Writer, r: RunRow) Io.Writer.Error!void {
-    try w.print("INSERT INTO runs (id, repo, workflow, event, branch, sha, status, conclusion, completed_at) VALUES ({d}, ", .{r.id});
+    try w.print(
+        "INSERT INTO runs (id, repo, workflow, event, branch, sha, status, conclusion, " ++
+            "completed_at) VALUES ({d}, ",
+        .{r.id},
+    );
     try pg.quote(w, r.repo);
     try w.writeAll(", ");
     try pg.quote(w, r.workflow);
@@ -68,13 +73,18 @@ pub fn writeUpsertRun(w: *Io.Writer, r: RunRow) Io.Writer.Error!void {
     try w.writeAll(", ");
     try text(w, r.completed_at);
     // created_at is deliberately not updated: it records when the run was first seen.
-    try w.writeAll(") ON CONFLICT (id) DO UPDATE SET repo = EXCLUDED.repo, workflow = EXCLUDED.workflow, " ++
-        "event = EXCLUDED.event, branch = EXCLUDED.branch, sha = EXCLUDED.sha, status = EXCLUDED.status, " ++
+    try w.writeAll(") ON CONFLICT (id) DO UPDATE SET repo = EXCLUDED.repo, " ++
+        "workflow = EXCLUDED.workflow, event = EXCLUDED.event, branch = EXCLUDED.branch, " ++
+        "sha = EXCLUDED.sha, status = EXCLUDED.status, " ++
         "conclusion = EXCLUDED.conclusion, completed_at = EXCLUDED.completed_at");
 }
 
 pub fn writeUpsertJob(w: *Io.Writer, j: JobRow) Io.Writer.Error!void {
-    try w.print("INSERT INTO jobs (id, run_id, name, runner_name, status, conclusion, started_at, completed_at) VALUES ({d}, {d}, ", .{ j.id, j.run_id });
+    try w.print(
+        "INSERT INTO jobs (id, run_id, name, runner_name, status, conclusion, started_at, " ++
+            "completed_at) VALUES ({d}, {d}, ",
+        .{ j.id, j.run_id },
+    );
     try pg.quote(w, j.name);
     try w.writeAll(", ");
     try text(w, j.runner_name);
@@ -86,13 +96,19 @@ pub fn writeUpsertJob(w: *Io.Writer, j: JobRow) Io.Writer.Error!void {
     try text(w, j.started_at);
     try w.writeAll(", ");
     try text(w, j.completed_at);
-    try w.writeAll(") ON CONFLICT (id) DO UPDATE SET run_id = EXCLUDED.run_id, name = EXCLUDED.name, runner_name = EXCLUDED.runner_name, " ++
+    try w.writeAll(") ON CONFLICT (id) DO UPDATE SET run_id = EXCLUDED.run_id, " ++
+        "name = EXCLUDED.name, runner_name = EXCLUDED.runner_name, " ++
         "status = EXCLUDED.status, conclusion = EXCLUDED.conclusion, " ++
-        "started_at = COALESCE(EXCLUDED.started_at, jobs.started_at), completed_at = EXCLUDED.completed_at");
+        "started_at = COALESCE(EXCLUDED.started_at, jobs.started_at), " ++
+        "completed_at = EXCLUDED.completed_at");
 }
 
 pub fn writeUpsertStep(w: *Io.Writer, s: StepRow) Io.Writer.Error!void {
-    try w.print("INSERT INTO steps (job_id, number, name, status, conclusion, started_at, completed_at) VALUES ({d}, {d}, ", .{ s.job_id, s.number });
+    try w.print(
+        "INSERT INTO steps (job_id, number, name, status, conclusion, started_at, completed_at) " ++
+            "VALUES ({d}, {d}, ",
+        .{ s.job_id, s.number },
+    );
     try pg.quote(w, s.name);
     try w.writeAll(", ");
     try pg.quote(w, s.status);
@@ -102,8 +118,10 @@ pub fn writeUpsertStep(w: *Io.Writer, s: StepRow) Io.Writer.Error!void {
     try text(w, s.started_at);
     try w.writeAll(", ");
     try text(w, s.completed_at);
-    try w.writeAll(") ON CONFLICT (job_id, number) DO UPDATE SET name = EXCLUDED.name, status = EXCLUDED.status, " ++
-        "conclusion = EXCLUDED.conclusion, started_at = COALESCE(EXCLUDED.started_at, steps.started_at), " ++
+    try w.writeAll(") ON CONFLICT (job_id, number) DO UPDATE SET name = EXCLUDED.name, " ++
+        "status = EXCLUDED.status, " ++
+        "conclusion = EXCLUDED.conclusion, " ++
+        "started_at = COALESCE(EXCLUDED.started_at, steps.started_at), " ++
         "completed_at = EXCLUDED.completed_at");
 }
 
@@ -162,7 +180,8 @@ pub const Store = struct {
     }
 
     fn remember(s: *Store, what: []const u8, detail: []const u8) void {
-        const t = std.fmt.bufPrint(&s.last_error, "{s}: {s}", .{ what, detail }) catch s.last_error[0..0];
+        const t = std.fmt.bufPrint(&s.last_error, "{s}: {s}", .{ what, detail }) catch
+            s.last_error[0..0];
         s.last_error_len = t.len;
     }
 
@@ -198,7 +217,12 @@ pub const Store = struct {
         return s.run(StepRow, writeUpsertStep, st);
     }
 
-    fn run(s: *Store, comptime T: type, comptime build: fn (*Io.Writer, T) Io.Writer.Error!void, row: T) pg.Error!void {
+    fn run(
+        s: *Store,
+        comptime T: type,
+        comptime build: fn (*Io.Writer, T) Io.Writer.Error!void,
+        row: T,
+    ) pg.Error!void {
         s.mu.lockUncancelable(s.io);
         defer s.mu.unlock(s.io);
         const c = try s.ensure();
@@ -207,7 +231,10 @@ pub const Store = struct {
         var aw: Io.Writer.Allocating = .init(arena_state.allocator());
         build(&aw.writer, row) catch return error.OutOfMemory;
         c.exec(aw.written()) catch |e| {
-            s.remember("write failed", if (c.lastErrorText().len > 0) c.lastErrorText() else @errorName(e));
+            s.remember(
+                "write failed",
+                if (c.lastErrorText().len > 0) c.lastErrorText() else @errorName(e),
+            );
             // A connection the server has dropped is let go, so the next row dials again instead
             // of failing for the life of the process. A `ServerError` is the statement's problem,
             // not the connection's, so that one is kept.
@@ -227,7 +254,12 @@ fn writeSetSchemaFn(w: *Io.Writer, schema: []const u8) Io.Writer.Error!void {
     return writeSetSchema(w, schema);
 }
 
-fn execWith(gpa: Allocator, c: *pg.Client, comptime build: fn (*Io.Writer, []const u8) Io.Writer.Error!void, arg: []const u8) !void {
+fn execWith(
+    gpa: Allocator,
+    c: *pg.Client,
+    comptime build: fn (*Io.Writer, []const u8) Io.Writer.Error!void,
+    arg: []const u8,
+) !void {
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
     defer arena_state.deinit();
     var aw: Io.Writer.Allocating = .init(arena_state.allocator());

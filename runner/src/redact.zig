@@ -4,7 +4,11 @@ const std = @import("std");
 pub const mask = "***";
 
 /// Writes `text` to `w` with every occurrence of any secret replaced by `***`.
-pub fn write(w: *std.Io.Writer, text: []const u8, secrets: []const []const u8) std.Io.Writer.Error!void {
+pub fn write(
+    w: *std.Io.Writer,
+    text: []const u8,
+    secrets: []const []const u8,
+) std.Io.Writer.Error!void {
     var i: usize = 0;
     outer: while (i < text.len) {
         for (secrets) |s| {

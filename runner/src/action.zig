@@ -82,8 +82,16 @@ pub fn parse(arena: Allocator, text: []const u8) Allocator.Error!Parsed {
     var diag: yaml.Diag = .{};
     const root = yaml.parse(arena, text, &diag) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.UnsupportedYaml => return invalid(arena, "uses YAML this runner does not support ({s}, line {d})", .{ diag.message, diag.line }),
-        error.InvalidYaml => return invalid(arena, "is not valid YAML ({s}, line {d})", .{ diag.message, diag.line }),
+        error.UnsupportedYaml => return invalid(
+            arena,
+            "uses YAML this runner does not support ({s}, line {d})",
+            .{ diag.message, diag.line },
+        ),
+        error.InvalidYaml => return invalid(
+            arena,
+            "is not valid YAML ({s}, line {d})",
+            .{ diag.message, diag.line },
+        ),
     };
     if (root != .map) return .{ .invalid = "is not a mapping" };
 
@@ -119,7 +127,11 @@ fn parseInputs(arena: Allocator, root: yaml.Node) Allocator.Error!Section([]cons
     for (ins.map, out) |e, *o| {
         o.* = .{ .name = e.key };
         if (e.value.get("default")) |d| o.default = scalar(d) orelse
-            return .{ .invalid = try std.fmt.allocPrint(arena, "input '{s}' has a default that is not a string", .{e.key}) };
+            return .{ .invalid = try std.fmt.allocPrint(
+                arena,
+                "input '{s}' has a default that is not a string",
+                .{e.key},
+            ) };
         if (e.value.get("required")) |r| o.required = isTrue(scalar(r) orelse "");
     }
     return .{ .ok = out };
@@ -134,7 +146,11 @@ fn parseOutputs(arena: Allocator, root: yaml.Node) Allocator.Error!Section([]con
     for (outs.map) |e| {
         const v = e.value.get("value") orelse continue;
         const value = scalar(v) orelse
-            return .{ .invalid = try std.fmt.allocPrint(arena, "output '{s}' has a value that is not a string", .{e.key}) };
+            return .{ .invalid = try std.fmt.allocPrint(
+                arena,
+                "output '{s}' has a value that is not a string",
+                .{e.key},
+            ) };
         try list.append(arena, .{ .name = e.key, .value = value });
     }
     return .{ .ok = list.items };
@@ -143,17 +159,23 @@ fn parseOutputs(arena: Allocator, root: yaml.Node) Allocator.Error!Section([]con
 /// `runs:` by `using`: a composite action's steps, a JavaScript action's scripts, or a Docker
 /// action's image and command.
 fn parseRuns(arena: Allocator, runs: yaml.Node) Allocator.Error!Section(Runs) {
-    const using_raw = (runs.get("using") orelse return .{ .invalid = "has no 'runs.using'" }).text() orelse
+    const using_raw = (runs.get("using") orelse
+        return .{ .invalid = "has no 'runs.using'" }).text() orelse
         return .{ .invalid = "has no 'runs.using'" };
     const using = try std.ascii.allocLowerString(arena, using_raw);
     if (std.mem.eql(u8, using, "composite")) return compositeRuns(arena, runs);
     if (std.mem.startsWith(u8, using, "node")) return nodeRuns(runs, using);
     if (std.mem.eql(u8, using, "docker")) return dockerRuns(arena, runs);
-    return .{ .invalid = try std.fmt.allocPrint(arena, "has an unknown 'runs.using' value '{s}'", .{using_raw}) };
+    return .{ .invalid = try std.fmt.allocPrint(
+        arena,
+        "has an unknown 'runs.using' value '{s}'",
+        .{using_raw},
+    ) };
 }
 
 fn compositeRuns(arena: Allocator, runs: yaml.Node) Allocator.Error!Section(Runs) {
-    const steps_n = runs.get("steps") orelse return .{ .invalid = "is a composite action without 'runs.steps'" };
+    const steps_n = runs.get("steps") orelse
+        return .{ .invalid = "is a composite action without 'runs.steps'" };
     if (steps_n != .seq) return .{ .invalid = "has 'runs.steps' that is not a list" };
     const steps = try arena.alloc(Step, steps_n.seq.len);
     for (steps_n.seq, steps, 1..) |sn, *st, i| {
@@ -166,7 +188,8 @@ fn compositeRuns(arena: Allocator, runs: yaml.Node) Allocator.Error!Section(Runs
 }
 
 fn nodeRuns(runs: yaml.Node, using: []const u8) Section(Runs) {
-    const main_n = runs.get("main") orelse return .{ .invalid = "is a JavaScript action without 'runs.main'" };
+    const main_n = runs.get("main") orelse
+        return .{ .invalid = "is a JavaScript action without 'runs.main'" };
     const main = main_n.text() orelse return .{ .invalid = "has 'runs.main' that is not a string" };
     return .{ .ok = .{ .node = .{
         .using = using,
@@ -179,8 +202,10 @@ fn nodeRuns(runs: yaml.Node, using: []const u8) Section(Runs) {
 }
 
 fn dockerRuns(arena: Allocator, runs: yaml.Node) Allocator.Error!Section(Runs) {
-    const image_n = runs.get("image") orelse return .{ .invalid = "is a Docker action without 'runs.image'" };
-    const image = image_n.text() orelse return .{ .invalid = "has 'runs.image' that is not a string" };
+    const image_n = runs.get("image") orelse
+        return .{ .invalid = "is a Docker action without 'runs.image'" };
+    const image = image_n.text() orelse
+        return .{ .invalid = "has 'runs.image' that is not a string" };
     var args: ?[]const []const u8 = null;
     if (runs.get("args")) |an| {
         if (an != .seq) return .{ .invalid = "has 'runs.args' that is not a list" };
@@ -206,18 +231,30 @@ fn dockerRuns(arena: Allocator, runs: yaml.Node) Allocator.Error!Section(Runs) {
 const StepParsed = union(enum) { ok: Step, invalid: []const u8 };
 
 fn compositeStep(arena: Allocator, n: yaml.Node, index: usize) Allocator.Error!StepParsed {
-    if (n != .map) return .{ .invalid = try std.fmt.allocPrint(arena, "has step {d} that is not a mapping", .{index}) };
+    if (n != .map) return .{ .invalid = try std.fmt.allocPrint(
+        arena,
+        "has step {d} that is not a mapping",
+        .{index},
+    ) };
     var st: Step = .{};
     for (n.map) |e| {
         const k = e.key;
         if (std.mem.eql(u8, k, "with") or std.mem.eql(u8, k, "env")) {
             const kv = (try keyValues(arena, e.value)) orelse
-                return .{ .invalid = try std.fmt.allocPrint(arena, "has step {d} whose '{s}' is not a mapping of strings", .{ index, k }) };
+                return .{ .invalid = try std.fmt.allocPrint(
+                    arena,
+                    "has step {d} whose '{s}' is not a mapping of strings",
+                    .{ index, k },
+                ) };
             if (std.mem.eql(u8, k, "with")) st.with = kv else st.env = kv;
             continue;
         }
         const v = scalar(e.value) orelse
-            return .{ .invalid = try std.fmt.allocPrint(arena, "has step {d} whose '{s}' is not a string", .{ index, k }) };
+            return .{ .invalid = try std.fmt.allocPrint(
+                arena,
+                "has step {d} whose '{s}' is not a string",
+                .{ index, k },
+            ) };
         if (std.mem.eql(u8, k, "id")) st.id = v //
         else if (std.mem.eql(u8, k, "name")) st.name = v //
         else if (std.mem.eql(u8, k, "if")) st.condition = v //
@@ -226,13 +263,25 @@ fn compositeStep(arena: Allocator, n: yaml.Node, index: usize) Allocator.Error!S
         else if (std.mem.eql(u8, k, "uses")) st.uses = v //
         else if (std.mem.eql(u8, k, "working-directory")) st.working_directory = v //
         else if (std.mem.eql(u8, k, "continue-on-error")) st.continue_on_error = v //
-        else return .{ .invalid = try std.fmt.allocPrint(arena, "has step {d} with an unknown key '{s}'", .{ index, k }) };
+        else return .{ .invalid = try std.fmt.allocPrint(
+            arena,
+            "has step {d} with an unknown key '{s}'",
+            .{ index, k },
+        ) };
     }
     if ((st.run == null) == (st.uses == null))
-        return .{ .invalid = try std.fmt.allocPrint(arena, "has step {d} that needs exactly one of 'run' and 'uses'", .{index}) };
+        return .{ .invalid = try std.fmt.allocPrint(
+            arena,
+            "has step {d} that needs exactly one of 'run' and 'uses'",
+            .{index},
+        ) };
     // GitHub requires an explicit shell for run steps in composite actions.
     if (st.run != null and st.shell == null)
-        return .{ .invalid = try std.fmt.allocPrint(arena, "has step {d} without 'shell' (required for run steps in composite actions)", .{index}) };
+        return .{ .invalid = try std.fmt.allocPrint(
+            arena,
+            "has step {d} without 'shell' (required for run steps in composite actions)",
+            .{index},
+        ) };
     return .{ .ok = st };
 }
 
@@ -288,7 +337,8 @@ pub fn parseUses(s_in: []const u8) ?Uses {
     const owner = parts.next() orelse return null;
     const name = parts.next() orelse return null;
     if (owner.len == 0 or name.len == 0) return null;
-    const path = if (owner.len + 1 + name.len < full.len) full[owner.len + 1 + name.len + 1 ..] else "";
+    const prefix_len = owner.len + 1 + name.len;
+    const path = if (prefix_len < full.len) full[prefix_len + 1 ..] else "";
     if (std.mem.indexOf(u8, path, "..") != null) return null;
     return .{ .repo = .{ .owner = owner, .name = name, .path = path, .ref = ref } };
 }

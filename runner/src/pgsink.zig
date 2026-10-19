@@ -1,9 +1,9 @@
 //! LogSink that writes job logs to the `job_logs` hypertable in batches (SPEC §4, §5.1).
 //!
-//! Lines are redacted, stamped with a per-job `seq` (1, 2, 3, ... with no gaps) and a timestamp when
-//! appended, and buffered. A batch is written with one `COPY` when it reaches `flush_lines`, when
-//! `flush_ms` has passed since the last write (checked on append and by a background flusher, so a
-//! quiet job's last line is not stuck), and on `flush()`/`close()` (step and job end).
+//! Lines are redacted, stamped with a per-job `seq` (1, 2, 3, ... with no gaps) and a timestamp
+//! when appended, and buffered. A batch is written with one `COPY` when it reaches `flush_lines`,
+//! when `flush_ms` has passed since the last write (checked on append and by a background flusher,
+//! so a quiet job's last line is not stuck), and on `flush()`/`close()` (step and job end).
 //!
 //! The database must never fail a job. If a write fails, the lines stay buffered and the next flush
 //! reconnects and retries (not more often than every 2 s); if the buffer outgrows `max_buffered`,
@@ -59,15 +59,29 @@ pub const PgSink = struct {
     stop: std.atomic.Value(bool) = .init(false),
     flusher: ?Io.Future(void) = null,
 
-    pub fn append(s: *PgSink, job_id: u64, step_number: u32, stream: sink.Stream, line: []const u8) sink.Error!void {
+    pub fn append(
+        s: *PgSink,
+        job_id: u64,
+        step_number: u32,
+        stream: sink.Stream,
+        line: []const u8,
+    ) sink.Error!void {
         return s.appendStep(job_id, step_number, null, stream, line);
     }
 
     /// As `append`, with the line's number in its own step (`sink.CollectedLine.seq`). Only the
     /// job's sink knows it; the runner's own messages come through `append`.
-    pub fn appendStep(s: *PgSink, job_id: u64, step_number: u32, step_seq: ?u64, stream: sink.Stream, line: []const u8) sink.Error!void {
+    pub fn appendStep(
+        s: *PgSink,
+        job_id: u64,
+        step_number: u32,
+        step_seq: ?u64,
+        stream: sink.Stream,
+        line: []const u8,
+    ) sink.Error!void {
         try s.inner.append(job_id, step_number, stream, line);
-        // Job id 0 marks messages that belong to no job (registering, waiting for work): console only.
+        // Job id 0 marks messages that belong to no job (registering, waiting for work): console
+        // only.
         if (job_id == 0) return;
 
         var aw: Io.Writer.Allocating = .init(s.gpa);
@@ -91,7 +105,8 @@ pub const PgSink = struct {
             .stream = stream,
             .text = owned,
         });
-        if (s.rows.items.len >= s.flush_lines or now(s.io) - s.last_flush_ms >= s.flush_ms) s.flushLocked();
+        if (s.rows.items.len >= s.flush_lines or now(s.io) - s.last_flush_ms >= s.flush_ms)
+            s.flushLocked();
         s.enforceCap();
     }
 
@@ -140,7 +155,8 @@ pub const PgSink = struct {
     }
 
     fn remember(s: *PgSink, what: []const u8, detail: []const u8) void {
-        const t = std.fmt.bufPrint(&s.last_error, "{s}: {s}", .{ what, detail }) catch s.last_error[0..0];
+        const t = std.fmt.bufPrint(&s.last_error, "{s}: {s}", .{ what, detail }) catch
+            s.last_error[0..0];
         s.last_error_len = t.len;
     }
 
@@ -150,7 +166,8 @@ pub const PgSink = struct {
         const t = now(s.io);
         if (t < s.retry_after_ms) return;
         s.writeBatch() catch |e| {
-            s.remember("log write failed", if (s.client) |c| (if (c.lastErrorText().len > 0) c.lastErrorText() else @errorName(e)) else @errorName(e));
+            const detail = if (s.client) |c| c.lastErrorText() else "";
+            s.remember("log write failed", if (detail.len > 0) detail else @errorName(e));
             if (s.client) |c| c.close();
             s.client = null;
             s.retry_after_ms = t + 2000;
@@ -183,7 +200,10 @@ pub const PgSink = struct {
             if (r.step_seq) |ss| try w.print("\t{d}", .{ss}) else try w.writeAll("\t\\N");
             try w.writeByte('\n');
         }
-        const n = try s.client.?.copyIn("COPY job_logs (ts, job_id, step_number, seq, stream, line, step_seq) FROM STDIN", data.written());
+        const n = try s.client.?.copyIn(
+            "COPY job_logs (ts, job_id, step_number, seq, stream, line, step_seq) FROM STDIN",
+            data.written(),
+        );
         if (n != s.rows.items.len) return error.ShortCopy;
         s.written += n;
         for (s.rows.items) |r| s.gpa.free(r.text);
@@ -208,7 +228,13 @@ fn countLogs(sc: *@import("dbtest.zig").Scratch) !u64 {
 }
 
 fn testSink(sc: *@import("dbtest.zig").Scratch, inner: *sink.LogSink) PgSink {
-    return .{ .gpa = std.testing.allocator, .io = std.testing.io, .cfg = sc.cfg, .schema = sc.schema, .inner = inner };
+    return .{
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .cfg = sc.cfg,
+        .schema = sc.schema,
+        .inner = inner,
+    };
 }
 
 test "integration: batches are written with gapless seq, redaction and the right columns" {

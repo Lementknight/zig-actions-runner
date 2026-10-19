@@ -72,7 +72,8 @@ pub const Loaded = struct {
 };
 
 pub fn load(arena: Allocator, json_text: []const u8) Error!Loaded {
-    const parsed = std.json.parseFromSlice(std.json.Value, arena, json_text, .{}) catch return error.BadMatcher;
+    const parsed = std.json.parseFromSlice(std.json.Value, arena, json_text, .{}) catch
+        return error.BadMatcher;
     const root = parsed.value;
     if (root != .object) return error.BadMatcher;
     const list = root.object.get("problemMatcher") orelse return error.BadMatcher;
@@ -85,7 +86,7 @@ pub fn load(arena: Allocator, json_text: []const u8) Error!Loaded {
         const owner_v = entry.object.get("owner") orelse continue;
         if (owner_v != .string) continue;
         const owner = owner_v.string;
-        const default_severity = blk: {
+        const severity = blk: {
             const s = entry.object.get("severity") orelse break :blk "error";
             break :blk if (s == .string and s.string.len > 0) s.string else "error";
         };
@@ -110,7 +111,8 @@ pub fn load(arena: Allocator, json_text: []const u8) Error!Loaded {
             const re = regex.Regex.compile(arena, rx_v.string) catch |e| {
                 // One unusable pattern makes the whole matcher inert: a matcher whose second
                 // pattern cannot compile would otherwise emit annotations from half a sequence.
-                try refused.append(arena, .{ .owner = owner, .pattern = rx_v.string, .why = @errorName(e) });
+                const why = @errorName(e);
+                try refused.append(arena, .{ .owner = owner, .pattern = rx_v.string, .why = why });
                 ok = false;
                 break;
             };
@@ -133,7 +135,7 @@ pub fn load(arena: Allocator, json_text: []const u8) Error!Loaded {
             });
         }
         if (!ok) continue;
-        try out.append(arena, .{ .owner = owner, .severity = default_severity, .patterns = pats.items });
+        try out.append(arena, .{ .owner = owner, .severity = severity, .patterns = pats.items });
     }
     return .{ .matchers = out.items, .refused = refused.items };
 }

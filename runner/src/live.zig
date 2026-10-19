@@ -66,9 +66,21 @@ pub const Live = struct {
     };
 
     /// As the results service numbers them (its protobuf enums).
-    pub const Conclusion = enum(u8) { unknown = 0, success = 2, failure = 3, cancelled = 4, skipped = 7 };
+    pub const Conclusion = enum(u8) {
+        unknown = 0,
+        success = 2,
+        failure = 3,
+        cancelled = 4,
+        skipped = 7,
+    };
 
-    pub fn init(gpa: Allocator, arena: Allocator, io: std.Io, job: *const job_mod.Job, log: *sink.LogSink) !Live {
+    pub fn init(
+        gpa: Allocator,
+        arena: Allocator,
+        io: std.Io,
+        job: *const job_mod.Job,
+        log: *sink.LogSink,
+    ) !Live {
         const n = dagger.logSteps(job.steps.len) + 1;
         const ids = try arena.alloc([]const u8, n);
         for (ids, 0..) |*id, i| {
@@ -91,7 +103,10 @@ pub const Live = struct {
             if (l.socket.open(l.gpa, l.io, l.job.runtime.feed_url, l.job.job_token)) |_| {
                 l.feed_open = true;
                 l.feed_last_ms = std.Io.Clock.real.now(l.io).toMilliseconds();
-            } else |e| l.say("live log feed unavailable ({s}); the log appears when the job ends", .{@errorName(e)});
+            } else |e| l.say(
+                "live log feed unavailable ({s}); the log appears when the job ends",
+                .{@errorName(e)},
+            );
         }
         l.begin(0, "Set up job", started_ms);
         l.task = l.io.concurrent(run, .{l}) catch null;
@@ -102,7 +117,14 @@ pub const Live = struct {
     }
 
     pub fn observer(l: *Live) dagger.Observer {
-        return .{ .ptr = l, .startedFn = stepStarted, .finishedFn = stepFinished, .extraStartedFn = extraStarted, .extraFinishedFn = extraFinished, .postsFn = posts };
+        return .{
+            .ptr = l,
+            .startedFn = stepStarted,
+            .finishedFn = stepFinished,
+            .extraStartedFn = extraStarted,
+            .extraFinishedFn = extraFinished,
+            .postsFn = posts,
+        };
     }
 
     /// GitHub's numbering after the main steps (see `loop.shownSteps`): one number per step that
@@ -150,7 +172,15 @@ pub const Live = struct {
             s.completed_ms = started_ms;
         };
         const name_copy = l.gpa.dupe(u8, name) catch return null;
-        l.steps.append(l.gpa, .{ .log_step = log_step, .number = l.next_number, .name = name_copy, .started_ms = started_ms }) catch {
+        l.steps.append(
+            l.gpa,
+            .{
+                .log_step = log_step,
+                .number = l.next_number,
+                .name = name_copy,
+                .started_ms = started_ms,
+            },
+        ) catch {
             l.gpa.free(name_copy);
             return null;
         };
@@ -159,10 +189,21 @@ pub const Live = struct {
         return &l.steps.items[l.steps.items.len - 1];
     }
 
-    pub fn end(l: *Live, log_step: u32, name: []const u8, conclusion: Conclusion, started_ms: i64, completed_ms: i64) void {
+    pub fn end(
+        l: *Live,
+        log_step: u32,
+        name: []const u8,
+        conclusion: Conclusion,
+        started_ms: i64,
+        completed_ms: i64,
+    ) void {
         l.mu.lockUncancelable(l.io);
         defer l.mu.unlock(l.io);
-        const s = l.stepLocked(log_step, name, if (started_ms > 0) started_ms else completed_ms) orelse return;
+        const s = l.stepLocked(
+            log_step,
+            name,
+            if (started_ms > 0) started_ms else completed_ms,
+        ) orelse return;
         s.completed = true;
         s.conclusion = conclusion;
         s.completed_ms = completed_ms;
@@ -177,13 +218,27 @@ pub const Live = struct {
 
     fn stepFinished(ptr: *anyopaque, number: u32, res: dagger.StepResult) void {
         const l: *Live = @ptrCast(@alignCast(ptr));
-        const name = if (res.name.len > 0) res.name else if (number >= 1 and number <= l.job.steps.len) l.job.steps[number - 1].name else "";
+        const in_job = number >= 1 and number <= l.job.steps.len;
+        const step_name = if (in_job) l.job.steps[number - 1].name else "";
+        const name = if (res.name.len > 0) res.name else step_name;
         const now = std.Io.Clock.real.now(l.io).toMilliseconds();
-        l.end(number, name, conclusionOf(res.outcome, res.continued), res.started_ms, if (res.completed_ms > 0) res.completed_ms else now);
+        l.end(
+            number,
+            name,
+            conclusionOf(res.outcome, res.continued),
+            res.started_ms,
+            if (res.completed_ms > 0) res.completed_ms else now,
+        );
         if (l.next) |o| o.finishedFn(o.ptr, number, res);
     }
 
-    fn extraStarted(ptr: *anyopaque, kind: dagger.ExtraKind, log_step: u32, name: []const u8, started_ms: i64) void {
+    fn extraStarted(
+        ptr: *anyopaque,
+        kind: dagger.ExtraKind,
+        log_step: u32,
+        name: []const u8,
+        started_ms: i64,
+    ) void {
         const l: *Live = @ptrCast(@alignCast(ptr));
         if (kind == .pre) {
             l.mu.lockUncancelable(l.io);
@@ -237,7 +292,10 @@ pub const Live = struct {
             for (l.pending, 0..) |*p, i| {
                 if (p.items.len == 0) continue;
                 const lines = p.toOwnedSlice(l.gpa) catch continue;
-                batches.append(arena, .{ .log_step = @intCast(i), .start_line = lines[0].seq, .lines = lines }) catch {
+                batches.append(
+                    arena,
+                    .{ .log_step = @intCast(i), .start_line = lines[0].seq, .lines = lines },
+                ) catch {
                     freeLines(l.gpa, lines);
                     continue;
                 };
@@ -260,7 +318,8 @@ pub const Live = struct {
         }
         // A step that prints nothing for a while (`npm install`, a compiler) would leave the feed
         // idle, and idle feeds were closed on the way within about a minute.
-        if (l.feed_open and std.Io.Clock.real.now(l.io).toMilliseconds() - l.feed_last_ms >= keepalive_ms) l.feedSend(null);
+        const idle_ms = std.Io.Clock.real.now(l.io).toMilliseconds() - l.feed_last_ms;
+        if (l.feed_open and idle_ms >= keepalive_ms) l.feedSend(null);
     }
 
     const keepalive_ms = 15_000;
@@ -280,10 +339,15 @@ pub const Live = struct {
                 l.socket.close(l.gpa);
                 if (attempt == 0 and l.feed_reopened < max_reopen) {
                     l.feed_reopened += 1;
-                    if (l.socket.open(l.gpa, l.io, l.job.runtime.feed_url, l.job.job_token)) |_| continue else |_| {}
+                    if (l.socket.open(l.gpa, l.io, l.job.runtime.feed_url, l.job.job_token)) |_|
+                        continue
+                    else |_| {}
                 }
                 l.feed_open = false;
-                l.say("live log feed lost ({s}); the log appears when the job ends", .{@errorName(e)});
+                l.say(
+                    "live log feed lost ({s}); the log appears when the job ends",
+                    .{@errorName(e)},
+                );
                 return;
             }
         }
@@ -295,7 +359,17 @@ pub const Live = struct {
         try w.writeByte('[');
         for (l.steps.items, 0..) |s, i| {
             if (i > 0) try w.writeByte(',');
-            try writeStep(arena, w, l.ids[s.log_step], s.number, s.name, s.completed, s.conclusion, s.started_ms, s.completed_ms);
+            try writeStep(
+                arena,
+                w,
+                l.ids[s.log_step],
+                s.number,
+                s.name,
+                s.completed,
+                s.conclusion,
+                s.started_ms,
+                s.completed_ms,
+            );
         }
         try w.writeByte(']');
         return aw.written();
@@ -316,7 +390,17 @@ pub const Live = struct {
             aw.writer.writeByte('[') catch return;
             for (final_steps, 0..) |s, i| {
                 if (i > 0) aw.writer.writeByte(',') catch return;
-                writeStep(arena, &aw.writer, s.id, s.number, s.name, true, s.conclusion, s.started_ms, s.completed_ms) catch return;
+                writeStep(
+                    arena,
+                    &aw.writer,
+                    s.id,
+                    s.number,
+                    s.name,
+                    true,
+                    s.conclusion,
+                    s.started_ms,
+                    s.completed_ms,
+                ) catch return;
             }
             aw.writer.writeByte(']') catch return;
             l.change_order += 1;
@@ -337,11 +421,19 @@ pub const Live = struct {
         }
     }
 
-    pub const Final = struct { id: []const u8, number: u32, name: []const u8, conclusion: Conclusion, started_ms: i64, completed_ms: i64 };
+    pub const Final = struct {
+        id: []const u8,
+        number: u32,
+        name: []const u8,
+        conclusion: Conclusion,
+        started_ms: i64,
+        completed_ms: i64,
+    };
 
     fn say(l: *Live, comptime fmt: []const u8, args: anytype) void {
         var buf: [512]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "job {d}: " ++ fmt, .{l.job.check_run_id} ++ args) catch return;
+        const text = std.fmt.bufPrint(&buf, "job {d}: " ++ fmt, .{l.job.check_run_id} ++ args) catch
+            return;
         l.log.append(0, 0, .stderr, text) catch {};
     }
 };
@@ -353,23 +445,40 @@ fn freeLines(gpa: Allocator, lines: []const Pending) void {
 
 /// One step for `WorkflowStepsUpdate` (actions/runner's results `Step`: snake_case names, the
 /// status and conclusion as their protobuf numbers).
-fn writeStep(arena: Allocator, w: *std.Io.Writer, id: []const u8, number: u32, name: []const u8, completed: bool, conclusion: Live.Conclusion, started_ms: i64, completed_ms: i64) !void {
+fn writeStep(
+    arena: Allocator,
+    w: *std.Io.Writer,
+    id: []const u8,
+    number: u32,
+    name: []const u8,
+    completed: bool,
+    conclusion: Live.Conclusion,
+    started_ms: i64,
+    completed_ms: i64,
+) !void {
     try w.writeAll("{\"external_id\":");
     try std.json.Stringify.value(id, .{}, w);
     try w.print(",\"number\":{d},\"name\":", .{number});
     try std.json.Stringify.value(name, .{}, w);
     // 3: in progress, 6: completed.
     try w.print(",\"status\":{d}", .{@as(u8, if (completed) 6 else 3)});
-    if (started_ms > 0) try w.print(",\"started_at\":\"{s}\"", .{try timefmt.isoTime(arena, started_ms)});
+    if (started_ms > 0)
+        try w.print(",\"started_at\":\"{s}\"", .{try timefmt.isoTime(arena, started_ms)});
     if (completed) {
         try w.print(",\"conclusion\":{d}", .{@backingInt(conclusion)});
-        if (completed_ms > 0) try w.print(",\"completed_at\":\"{s}\"", .{try timefmt.isoTime(arena, completed_ms)});
+        if (completed_ms > 0)
+            try w.print(",\"completed_at\":\"{s}\"", .{try timefmt.isoTime(arena, completed_ms)});
     }
     try w.writeByte('}');
 }
 
 /// A feed message: actions/runner's `TimelineRecordFeedLinesWrapper`, camelCase.
-pub fn feedMessage(arena: Allocator, step_id: []const u8, lines: []const []const u8, start_line: u64) ![]const u8 {
+pub fn feedMessage(
+    arena: Allocator,
+    step_id: []const u8,
+    lines: []const []const u8,
+    start_line: u64,
+) ![]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.print("{{\"count\":{d},\"value\":", .{lines.len});

@@ -38,12 +38,13 @@ pub const Config = struct {
     /// Absent means "log to stdout only" (StdoutSink).
     database_url: ?[]const u8 = null,
     dagger_cmd: []const u8 = "dagger",
-    /// Base image for jobs. The default gets git, curl and CA certificates installed (cached by Dagger);
-    /// a custom image is used as is.
+    /// Base image for jobs. The default gets git, curl and CA certificates installed (cached by
+    /// Dagger); a custom image is used as is.
     image: []const u8 = "ubuntu:24.04",
     log_flush_lines: u32 = 200,
     log_flush_ms: u32 = 500,
-    /// What runs JavaScript actions (`runs.using: node*`). Bun by default; Node for exact Node behaviour.
+    /// What runs JavaScript actions (`runs.using: node*`). Bun by default; Node for exact Node
+    /// behaviour.
     js_runtime: JsRuntime = .bun,
     engine: EngineMode = .direct,
     /// The engine container `direct` sessions run `buildctl dial-stdio` in.
@@ -53,24 +54,25 @@ pub const Config = struct {
     engine_host: []const u8 = "",
     /// The Docker API socket (from DOCKER_HOST when it is `unix://`).
     docker_socket: []const u8 = "/var/run/docker.sock",
-    /// Give each step's commands access to the job's Dagger engine (`experimentalPrivilegedNesting`), so
-    /// `dagger call` inside a job works, as dagger/dagger-for-github expects. That access is enough to run
-    /// privileged containers, so a job can control the runner's host: turn it off for untrusted workflows.
+    /// Give each step's commands access to the job's Dagger engine
+    /// (`experimentalPrivilegedNesting`), so `dagger call` inside a job works, as
+    /// dagger/dagger-for-github expects. That access is enough to run privileged containers, so a
+    /// job can control the runner's host: turn it off for untrusted workflows.
     dagger_nesting: bool = true,
     /// Mount persistent Dagger cache volumes at package managers' cache directories in every job.
     package_caches: bool = true,
-    /// Reuse a step's result from an earlier run when its inputs are unchanged (steps that use secrets
-    /// always run). A workflow can opt out with `ZIG_RUNNER_STEP_CACHE: false` in its env.
+    /// Reuse a step's result from an earlier run when its inputs are unchanged (steps that use
+    /// secrets always run). A workflow can opt out with `ZIG_RUNNER_STEP_CACHE: false` in its env.
     step_cache: bool = true,
     /// Who steps run as in the default image (`RUNNER_STEP_USER`).
     step_user: StepUser = .runner,
     /// Experimental: key the steps after one that always runs on what it produced rather than on
     /// the step itself (see `dagger.Options.output_keys`).
     output_keys: bool = false,
-    /// Give a step that did not name a run-specific value (`GITHUB_SHA`, `GITHUB_RUN_ID`, the actor,
-    /// the refs) a constant instead of the real one, so that a step which reads one indirectly
-    /// cannot be replayed with an earlier run's value. On by default, and a deliberate divergence
-    /// from GitHub's runner: see SPEC "Where this runner differs from GitHub's".
+    /// Give a step that did not name a run-specific value (`GITHUB_SHA`, `GITHUB_RUN_ID`, the
+    /// actor, the refs) a constant instead of the real one, so that a step which reads one
+    /// indirectly cannot be replayed with an earlier run's value. On by default, and a deliberate
+    /// divergence from GitHub's runner: see SPEC "Where this runner differs from GitHub's".
     enforce_volatile: bool = true,
     /// Where a job's log is spooled while it runs, so the copy the upload reads is not held in
     /// memory for the length of the job (see `sink.Spool` and docs/RELATED.md, "Streaming a step's
@@ -94,18 +96,33 @@ pub const Config = struct {
     once: bool = false,
     /// Runners in this process, each serving jobs one after another, concurrently with the others.
     runners: u32 = 1,
-    /// Connect to the configured database, report what is there, and exit (no GitHub credentials needed).
+    /// Connect to the configured database, report what is there, and exit (no GitHub credentials
+    /// needed).
     db_check: bool = false,
     /// Dev: run a saved acquirejob response through the executor without contacting GitHub.
     exec_job: ?[]const u8 = null,
     /// Register one runner, print the shape of its config, delete it, exit.
     inspect: bool = false,
 
-    pub const Error = error{ MissingGhToken, MissingGhScope, InvalidScope, InvalidNumber, InvalidJsRuntime, InvalidStepUser, InvalidEngine, InvalidBool, UnknownFlag, MissingFlagValue };
+    pub const Error = error{
+        MissingGhToken,
+        MissingGhScope,
+        InvalidScope,
+        InvalidNumber,
+        InvalidJsRuntime,
+        InvalidStepUser,
+        InvalidEngine,
+        InvalidBool,
+        UnknownFlag,
+        MissingFlagValue,
+    };
 
     /// Values are borrowed from `environ` / `args`, which must outlive the Config.
     pub fn load(environ: *const std.process.Environ.Map, args: []const [:0]const u8) Error!Config {
-        var creds: Credentials = .{ .token = environ.get("GH_TOKEN"), .scope = environ.get("GH_SCOPE") };
+        var creds: Credentials = .{
+            .token = environ.get("GH_TOKEN"),
+            .scope = environ.get("GH_SCOPE"),
+        };
         var c: Config = .{ .gh_token = "", .scope = undefined };
         try c.fromEnviron(environ);
 
@@ -185,37 +202,46 @@ pub const Config = struct {
 
     /// One `--key value` flag (SPEC.md §2's flag list); flags override the environment.
     fn applyFlag(c: *Config, key: []const u8, val: []const u8, creds: *Credentials) Error!void {
-        if (std.mem.eql(u8, key, "token")) creds.token = val //
-        else if (std.mem.eql(u8, key, "scope")) creds.scope = val //
-        else if (std.mem.eql(u8, key, "exec-job")) c.exec_job = val //
-        else if (std.mem.eql(u8, key, "labels")) c.labels = val //
-        else if (std.mem.eql(u8, key, "group-id")) c.runner_group_id = try num(u64, val) //
-        else if (std.mem.eql(u8, key, "name-prefix")) c.name_prefix = val //
-        else if (std.mem.eql(u8, key, "database-url")) c.database_url = val //
-        else if (std.mem.eql(u8, key, "dagger-cmd")) c.dagger_cmd = val //
-        else if (std.mem.eql(u8, key, "image")) c.image = val //
-        else if (std.mem.eql(u8, key, "log-flush-lines")) c.log_flush_lines = try num(u32, val) //
-        else if (std.mem.eql(u8, key, "log-flush-ms")) c.log_flush_ms = try num(u32, val) //
-        else if (std.mem.eql(u8, key, "js-runtime")) c.js_runtime = try jsRuntime(val) //
-        else if (std.mem.eql(u8, key, "engine")) c.engine = try engineMode(val) //
-        else if (std.mem.eql(u8, key, "engine-host")) c.engine_host = val //
-        else if (std.mem.eql(u8, key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
-        else if (std.mem.eql(u8, key, "package-caches")) c.package_caches = try boolean(val) //
-        else if (std.mem.eql(u8, key, "step-cache")) c.step_cache = try boolean(val) //
-        else if (std.mem.eql(u8, key, "step-user")) c.step_user = try stepUser(val) //
-        else if (std.mem.eql(u8, key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
-        else if (std.mem.eql(u8, key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
-        else if (std.mem.eql(u8, key, "log-spool-dir")) c.log_spool_dir = val //
-        else if (std.mem.eql(u8, key, "enforce-volatile")) c.enforce_volatile = try boolean(val) //
-        else if (std.mem.eql(u8, key, "output-keys")) c.output_keys = try boolean(val) //
-        else if (std.mem.eql(u8, key, "output-keys-days")) c.output_keys_days = try count(val) //
-        else if (std.mem.eql(u8, key, "runners")) c.runners = try count(val) //
+        const eq = struct {
+            fn f(a: []const u8, b: []const u8) bool {
+                return std.mem.eql(u8, a, b);
+            }
+        }.f;
+        if (eq(key, "token")) creds.token = val //
+        else if (eq(key, "scope")) creds.scope = val //
+        else if (eq(key, "exec-job")) c.exec_job = val //
+        else if (eq(key, "labels")) c.labels = val //
+        else if (eq(key, "group-id")) c.runner_group_id = try num(u64, val) //
+        else if (eq(key, "name-prefix")) c.name_prefix = val //
+        else if (eq(key, "database-url")) c.database_url = val //
+        else if (eq(key, "dagger-cmd")) c.dagger_cmd = val //
+        else if (eq(key, "image")) c.image = val //
+        else if (eq(key, "log-flush-lines")) c.log_flush_lines = try num(u32, val) //
+        else if (eq(key, "log-flush-ms")) c.log_flush_ms = try num(u32, val) //
+        else if (eq(key, "js-runtime")) c.js_runtime = try jsRuntime(val) //
+        else if (eq(key, "engine")) c.engine = try engineMode(val) //
+        else if (eq(key, "engine-host")) c.engine_host = val //
+        else if (eq(key, "dagger-nesting")) c.dagger_nesting = try boolean(val) //
+        else if (eq(key, "package-caches")) c.package_caches = try boolean(val) //
+        else if (eq(key, "step-cache")) c.step_cache = try boolean(val) //
+        else if (eq(key, "step-user")) c.step_user = try stepUser(val) //
+        else if (eq(key, "uv-env-in-cache")) c.uv_env_in_cache = try boolean(val) //
+        else if (eq(key, "output-keys-max-ms")) c.output_keys_max_ms = try millis(val) //
+        else if (eq(key, "log-spool-dir")) c.log_spool_dir = val //
+        else if (eq(key, "enforce-volatile")) c.enforce_volatile = try boolean(val) //
+        else if (eq(key, "output-keys")) c.output_keys = try boolean(val) //
+        else if (eq(key, "output-keys-days")) c.output_keys_days = try count(val) //
+        else if (eq(key, "runners")) c.runners = try count(val) //
         else return error.UnknownFlag;
     }
 
-    /// Where logs and run state go: `DATABASE_URL` / `--database-url`, else the standard PG* variables.
-    /// Null means the runner logs to stdout only (StdoutSink).
-    pub fn pgConfig(c: *const Config, arena: std.mem.Allocator, environ: *const std.process.Environ.Map) pg.ParseError!?pg.Config {
+    /// Where logs and run state go: `DATABASE_URL` / `--database-url`, else the standard PG*
+    /// variables. Null means the runner logs to stdout only (StdoutSink).
+    pub fn pgConfig(
+        c: *const Config,
+        arena: std.mem.Allocator,
+        environ: *const std.process.Environ.Map,
+    ) pg.ParseError!?pg.Config {
         if (c.database_url) |u| return try pg.parseUrl(arena, u);
         return pg.fromEnv(environ);
     }
@@ -250,7 +276,11 @@ pub const Config = struct {
     /// How jobs reach the engine, for `dagger.Options.engine`: null means a `dagger run` child.
     pub fn engineEndpoint(c: *const Config) ?@import("engine.zig").Endpoint {
         return switch (c.engine) {
-            .direct => .{ .host = c.engine_host, .docker_socket = c.docker_socket, .container = c.engine_container },
+            .direct => .{
+                .host = c.engine_host,
+                .docker_socket = c.docker_socket,
+                .container = c.engine_container,
+            },
             .cli => null,
         };
     }

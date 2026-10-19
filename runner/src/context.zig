@@ -1,8 +1,10 @@
-//! Converts the job's `contextData` (GitHub's pipeline context data encoding) into expression values.
+//! Converts the job's `contextData` (GitHub's pipeline context data encoding) into expression
+//! values.
 //!
-//! Strings, booleans, numbers and null are plain JSON. A dictionary is `{"t":2,"d":[{"k":..,"v":..}]}`
-//! and an array is `{"t":1,"a":[..]}`. A null context (for example `matrix` outside a matrix job) is
-//! null, so `matrix.os` evaluates to an empty string, as in GitHub.
+//! Strings, booleans, numbers and null are plain JSON. A dictionary is
+//! `{"t":2,"d":[{"k":..,"v":..}]}` and an array is `{"t":1,"a":[..]}`. A null context (for example
+//! `matrix` outside a matrix job) is null, so `matrix.os` evaluates to an empty string, as in
+//! GitHub.
 const std = @import("std");
 const expr = @import("expr.zig");
 
@@ -14,7 +16,8 @@ pub fn fromContextData(arena: Allocator, v: std.json.Value) Allocator.Error!expr
         .bool => |b| return .{ .boolean = b },
         .integer => |i| return .{ .number = @floatFromInt(i) },
         .float => |f| return .{ .number = f },
-        .number_string => |s| return .{ .number = std.fmt.parseFloat(f64, s) catch std.math.nan(f64) },
+        .number_string => |s| return .{ .number = std.fmt.parseFloat(f64, s) catch
+            std.math.nan(f64) },
         .string => |s| return .{ .string = s },
         .array => |a| {
             const out = try arena.alloc(expr.Value, a.items.len);
@@ -29,7 +32,10 @@ pub fn fromContextData(arena: Allocator, v: std.json.Value) Allocator.Error!expr
                     const k = item.object.get("k") orelse continue;
                     if (k != .string) continue;
                     const val = item.object.get("v") orelse .null;
-                    try entries.append(arena, .{ .key = k.string, .value = try fromContextData(arena, val) });
+                    try entries.append(
+                        arena,
+                        .{ .key = k.string, .value = try fromContextData(arena, val) },
+                    );
                 }
                 return .{ .object = entries.items };
             };
@@ -40,7 +46,11 @@ pub fn fromContextData(arena: Allocator, v: std.json.Value) Allocator.Error!expr
 }
 
 /// The value of a named top-level context in `contextData`, or null when it is absent.
-pub fn named(arena: Allocator, context_data: std.json.Value, name: []const u8) Allocator.Error!expr.Value {
+pub fn named(
+    arena: Allocator,
+    context_data: std.json.Value,
+    name: []const u8,
+) Allocator.Error!expr.Value {
     if (context_data != .object) return .null;
     const v = context_data.object.get(name) orelse return .null;
     return fromContextData(arena, v);
