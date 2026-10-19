@@ -72,6 +72,14 @@ pub const Query = struct {
         q.depth -= count;
     }
 
+    /// Text written the old way — `name(args) { ` repeated — that opened `opened` selections. A
+    /// bridge while some query text is still built elsewhere; it goes when the last such writer
+    /// does.
+    pub fn splice(q: *Query, text: []const u8, opened: usize) !void {
+        try (try q.ink()).writeAll(text);
+        q.depth += opened;
+    }
+
     /// The document, every open selection closed.
     pub fn finish(q: *Query) ![]const u8 {
         const w = try q.ink();
