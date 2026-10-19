@@ -1,14 +1,13 @@
 //! Checks the two conventions in SPEC.md §10 that a tool can check: a function is at most 70
 //! lines, and a line is at most 100 columns. Both limits are TigerBeetle's; both were adopted on
-//! 2026-10-18
-//! when the code had grown too dense to read, with 17 functions over the first and 9% of lines over
-//! the second.
+//! 2026-10-18 when the code had grown too dense to read, with 17 functions over the first and 9%
+//! of lines over the second.
 //!
 //! Those existing violations are the refactor queue, not a reason for CI to be red. So the check is
 //! a **ratchet**: a baseline file lists every function over 70 lines with its length, and every
-//! file's count of long lines, and the check fails only when something gets *worse* — a new long
-//! function, a listed one growing, or a file gaining long lines. Shrinking is free and is reported
-//! so the baseline can be tightened with `--update-baseline`.
+//! file's count of long lines outside `test` blocks, and the check fails only when something gets
+//! *worse* — a new long function, a listed one growing, or a file gaining long lines. Shrinking is
+//! free and is reported so the baseline can be tightened with `--update-baseline`.
 //!
 //! Function spans come from `std.zig.Ast`, not from counting braces: a brace heuristic once blamed
 //! a 5-line helper for the 2,000-line struct declared after it.
@@ -116,22 +115,43 @@ fn checkFile(arena: Allocator, io: std.Io, path: []const u8, found: *Findings) !
     };
     found.files += 1;
 
-    var long: usize = 0;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |l| {
-        if (columns(l) > max_line_cols) long += 1;
-    }
-    if (long > 0) try found.long_lines.put(arena, path, long);
-
     const source = try arena.allocSentinel(u8, bytes.len, 0);
     @memcpy(source, bytes);
     var tree = try Ast.parse(arena, source, .{});
     if (tree.errors.len > 0) {
         // zig fmt and ast-check report syntax; this tool does not need to repeat them.
-        std.debug.print("{s}: did not parse; skipping its functions\n", .{path});
+        std.debug.print("{s}: did not parse; skipping it\n", .{path});
         return;
     }
+    const long = countLongLines(bytes, try testLines(arena, &tree));
+    if (long > 0) try found.long_lines.put(arena, path, long);
     for (tree.rootDecls()) |decl| try visit(arena, &tree, path, decl, found);
+}
+
+/// Lines over the limit, except inside `test` blocks (`in_test`, indexed by line): a long expected
+/// string is clearest whole (SPEC.md §10).
+fn countLongLines(bytes: []const u8, in_test: []const bool) usize {
+    var long: usize = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    var i: usize = 0;
+    while (lines.next()) |l| : (i += 1) {
+        if (columns(l) > max_line_cols and !in_test[i]) long += 1;
+    }
+    return long;
+}
+
+/// Which lines of the file are inside a top-level `test` block.
+fn testLines(arena: Allocator, tree: *Ast) ![]const bool {
+    const total = tree.tokenLocation(0, @intCast(tree.tokens.len - 1)).line + 2;
+    const in_test = try arena.alloc(bool, total);
+    @memset(in_test, false);
+    for (tree.rootDecls()) |decl| {
+        if (tree.nodeTag(decl) != .test_decl) continue;
+        const first = tree.tokenLocation(0, tree.firstToken(decl)).line;
+        const last = tree.tokenLocation(0, tree.lastToken(decl)).line;
+        for (first..last + 1) |i| in_test[i] = true;
+    }
+    return in_test;
 }
 
 /// Measures a function declaration, and descends into any container a declaration defines, so

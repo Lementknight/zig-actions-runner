@@ -554,7 +554,8 @@ conventions` checks the two that a tool can check.
   functions and are exempt: a long test is a table of cases.
 - **A line is at most 100 columns.** `zig fmt` will not wrap it for you; break the expression. The
   one exception is a string literal or URL that cannot be split. 9% of lines exceeded this when the
-  rule was written, 13% in `dagger.zig`.
+  rule was written, 13% in `dagger.zig`. Lines inside `test` blocks are exempt, as the blocks are
+  from the function rule: an expected string is clearest whole, and the tool does not count them.
 - **No cap on file length.** TigerBeetle, zls and Ghostty all carry files of 8,000-20,000 lines.
   Split a file when its sections stop sharing state, not when it is long; until then, `// ---`
   section markers name the seams (there are 36).
