@@ -69,6 +69,15 @@ pub const Query = struct {
         try (try q.ink()).print("{s}: {s} ", .{ alias, name });
     }
 
+    /// `alias: name(args) `: a scalar with arguments, such as `glob(pattern:)`.
+    pub fn leafArgs(q: *Query, alias: ?[]const u8, name: []const u8, args: anytype) !void {
+        const w = try q.ink();
+        if (alias) |a| try w.print("{s}: ", .{a});
+        try w.writeAll(name);
+        try writeArgs(w, args);
+        try w.writeAll(" ");
+    }
+
     /// Closes the `count` most recently opened selections.
     pub fn close(q: *Query, count: usize) !void {
         std.debug.assert(count <= q.depth);
@@ -216,6 +225,20 @@ test "a fragment carries its open selections into the document it is spliced int
     try std.testing.expectEqualStrings(
         "{ loadContainerFromID(id:\"c1\") { withEnvVariable(name:\"A\",value:\"1\") { " ++
             "withEnvVariable(name:\"B\",value:\"2\") { id } } } }",
+        try q.finish(),
+    );
+}
+
+test "a scalar with arguments opens nothing" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    var q: Query = .init(arena_state.allocator());
+    try q.call("directory", .{ .path = "/src" });
+    try q.leafArgs("p0", "glob", .{ .pattern = "*.zig" });
+    try q.leafArgs(null, "glob", .{ .pattern = "**" });
+    try std.testing.expectEqual(@as(usize, 1), q.depth);
+    try std.testing.expectEqualStrings(
+        "{ directory(path:\"/src\") { p0: glob(pattern:\"*.zig\") glob(pattern:\"**\") } }",
         try q.finish(),
     );
 }
