@@ -31,6 +31,7 @@ const matcher = @import("matcher.zig");
 const action = @import("action.zig");
 const config = @import("config.zig");
 const engine = @import("engine.zig");
+const Query = @import("dagger/query.zig").Query;
 
 const Allocator = std.mem.Allocator;
 
@@ -4409,12 +4410,7 @@ const Exec = struct {
         const arena = x.arena;
         const rt = (if (x.musl) js_runtimes_musl else js_runtimes).get(x.js_runtime);
         var msg: []const u8 = "";
-        const libs: []const u8 = if (x.musl) " libs: directory(path:\"/usr/lib\") { filter(include:[\"libstdc++.so*\",\"libgcc_s.so*\"]) { id } }" else "";
-        const doc = if (rt.npm_dir) |npm|
-            try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }} npm: directory(path:\"{s}\") {{ id }}{s} }} }} }}", .{ rt.image, rt.binary, npm, libs })
-        else
-            try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }}{s} }} }} }}", .{ rt.image, rt.binary, libs });
-        const data = gql(arena, x.transport, doc, &msg) catch {
+        const data = gql(arena, x.transport, try jsRuntimeQuery(arena, rt, x.musl), &msg) catch {
             _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}: {s}", .{ rt.image, msg });
             return false;
         };
@@ -4462,8 +4458,7 @@ const Exec = struct {
         const arena = x.arena;
         const rt = (if (x.musl) js_runtimes_musl else js_runtimes).get(.node);
         var msg: []const u8 = "";
-        const libs: []const u8 = if (x.musl) " libs: directory(path:\"/usr/lib\") { filter(include:[\"libstdc++.so*\",\"libgcc_s.so*\"]) { id } }" else "";
-        const data = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ container {{ from(address:\"{s}\") {{ bin: file(path:\"{s}\") {{ id }}{s} }} }} }}", .{ rt.image, rt.binary, libs }), &msg) catch {
+        const data = gql(arena, x.transport, try jsRuntimeQuery(arena, rt, x.musl), &msg) catch {
             _ = try x.actionFailed(num, "could not get Node from {s}: {s}", .{ rt.image, msg });
             return null;
         };
@@ -5729,6 +5724,29 @@ const npm_node_shim =
     \\exec /github/_runtime/node/node /github/_runtime/npm/bin/npm-cli.js "$@"
     \\
 ;
+
+/// The ids of a JavaScript runtime's files in its image: the binary (`bin`), npm when the runtime
+/// ships it (`npm`), and on musl the C++ runtime it needs (`libs`).
+fn jsRuntimeQuery(arena: Allocator, rt: JsRuntimeSource, musl: bool) ![]const u8 {
+    var q: Query = .init(arena);
+    try q.open("container");
+    try q.call("from", .{ .address = rt.image });
+    try q.callAs("bin", "file", .{ .path = rt.binary });
+    try q.leaf("id");
+    try q.close(1);
+    if (rt.npm_dir) |npm| {
+        try q.callAs("npm", "directory", .{ .path = npm });
+        try q.leaf("id");
+        try q.close(1);
+    }
+    if (musl) {
+        try q.callAs("libs", "directory", .{ .path = "/usr/lib" });
+        try q.call("filter", .{ .include = &[_][]const u8{ "libstdc++.so*", "libgcc_s.so*" } });
+        try q.leaf("id");
+        try q.close(2);
+    }
+    return q.finish();
+}
 
 const JsRuntimeSource = struct { image: []const u8, binary: []const u8, npm_dir: ?[]const u8 = null };
 /// Bun is pinned to the version the repository's images use (see api/Dockerfile).
