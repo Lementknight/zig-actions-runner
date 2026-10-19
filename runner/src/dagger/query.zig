@@ -64,6 +64,11 @@ pub const Query = struct {
         try (try q.ink()).print("{s} ", .{name});
     }
 
+    /// `alias: name `: a scalar selected under another name.
+    pub fn leafAs(q: *Query, alias: []const u8, name: []const u8) !void {
+        try (try q.ink()).print("{s}: {s} ", .{ alias, name });
+    }
+
     /// Closes the `count` most recently opened selections.
     pub fn close(q: *Query, count: usize) !void {
         std.debug.assert(count <= q.depth);
