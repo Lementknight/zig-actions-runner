@@ -72,12 +72,24 @@ pub const Query = struct {
         q.depth -= count;
     }
 
-    /// Text written the old way — `name(args) { ` repeated — that opened `opened` selections. A
-    /// bridge while some query text is still built elsewhere; it goes when the last such writer
-    /// does.
-    pub fn splice(q: *Query, text: []const u8, opened: usize) !void {
-        try (try q.ink()).writeAll(text);
-        q.depth += opened;
+    /// Calls built apart from the document they will join: what a step adds to its container,
+    /// which `outputKeyed` then reuses in a second query. See `initFragment`, `fragment`, `splice`.
+    pub const Fragment = struct { text: []const u8, opened: usize };
+
+    /// A query that is not a document: no opening brace, so its calls can be spliced into another.
+    pub fn initFragment(arena: Allocator) Query {
+        return .{ .out = .init(arena), .began = true };
+    }
+
+    /// What has been built so far, with the selections it leaves open.
+    pub fn fragment(q: *Query) Fragment {
+        return .{ .text = q.out.written(), .opened = q.depth };
+    }
+
+    /// A fragment's calls, here; its open selections are now this query's to close.
+    pub fn splice(q: *Query, f: Fragment) !void {
+        try (try q.ink()).writeAll(f.text);
+        q.depth += f.opened;
     }
 
     /// The document, every open selection closed.
@@ -179,6 +191,26 @@ test "no arguments writes no parentheses; close shuts the inner selections only"
     try std.testing.expectEqualStrings(
         "{ container { libs: directory(path:\"/usr/lib\") { " ++
             "filter(include:[\"libstdc++.so*\"]) { id } } sync { } } }",
+        try q.finish(),
+    );
+}
+
+test "a fragment carries its open selections into the document it is spliced into" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var env: Query = .initFragment(arena);
+    try env.call("withEnvVariable", .{ .name = "A", .value = "1" });
+    try env.call("withEnvVariable", .{ .name = "B", .value = "2" });
+    const f = env.fragment();
+    try std.testing.expectEqual(@as(usize, 2), f.opened);
+    var q: Query = .init(arena);
+    try q.call("loadContainerFromID", .{ .id = "c1" });
+    try q.splice(f);
+    try q.leaf("id");
+    try std.testing.expectEqualStrings(
+        "{ loadContainerFromID(id:\"c1\") { withEnvVariable(name:\"A\",value:\"1\") { " ++
+            "withEnvVariable(name:\"B\",value:\"2\") { id } } } }",
         try q.finish(),
     );
 }

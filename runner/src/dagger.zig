@@ -620,9 +620,20 @@ fn registryHost(image: []const u8) []const u8 {
     return "docker.io";
 }
 
-/// `withRegistryAuth(...) { ` for a service's or the job container's `credentials`, or null without
-/// them. Sets `err_msg` (and returns null) when the password could not be registered as a secret.
-fn registryAuthNode(arena: Allocator, ev: *Evaluator, transport: Transport, counter: *u32, svc: job_mod.Service, image: []const u8, err_msg: *[]const u8) !?[]const u8 {
+/// `withRegistryAuth`'s arguments for an image behind a private registry.
+const RegistryAuth = struct { address: []const u8, username: []const u8, secret: []const u8 };
+
+/// The credentials for a service's or the job container's image, or null without them. Sets
+/// `err_msg` (and returns null) when the password could not be registered as a secret.
+fn registryAuth(
+    arena: Allocator,
+    ev: *Evaluator,
+    transport: Transport,
+    counter: *u32,
+    svc: job_mod.Service,
+    image: []const u8,
+    err_msg: *[]const u8,
+) !?RegistryAuth {
     const ut = svc.username orelse return null;
     const pt = svc.password orelse return null;
     const sc = try ev.scope(&.{});
@@ -633,16 +644,7 @@ fn registryAuthNode(arena: Allocator, ev: *Evaluator, transport: Transport, coun
         err_msg.* = try std.fmt.allocPrint(arena, "could not register the credentials for {s}: {s}", .{ image, err_msg.* });
         return null;
     };
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.writeAll("withRegistryAuth(address:");
-    try std.json.Stringify.value(registryHost(image), .{}, w);
-    try w.writeAll(",username:");
-    try std.json.Stringify.value(user, .{}, w);
-    try w.writeAll(",secret:");
-    try std.json.Stringify.value(secret, .{}, w);
-    try w.writeAll(") { ");
-    return aw.written();
+    return .{ .address = registryHost(image), .username = user, .secret = secret };
 }
 
 /// The `options:` of a service that are not carried out, as written. Health checks are: the service
@@ -2260,8 +2262,8 @@ fn writeImage(
 ) !void {
     if (job.container) |jc| {
         // A private image: its registry's credentials.
-        if (try registryAuthNode(arena, ev, transport, secret_counter, jc, plan.job_image, err_msg)) |node| {
-            try q.splice(node, 1);
+        if (try registryAuth(arena, ev, transport, secret_counter, jc, plan.job_image, err_msg)) |auth| {
+            try q.call("withRegistryAuth", auth);
         } else if (err_msg.len > 0) return error.BaseContainerFailed;
     }
     try q.call("from", .{ .address = plan.job_image });
@@ -4856,7 +4858,10 @@ const Exec = struct {
         braces += try x.writeActionEnv(w);
         braces += try writeActionSecrets(arena, w, env.secret);
         // A Docker action reaches the job's services by name, as on GitHub's container network.
-        braces += try x.writeServiceBindings(w);
+        var bindings: Query = .initFragment(arena);
+        try x.writeServiceBindings(&bindings);
+        try w.writeAll(bindings.fragment().text);
+        braces += bindings.fragment().opened;
         try w.writeAll("withExec(args:");
         try std.json.Stringify.value([_][]const u8{ busybox_path, "sh", "-c", script }, .{}, w);
         try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
@@ -5094,13 +5099,15 @@ const Exec = struct {
         x.sh.append(ls, "##[group]Starting job container");
         x.sh.append(ls, try std.fmt.allocPrint(arena, "Pulling {s}", .{x.job_image}));
         var auth_msg: []const u8 = "";
-        const auth_node = try registryAuthNode(arena, ev, x.transport, &x.secret_counter, jc, x.job_image, &auth_msg);
-        const auth = auth_node orelse "";
-        const image_json = std.json.fmt(x.job_image, .{});
-        const head = try std.fmt.allocPrint(arena, "{{ container {{ {s}from(address:{f}) {{ ", .{ auth, image_json });
-        const closing = if (std.mem.indexOf(u8, head, "withRegistryAuth") != null) " } } } }" else " } } }";
+        const head: ImageHead = .{
+            .auth = try registryAuth(arena, ev, x.transport, &x.secret_counter, jc, x.job_image, &auth_msg),
+            .image = x.job_image,
+        };
         var msg: []const u8 = "";
-        const cfg = gql(arena, x.transport, try std.mem.concat(arena, u8, &.{ head, "imageRef", closing }), &msg) catch {
+        var ref_q: Query = .init(arena);
+        try head.begin(&ref_q);
+        try ref_q.leaf("imageRef");
+        const cfg = gql(arena, x.transport, try ref_q.finish(), &msg) catch {
             x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to pull {s}: {s}", .{ x.job_image, msg }));
             x.sh.append(ls, "##[endgroup]");
             return false;
@@ -5109,7 +5116,11 @@ const Exec = struct {
             x.sh.append(ls, try std.fmt.allocPrint(arena, "Digest: {s}", .{ref[at + 1 ..]}));
         };
         // No /lib (a scratch image) is not musl.
-        if (gql(arena, x.transport, try std.mem.concat(arena, u8, &.{ head, "directory(path:\"/lib\") { entries }", closing }), &msg)) |lib| {
+        var lib_q: Query = .init(arena);
+        try head.begin(&lib_q);
+        try lib_q.call("directory", .{ .path = "/lib" });
+        try lib_q.leaf("entries");
+        if (gql(arena, x.transport, try lib_q.finish(), &msg)) |lib| {
             if (jsonFind(lib, "entries")) |entries| if (entries == .array) for (entries.array.items) |e| {
                 if (e == .string and std.mem.startsWith(u8, e.string, "ld-musl-")) x.musl = true;
             };
@@ -5177,9 +5188,18 @@ const Exec = struct {
         return .{ .image = image, .env = env, .ports = ports.items };
     }
 
-    /// `{ container {` and, for a private registry, its credentials, then `from(address:) {` — how
-    /// both of a service's queries start — and how many braces that opened.
-    const ServiceHead = struct { text: []const u8, braces: usize };
+    /// How a query on an image starts: `container`, for a private registry its credentials, then
+    /// `from` the image. Both of a service's queries, and both of the job container's, begin so.
+    const ImageHead = struct {
+        auth: ?RegistryAuth,
+        image: []const u8,
+
+        fn begin(h: ImageHead, q: *Query) !void {
+            try q.open("container");
+            if (h.auth) |a| try q.call("withRegistryAuth", a);
+            try q.call("from", .{ .address = h.image });
+        }
+    };
 
     fn serviceHead(
         x: *Exec,
@@ -5187,12 +5207,10 @@ const Exec = struct {
         sc: expr.Scope,
         svc: job_mod.Service,
         image: []const u8,
-    ) !?ServiceHead {
+    ) !?ImageHead {
         const arena = x.arena;
         const ev = x.ev;
-        var head: std.Io.Writer.Allocating = .init(arena);
-        var head_braces: usize = 2;
-        try head.writer.writeAll("{ container { ");
+        var auth: ?RegistryAuth = null;
         if (svc.username) |ut| if (svc.password) |pt| {
             const user = ev.render(ut, sc) catch "";
             const pass = ev.render(pt, sc) catch "";
@@ -5201,22 +5219,10 @@ const Exec = struct {
                     x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Could not register the credentials of service '{s}': {s}", .{ svc.name, x.err_msg }));
                     return null;
                 };
-                const hw = &head.writer;
-                try hw.writeAll("withRegistryAuth(address:");
-                try std.json.Stringify.value(registryHost(image), .{}, hw);
-                try hw.writeAll(",username:");
-                try std.json.Stringify.value(user, .{}, hw);
-                try hw.writeAll(",secret:");
-                try std.json.Stringify.value(secret, .{}, hw);
-                try hw.writeAll(") { ");
-                head_braces += 1;
+                auth = .{ .address = registryHost(image), .username = user, .secret = secret };
             }
         };
-        try head.writer.writeAll("from(address:");
-        try std.json.Stringify.value(image, .{}, &head.writer);
-        try head.writer.writeAll(") { ");
-        head_braces += 1;
-        return .{ .text = head.written(), .braces = head_braces };
+        return .{ .auth = auth, .image = image };
     }
 
     /// The image's configuration first: its entrypoint and command (the service runs them), and the
@@ -5231,15 +5237,16 @@ const Exec = struct {
         ls: u32,
         svc: job_mod.Service,
         image: []const u8,
-        head: ServiceHead,
+        head: ImageHead,
     ) !?ServiceConfig {
         const arena = x.arena;
         x.sh.append(ls, try std.fmt.allocPrint(arena, "Pulling {s}", .{image}));
-        var cfg_doc: std.Io.Writer.Allocating = .init(arena);
-        try cfg_doc.writer.writeAll(head.text);
-        try cfg_doc.writer.writeAll("entrypoint defaultArgs imageRef");
-        for (0..head.braces) |_| try cfg_doc.writer.writeAll(" }");
-        const cfg = gql(arena, x.transport, cfg_doc.written(), &x.err_msg) catch {
+        var q: Query = .init(arena);
+        try head.begin(&q);
+        try q.leaf("entrypoint");
+        try q.leaf("defaultArgs");
+        try q.leaf("imageRef");
+        const cfg = gql(arena, x.transport, try q.finish(), &x.err_msg) catch {
             x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to pull {s} for service {s}: {s}", .{ image, svc.name, x.err_msg }));
             return null;
         };
@@ -5264,40 +5271,22 @@ const Exec = struct {
         svc: job_mod.Service,
         svc_index: usize,
         spec: ServiceSpec,
-        head: ServiceHead,
+        head: ImageHead,
         cfg: ServiceConfig,
         busybox: []const u8,
     ) !?[]const u8 {
         const arena = x.arena;
-        var doc: std.Io.Writer.Allocating = .init(arena);
-        const w = &doc.writer;
-        try w.writeAll(head.text);
-        var braces = head.braces;
-        try w.writeAll("withFile(path:\"" ++ busybox_path ++ "\",permissions:493,source:");
-        try std.json.Stringify.value(busybox, .{}, w);
-        try w.writeAll(") { ");
-        braces += 1;
+        var q: Query = .init(arena);
+        try head.begin(&q);
+        try q.call("withFile", .{ .path = busybox_path, .permissions = @as(u32, 0o755), .source = busybox });
         // The services started before this one, by name, as on a shared network. (A service
         // cannot reach one started after it: a binding needs the service to exist.)
-        braces += try x.writeServiceBindings(w);
+        try x.writeServiceBindings(&q);
         // As GitHub's runner sets them for service containers.
         const defaults = [_]job_mod.EnvVar{ .{ .name = "GITHUB_ACTIONS", .value = "true" }, .{ .name = "CI", .value = "true" } };
-        for (&defaults) |e| {
-            try w.print("withEnvVariable(name:\"{s}\",value:\"{s}\") {{ ", .{ e.name, e.value });
-            braces += 1;
-        }
-        for (spec.env) |e| {
-            try w.writeAll("withEnvVariable(name:");
-            try std.json.Stringify.value(e.name, .{}, w);
-            try w.writeAll(",value:");
-            try std.json.Stringify.value(e.value, .{}, w);
-            try w.writeAll(") { ");
-            braces += 1;
-        }
-        for (spec.ports) |p| {
-            try w.print("withExposedPort(port:{d}) {{ ", .{p.container});
-            braces += 1;
-        }
+        for (&defaults) |e| try q.call("withEnvVariable", .{ .name = e.name, .value = e.value });
+        for (spec.env) |e| try q.call("withEnvVariable", .{ .name = e.name, .value = e.value });
+        for (spec.ports) |p| try q.call("withExposedPort", .{ .port = p.container });
         // The image's entrypoint and command, started by a shell that first prints the marker
         // that names this service's output. `start` waits until the exposed ports accept
         // connections, which is when servers such as Postgres are ready (during its first-run
@@ -5307,11 +5296,9 @@ const Exec = struct {
         try args.appendSlice(arena, &.{ busybox_path, "sh", "-c", sh_c, "zig-service" });
         try args.appendSlice(arena, cfg.entrypoint);
         try args.appendSlice(arena, cfg.cmd);
-        try w.writeAll("asService(args:");
-        try std.json.Stringify.value(args.items, .{}, w);
-        try w.writeAll(") { start }");
-        for (0..braces) |_| try w.writeAll(" }");
-        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch {
+        try q.call("asService", .{ .args = args.items });
+        try q.leaf("start");
+        const data = gql(arena, x.transport, try q.finish(), &x.err_msg) catch {
             x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Failed to start service container {s}: {s}", .{ svc.name, x.err_msg }));
             return null;
         };
@@ -5324,17 +5311,12 @@ const Exec = struct {
     /// The job's container: the services under their names, and busybox for the forwarders.
     fn bindServicesToJob(x: *Exec, ls: u32, busybox: []const u8) !bool {
         const arena = x.arena;
-        var doc: std.Io.Writer.Allocating = .init(arena);
-        const w = &doc.writer;
-        try w.writeAll("{ loadContainerFromID(id:");
-        try std.json.Stringify.value(x.container_id, .{}, w);
-        try w.writeAll(") { withFile(path:\"" ++ busybox_path ++ "\",permissions:493,source:");
-        try std.json.Stringify.value(busybox, .{}, w);
-        try w.writeAll(") { ");
-        const braces = 3 + try x.writeServiceBindings(w);
-        try w.writeAll("id");
-        for (0..braces) |_| try w.writeAll(" }");
-        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch {
+        var q: Query = .init(arena);
+        try q.call("loadContainerFromID", .{ .id = x.container_id });
+        try q.call("withFile", .{ .path = busybox_path, .permissions = @as(u32, 0o755), .source = busybox });
+        try x.writeServiceBindings(&q);
+        try q.leaf("id");
+        const data = gql(arena, x.transport, try q.finish(), &x.err_msg) catch {
             x.sh.errorLine(ls, try std.fmt.allocPrint(arena, "Could not bind the services to the job: {s}", .{x.err_msg}));
             return false;
         };
@@ -5342,16 +5324,9 @@ const Exec = struct {
         return true;
     }
 
-    /// `withServiceBinding` for each service, open (the caller closes the braces); how many.
-    fn writeServiceBindings(x: *Exec, w: *std.Io.Writer) !usize {
-        for (x.services.items) |r| {
-            try w.writeAll("withServiceBinding(alias:");
-            try std.json.Stringify.value(r.name, .{}, w);
-            try w.writeAll(",service:");
-            try std.json.Stringify.value(r.id, .{}, w);
-            try w.writeAll(") { ");
-        }
-        return x.services.items.len;
+    /// `withServiceBinding` for each service.
+    fn writeServiceBindings(x: *Exec, q: *Query) !void {
+        for (x.services.items) |r| try q.call("withServiceBinding", .{ .alias = r.name, .service = r.id });
     }
 
     /// "Stop containers", after the post scripts, as GitHub's runner ends a job with services.
