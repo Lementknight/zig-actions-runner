@@ -72,13 +72,16 @@ pub const marker = "::zig-step::";
 /// often use (`jq`, `curl`). Installed once per engine: Dagger caches this exec, so only the first
 /// job pays for it.
 pub const provision_packages = [_][]const u8{
-    "git",               "git-lfs",        "ca-certificates", "curl",        "wget",         "xz-utils",
-    "bzip2",             "zstd",           "zip",             "unzip",       "jq",           "sudo",
-    "gnupg",             "openssh-client", "rsync",           "file",        "lsb-release",  "tzdata",
-    "build-essential",   "pkg-config",     "python3",         "python3-pip", "python3-venv", "python-is-python3",
-    "postgresql-client", "netcat-openbsd", "procps",
+    "git",            "git-lfs",     "ca-certificates", "curl",              "wget",
+    "xz-utils",       "bzip2",       "zstd",            "zip",               "unzip",
+    "jq",             "sudo",        "gnupg",           "openssh-client",    "rsync",
+    "file",           "lsb-release", "tzdata",          "build-essential",   "pkg-config",
+    "python3",        "python3-pip", "python3-venv",    "python-is-python3", "postgresql-client",
+    "netcat-openbsd", "procps",
 };
-pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends " ++ packageList() ++ " >/dev/null && rm -rf /var/lib/apt/lists/*";
+pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteractive " ++
+    "apt-get install -y -qq --no-install-recommends " ++ packageList() ++
+    " >/dev/null && rm -rf /var/lib/apt/lists/*";
 
 /// The user steps run as in the default image with `Options.step_user = .runner`, as on GitHub's
 /// hosted runners: uid 1001, home /home/runner, passwordless sudo, and /github (the workspace, file
@@ -86,9 +89,12 @@ pub const provision_script = "apt-get update -qq && DEBIAN_FRONTEND=noninteracti
 /// fails) behave as on GitHub; root ignores them.
 const runner_user = "runner";
 const runner_home = "/home/runner";
+const chown_runner = " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root;
 const provision_runner_script = provision_script ++
-    " && (id -u " ++ runner_user ++ " >/dev/null 2>&1 || useradd -m -u 1001 -s /bin/bash " ++ runner_user ++ ")" ++
-    " && printf '%s\\n' '" ++ runner_user ++ " ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/" ++ runner_user ++ " && chmod 0440 /etc/sudoers.d/" ++ runner_user ++
+    " && (id -u " ++ runner_user ++ " >/dev/null 2>&1 || " ++
+    "useradd -m -u 1001 -s /bin/bash " ++ runner_user ++ ")" ++
+    " && printf '%s\\n' '" ++ runner_user ++ " ALL=(ALL) NOPASSWD:ALL' > " ++
+    "/etc/sudoers.d/" ++ runner_user ++ " && chmod 0440 /etc/sudoers.d/" ++ runner_user ++
     " && mkdir -p " ++ work_root ++ " " ++ docker_home ++ runnerCacheDirs() ++
     " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " /github " ++ runner_home;
 
@@ -293,32 +299,7 @@ fn stepScriptFc(
     for (fc_kinds) |k| try w.print("> {s} ", .{try fcPath(arena, k, fc)});
     try w.writeByte('\n');
     switch (r) {
-        .run => |sc| {
-            if (sc.always_run) |why| {
-                try w.writeAll(": ");
-                try shellQuote(w, why);
-                try w.writeByte('\n');
-            }
-            if (sc.write_event) try w.writeAll("if [ -n \"${" ++ event_env ++ "+x}\" ]; then mkdir -p " ++ event_dir ++ " && printf '%s' \"$" ++ event_env ++ "\" > " ++ event_path ++ "; fi\n");
-            // The script is a file, as on GitHub: `$0`, BASH_SOURCE and error messages name it, and
-            // a Python traceback names it too — hence the extension following the shell.
-            const path = try scriptPath(arena, fc, sc.shell);
-            try w.writeAll("printf '%s' ");
-            try shellQuote(w, sc.script);
-            try w.print(" > {s}\n", .{path});
-            if (sc.shell == null) try w.writeAll("if command -v bash >/dev/null 2>&1; then zig_shell=bash; else zig_shell=sh; fi\n");
-            try w.writeAll("( ");
-            if (sc.working_directory) |wd| {
-                try w.writeAll("cd ");
-                try shellQuote(w, wd);
-                try w.writeAll(" && ");
-            }
-            try writeEnvCommand(w, arena, "env ", sc.env, sc.secret_env, sc.write_event, sc.withhold_volatile, fc, action_name);
-            try writeShellCommand(w, arena, sc.shell, path);
-            // The script file goes once it ran: otherwise every later step's filesystem holds it, and
-            // with it whatever the script embeds (a commit from `${{ github.sha }}`).
-            try w.print(")\nrc=$?\nrm -f {s}\n", .{path});
-        },
+        .run => |sc| try writeRunScript(w, arena, sc, fc, action_name),
         .checkout => |f| {
             // The tree is mounted by the query (`withDirectory`); the step reports it in the shape
             // actions/checkout's log has (the same folds, and the commit last), with what happened.
@@ -341,6 +322,53 @@ fn stepScriptFc(
     try writeCombinedFileCommands(w, arena, "", fc);
     try w.print("echo '{s}end {d}'\nexit $rc\n", .{ marker, n });
     return aw.written();
+}
+
+/// The `run:` part of a step's script: the event file when asked, the script written to its file,
+/// then run under its shell in a subshell with the step's env, and removed.
+fn writeRunScript(
+    w: *std.Io.Writer,
+    arena: Allocator,
+    sc: anytype,
+    fc: u32,
+    action_name: []const u8,
+) !void {
+    if (sc.always_run) |why| {
+        try w.writeAll(": ");
+        try shellQuote(w, why);
+        try w.writeByte('\n');
+    }
+    if (sc.write_event) try w.writeAll("if [ -n \"${" ++ event_env ++ "+x}\" ]; then mkdir -p " ++
+        event_dir ++ " && printf '%s' \"$" ++ event_env ++ "\" > " ++ event_path ++ "; fi\n");
+    // The script is a file, as on GitHub: `$0`, BASH_SOURCE and error messages name it, and
+    // a Python traceback names it too — hence the extension following the shell.
+    const path = try scriptPath(arena, fc, sc.shell);
+    try w.writeAll("printf '%s' ");
+    try shellQuote(w, sc.script);
+    try w.print(" > {s}\n", .{path});
+    if (sc.shell == null) try w.writeAll("if command -v bash >/dev/null 2>&1; then " ++
+        "zig_shell=bash; else zig_shell=sh; fi\n");
+    try w.writeAll("( ");
+    if (sc.working_directory) |wd| {
+        try w.writeAll("cd ");
+        try shellQuote(w, wd);
+        try w.writeAll(" && ");
+    }
+    try writeEnvCommand(
+        w,
+        arena,
+        "env ",
+        sc.env,
+        sc.secret_env,
+        sc.write_event,
+        sc.withhold_volatile,
+        fc,
+        action_name,
+    );
+    try writeShellCommand(w, arena, sc.shell, path);
+    // The script file goes once it ran: otherwise every later step's filesystem holds it,
+    // and with it whatever the script embeds (a commit from `${{ github.sha }}`).
+    try w.print(")\nrc=$?\nrm -f {s}\n", .{path});
 }
 
 /// After a step: its file commands in one file (`all_<fc>`), each after a
@@ -395,7 +423,8 @@ fn containerScript(
     var aw: std.Io.Writer.Allocating = .init(arena);
     const w = &aw.writer;
     try w.print(
-        "echo '{s}begin {d}'\nB=" ++ busybox_path ++ "\n\"$B\" mkdir -p " ++ fc_dir ++ " " ++ docker_home ++ " " ++ event_dir ++ " && : ",
+        "echo '{s}begin {d}'\nB=" ++ busybox_path ++ "\n\"$B\" mkdir -p " ++ fc_dir ++ " " ++
+            docker_home ++ " " ++ event_dir ++ " && : ",
         .{ marker, n },
     );
     for (fc_kinds) |k| try w.print("> {s} ", .{try fcPath(arena, k, fc)});
@@ -405,7 +434,8 @@ fn containerScript(
         try shellQuote(w, why);
         try w.writeByte('\n');
     }
-    if (write_event) try w.writeAll("if [ -n \"${" ++ event_env ++ "+x}\" ]; then \"$B\" printf '%s' \"$" ++ event_env ++ "\" > " ++ event_path ++ "; fi\n");
+    if (write_event) try w.writeAll("if [ -n \"${" ++ event_env ++ "+x}\" ]; then " ++
+        "\"$B\" printf '%s' \"$" ++ event_env ++ "\" > " ++ event_path ++ "; fi\n");
     try writeEnvCommand(
         w,
         arena,
@@ -1184,12 +1214,11 @@ fn checkoutLog(arena: Allocator, f: Fetched) ![]const []const u8 {
     try out.append(arena, "##[group]Fetching the repository");
     try out.append(
         arena,
-        try std.fmt.allocPrint(arena, "Fetched {s} with Dagger's git support (the runner's built-in checkout replaces actions/checkout)", .{f.url}),
+        try std.fmt.allocPrint(arena, "Fetched {s} with Dagger's git support (the runner's " ++
+            "built-in checkout replaces actions/checkout)", .{f.url}),
     );
-    try out.append(
-        arena,
-        try std.fmt.allocPrint(arena, "{s}: {s}", .{ if (isSha(f.want)) "Commit" else "Ref", f.want }),
-    );
+    const kind: []const u8 = if (isSha(f.want)) "Commit" else "Ref";
+    try out.append(arena, try std.fmt.allocPrint(arena, "{s}: {s}", .{ kind, f.want }));
     if (f.depth == 0) {
         try out.append(arena, "Depth: full history");
     } else {
@@ -1220,10 +1249,9 @@ fn checkoutLog(arena: Allocator, f: Fetched) ![]const []const u8 {
             try std.fmt.allocPrint(arena, "branch '{s}' set up to track 'origin/{s}'.", .{ b, b }),
         );
     } else if (std.mem.startsWith(u8, ref, "refs/pull/")) {
-        try out.append(
-            arena,
-            try std.fmt.allocPrint(arena, "HEAD is detached at refs/remotes/pull/{s}", .{ref["refs/pull/".len..]}),
-        );
+        const pull = ref["refs/pull/".len..];
+        try out.append(arena, try std.fmt.allocPrint(arena, "HEAD is detached at " ++
+            "refs/remotes/pull/{s}", .{pull}));
     } else if (std.mem.startsWith(u8, ref, "refs/")) {
         try out.append(arena, try std.fmt.allocPrint(arena, "HEAD is detached at {s}", .{ref}));
     } else {
@@ -1310,7 +1338,8 @@ fn unresolvedMessage(
         return std.fmt.allocPrint(
             arena,
             "Unable to resolve action {s}, repository not found{s}",
-            .{ repo, if (own_repo) "" else " (or private: the job's GITHUB_TOKEN reads only the job's own repository)" },
+            .{ repo, if (own_repo) "" else " (or private: the job's GITHUB_TOKEN reads only " ++
+                "the job's own repository)" },
         );
     }
     return std.fmt.allocPrint(
@@ -1349,9 +1378,7 @@ fn fetchCheckout(
         ws;
     const want = co.ref orelse (if (co.repository == null) job.github.sha else "HEAD");
     const label = if (isSha(want)) want[0..7] else want;
-    // The workflow's own commit is named by the ref that triggered the run, as actions/checkout
-    // does.
-    const git_ref: ?[]const u8 = if (co.ref) |r| (if (isSha(r)) null else r) else if (co.repository == null and job.github.ref.len > 0) job.github.ref else null;
+    const git_ref = checkoutGitRef(co, job);
     var f: Fetched = .{
         .result = .{ .failed = "" },
         .repo = repo,
@@ -1378,31 +1405,57 @@ fn fetchCheckout(
     var msg: []const u8 = "";
     if (gql(arena, t, doc, &msg)) |data| {
         if (jsonFindString(data, "id")) |id| {
-            const has_modules = if (jsonFind(
-                data,
-                "entries",
-            )) |es| (es == .array and for (es.array.items) |e| (if (e == .string and std.mem.eql(u8, e.string, ".gitmodules")) break true) else false) else false;
-            f.result = .{ .dir = if (!co.submodules and has_modules) try withoutSubmodules(
-                arena,
-                t,
-                id,
-                &msg,
-            ) orelse {
-                f.result = .{ .failed = try std.fmt.allocPrint(
-                    arena,
-                    "could not leave {s}'s submodules out: {s}",
-                    .{ repo, msg },
-                ) };
-                return f;
-            } else id };
+            f.result = try checkedOutTree(arena, t, co, repo, data, id, &msg);
             return f;
         }
         msg = "Dagger returned no tree";
     } else |_| {}
     f.result = .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}@{s}: {s}{s}", .{
-        repo, label, msg, if (looksLikeAuthFailure(msg)) " (the job's GITHUB_TOKEN reads only the job's own repository; another private one cannot be checked out)" else "",
+        repo, label, msg,
+        if (looksLikeAuthFailure(msg)) " (the job's GITHUB_TOKEN reads only " ++
+            "the job's own repository; another private one cannot be checked out)" else "",
     }) };
     return f;
+}
+
+/// The ref the checkout is named by (`git_ref`): the one asked for unless it is a commit, else for
+/// the workflow's own repository the ref that triggered the run, as actions/checkout does.
+fn checkoutGitRef(co: job_mod.Checkout, job: job_mod.Job) ?[]const u8 {
+    if (co.ref) |r| return if (isSha(r)) null else r;
+    if (co.repository == null and job.github.ref.len > 0) return job.github.ref;
+    return null;
+}
+
+/// Whether the tree's root lists a `.gitmodules` (the query asks for `entries` only without
+/// `submodules`).
+fn hasGitmodules(data: std.json.Value) bool {
+    const es = jsonFind(data, "entries") orelse return false;
+    if (es != .array) return false;
+    for (es.array.items) |e| {
+        if (e == .string and std.mem.eql(u8, e.string, ".gitmodules")) return true;
+    }
+    return false;
+}
+
+/// The tree as checked out: `id`, or with its submodule directories emptied when the checkout did
+/// not ask for them.
+fn checkedOutTree(
+    arena: Allocator,
+    t: Transport,
+    co: job_mod.Checkout,
+    repo: []const u8,
+    data: std.json.Value,
+    id: []const u8,
+    msg: *[]const u8,
+) !@FieldType(Fetched, "result") {
+    if (co.submodules or !hasGitmodules(data)) return .{ .dir = id };
+    const dir = try withoutSubmodules(arena, t, id, msg) orelse return .{
+        .failed = try std.fmt.allocPrint(arena, "could not leave {s}'s submodules out: {s}", .{
+            repo,
+            msg.*,
+        }),
+    };
+    return .{ .dir = dir };
 }
 
 // --- expression evaluation ---
@@ -1539,7 +1592,7 @@ const Evaluator = struct {
         const job_fields = try arena.alloc(expr.Value.Entry, if (ev.services != null) 2 else 1);
         job_fields[0] = .{
             .key = "status",
-            .value = .{ .string = if (ev.cancelled) "cancelled" else if (ev.job_failed) "failure" else "success" },
+            .value = .{ .string = ev.jobStatus() },
         };
         if (ev.services) |v| job_fields[1] = .{ .key = "services", .value = v };
         const runner_fields = try arena.alloc(expr.Value.Entry, if (ev.runner_debug) 7 else 6);
@@ -1593,15 +1646,21 @@ const Evaluator = struct {
         return out;
     }
 
+    /// `job.status` as the expression language sees it.
+    fn jobStatus(ev: *const Evaluator) []const u8 {
+        if (ev.cancelled) return "cancelled";
+        return if (ev.job_failed) "failure" else "success";
+    }
+
     fn setServices(ev: *Evaluator, running: []const Exec.RunningService) !void {
         const arena = ev.arena;
         const entries = try arena.alloc(expr.Value.Entry, running.len);
         for (running, entries) |r, *e| {
             const ports = try arena.alloc(expr.Value.Entry, r.ports.len);
-            for (
-                r.ports,
-                ports,
-            ) |p, *pe| pe.* = .{ .key = try std.fmt.allocPrint(arena, "{d}", .{p.container}), .value = .{ .string = try std.fmt.allocPrint(arena, "{d}", .{p.host}) } };
+            for (r.ports, ports) |p, *pe| pe.* = .{
+                .key = try std.fmt.allocPrint(arena, "{d}", .{p.container}),
+                .value = .{ .string = try std.fmt.allocPrint(arena, "{d}", .{p.host}) },
+            };
             // A stable id of the running service (GitHub gives the container's id).
             var digest: [32]u8 = undefined;
             std.crypto.hash.sha2.Sha256.hash(r.id, &digest, .{});
@@ -1631,10 +1690,13 @@ const Evaluator = struct {
             .skipped, .not_run => "skipped",
         };
         const conclusion: []const u8 = if (outcome == .failure and continued) "success" else raw;
-        try ev.steps.append(
-            ev.arena,
-            .{ .id = if (step.context_name.len > 0) step.context_name else step.id, .outcome = raw, .conclusion = conclusion, .outputs = outputs },
-        );
+        const id = if (step.context_name.len > 0) step.context_name else step.id;
+        try ev.steps.append(ev.arena, .{
+            .id = id,
+            .outcome = raw,
+            .conclusion = conclusion,
+            .outputs = outputs,
+        });
     }
 
     /// A string from the `github` context ("" when absent).
@@ -1904,7 +1966,12 @@ const Shared = struct {
             .disabled => |name| {
                 const msg = std.fmt.allocPrint(
                     sh.arena,
-                    "The `{s}` command is disabled. Please upgrade to using Environment Files or opt into unsecure command execution by setting the `ACTIONS_ALLOW_UNSECURE_COMMANDS` environment variable to `true`. For more information see: https://github.blog/changelog/2020-10-01-github-actions-deprecating-set-env-and-add-path-commands/",
+                    "The `{s}` command is disabled. Please upgrade to using Environment Files " ++
+                        "or opt " ++
+                        "into unsecure command execution by setting the " ++
+                        "`ACTIONS_ALLOW_UNSECURE_COMMANDS` environment variable to `true`. " ++
+                        "For more information see: " ++
+                        "https://github.blog/changelog/2020-10-01-github-actions-deprecating-set-env-and-add-path-commands/",
                     .{name},
                 ) catch return;
                 sh.errorLineLocked(step, msg);
@@ -2185,7 +2252,8 @@ fn readLogs(io: std.Io, sh: *Shared, file: std.Io.File) void {
 // --- running a job ---
 
 /// Prints the session's port and token for the runner, then waits for stdin to close.
-const session_script = "printf '%s %s\\n' \"$DAGGER_SESSION_PORT\" \"$DAGGER_SESSION_TOKEN\"; cat >/dev/null";
+const session_script = "printf '%s %s\\n' \"$DAGGER_SESSION_PORT\" \"$DAGGER_SESSION_TOKEN\"; " ++
+    "cat >/dev/null";
 
 fn base64Encode(arena: Allocator, s: []const u8) ![]const u8 {
     const enc = std.base64.standard.Encoder;
@@ -2346,14 +2414,12 @@ fn runDirect(
             ep,
             .{ .ptr = &demux, .onRecord = SpanDemux.onRecord },
         )) |_| {
-            if (waiting) sh.append(
-                0,
-                try std.fmt.allocPrint(arena, "The Dagger engine accepted the session after {d} s.", .{@divTrunc(std.Io.Clock.awake.now(io).toMilliseconds() - started, 1000)}),
-            );
+            if (waiting) sh.append(0, try engineAcceptedNote(arena, io, started));
             break;
         } else |e| {
             const starting = switch (e) {
-                error.ConnectionRefused, error.FileNotFound, error.ConnectionResetByPeer, error.EngineUnreachable => true,
+                error.ConnectionRefused, error.FileNotFound => true,
+                error.ConnectionResetByPeer, error.EngineUnreachable => true,
                 else => false,
             };
             const cancelled = if (opts.cancel) |c| c.requested.load(.acquire) else false;
@@ -2362,7 +2428,8 @@ fn runDirect(
                 return fail(sh, results, try engineOpenError(arena, e, ep));
             if (!waiting) sh.append(
                 0,
-                try std.fmt.allocPrint(arena, "Waiting for the Dagger engine to accept connections ({s}): it may be starting", .{@errorName(e)}),
+                try std.fmt.allocPrint(arena, "Waiting for the Dagger engine to accept " ++
+                    "connections ({s}): it may be starting", .{@errorName(e)}),
             );
             waiting = true;
             io.sleep(.fromSeconds(2), .awake) catch
@@ -2388,6 +2455,14 @@ fn runDirect(
     );
 }
 
+/// How long the engine took to accept the session, once it did after a wait.
+fn engineAcceptedNote(arena: Allocator, io: std.Io, started: i64) ![]const u8 {
+    const secs = @divTrunc(std.Io.Clock.awake.now(io).toMilliseconds() - started, 1000);
+    return std.fmt.allocPrint(arena, "The Dagger engine accepted the session after {d} s.", .{
+        secs,
+    });
+}
+
 /// Opens a session, starting the engine container first if it exists but is stopped, and having the
 /// `dagger` CLI create it (`dagger core version`) if it does not exist, as `dagger run` would.
 /// How long a job waits for an engine that refuses connections (see `runDirect`).
@@ -2408,7 +2483,12 @@ fn openSession(
         error.EngineContainerNotFound => {
             var child = std.process.spawn(
                 io,
-                .{ .argv = &.{ opts.dagger_cmd, "core", "version" }, .stdin = .ignore, .stdout = .ignore, .stderr = .ignore },
+                .{
+                    .argv = &.{ opts.dagger_cmd, "core", "version" },
+                    .stdin = .ignore,
+                    .stdout = .ignore,
+                    .stderr = .ignore,
+                },
             ) catch return e;
             _ = child.wait(io) catch return e;
             return sess.open(opts.gpa, io, ep, h);
@@ -2426,12 +2506,14 @@ fn engineOpenError(arena: Allocator, e: anyerror, ep: engine.Endpoint) ![]const 
     return switch (e) {
         error.EngineContainerNotFound => std.fmt.allocPrint(
             arena,
-            "the Dagger engine container '{s}' does not exist and `dagger core version` did not create it (set RUNNER_ENGINE=cli to use the dagger CLI instead)",
+            "the Dagger engine container '{s}' does not exist and `dagger core version` did " ++
+                "not create it (set RUNNER_ENGINE=cli to use the dagger CLI instead)",
             .{ep.container},
         ),
         error.FileNotFound, error.ConnectionRefused => std.fmt.allocPrint(
             arena,
-            "could not reach the Docker API at {s} (is Docker running? DOCKER_HOST sets another socket)",
+            "could not reach the Docker API at {s} (is Docker running? DOCKER_HOST sets " ++
+                "another socket)",
             .{ep.docker_socket},
         ),
         else => std.fmt.allocPrint(
@@ -2727,7 +2809,7 @@ fn writeProvisionAndWorkspace(q: *Query, arena: Allocator, ev: *Evaluator, plan:
         " && ln -sfn {s} {s}/.venv",
         .{ e, ev.workspace },
     ) else "";
-    const chown = if (plan.as_runner) " && chown -R " ++ runner_user ++ ":" ++ runner_user ++ " " ++ work_root else "";
+    const chown = if (plan.as_runner) chown_runner else "";
     const mk = if (plan.provision)
         try std.fmt.allocPrint(
             arena,
@@ -2760,6 +2842,12 @@ fn writeCacheMounts(q: *Query, arena: Allocator, plan: BasePlan) !void {
     }
 }
 
+/// Run-specific values do not take part in exec cache keys under step caching, so unchanged steps
+/// are reused: they travel in a volatile variable rather than an ordinary one.
+fn envVarNode(is_volatile: bool) []const u8 {
+    return if (is_volatile) "withVolatileVariable" else "withEnvVariable";
+}
+
 /// The values that identify this run: the event payload, the ran marker, uv's environment, and the
 /// default variables — volatile under step caching, so they do not reach exec cache keys.
 fn writeRunEnv(q: *Query, ev: *Evaluator, plan: BasePlan) !void {
@@ -2784,7 +2872,7 @@ fn writeRunEnv(q: *Query, ev: *Evaluator, plan: BasePlan) !void {
     }
     for (try ev.defaultEnv()) |e| {
         // Run-specific values do not take part in exec cache keys, so unchanged steps are reused.
-        const node = if (plan.step_cache and isVolatile(e.name)) "withVolatileVariable" else "withEnvVariable";
+        const node = envVarNode(plan.step_cache and isVolatile(e.name));
         try q.call(node, .{ .name = e.name, .value = e.value });
     }
 }
@@ -2978,18 +3066,21 @@ fn runStep(
     const sc1 = try ev.scope(step_env);
     const coe = std.mem.eql(u8, ev.render(step.continue_on_error, sc1) catch "false", "true");
     res.continued = coe;
-    const timeout: ?[]const u8 = if (step.timeout_minutes) |t| (ev.render(t, sc1) catch null) else null;
-    const timeout_ms = timeoutMs(timeout);
+    const limit: ?[]const u8 = if (step.timeout_minutes) |t| ev.render(t, sc1) catch null else null;
+    const timeout_ms = timeoutMs(limit);
 
     // Env that carries a secret goes in as a Dagger secret, the rest in the script.
     var plain: std.ArrayList(job_mod.EnvVar) = .empty;
     var secret: std.ArrayList(SecretRef) = .empty;
-    splitEnv(arena, x.transport, x.job.*, &x.secret_counter, step_env, &plain, &secret, &x.err_msg) catch {
-        const msg = try std.fmt.allocPrint(arena, "Dagger could not register a secret: {s}", .{x.err_msg});
+    x.splitStepEnv(step_env, &plain, &secret) catch {
+        const msg = try std.fmt.allocPrint(arena, "Dagger could not register a secret: {s}", .{
+            x.err_msg,
+        });
         try failStep(ev, x.sh, x.observer, step, res, num, msg, coe);
         return null;
     };
 
+    const how: StepRun = .{ .coe = coe, .timeout = limit, .timeout_ms = timeout_ms, .scope = sc1 };
     var resolved: Resolved = undefined;
     var mount_buf: [1]Mount = undefined;
     var mounts: []const Mount = &.{};
@@ -2999,20 +3090,22 @@ fn runStep(
             return null;
         },
         .script => |sc| {
-            resolved = try prepareScript(x, step, res, num, coe, sc1, step_env, plain.items, sc) orelse return null;
+            const env = plain.items;
+            resolved = try prepareScript(x, step, res, num, coe, sc1, step_env, env, sc) orelse
+                return null;
         },
         .checkout => |inputs| {
-            const f = try prepareCheckout(x, step, res, num, coe, sc1, step_env, inputs) orelse return null;
+            const f = try prepareCheckout(x, step, res, num, coe, sc1, step_env, inputs) orelse
+                return null;
             resolved = .{ .checkout = f };
-            mount_buf[0] = .{ .dir = .{ .path = f.mount, .id = f.result.dir, .owner = x.dir_owner } };
+            const dir = f.result.dir;
+            mount_buf[0] = .{ .dir = .{ .path = f.mount, .id = dir, .owner = x.dir_owner } };
             mounts = &mount_buf;
         },
         .uses, .docker => {
-            const how = StepRun{ .coe = coe, .timeout = timeout, .timeout_ms = timeout_ms, .scope = sc1 };
             return runActionStep(x, watch, results, step, res, num, how, plain.items, secret.items);
         },
     }
-    const how = StepRun{ .coe = coe, .timeout = timeout, .timeout_ms = timeout_ms, .scope = sc1 };
     return runResolvedStep(x, watch, results, step, res, num, how, resolved, mounts, secret.items);
 }
 
@@ -3165,6 +3258,22 @@ fn runResolvedStep(
 
 /// What every step ends with: its times and outcome on the result, the evaluator told, the job
 /// marked failed unless the step continues on error, and the observer told it finished.
+/// A composite action's step whose condition was false, as `steps.<id>` sees it.
+/// `s` with its expressions evaluated, itself when there is none or they fail, null for null.
+/// A JavaScript action's script as a `run:` step: no shell, no working directory.
+fn scriptRun(script: []const u8, env: []const job_mod.EnvVar) Resolved {
+    return .{ .run = .{ .script = script, .shell = null, .working_directory = null, .env = env } };
+}
+
+fn interpolateOptional(arena: Allocator, s: ?[]const u8, sc: expr.Scope) ?[]const u8 {
+    const d = s orelse return null;
+    return expr.interpolate(arena, d, sc) catch d;
+}
+
+fn skippedStep(id: []const u8) StepCtx {
+    return .{ .id = id, .outcome = "skipped", .conclusion = "skipped", .outputs = &.{} };
+}
+
 fn recordOutcome(
     x: *Exec,
     step: job_mod.Step,
@@ -3199,28 +3308,40 @@ fn appendCheckoutPost(x: *Exec, num: u32, name: []const u8) !void {
     });
 }
 
-fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *Shared, results: []StepResult, transport: Transport) !Result {
+fn runSteps(
+    arena: Allocator,
+    io: std.Io,
+    opts: Options,
+    job: job_mod.Job,
+    sh: *Shared,
+    results: []StepResult,
+    transport: Transport,
+) !Result {
     var ev = try Evaluator.init(arena, &job);
     ev.runner_name = opts.runner_name;
     ev.runner_debug = sh.step_debug;
-    var secret_counter: u32 = 0;
     var err_msg: []const u8 = "";
     // Services hold state a cached step would not have changed (a migration replayed from cache
     // leaves a fresh database empty), so a job with services runs every step.
-    const step_cache = opts.step_cache and !optsOutOfStepCache(ev.job_env.items) and job.services.len == 0;
-    const plan = basePlan(arena, io, transport, &ev, job, opts, step_cache, &err_msg) catch |e| switch (e) {
-        error.BaseContainerFailed => return fail(sh, results, err_msg),
-        else => return e,
-    };
-    const container_id = baseContainerId(arena, transport, &ev, job, plan, &secret_counter, &err_msg) catch |e| switch (e) {
-        error.BaseContainerFailed => return fail(sh, results, err_msg),
-        else => return e,
-    };
-    var x = try execFor(arena, io, transport, sh, &ev, &job, opts, plan, container_id, secret_counter, step_cache);
+    const no_services = job.services.len == 0;
+    const step_cache = opts.step_cache and !optsOutOfStepCache(ev.job_env.items) and no_services;
+    const plan = basePlan(arena, io, transport, &ev, job, opts, step_cache, &err_msg) catch |e|
+        switch (e) {
+            error.BaseContainerFailed => return fail(sh, results, err_msg),
+            else => return e,
+        };
+    var counter: u32 = 0;
+    const base = baseContainerId(arena, transport, &ev, job, plan, &counter, &err_msg) catch |e|
+        switch (e) {
+            error.BaseContainerFailed => return fail(sh, results, err_msg),
+            else => return e,
+        };
+    var x = try execFor(arena, io, transport, sh, &ev, &job, opts, plan, base, counter, step_cache);
     ev.hash_files = .{ .ptr = &x, .hashFn = Exec.hashFiles };
 
     var watch: Watch = .{ .io = io, .transport = transport, .cancel = opts.cancel };
-    var watching: ?std.Io.Future(void) = if (transport.abortFn != null) (io.concurrent(Watch.run, .{&watch}) catch null) else null;
+    var watching: ?std.Io.Future(void) = null;
+    if (transport.abortFn != null) watching = io.concurrent(Watch.run, .{&watch}) catch null;
     defer if (watching) |*f| {
         watch.done.store(true, .release);
         f.cancel(io);
@@ -3228,27 +3349,50 @@ fn runSteps(arena: Allocator, io: std.Io, opts: Options, job: job_mod.Job, sh: *
 
     if (try setUpJob(&x, opts, results)) |failed| return failed;
 
-    if ((job.container != null or job.services.len > 0) and !try x.startServices()) {
-        var failed = try finish(arena, sh, results, "");
-        failed.succeeded = false;
-        failed.engine_error = null;
-        failed.extra = x.extra.items;
-        failed.next_log_step = x.next_log_step;
-        return failed;
+    if (job.container != null or !no_services) {
+        if (!try x.startServices()) return servicesFailed(&x, arena, sh, results);
     }
+    if (try runPres(&x, arena, sh, results, job)) |failed| return failed;
+    for (job.steps, results, 1..) |step, *res, n| {
+        const num: u32 = @intCast(n);
+        if (try runStep(&x, &watch, opts.cancel, results, step, res, num)) |finished|
+            return finished;
+    }
+    return finishJob(&x, opts, results);
+}
 
-    // JavaScript actions' `pre` scripts run before any step, as on GitHub.
+/// The job, failed at "Initialize containers": every step not run, the service steps shown.
+fn servicesFailed(x: *Exec, arena: Allocator, sh: *Shared, results: []StepResult) !Result {
+    var failed = try finish(arena, sh, results, "");
+    failed.succeeded = false;
+    failed.engine_error = null;
+    failed.extra = x.extra.items;
+    failed.next_log_step = x.next_log_step;
+    return failed;
+}
+
+/// JavaScript actions' `pre` scripts, before any step, as on GitHub. The job's result when the
+/// engine failed on one; null to go on.
+fn runPres(
+    x: *Exec,
+    arena: Allocator,
+    sh: *Shared,
+    results: []StepResult,
+    job: job_mod.Job,
+) !?Result {
     for (job.steps, 1..) |step, n| if (step.action == .uses) {
         x.runPre(@intCast(n), step) catch |e| switch (e) {
-            error.EngineFailed => return finish(arena, sh, results, x.err_msg),
+            error.EngineFailed => return try finish(arena, sh, results, x.err_msg),
             else => return e,
         };
     };
+    return null;
+}
 
-    for (job.steps, results, 1..) |step, *res, n| {
-        if (try runStep(&x, &watch, opts.cancel, results, step, res, @intCast(n))) |finished| return finished;
-    }
-    return finishJob(&x, opts, results);
+/// The job's name as GitHub shows it: its display name, else its key in the workflow, else "job".
+fn jobLabel(job: job_mod.Job) []const u8 {
+    if (job.display_name.len > 0) return job.display_name;
+    return if (job.github.job.len > 0) job.github.job else "job";
 }
 
 /// What the job runs in, decided before any step: the image, whether it is provisioned and steps
@@ -3472,8 +3616,7 @@ fn setUpJob(x: *Exec, opts: Options, results: []StepResult) !?Result {
         return failed;
     }
     const job = x.job;
-    const name = if (job.display_name.len > 0) job.display_name else if (job.github.job.len > 0) job.github.job else "job";
-    x.setUpLine(try std.fmt.allocPrint(arena, "Complete job name: {s}", .{name}));
+    x.setUpLine(try std.fmt.allocPrint(arena, "Complete job name: {s}", .{jobLabel(job.*)}));
     return null;
 }
 
@@ -3527,14 +3670,16 @@ fn jobOutputs(arena: Allocator, ev: *Evaluator, job: job_mod.Job, result: *Resul
         const value = ev.render(o.value, sc) catch {
             try lines.append(
                 arena,
-                try std.fmt.allocPrint(arena, "##[warning]Could not evaluate output '{s}': {s}", .{ o.name, ev.diag }),
+                try std.fmt.allocPrint(arena, "##[warning]Could not evaluate output " ++
+                    "'{s}': {s}", .{ o.name, ev.diag }),
             );
             continue;
         };
         if (containsSecret(job, value)) {
             try lines.append(
                 arena,
-                try std.fmt.allocPrint(arena, "##[warning]Skip output '{s}' since it may contain secret.", .{o.name}),
+                try std.fmt.allocPrint(arena, "##[warning]Skip output '{s}' since it may " ++
+                    "contain secret.", .{o.name}),
             );
             continue;
         }
@@ -4317,7 +4462,8 @@ const Exec = struct {
         switch (target) {
             .changes => |removed| x.sh.appendFmt(
                 num,
-                "##[debug]Output keys: the next steps start from this step's output, sha256:{s} ({d} removed paths)",
+                "##[debug]Output keys: the next steps start from this step's output, " ++
+                    "sha256:{s} ({d} removed paths)",
                 .{ short, removed.len },
             ),
             .replace_dir => |dir| x.sh.appendFmt(
@@ -4344,56 +4490,86 @@ const Exec = struct {
     fn collect(x: *Exec, num: u32, data: std.json.Value) !ExecOut {
         const arena = x.arena;
         const ev = x.ev;
-        var code: i32 = if (jsonFind(data, "exitCode")) |c| (if (c == .integer) @intCast(c.integer) else 1) else 1;
-
-        // A cached step prints no log lines. Wait briefly for a live stream, then replay the result.
-        // Without step caching nothing is replayed from an earlier job: run-specific values are part
-        // of every key.
-        const ran: ?bool = if (!x.step_cache) true else if (fileCommand(data, "fc_ran")) |m| std.mem.eql(u8, std.mem.trim(u8, m, " \n"), x.ran_marker) else null;
-        _ = awaitLiveOrReplay(x.io, x.sh, num, jsonFindString(data, "stdout") orelse "", jsonFindString(data, "stderr") orelse "", ran);
+        var code = exitCode(data);
+        const stdout = jsonFindString(data, "stdout") orelse "";
+        const stderr = jsonFindString(data, "stderr") orelse "";
+        // A cached step prints no log lines. Wait briefly for a live stream, then replay the
+        // result. Without step caching nothing is replayed from an earlier job: run-specific
+        // values are part of every key.
+        _ = awaitLiveOrReplay(x.io, x.sh, num, stdout, stderr, x.ranThisRun(data));
 
         // File commands: outputs for `steps.<id>.outputs`, env and PATH for the steps that follow.
         var outputs: []const job_mod.EnvVar = &.{};
         var cmd_error: ?[]const u8 = null;
-        if (fileCommand(data, "fc_output")) |text| switch (try commands.parseKeyValues(arena, text)) {
+        const fc_output = fileCommand(data, "fc_output");
+        if (fc_output) |text| switch (try commands.parseKeyValues(arena, text)) {
             .ok => |kv| outputs = kv,
-            .invalid => |why| cmd_error = try std.fmt.allocPrint(arena, "Unable to process the GITHUB_OUTPUT file command: {s}", .{why}),
+            .invalid => |why| cmd_error = try std.fmt.allocPrint(arena, "Unable to process " ++
+                "the GITHUB_OUTPUT file command: {s}", .{why}),
         };
         if (fileCommand(data, "fc_env")) |text| switch (try commands.parseKeyValues(arena, text)) {
             .ok => |kv| for (kv) |e| {
                 if (commands.isProtectedEnvName(e.name)) {
-                    x.sh.append(num, try std.fmt.allocPrint(arena, "Warning: ignored GITHUB_ENV entry '{s}' (reserved name)", .{e.name}));
+                    x.sh.append(num, try std.fmt.allocPrint(arena, "Warning: ignored " ++
+                        "GITHUB_ENV entry '{s}' (reserved name)", .{e.name}));
                     continue;
                 }
                 try Evaluator.putEnv(arena, &ev.job_env, e.name, e.value);
                 try ev.pending_env.append(arena, e);
             },
-            .invalid => |why| cmd_error = try std.fmt.allocPrint(arena, "Unable to process the GITHUB_ENV file command: {s}", .{why}),
+            .invalid => |why| cmd_error = try std.fmt.allocPrint(arena, "Unable to process " ++
+                "the GITHUB_ENV file command: {s}", .{why}),
         };
-        if (fileCommand(data, "fc_path")) |text| for (try commands.parsePaths(arena, text)) |dir| try ev.pending_path.append(arena, dir);
-        if (fileCommand(data, "fc_step_summary")) |text| if (text.len > 0 and num <= x.summaries.len) {
-            const so_far = x.summaries[num - 1];
-            if (so_far.len + text.len > max_summary_bytes) {
-                // GitHub's runner's words; the summary is not uploaded.
-                x.sh.append(num, try std.fmt.allocPrint(arena, "##[error]$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of {d}k, got {d}k. For more information see: https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions#adding-a-markdown-summary", .{ max_summary_bytes / 1024, (so_far.len + text.len) / 1024 }));
-            } else x.summaries[num - 1] = try std.mem.concat(arena, u8, &.{ so_far, text });
-        };
+        if (fileCommand(data, "fc_path")) |text| {
+            for (try commands.parsePaths(arena, text)) |dir| try ev.pending_path.append(arena, dir);
+        }
+        if (fileCommand(data, "fc_step_summary")) |text| try x.appendSummary(num, text);
         if (cmd_error) |msg| {
             x.sh.append(num, msg);
             if (code == 0) code = 1;
         }
         // Outputs set with the deprecated `::set-output` come after GITHUB_OUTPUT's, which win.
         const legacy = x.sh.takeOutputs(num);
-        if (legacy.len > 0) outputs = try std.mem.concat(arena, job_mod.EnvVar, &.{ outputs, legacy });
+        if (legacy.len > 0)
+            outputs = try std.mem.concat(arena, job_mod.EnvVar, &.{ outputs, legacy });
         var state: []const job_mod.EnvVar = x.sh.takeState(num);
-        if (fileCommand(data, "fc_state")) |text| switch (try commands.parseKeyValues(arena, text)) {
+        const fc_state = fileCommand(data, "fc_state");
+        if (fc_state) |text| switch (try commands.parseKeyValues(arena, text)) {
             .ok => |kv| state = try std.mem.concat(arena, job_mod.EnvVar, &.{ state, kv }),
-            .invalid => |why| x.sh.append(num, try std.fmt.allocPrint(arena, "Unable to process the GITHUB_STATE file command: {s}", .{why})),
+            .invalid => |why| x.sh.append(num, try std.fmt.allocPrint(arena, "Unable to " ++
+                "process the GITHUB_STATE file command: {s}", .{why})),
         };
         const refused = code != 0 and for (bun_load_errors) |e| {
-            if (std.mem.indexOf(u8, jsonFindString(data, "stderr") orelse "", e) != null) break true;
+            if (std.mem.indexOf(u8, stderr, e) != null) break true;
         } else false;
         return .{ .code = code, .outputs = outputs, .state = state, .bun_refused = refused };
+    }
+
+    /// Whether the step ran in this job (true), was replayed from an earlier run (false), or did
+    /// not say (null): under step caching the exec writes the run's marker to a file command.
+    fn ranThisRun(x: *Exec, data: std.json.Value) ?bool {
+        if (!x.step_cache) return true;
+        const m = fileCommand(data, "fc_ran") orelse return null;
+        return std.mem.eql(u8, std.mem.trim(u8, m, " \n"), x.ran_marker);
+    }
+
+    /// Text a step added to $GITHUB_STEP_SUMMARY; past the size limit the summary is dropped, in
+    /// GitHub's runner's words.
+    fn appendSummary(x: *Exec, num: u32, text: []const u8) !void {
+        if (text.len == 0 or num > x.summaries.len) return;
+        const so_far = x.summaries[num - 1];
+        if (so_far.len + text.len > max_summary_bytes) {
+            x.sh.append(num, try std.fmt.allocPrint(
+                x.arena,
+                "##[error]$GITHUB_STEP_SUMMARY upload aborted, supports content up to a size of " ++
+                    "{d}k, got {d}k. For more information see: https://docs.github.com/actions/" ++
+                    "using-workflows/workflow-commands-for-github-actions" ++
+                    "#adding-a-markdown-summary",
+                .{ max_summary_bytes / 1024, (so_far.len + text.len) / 1024 },
+            ));
+            return;
+        }
+        x.summaries[num - 1] = try std.mem.concat(x.arena, u8, &.{ so_far, text });
     }
 
     const ActionOut = struct {
@@ -4401,6 +4577,25 @@ const Exec = struct {
         exit_code: i32 = 0,
         outputs: []const job_mod.EnvVar = &.{},
     };
+
+    /// Why a Docker action's exec always runs under step caching: it has the job token
+    /// (ACTIONS_RUNTIME_TOKEN). Null without step caching.
+    fn alwaysRunNote(x: *Exec) !?[]const u8 {
+        if (!x.step_cache) return null;
+        return try std.fmt.allocPrint(x.arena, "zig-runner runs this step every time: " ++
+            "it uses secrets (run {s})", .{x.run_nonce});
+    }
+
+    /// `splitEnv` with this Exec's session, job and secret counter; the message in `x.err_msg`.
+    fn splitStepEnv(
+        x: *Exec,
+        env: []const job_mod.EnvVar,
+        plain: *std.ArrayList(job_mod.EnvVar),
+        secret: *std.ArrayList(SecretRef),
+    ) !void {
+        const counter = &x.secret_counter;
+        return splitEnv(x.arena, x.transport, x.job.*, counter, env, plain, secret, &x.err_msg);
+    }
 
     fn actionFailed(x: *Exec, num: u32, comptime fmt: []const u8, args: anytype) !ActionOut {
         x.sh.append(num, try std.fmt.allocPrint(x.arena, fmt, args));
@@ -4423,7 +4618,7 @@ const Exec = struct {
     ) anyerror!ActionOut {
         const arena = x.arena;
         const ev = x.ev;
-        const loaded = if (!nested) try x.loadFor(num, u) else if (u.local) try x.loadLocal(u) else try x.loadAction(u);
+        const loaded = try x.loadUses(num, u, nested);
         const act = switch (loaded) {
             .failed, .unresolved => |msg| return x.actionFailed(num, "{s}", .{msg}),
             .ok => |a| a,
@@ -4441,12 +4636,17 @@ const Exec = struct {
         };
 
         // GitHub allows composite actions nested 9 deep.
-        if (x.depth >= max_composite_depth) return x.actionFailed(num, "{s}: composite actions can be nested at most {d} levels deep", .{ act.ref_label, max_composite_depth });
+        if (x.depth >= max_composite_depth) return x.actionFailed(
+            num,
+            "{s}: composite actions can be nested at most {d} levels deep",
+            .{ act.ref_label, max_composite_depth },
+        );
         x.depth += 1;
         defer x.depth -= 1;
 
-        // The action's steps see its own `inputs` and `steps`, and `github.action_path`; the job's come
-        // back afterwards. GITHUB_ENV and GITHUB_PATH changes outlive the action, as on GitHub.
+        // The action's steps see its own `inputs` and `steps`, and `github.action_path`; the job's
+        // come back afterwards. GITHUB_ENV and GITHUB_PATH changes outlive the action, as on
+        // GitHub.
         const saved_steps = ev.steps;
         const saved_inputs = ev.inputs;
         const saved_github = ev.github;
@@ -4460,18 +4660,28 @@ const Exec = struct {
         try x.enterAction(act, inputs);
 
         var outcome: CompositeOutcome = .{};
-        const composite = CompositeRun{ .act = act, .step_env = step_env, .step_secret = step_secret };
-        for (steps, 1..) |st, i| try x.runCompositeStep(num, composite, st, i, &outcome);
+        const comp = CompositeRun{ .act = act, .step_env = step_env, .step_secret = step_secret };
+        for (steps, 1..) |st, i| try x.runCompositeStep(num, comp, st, i, &outcome);
 
         // The action's outputs, evaluated against its own steps.
         const sc_out = try ev.scope(step_env);
         const outputs = try arena.alloc(job_mod.EnvVar, act.meta.outputs.len);
-        for (act.meta.outputs, outputs) |o, *dst| dst.* = .{ .name = o.name, .value = expr.interpolate(arena, o.value, sc_out) catch "" };
+        for (act.meta.outputs, outputs) |o, *dst| dst.* = .{
+            .name = o.name,
+            .value = expr.interpolate(arena, o.value, sc_out) catch "",
+        };
         return .{ .failed = outcome.failed, .exit_code = outcome.exit_code, .outputs = outputs };
     }
 
     /// Points the evaluator at a composite action: its `inputs`, an empty `steps`, and the
     /// `github.action_*` entries. The caller saves and restores what this replaces.
+    /// A `uses:` step's action: a nested one is read without a "Set up job" line (the job's own
+    /// steps were listed there), a local one from the workspace.
+    fn loadUses(x: *Exec, num: u32, u: job_mod.Uses, nested: bool) !LoadResult {
+        if (!nested) return x.loadFor(num, u);
+        return if (u.local) x.loadLocal(u) else x.loadAction(u);
+    }
+
     fn enterAction(x: *Exec, act: Loaded, inputs: []const expr.Value.Entry) !void {
         const ev = x.ev;
         ev.steps = .empty;
@@ -4544,12 +4754,18 @@ const Exec = struct {
         var env_error: ?[]const u8 = null;
         for (st.env) |e| {
             const v = expr.interpolate(arena, e.value, sc_env) catch {
-                env_error = try std.fmt.allocPrint(arena, "could not evaluate env '{s}': {s}", .{ e.name, ev.diag });
+                env_error = try std.fmt.allocPrint(arena, "could not evaluate env '{s}': {s}", .{
+                    e.name,
+                    ev.diag,
+                });
                 break;
             };
             try nested_env.append(arena, .{ .name = e.name, .value = v });
         }
-        const all_env = try std.mem.concat(arena, job_mod.EnvVar, &.{ comp.step_env, nested_env.items });
+        const all_env = try std.mem.concat(arena, job_mod.EnvVar, &.{
+            comp.step_env,
+            nested_env.items,
+        });
         const sc = try ev.scope(all_env);
         const display = if (st.name) |nm|
             (expr.interpolate(arena, nm, sc) catch nm)
@@ -4557,15 +4773,16 @@ const Exec = struct {
             firstLine(r)
         else
             st.uses orelse "";
-        if (env_error) |msg| return x.nestedFailed(num, ctx_id, display, msg, &outcome.failed, &outcome.exit_code);
+        if (env_error) |msg| return x.nestedFailed(num, ctx_id, display, msg, outcome);
 
         const cond = st.condition orelse "success()";
         const go = expr.evalCondition(arena, cond, sc) catch {
-            const msg = try std.fmt.allocPrint(arena, "could not evaluate the condition '{s}': {s}", .{ cond, ev.diag });
-            return x.nestedFailed(num, ctx_id, display, msg, &outcome.failed, &outcome.exit_code);
+            const msg = try std.fmt.allocPrint(arena, "could not evaluate the condition " ++
+                "'{s}': {s}", .{ cond, ev.diag });
+            return x.nestedFailed(num, ctx_id, display, msg, outcome);
         };
         if (!go) {
-            try ev.steps.append(arena, .{ .id = ctx_id, .outcome = "skipped", .conclusion = "skipped", .outputs = &.{} });
+            try ev.steps.append(arena, skippedStep(ctx_id));
             return;
         }
         const coe = if (st.continue_on_error) |c|
@@ -4642,14 +4859,7 @@ const Exec = struct {
                     "could not evaluate input '{s}': {s}",
                     .{ kv.name, ev.diag },
                 );
-                return x.nestedFailed(
-                    num,
-                    step.ctx_id,
-                    step.display,
-                    msg,
-                    &outcome.failed,
-                    &outcome.exit_code,
-                );
+                return x.nestedFailed(num, step.ctx_id, step.display, msg, outcome);
             };
             try with.append(arena, .{ .name = kv.name, .value = .{ .lit = v } });
         }
@@ -4684,17 +4894,19 @@ const Exec = struct {
         const ev = x.ev;
         const act = comp.act;
         const script = expr.interpolate(arena, run_text, step.sc) catch {
-            const msg = try std.fmt.allocPrint(arena, "could not evaluate the script: {s}", .{ev.diag});
-            return x.nestedFailed(num, step.ctx_id, step.display, msg, &outcome.failed, &outcome.exit_code);
+            const msg = try std.fmt.allocPrint(arena, "could not evaluate the script: {s}", .{
+                ev.diag,
+            });
+            return x.nestedFailed(num, step.ctx_id, step.display, msg, outcome);
         };
         // Without a name, the step is shown by its command as it will run.
         const display = if (st.name == null) firstLine(script) else step.display;
         const shell = expr.interpolate(arena, st.shell.?, step.sc) catch st.shell.?;
         if (!job_mod.validShell(shell)) {
             const msg = try job_mod.unsupportedShell(arena, shell);
-            return x.nestedFailed(num, step.ctx_id, display, msg, &outcome.failed, &outcome.exit_code);
+            return x.nestedFailed(num, step.ctx_id, display, msg, outcome);
         }
-        const wd: ?[]const u8 = if (st.working_directory) |d| (expr.interpolate(arena, d, step.sc) catch d) else null;
+        const wd = interpolateOptional(arena, st.working_directory, step.sc);
 
         // Env that carries a secret goes in as a Dagger secret, the rest in the script.
         var plain: std.ArrayList(job_mod.EnvVar) = .empty;
@@ -4713,7 +4925,12 @@ const Exec = struct {
         const fc = x.next_fc;
         x.next_fc += 1;
         const resolved: Resolved = .{
-            .run = .{ .script = script, .shell = shell, .working_directory = wd, .env = plain.items },
+            .run = .{
+                .script = script,
+                .shell = shell,
+                .working_directory = wd,
+                .env = plain.items,
+            },
         };
         const mounts: []const Mount = if (mounted) &.{} else &m;
         const out = try x.execScript(num, fc, resolved, step.ctx_id, secret.items, mounts);
@@ -4779,7 +4996,14 @@ const Exec = struct {
                 );
                 return x.runAction(
                     num,
-                    .{ .owner = "", .name = "", .path = dir, .ref = "", .inputs = with, .local = true },
+                    .{
+                        .owner = "",
+                        .name = "",
+                        .path = dir,
+                        .ref = "",
+                        .inputs = with,
+                        .local = true,
+                    },
                     caller,
                     step_env,
                     step_secret,
@@ -4787,14 +5011,18 @@ const Exec = struct {
                 );
             },
             .repo => |r| {
-                if (std.ascii.eqlIgnoreCase(r.owner, "actions") and std.ascii.eqlIgnoreCase(r.name, "checkout") and r.path.len == 0) return x.runNestedCheckout(
-                    num,
-                    ctx_id,
-                    with,
-                );
+                const is_checkout = std.ascii.eqlIgnoreCase(r.owner, "actions") and
+                    std.ascii.eqlIgnoreCase(r.name, "checkout") and r.path.len == 0;
+                if (is_checkout) return x.runNestedCheckout(num, ctx_id, with);
                 return x.runAction(
                     num,
-                    .{ .owner = r.owner, .name = r.name, .path = r.path, .ref = r.ref, .inputs = with },
+                    .{
+                        .owner = r.owner,
+                        .name = r.name,
+                        .path = r.path,
+                        .ref = r.ref,
+                        .inputs = with,
+                    },
                     caller,
                     step_env,
                     step_secret,
@@ -4906,17 +5134,18 @@ const Exec = struct {
             var val: []const u8 = "";
             if (findInput(u.inputs, def.name)) |t| {
                 ev.diag = "";
-                val = ev.render(
-                    t,
-                    caller,
-                ) catch return .{ .failed = try x.actionFailed(num, "could not evaluate input '{s}': {s}", .{ def.name, ev.diag }) };
+                val = ev.render(t, caller) catch return .{
+                    .failed = try x.actionFailed(num, "could not evaluate input '{s}': {s}", .{
+                        def.name,
+                        ev.diag,
+                    }),
+                };
             } else if (def.default) |d| {
                 ev.diag = "";
-                val = expr.interpolate(
-                    arena,
-                    d,
-                    caller,
-                ) catch return .{ .failed = try x.actionFailed(num, "could not evaluate the default of input '{s}': {s}", .{ def.name, ev.diag }) };
+                val = expr.interpolate(arena, d, caller) catch return .{
+                    .failed = try x.actionFailed(num, "could not evaluate the default of " ++
+                        "input '{s}': {s}", .{ def.name, ev.diag }),
+                };
             }
             try inputs.append(arena, .{ .key = def.name, .value = .{ .string = val } });
         }
@@ -4930,7 +5159,8 @@ const Exec = struct {
         if (warn and unexpected.items.len > 0) {
             var valid: std.ArrayList([]const u8) = .empty;
             for (act.meta.inputs) |def| try valid.append(arena, def.name);
-            x.sh.append(num, try std.fmt.allocPrint(arena, "Warning: Unexpected input(s) '{s}', valid inputs are ['{s}']", .{
+            x.sh.append(num, try std.fmt.allocPrint(arena, "Warning: Unexpected input(s) " ++
+                "'{s}', valid inputs are ['{s}']", .{
                 try std.mem.join(
                     arena,
                     "', '",
@@ -4948,7 +5178,8 @@ const Exec = struct {
     /// reports why.
     fn runPre(x: *Exec, num: u32, step: job_mod.Step) !void {
         const u = step.action.uses;
-        // A local action is read when its step runs, after the checkout; GitHub runs no `pre` for it.
+        // A local action is read when its step runs, after the checkout; GitHub runs no `pre` for
+        // it.
         if (u.local) return;
         const act = switch (try x.loadFor(num, u)) {
             .failed, .unresolved => return,
@@ -4971,19 +5202,32 @@ const Exec = struct {
         };
         var plain: std.ArrayList(job_mod.EnvVar) = .empty;
         var secret: std.ArrayList(SecretRef) = .empty;
-        splitEnv(x.arena, x.transport, x.job.*, &x.secret_counter, step_env, &plain, &secret, &x.err_msg) catch return error.EngineFailed;
+        x.splitStepEnv(step_env, &plain, &secret) catch return error.EngineFailed;
         // A step of its own, "Pre Run x@v1", logged under the next log step.
         const ls = x.next_log_step;
         x.next_log_step += 1;
         const started = std.Io.Clock.real.now(x.io).toMilliseconds();
         const pre_name = x.extraName("Pre", num, act) catch "Pre";
         x.startExtra(.pre, ls, pre_name, started);
+        const env = plain.items;
+        const sec = secret.items;
         const pre_out = switch (act.meta.runs) {
-            .docker => |dk| if (try x.dockerRunFor(ls, act, u, dk, inputs, plain.items, secret.items, pre)) |dr| try x.runContainer(ls, .pre, dr, &.{}) else null,
-            else => try x.runJsScript(ls, .pre, act, u, pre, inputs, plain.items, secret.items, &.{}),
+            .docker => |dk| blk: {
+                const dr = try x.dockerRunFor(ls, act, u, dk, inputs, env, sec, pre) orelse
+                    break :blk null;
+                break :blk try x.runContainer(ls, .pre, dr, &.{});
+            },
+            else => try x.runJsScript(ls, .pre, act, u, pre, inputs, env, sec, &.{}),
         };
         var ok = false;
-        defer x.addExtra(.{ .kind = .pre, .name = pre_name, .log_step = ls, .outcome = if (ok) .success else .failure, .started_ms = started, .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds() }) catch {};
+        defer x.addExtra(.{
+            .kind = .pre,
+            .name = pre_name,
+            .log_step = ls,
+            .outcome = if (ok) .success else .failure,
+            .started_ms = started,
+            .completed_ms = std.Io.Clock.real.now(x.io).toMilliseconds(),
+        }) catch {};
         const out = pre_out orelse {
             ev.job_failed = true;
             x.hook_failed = true;
@@ -5091,12 +5335,17 @@ const Exec = struct {
             if (!try x.appendJsRuntimeMounts(num, &mounts)) return null;
         }
         // Mounted once: a later phase sees what an earlier one left in the action's directory.
-        if (!x.mounted_actions.contains(act.mount)) try mounts.append(arena, .{ .dir = .{ .path = act.mount, .id = act.dir, .owner = x.dir_owner } });
+        const action_dir: Mount = .{
+            .dir = .{ .path = act.mount, .id = act.dir, .owner = x.dir_owner },
+        };
+        if (!x.mounted_actions.contains(act.mount)) try mounts.append(arena, action_dir);
         const env = try x.jsEnv(act, inputs, state, step_env, step_secret);
 
         // GitHub folds the action's inputs at the start of its main step; its pre and post steps
         // start with their output.
-        if (phase == .main) try x.logGroup(num, phase, act.ref_label, try shownInputs(arena, inputs), step_env, step_secret, &.{});
+        const shown = try shownInputs(arena, inputs);
+        if (phase == .main)
+            try x.logGroup(num, phase, act.ref_label, shown, step_env, step_secret, &.{});
 
         const script = try jsCommand(arena, js_runtime_path, act, script_rel);
         const fc = x.next_fc;
@@ -5106,7 +5355,7 @@ const Exec = struct {
         const pending_env = try arena.dupe(job_mod.EnvVar, x.ev.pending_env.items);
         const pending_path = try arena.dupe([]const u8, x.ev.pending_path.items);
         const name = if (act.repository.len > 0) act.repository else act.ref_label;
-        const resolved: Resolved = .{ .run = .{ .script = script, .shell = null, .working_directory = null, .env = env.plain } };
+        const resolved = scriptRun(script, env.plain);
         const out = try x.execScript(num, fc, resolved, name, env.secret, mounts.items);
         x.js_mounted = true;
         try x.mounted_actions.put(arena, act.mount, {});
@@ -5114,8 +5363,8 @@ const Exec = struct {
 
         // Bun refused the action's code before running any of it, so running it again with Node
         // repeats nothing. The second try starts where the first did, not from the refused exec:
-        // with step caching that exec always runs (it has the job token), and starting from it would
-        // keep every later step from being replayed.
+        // with step caching that exec always runs (it has the job token), and starting from it
+        // would keep every later step from being replayed.
         x.sh.append(num, "Bun could not load this action's code; running it with Node instead.");
         const node_mounts = (try x.nodeFallback(num)) orelse return out;
         x.container_id = before;
@@ -5123,12 +5372,7 @@ const Exec = struct {
         try x.ev.pending_env.appendSlice(arena, pending_env);
         x.ev.pending_path.clearRetainingCapacity();
         try x.ev.pending_path.appendSlice(arena, pending_path);
-        const again: Resolved = .{ .run = .{
-            .script = try jsCommand(arena, js_fallback_path, act, script_rel),
-            .shell = null,
-            .working_directory = null,
-            .env = env.plain,
-        } };
+        const again = scriptRun(try jsCommand(arena, js_fallback_path, act, script_rel), env.plain);
         const fc_again = x.next_fc;
         x.next_fc += 1;
         const all_mounts = try std.mem.concat(arena, Mount, &.{ mounts.items, node_mounts });
@@ -5196,40 +5440,46 @@ const Exec = struct {
         const rt = (if (x.musl) js_runtimes_musl else js_runtimes).get(x.js_runtime);
         var msg: []const u8 = "";
         const data = gql(arena, x.transport, try jsRuntimeQuery(arena, rt, x.musl), &msg) catch {
-            _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}: {s}", .{ rt.image, msg });
+            _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}: {s}", .{
+                rt.image,
+                msg,
+            });
             return false;
         };
-        const bin = (if (jsonFind(data, "bin")) |b| jsonFindString(b, "id") else null) orelse {
-            _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}", .{rt.image});
+        const bin = idOf(data, "bin") orelse {
+            _ = try x.actionFailed(num, "could not get the JavaScript runtime from {s}", .{
+                rt.image,
+            });
             return false;
         };
         if (x.musl) {
-            const libs_id = (if (jsonFind(data, "libs")) |l| jsonFindString(l, "id") else null) orelse {
+            const libs_id = idOf(data, "libs") orelse {
                 _ = try x.actionFailed(num, "could not get the C++ runtime from {s}", .{rt.image});
                 return false;
             };
             try mounts.append(arena, .{ .dir = .{ .path = js_lib_dir, .id = libs_id } });
-            try mounts.append(arena, .{ .file = .{ .path = js_musl_dir ++ "/node", .id = bin, .permissions = 0o755 } });
-            try mounts.append(arena, .{ .new_file = .{ .path = js_runtime_path, .contents = try muslWrapper(arena, "node"), .permissions = 0o755 } });
-        } else try mounts.append(arena, .{ .file = .{ .path = js_runtime_path, .id = bin, .permissions = 0o755 } });
-        try mounts.append(arena, .{ .new_file = .{ .path = js_shim_path, .contents = node_shim, .permissions = 0o755 } });
+            try mounts.append(arena, fileMount(js_musl_dir ++ "/node", bin));
+            try mounts.append(arena, newFileMount(js_runtime_path, try muslWrapper(arena, "node")));
+        } else try mounts.append(arena, fileMount(js_runtime_path, bin));
+        try mounts.append(arena, newFileMount(js_shim_path, node_shim));
         switch (x.js_runtime) {
             // The same binary named `bun` is Bun's own CLI, for `bun x`.
             .bun => {
                 if (x.musl) {
-                    try mounts.append(arena, .{ .file = .{ .path = js_musl_dir ++ "/bun", .id = bin, .permissions = 0o755 } });
-                    try mounts.append(arena, .{ .new_file = .{ .path = js_bun_path, .contents = try muslWrapper(arena, "bun"), .permissions = 0o755 } });
-                } else try mounts.append(arena, .{ .file = .{ .path = js_bun_path, .id = bin, .permissions = 0o755 } });
-                try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npx", .contents = npx_bun_shim, .permissions = 0o755 } });
+                    try mounts.append(arena, fileMount(js_musl_dir ++ "/bun", bin));
+                    const wrapper = try muslWrapper(arena, "bun");
+                    try mounts.append(arena, newFileMount(js_bun_path, wrapper));
+                } else try mounts.append(arena, fileMount(js_bun_path, bin));
+                try mounts.append(arena, newFileMount(js_bin_dir ++ "/npx", npx_bun_shim));
             },
             .node => {
-                const npm = (if (jsonFind(data, "npm")) |d| jsonFindString(d, "id") else null) orelse {
+                const npm = idOf(data, "npm") orelse {
                     _ = try x.actionFailed(num, "could not get npm from {s}", .{rt.image});
                     return false;
                 };
                 try mounts.append(arena, .{ .dir = .{ .path = js_npm_dir, .id = npm } });
-                try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npx", .contents = npx_node_shim, .permissions = 0o755 } });
-                try mounts.append(arena, .{ .new_file = .{ .path = js_bin_dir ++ "/npm", .contents = npm_node_shim, .permissions = 0o755 } });
+                try mounts.append(arena, newFileMount(js_bin_dir ++ "/npx", npx_node_shim));
+                try mounts.append(arena, newFileMount(js_bin_dir ++ "/npm", npm_node_shim));
             },
         }
         return true;
@@ -5247,16 +5497,13 @@ const Exec = struct {
             _ = try x.actionFailed(num, "could not get Node from {s}: {s}", .{ rt.image, msg });
             return null;
         };
-        const bin = (if (jsonFind(data, "bin")) |b| jsonFindString(b, "id") else null) orelse {
+        const bin = idOf(data, "bin") orelse {
             _ = try x.actionFailed(num, "could not get Node from {s}", .{rt.image});
             return null;
         };
         var mounts: std.ArrayList(Mount) = .empty;
         if (x.musl) {
-            const libs_id = (if (jsonFind(data, "libs")) |l| jsonFindString(
-                l,
-                "id",
-            ) else null) orelse {
+            const libs_id = idOf(data, "libs") orelse {
                 _ = try x.actionFailed(num, "could not get the C++ runtime from {s}", .{rt.image});
                 return null;
             };
@@ -5266,15 +5513,12 @@ const Exec = struct {
             );
             try mounts.append(
                 arena,
-                .{ .file = .{ .path = js_fallback_dir ++ "/node-musl", .id = bin, .permissions = 0o755 } },
+                fileMount(js_fallback_dir ++ "/node-musl", bin),
             );
-            try mounts.append(
-                arena,
-                .{ .new_file = .{ .path = js_fallback_path, .contents = "#!/bin/sh\nLD_LIBRARY_PATH=" ++ js_fallback_dir ++ "/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} exec " ++ js_fallback_dir ++ "/node-musl \"$@\"\n", .permissions = 0o755 } },
-            );
+            try mounts.append(arena, newFileMount(js_fallback_path, node_fallback_wrapper));
         } else try mounts.append(
             arena,
-            .{ .file = .{ .path = js_fallback_path, .id = bin, .permissions = 0o755 } },
+            fileMount(js_fallback_path, bin),
         );
         x.node_fallback_mounted = true;
         return mounts.items;
@@ -5324,9 +5568,12 @@ const Exec = struct {
                 if (p.len == 0 or p[0] == '#') continue;
                 const exclude = p[0] == '!';
                 if (exclude) p = std.mem.trimStart(u8, p[1..], " ");
-                if (std.mem.startsWith(u8, p, ws) and std.mem.startsWith(u8, p[ws.len..], "/")) p = p[ws.len + 1 ..] //
+                const in_ws = std.mem.startsWith(u8, p, ws) and
+                    std.mem.startsWith(u8, p[ws.len..], "/");
+                // An absolute path outside the workspace: GitHub ignores those files.
+                if (in_ws) p = p[ws.len + 1 ..] //
                 else if (std.mem.eql(u8, p, ws)) p = "**" //
-                else if (p.len > 0 and p[0] == '/') continue; // outside the workspace: GitHub ignores those files
+                else if (p.len > 0 and p[0] == '/') continue;
                 while (std.mem.startsWith(u8, p, "./")) p = p[2..];
                 p = std.mem.trimEnd(u8, p, "/");
                 if (p.len == 0) continue;
@@ -5608,10 +5855,10 @@ const Exec = struct {
             .{ .name = "ACTIONS_CACHE_SERVICE_V2", .value = if (rt.cache_v2) "True" else "" },
         };
         for (vars) |v| if (v.value.len > 0) try env.append(x.arena, v);
-        for (state) |st| try env.append(
-            x.arena,
-            .{ .name = try std.fmt.allocPrint(x.arena, "STATE_{s}", .{st.name}), .value = st.value },
-        );
+        for (state) |st| {
+            const name = try std.fmt.allocPrint(x.arena, "STATE_{s}", .{st.name});
+            try env.append(x.arena, .{ .name = name, .value = st.value });
+        }
     }
 
     /// As GitHub shows an action: `##[group]Run <action>`, its inputs, the env it gets (the job's
@@ -5703,6 +5950,35 @@ const Exec = struct {
     /// directory, with the Dockerfile's directory as the context, as GitHub builds it), and its
     /// `args` and `env:` evaluated with its `inputs` in scope. Null when they cannot be evaluated
     /// (logged).
+    /// A Docker action's environment: the step's `env:`, its inputs as INPUT_*, and the action's
+    /// own `env:` evaluated; null, with the step failed, when one of those cannot be evaluated.
+    fn dockerEnv(
+        x: *Exec,
+        num: u32,
+        act: Loaded,
+        action_env: []const action.KeyValue,
+        sc: expr.Scope,
+        step_env: []const job_mod.EnvVar,
+        inputs: []const expr.Value.Entry,
+    ) !?[]const job_mod.EnvVar {
+        const arena = x.arena;
+        var env: std.ArrayList(job_mod.EnvVar) = .empty;
+        try env.appendSlice(arena, step_env);
+        try env.appendSlice(arena, try inputEnv(arena, inputs));
+        for (action_env) |e| {
+            const value = expr.interpolate(arena, e.value, sc) catch {
+                _ = try x.actionFailed(num, "could not evaluate env '{s}' of {s}: {s}", .{
+                    e.name,
+                    act.ref_label,
+                    x.ev.diag,
+                });
+                return null;
+            };
+            try env.append(arena, .{ .name = e.name, .value = value });
+        }
+        return env.items;
+    }
+
     fn dockerRunFor(
         x: *Exec,
         num: u32,
@@ -5726,23 +6002,21 @@ const Exec = struct {
         if (dk.args) |list| {
             const out = try arena.alloc([]const u8, list.len);
             for (list, out) |a, *dst| dst.* = expr.interpolate(arena, a, sc) catch {
-                _ = try x.actionFailed(num, "could not evaluate the args of {s}: {s}", .{ act.ref_label, ev.diag });
+                _ = try x.actionFailed(num, "could not evaluate the args of {s}: {s}", .{
+                    act.ref_label,
+                    ev.diag,
+                });
                 return null;
             };
             args = out;
         }
-        var env: std.ArrayList(job_mod.EnvVar) = .empty;
-        try env.appendSlice(arena, step_env);
-        try env.appendSlice(arena, try inputEnv(arena, inputs));
-        for (dk.env) |e| try env.append(arena, .{ .name = e.name, .value = expr.interpolate(arena, e.value, sc) catch {
-            _ = try x.actionFailed(num, "could not evaluate env '{s}' of {s}: {s}", .{ e.name, act.ref_label, ev.diag });
-            return null;
-        } });
+        const env = try x.dockerEnv(num, act, dk.env, sc, step_env, inputs) orelse return null;
 
         const image: DockerRun.Image = if (std.mem.startsWith(u8, dk.image, "docker://"))
             .{ .pull = dk.image["docker://".len..] }
         else img: {
-            const rel = try std.fs.path.resolveAllocPosix(arena, &.{ if (act.sub.len > 0) act.sub else ".", dk.image });
+            const from = if (act.sub.len > 0) act.sub else ".";
+            const rel = try std.fs.path.resolveAllocPosix(arena, &.{ from, dk.image });
             break :img .{ .build = .{
                 .dir = act.dir,
                 .context = std.fs.path.dirnamePosix(rel) orelse ".",
@@ -5753,7 +6027,7 @@ const Exec = struct {
             .image = image,
             .entrypoint = entrypoint,
             .args = args,
-            .env = env.items,
+            .env = env,
             .secret = step_secret,
             .label = act.ref_label,
             .repository = act.repository,
@@ -5823,6 +6097,46 @@ const Exec = struct {
     /// job's container afterwards, deletions included. The command is started by a static busybox
     /// (`busybox_image`), so images without a shell work too. Null when the image could not be
     /// pulled or built (logged).
+    /// The step's log group, with the image the action runs in.
+    fn logContainerStart(x: *Exec, num: u32, phase: Phase, dr: DockerRun) !void {
+        const arena = x.arena;
+        const image_line = switch (dr.image) {
+            .pull => |ref| try std.fmt.allocPrint(arena, "image: {s}", .{ref}),
+            .build => |b| try std.fmt.allocPrint(arena, "image: built from {s}", .{
+                try std.fs.path.resolveAllocPosix(arena, &.{ b.context, b.dockerfile }),
+            }),
+        };
+        try x.logGroup(num, phase, dr.label, dr.shown, dr.step_env, dr.step_secret, &.{image_line});
+    }
+
+    /// The shell a Docker action's container runs. It always has the job token
+    /// (ACTIONS_RUNTIME_TOKEN), so with step caching it always runs and is never replayed, which
+    /// is why it keeps the real run-specific values (`false`).
+    fn containerScriptFor(
+        x: *Exec,
+        num: u32,
+        fc: u32,
+        argv: []const []const u8,
+        env: []const job_mod.EnvVar,
+        names: []const []const u8,
+        dr: DockerRun,
+    ) ![]const u8 {
+        const label = if (dr.repository.len > 0) dr.repository else dr.label;
+        const always_run = try x.alwaysRunNote();
+        return containerScript(
+            x.arena,
+            num,
+            fc,
+            argv,
+            env,
+            names,
+            always_run,
+            x.event_from_env,
+            false,
+            label,
+        );
+    }
+
     fn runContainer(
         x: *Exec,
         num: u32,
@@ -5831,11 +6145,7 @@ const Exec = struct {
         state: []const job_mod.EnvVar,
     ) !?ExecOut {
         const arena = x.arena;
-        const image_line = switch (dr.image) {
-            .pull => |ref| try std.fmt.allocPrint(arena, "image: {s}", .{ref}),
-            .build => |b| try std.fmt.allocPrint(arena, "image: built from {s}", .{try std.fs.path.resolveAllocPosix(arena, &.{ b.context, b.dockerfile })}),
-        };
-        if (phase == .main) try x.logGroup(num, phase, dr.label, dr.shown, dr.step_env, dr.step_secret, &.{image_line});
+        if (phase == .main) try x.logContainerStart(num, phase, dr);
         const busybox = (try x.busyboxFile(num)) orelse return null;
         const img = (try x.imageInfo(num, dr.image, dr.label)) orelse return null;
         const argv = (try x.containerArgv(num, dr, img)) orelse return null;
@@ -5843,18 +6153,15 @@ const Exec = struct {
         const env = try x.containerEnv(dr, state);
         const names = try arena.alloc([]const u8, env.secret.len);
         for (env.secret, names) |sr, *n| n.* = sr.name;
-        // It always has the job token (ACTIONS_RUNTIME_TOKEN), so with step caching it always runs.
-        const always_run: ?[]const u8 = if (x.step_cache) try std.fmt.allocPrint(arena, "zig-runner runs this step every time: it uses secrets (run {s})", .{x.run_nonce}) else null;
         const fc = x.next_fc;
         x.next_fc += 1;
-        // `false`: a Docker action always runs under step caching (it gets the job token), so it is
-        // never replayed and keeps the real run-specific values.
-        const script = try containerScript(arena, num, fc, argv, env.plain, names, always_run, x.event_from_env, false, if (dr.repository.len > 0) dr.repository else dr.label);
+        const script = try x.containerScriptFor(num, fc, argv, env.plain, names, dr);
 
         var q: Query = .init(arena);
         try q.call("loadContainerFromID", .{ .id = img.id });
         try q.call("withWorkdir", .{ .path = docker_workspace });
-        try q.call("withFile", .{ .path = busybox_path, .permissions = @as(u32, 0o755), .source = busybox });
+        const mode: u32 = 0o755;
+        try q.call("withFile", .{ .path = busybox_path, .permissions = mode, .source = busybox });
         try x.writeActionDirs(&q, img, ws_in);
         try x.writeActionEnv(&q);
         try writeActionSecrets(arena, &q, env.secret);
@@ -5880,7 +6187,8 @@ const Exec = struct {
         try q.close(1);
 
         x.beginExec(num);
-        const data = gql(arena, x.transport, try q.finish(), &x.err_msg) catch return error.EngineFailed;
+        const data = gql(arena, x.transport, try q.finish(), &x.err_msg) catch
+            return error.EngineFailed;
         const out = try x.collect(num, data);
         try x.takeWorkspaceBack(num, data, out);
         return out;
@@ -5979,7 +6287,7 @@ const Exec = struct {
     fn writeActionEnv(x: *Exec, q: *Query) !void {
         const ev = x.ev;
         for (try ev.defaultEnv()) |e| {
-            const node = if (x.step_cache and isVolatile(e.name)) "withVolatileVariable" else "withEnvVariable";
+            const node = envVarNode(x.step_cache and isVolatile(e.name));
             // GitHub mounts the workspace at /github/workspace in a Docker action, and says so.
             const value = if (std.mem.eql(
                 u8,
@@ -6016,7 +6324,7 @@ const Exec = struct {
         if (jsonFind(data, "home")) |h| if (jsonFindString(h, "id")) |id| {
             x.docker_home = id;
         };
-        const ws_out = (if (jsonFind(data, "ws")) |d| jsonFindString(d, "id") else null) orelse {
+        const ws_out = idOf(data, "ws") orelse {
             x.err_msg = "Dagger returned no workspace directory";
             return error.EngineFailed;
         };
@@ -6099,7 +6407,9 @@ const Exec = struct {
         for (x.job.services, 0..) |svc, svc_index| {
             x.sh.append(
                 ls,
-                try std.fmt.allocPrint(arena, "##[group]Starting {s} service container", .{svc.name}),
+                try std.fmt.allocPrint(arena, "##[group]Starting {s} service container", .{
+                    svc.name,
+                }),
             );
             defer x.sh.append(ls, "##[endgroup]");
             if (!try x.startService(ls, sc, svc, svc_index, busybox)) {
@@ -6163,7 +6473,8 @@ const Exec = struct {
         if (gql(arena, x.transport, try lib_q.finish(), &msg)) |lib| {
             if (jsonFind(lib, "entries")) |entries|
                 if (entries == .array) for (entries.array.items) |e| {
-                    if (e == .string and std.mem.startsWith(u8, e.string, "ld-musl-")) x.musl = true;
+                    if (e == .string and std.mem.startsWith(u8, e.string, "ld-musl-"))
+                        x.musl = true;
                 };
         } else |_| {}
         x.sh.append(ls, "##[endgroup]");
@@ -6196,7 +6507,10 @@ const Exec = struct {
         for (spec.ports) |p| {
             x.sh.append(
                 ls,
-                try std.fmt.allocPrint(x.arena, "{d}/tcp -> localhost:{d}", .{ p.container, p.host }),
+                try std.fmt.allocPrint(x.arena, "{d}/tcp -> localhost:{d}", .{
+                    p.container,
+                    p.host,
+                }),
             );
         }
         try x.services.append(x.arena, .{ .name = svc.name, .id = id, .ports = spec.ports });
@@ -6217,14 +6531,18 @@ const Exec = struct {
         if (image.len == 0) {
             x.sh.errorLine(
                 ls,
-                try std.fmt.allocPrint(arena, "The service '{s}' has no image: {s}", .{ svc.name, ev.diag }),
+                try std.fmt.allocPrint(arena, "The service '{s}' has no image: {s}", .{
+                    svc.name,
+                    ev.diag,
+                }),
             );
             return null;
         }
         const env = ev.renderEnv(svc.env, sc) catch {
             x.sh.errorLine(
                 ls,
-                try std.fmt.allocPrint(arena, "Could not evaluate the env of service '{s}': {s}", .{ svc.name, ev.diag }),
+                try std.fmt.allocPrint(arena, "Could not evaluate the env of service '{s}': " ++
+                    "{s}", .{ svc.name, ev.diag }),
             );
             return null;
         };
@@ -6234,7 +6552,9 @@ const Exec = struct {
             const port = parseServicePort(text) orelse {
                 x.sh.errorLine(
                     ls,
-                    try std.fmt.allocPrint(arena, "Unsupported port '{s}' for service '{s}' (TCP ports only: 'container', 'host:container' or 'ip:host:container')", .{ text, svc.name }),
+                    try std.fmt.allocPrint(arena, "Unsupported port '{s}' for service '{s}' " ++
+                        "(TCP ports only: 'container', 'host:container' or " ++
+                        "'ip:host:container')", .{ text, svc.name }),
                 );
                 return null;
             };
@@ -6245,7 +6565,8 @@ const Exec = struct {
             const ignored = try ignoredServiceOptions(arena, ev.render(t, sc) catch "");
             if (ignored.len > 0) x.sh.append(
                 ls,
-                try std.fmt.allocPrint(arena, "##[warning]Service options not supported and ignored: {s}", .{ignored}),
+                try std.fmt.allocPrint(arena, "##[warning]Service options not supported and " ++
+                    "ignored: {s}", .{ignored}),
             );
         }
         if (svc.volumes.len > 0)
@@ -6289,7 +6610,8 @@ const Exec = struct {
                 ) catch {
                     x.sh.errorLine(
                         ls,
-                        try std.fmt.allocPrint(arena, "Could not register the credentials of service '{s}': {s}", .{ svc.name, x.err_msg }),
+                        try std.fmt.allocPrint(arena, "Could not register the credentials of " ++
+                            "service '{s}': {s}", .{ svc.name, x.err_msg }),
                     );
                     return null;
                 };
@@ -6323,7 +6645,11 @@ const Exec = struct {
         const cfg = gql(arena, x.transport, try q.finish(), &x.err_msg) catch {
             x.sh.errorLine(
                 ls,
-                try std.fmt.allocPrint(arena, "Failed to pull {s} for service {s}: {s}", .{ image, svc.name, x.err_msg }),
+                try std.fmt.allocPrint(arena, "Failed to pull {s} for service {s}: {s}", .{
+                    image,
+                    svc.name,
+                    x.err_msg,
+                }),
             );
             return null;
         };
@@ -6335,7 +6661,8 @@ const Exec = struct {
         if (entrypoint.len + cmd.len == 0) {
             x.sh.errorLine(
                 ls,
-                try std.fmt.allocPrint(arena, "The image {s} of service {s} has no entrypoint or command to run", .{ image, svc.name }),
+                try std.fmt.allocPrint(arena, "The image {s} of service {s} has no entrypoint " ++
+                    "or command to run", .{ image, svc.name }),
             );
             return null;
         }
@@ -6391,7 +6718,10 @@ const Exec = struct {
         const data = gql(arena, x.transport, try q.finish(), &x.err_msg) catch {
             x.sh.errorLine(
                 ls,
-                try std.fmt.allocPrint(arena, "Failed to start service container {s}: {s}", .{ svc.name, x.err_msg }),
+                try std.fmt.allocPrint(arena, "Failed to start service container {s}: {s}", .{
+                    svc.name,
+                    x.err_msg,
+                }),
             );
             return null;
         };
@@ -6418,7 +6748,9 @@ const Exec = struct {
         const data = gql(arena, x.transport, try q.finish(), &x.err_msg) catch {
             x.sh.errorLine(
                 ls,
-                try std.fmt.allocPrint(arena, "Could not bind the services to the job: {s}", .{x.err_msg}),
+                try std.fmt.allocPrint(arena, "Could not bind the services to the job: {s}", .{
+                    x.err_msg,
+                }),
             );
             return false;
         };
@@ -6459,7 +6791,8 @@ const Exec = struct {
                 x.transport,
                 doc,
                 &msg,
-            ) catch x.sh.append(ls, try std.fmt.allocPrint(x.arena, "##[warning]Could not stop {s}: {s}", .{ r.name, msg }));
+            ) catch x.sh.append(ls, try std.fmt.allocPrint(x.arena, "##[warning]Could not stop " ++
+                "{s}: {s}", .{ r.name, msg }));
         }
         // The job container goes with the job's session.
         if (x.job.container != null) x.sh.append(
@@ -6495,11 +6828,11 @@ const Exec = struct {
             );
             return null;
         };
-        const id = (if (jsonFind(data, "bb")) |b| jsonFindString(b, "id") else null) orelse {
+        const id = idOf(data, "bb") orelse {
             _ = try x.actionFailed(num, "could not get busybox from {s}", .{busybox_image});
             return null;
         };
-        x.empty_dir = (if (jsonFind(data, "empty")) |e| jsonFindString(e, "id") else null) orelse {
+        x.empty_dir = idOf(data, "empty") orelse {
             _ = try x.actionFailed(num, "Dagger returned no directory", .{});
             return null;
         };
@@ -6568,17 +6901,16 @@ const Exec = struct {
         ctx_id: []const u8,
         display: []const u8,
         msg: []const u8,
-        failed: *bool,
-        exit_code: *i32,
+        outcome: *CompositeOutcome,
     ) !void {
         x.sh.errorLine(num, try std.fmt.allocPrint(x.arena, "{s}: {s}", .{ display, msg }));
         try x.ev.steps.append(
             x.arena,
             .{ .id = ctx_id, .outcome = "failure", .conclusion = "failure", .outputs = &.{} },
         );
-        failed.* = true;
+        outcome.failed = true;
         x.ev.job_failed = true;
-        if (exit_code.* == 0) exit_code.* = 1;
+        if (outcome.exit_code == 0) outcome.exit_code = 1;
     }
 
     const Loaded = struct {
@@ -6605,58 +6937,78 @@ const Exec = struct {
     /// `action.yml` or `action.yaml`.
     fn loadAction(x: *Exec, u: job_mod.Uses) !LoadResult {
         const arena = x.arena;
+        const repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name });
         const sub = if (u.path.len > 0) try std.fmt.allocPrint(arena, "/{s}", .{u.path}) else "";
-        const ref_label = try std.fmt.allocPrint(arena, "{s}/{s}{s}@{s}", .{ u.owner, u.name, sub, u.ref });
-        const url = try std.fmt.allocPrint(arena, "{s}/{s}/{s}.git", .{ std.mem.trimEnd(u8, x.job.github.server_url, "/"), u.owner, u.name });
-
+        const ref_label = try std.fmt.allocPrint(arena, "{s}{s}@{s}", .{ repository, sub, u.ref });
         // GITHUB_TOKEN reads only the job's own repository; other actions are fetched anonymously.
-        const own_repo = std.mem.eql(u8, try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name }), x.job.github.repository);
-        const auth: ?[]const u8 = if (own_repo) x.gitAuth() else null;
-        const auth_user: ?[]const u8 = if (auth != null) "x-access-token" else null;
-        var q: Query = .init(arena);
-        try q.call("git", .{ .url = url, .httpAuthUsername = auth_user, .httpAuthToken = auth });
-        if (isSha(u.ref)) try q.call("commit", .{ .id = u.ref }) else try q.call("ref", .{ .name = u.ref });
-        try q.call("tree", .{ .depth = @as(u32, 1) });
-        try q.leaf("id");
-        try q.leafArgs(null, "entries", .{ .path = if (u.path.len > 0) u.path else "." });
-        try q.close(1);
-        try q.leafAs("sha", "commit");
+        const own_repo = std.mem.eql(u8, repository, x.job.github.repository);
         var msg: []const u8 = "";
-        const data = gql(arena, x.transport, try q.finish(), &msg) catch
+        const tree_query = try x.actionTreeQuery(u, repository, own_repo);
+        const data = gql(arena, x.transport, tree_query, &msg) catch
             return .{ .unresolved = try unresolvedMessage(arena, u, msg, own_repo) };
-        const dir = jsonFindString(data, "id") orelse return .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}: Dagger returned no tree", .{ref_label}) };
-        var file_name: ?[]const u8 = null;
-        if (jsonFind(data, "entries")) |entries| if (entries == .array) for (entries.array.items) |e| {
-            if (e != .string) continue;
-            if (std.mem.eql(u8, e.string, "action.yml") or (file_name == null and std.mem.eql(u8, e.string, "action.yaml"))) file_name = e.string;
-        };
-        const name = file_name orelse return .{ .failed = try std.fmt.allocPrint(arena, "{s} has no action.yml or action.yaml", .{ref_label}) };
+        const dir = jsonFindString(data, "id") orelse
+            return loadFailed(arena, "could not fetch {s}: Dagger returned no tree", .{ref_label});
+        const name = actionFileName(data) orelse
+            return loadFailed(arena, "{s} has no action.yml or action.yaml", .{ref_label});
 
-        const file_path = if (u.path.len > 0) try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.path, name }) else name;
+        const file_path = try joinPath(arena, u.path, name);
         var fq: Query = .init(arena);
         try fq.call("loadDirectoryFromID", .{ .id = dir });
         try fq.call("file", .{ .path = file_path });
         try fq.leaf("contents");
         const fdata = gql(arena, x.transport, try fq.finish(), &msg) catch
-            return .{ .failed = try std.fmt.allocPrint(arena, "could not read {s} of {s}: {s}", .{ name, ref_label, msg }) };
-        const text = jsonFindString(fdata, "contents") orelse return .{ .failed = try std.fmt.allocPrint(arena, "could not read {s} of {s}", .{ name, ref_label }) };
+            return loadFailed(arena, "could not read {s} of {s}: {s}", .{ name, ref_label, msg });
+        const text = jsonFindString(fdata, "contents") orelse
+            return loadFailed(arena, "could not read {s} of {s}", .{ name, ref_label });
 
         const meta = switch (try action.parse(arena, text)) {
             .ok => |m| m,
-            .invalid => |why| return .{ .failed = try std.fmt.allocPrint(arena, "{s} of {s} {s}", .{ name, ref_label, why }) },
+            .invalid => |why| return loadFailed(arena, "{s} of {s} {s}", .{ name, ref_label, why }),
         };
-        const mount = try std.fmt.allocPrint(arena, "/github/_actions/{s}/{s}/{s}", .{ u.owner, u.name, u.ref });
+        const mount = try std.fmt.allocPrint(arena, "/github/_actions/{s}/{s}", .{
+            repository,
+            u.ref,
+        });
         return .{ .ok = .{
             .meta = meta,
             .dir = dir,
             .mount = mount,
-            .path = if (u.path.len > 0) try std.fmt.allocPrint(arena, "{s}/{s}", .{ mount, u.path }) else mount,
+            .path = try joinPath(arena, mount, u.path),
             .sub = u.path,
             .ref_label = ref_label,
             .sha = jsonFindString(data, "sha") orelse "",
-            .repository = try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name }),
+            .repository = repository,
             .ref = u.ref,
         } };
+    }
+
+    /// The action's repository at its ref: the tree's id, the entries of the action's directory
+    /// (to find its metadata file), and the commit it resolved to. The job's token only for its
+    /// own repository.
+    fn actionTreeQuery(
+        x: *Exec,
+        u: job_mod.Uses,
+        repository: []const u8,
+        own_repo: bool,
+    ) ![]const u8 {
+        const arena = x.arena;
+        const server = std.mem.trimEnd(u8, x.job.github.server_url, "/");
+        const url = try std.fmt.allocPrint(arena, "{s}/{s}.git", .{ server, repository });
+        const auth: ?[]const u8 = if (own_repo) x.gitAuth() else null;
+        const auth_user: ?[]const u8 = if (auth != null) "x-access-token" else null;
+        var q: Query = .init(arena);
+        try q.call("git", .{ .url = url, .httpAuthUsername = auth_user, .httpAuthToken = auth });
+        if (isSha(u.ref)) {
+            try q.call("commit", .{ .id = u.ref });
+        } else {
+            try q.call("ref", .{ .name = u.ref });
+        }
+        try q.call("tree", .{ .depth = @as(u32, 1) });
+        try q.leaf("id");
+        try q.leafArgs(null, "entries", .{ .path = if (u.path.len > 0) u.path else "." });
+        try q.close(1);
+        try q.leafAs("sha", "commit");
+        return q.finish();
     }
 
     /// Reads a local action (`uses: ./path`) from the workspace as the job's container has it now,
@@ -6672,7 +7024,8 @@ const Exec = struct {
         const label = try std.fmt.allocPrint(arena, "./{s}", .{u.path});
         const missing = try std.fmt.allocPrint(
             arena,
-            "Can't find 'action.yml' or 'action.yaml' under '{s}'. Did you forget to run actions/checkout before running your local action?",
+            "Can't find 'action.yml' or 'action.yaml' under '{s}'. Did you forget to run " ++
+                "actions/checkout before running your local action?",
             .{abs},
         );
         var q: Query = .init(arena);
@@ -6703,10 +7056,8 @@ const Exec = struct {
                 "could not read {s} of {s}: {s}",
                 .{ name, label, msg },
             ) };
-        const text = jsonFindString(
-            fdata,
-            "contents",
-        ) orelse return .{ .failed = try std.fmt.allocPrint(arena, "could not read {s} of {s}", .{ name, label }) };
+        const text = jsonFindString(fdata, "contents") orelse
+            return loadFailed(arena, "could not read {s} of {s}", .{ name, label });
         const meta = switch (try action.parse(arena, text)) {
             .ok => |m| m,
             .invalid => |why| return .{ .failed = try std.fmt.allocPrint(
@@ -6748,10 +7099,10 @@ const max_event_env = 100 * 1024;
 /// (`readsRunSpecific`), and a step that reads the commit some other way still sees a new workspace
 /// (`.git` included) after a checkout, so its key changes with the commit anyway.
 const volatile_env = [_][]const u8{
-    "GITHUB_RUN_ID",   "GITHUB_RUN_NUMBER",   "GITHUB_RUN_ATTEMPT",  "GITHUB_ACTOR",         "GITHUB_TRIGGERING_ACTOR", "RUNNER_NAME",
-    "GITHUB_SHA",      "GITHUB_REF",          "GITHUB_REF_NAME",     "GITHUB_REF_TYPE",      "GITHUB_BASE_REF",         "GITHUB_HEAD_REF",
-    // Follow the actor, the commit and the branch, as the variables above do.
-    "GITHUB_ACTOR_ID", "GITHUB_WORKFLOW_REF", "GITHUB_WORKFLOW_SHA", "GITHUB_REF_PROTECTED",
+    "GITHUB_RUN_ID",           "GITHUB_RUN_NUMBER",   "GITHUB_RUN_ATTEMPT",  "GITHUB_ACTOR",
+    "GITHUB_TRIGGERING_ACTOR", "RUNNER_NAME",         "GITHUB_SHA",          "GITHUB_REF",
+    "GITHUB_REF_NAME",         "GITHUB_REF_TYPE",     "GITHUB_BASE_REF",     "GITHUB_HEAD_REF",
+    "GITHUB_ACTOR_ID",         "GITHUB_WORKFLOW_REF", "GITHUB_WORKFLOW_SHA", "GITHUB_REF_PROTECTED",
 };
 
 /// What a step that did not name a run-specific value is given instead of one.
@@ -6861,6 +7212,49 @@ fn jsRuntimeQuery(arena: Allocator, rt: JsRuntimeSource, musl: bool) ![]const u8
     return q.finish();
 }
 
+/// `dir/name`; one of them alone when the other is empty.
+fn joinPath(arena: Allocator, dir: []const u8, name: []const u8) ![]const u8 {
+    if (dir.len == 0) return name;
+    if (name.len == 0) return dir;
+    return std.fmt.allocPrint(arena, "{s}/{s}", .{ dir, name });
+}
+
+/// `action.yml` when the directory has one, else `action.yaml`, else null.
+fn actionFileName(data: std.json.Value) ?[]const u8 {
+    const entries = jsonFind(data, "entries") orelse return null;
+    if (entries != .array) return null;
+    var found: ?[]const u8 = null;
+    for (entries.array.items) |e| {
+        if (e != .string) continue;
+        if (std.mem.eql(u8, e.string, "action.yml")) return e.string;
+        if (found == null and std.mem.eql(u8, e.string, "action.yaml")) found = e.string;
+    }
+    return found;
+}
+
+/// A `uses:` step that cannot run, with why, in the "Set up job" log.
+fn loadFailed(arena: Allocator, comptime fmt: []const u8, args: anytype) !Exec.LoadResult {
+    return .{ .failed = try std.fmt.allocPrint(arena, fmt, args) };
+}
+
+/// Runs the musl Node with its own C++ runtime first on the library path.
+const node_fallback_wrapper = "#!/bin/sh\nLD_LIBRARY_PATH=" ++ js_fallback_dir ++
+    "/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} exec " ++ js_fallback_dir ++ "/node-musl \"$@\"\n";
+
+fn fileMount(path: []const u8, id: []const u8) Mount {
+    return .{ .file = .{ .path = path, .id = id, .permissions = 0o755 } };
+}
+
+fn newFileMount(path: []const u8, contents: []const u8) Mount {
+    return .{ .new_file = .{ .path = path, .contents = contents, .permissions = 0o755 } };
+}
+
+/// The `id` under alias `key` of a query result, or null.
+fn idOf(data: std.json.Value, key: []const u8) ?[]const u8 {
+    const v = jsonFind(data, key) orelse return null;
+    return jsonFindString(v, "id");
+}
+
 const JsRuntimeSource = struct {
     image: []const u8,
     binary: []const u8,
@@ -6895,13 +7289,15 @@ const js_fallback_path = js_fallback_dir ++ "/node";
 /// What Bun prints when it refuses a program before running any of it, so the program can be run
 /// again with Node. actions/setup-python v7's bundle mixes an ES `import` with CommonJS `exports`,
 /// which Node accepts.
-const bun_load_errors = [_][]const u8{"error: Cannot use import statement with CommonJS-only features"};
+const bun_load_errors = [_][]const u8{"error: Cannot use import statement with CommonJS-only " ++
+    "features"};
 
 /// On musl, `js_runtime_path` (and `js_bun_path`) start the binary with its C++ runtime found.
 fn muslWrapper(arena: Allocator, name: []const u8) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
-        "#!/bin/sh\nLD_LIBRARY_PATH=" ++ js_lib_dir ++ "${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}} exec " ++ js_musl_dir ++ "/{s} \"$@\"\n",
+        "#!/bin/sh\nLD_LIBRARY_PATH=" ++ js_lib_dir ++ "${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}} " ++
+            "exec " ++ js_musl_dir ++ "/{s} \"$@\"\n",
         .{name},
     );
 }
@@ -6956,10 +7352,10 @@ fn packageCacheScope(arena: Allocator, ev: *Evaluator, repository: []const u8) !
 
 /// `ACTIONS_STEP_DEBUG` set to true, as a secret or a repository variable, shows `::debug::` lines.
 fn stepDebug(arena: Allocator, job: job_mod.Job) bool {
-    for (job.secret_vars) |sv| if (std.mem.eql(u8, sv.name, "ACTIONS_STEP_DEBUG")) return std.ascii.eqlIgnoreCase(
-        sv.value,
-        "true",
-    );
+    for (job.secret_vars) |sv| {
+        if (!std.mem.eql(u8, sv.name, "ACTIONS_STEP_DEBUG")) continue;
+        return std.ascii.eqlIgnoreCase(sv.value, "true");
+    }
     if (job.context_data == .object) if (job.context_data.object.get("vars")) |vars| {
         const v = context.fromContextData(arena, vars) catch return false;
         if (v == .object) for (v.object) |e| if (std.mem.eql(u8, e.key, "ACTIONS_STEP_DEBUG")) {
@@ -7019,7 +7415,8 @@ fn stepInterrupted(
         .timed_out => {
             sh.errorLine(
                 num,
-                try std.fmt.allocPrint(ev.arena, "The action '{s}' has timed out after {s} minutes.", .{ res.name, std.mem.trim(u8, timeout, " ") }),
+                try std.fmt.allocPrint(ev.arena, "The action '{s}' has timed out after {s} " ++
+                    "minutes.", .{ res.name, std.mem.trim(u8, timeout, " ") }),
             );
             res.outcome = .failure;
             if (!coe) ev.job_failed = true;
@@ -7062,6 +7459,12 @@ fn engineFailed(
 const live_grace_ms = 60;
 
 /// The contents of a file command read by the step's query ("" when the field is absent).
+/// The exec's exit code; 1 when the result lacks one.
+fn exitCode(data: std.json.Value) i32 {
+    const c = jsonFind(data, "exitCode") orelse return 1;
+    return if (c == .integer) @intCast(c.integer) else 1;
+}
+
 fn fileCommand(data: std.json.Value, alias: []const u8) ?[]const u8 {
     if (jsonFind(data, "fc_all")) |all| {
         const text = combinedFileCommand(
@@ -7084,7 +7487,9 @@ fn combinedFileCommand(all: []const u8, kind: []const u8) ?[]const u8 {
         // The next marker starts a line; the newline before it is the one added after the contents.
         const next = std.mem.indexOfPos(u8, all, body, "\n" ++ fc_marker) orelse all.len;
         if (std.mem.eql(u8, all[i + fc_marker.len .. line_end], kind)) {
-            const end = if (next == all.len and all.len > body and all[all.len - 1] == '\n') all.len - 1 else next;
+            const at_end = next == all.len;
+            const trailing_newline = at_end and all.len > body and all[all.len - 1] == '\n';
+            const end = if (trailing_newline) all.len - 1 else next;
             return all[body..@max(body, end)];
         }
         start = if (next == all.len) all.len else next + 1;
@@ -7170,7 +7575,8 @@ fn fail(sh: *Shared, results: []StepResult, msg: []const u8) !Result {
 
 /// The note a replayed step's log ends with. The runner counts it per job (see `loop.zig`), so a
 /// step cached by the engine is visible in the runner's own log, not only in the step's.
-pub const reused_note = "Reused from Dagger's cache: this step's inputs were unchanged since an earlier run, so the output above was recorded then.";
+pub const reused_note = "Reused from Dagger's cache: this step's inputs were unchanged since " ++
+    "an earlier run, so the output above was recorded then.";
 
 /// Says which steps Dagger served from cache. Decided once the session has ended and the log stream
 /// is fully read, not when a step's output is replayed: the live stream can lag behind a step that
@@ -7347,7 +7753,11 @@ fn testStep(script: []const u8) job_mod.Step {
         .id = "x",
         .name = "n",
         .condition = "success()",
-        .action = .{ .script = .{ .script = .{ .lit = script }, .shell = null, .working_directory = null } },
+        .action = .{ .script = .{
+            .script = .{ .lit = script },
+            .shell = null,
+            .working_directory = null,
+        } },
     };
 }
 
@@ -7553,7 +7963,8 @@ const base_answer = "{\"data\":{\"container\":{\"from\":{\"withWorkdir\":{\"id\"
 fn exec(arena: Allocator, id: []const u8, code: i32, out: []const u8) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
-        "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":{{\"id\":\"{s}\",\"exitCode\":{d},\"stdout\":\"{s}\",\"stderr\":\"\"}}}}}}}}",
+        "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":{{\"id\":\"{s}\"," ++
+            "\"exitCode\":{d},\"stdout\":\"{s}\",\"stderr\":\"\"}}}}}}}}",
         .{ id, code, out },
     );
 }
@@ -7810,7 +8221,11 @@ fn execFc(
 ) ![]const u8 {
     return std.fmt.allocPrint(
         arena,
-        "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":{{\"id\":\"{s}\",\"exitCode\":0,\"stdout\":\"{s}\",\"stderr\":\"\",\"fc_output\":{{\"contents\":\"{s}\"}},\"fc_env\":{{\"contents\":\"{s}\"}},\"fc_path\":{{\"contents\":\"{s}\"}}}}}}}}}}",
+        "{{\"data\":{{\"loadContainerFromID\":{{\"withExec\":{{\"id\":\"{s}\"," ++
+            "\"exitCode\":0,\"stdout\":\"{s}\",\"stderr\":\"\"," ++
+            "\"fc_output\":{{\"contents\":\"{s}\"}}," ++
+            "\"fc_env\":{{\"contents\":\"{s}\"}}," ++
+            "\"fc_path\":{{\"contents\":\"{s}\"}}}}}}}}}}",
         .{ id, out, fc_output, fc_env, fc_path },
     );
 }
