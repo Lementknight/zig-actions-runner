@@ -32,6 +32,7 @@ const action = @import("action.zig");
 const config = @import("config.zig");
 const engine = @import("engine.zig");
 const Query = @import("dagger/query.zig").Query;
+const Raw = @import("dagger/query.zig").Raw;
 
 const Allocator = std.mem.Allocator;
 
@@ -3182,36 +3183,33 @@ const Exec = struct {
         const secret_env = step_run.secret_env;
         const script = try std.mem.concat(arena, u8, &.{ x.forward_prelude, try stepScriptFc(arena, num, fc, resolved, action_name) });
         const before = x.container_id;
-        var doc: std.Io.Writer.Allocating = .init(arena);
-        const w = &doc.writer;
-        try w.writeAll("{ loadContainerFromID(id:");
-        try std.json.Stringify.value(x.container_id, .{}, w);
-        try w.writeAll(") { ");
-        const env_start = doc.written().len;
-        var braces: usize = 2; // query + loadContainerFromID
-        const env_braces = try x.writePendingEnv(w);
-        braces += env_braces;
-        // The variables earlier steps set, which the container before this step lacks.
-        const env_nodes = try arena.dupe(u8, doc.written()[env_start..]);
-        var mount_doc: std.Io.Writer.Allocating = .init(arena);
-        try writeMounts(&mount_doc.writer, mounts);
-        braces += try writeActionSecrets(arena, w, secret_env);
-        try w.writeAll(mount_doc.written());
-        braces += mounts.len;
-        try x.writeScriptExec(w, script, fc, secret_env);
-        for (0..braces) |_| try w.writeAll(" }");
+        // What the runner adds for the step, apart from its secrets: the variables earlier steps
+        // set, which the container before this step lacks, and the mounts. `outputKeyed` reuses it.
+        var env: Query = .initFragment(arena);
+        try x.writePendingEnv(&env);
+        var mount_nodes: Query = .initFragment(arena);
+        try writeMounts(&mount_nodes, mounts);
+        var pre: Query = .initFragment(arena);
+        try pre.splice(env.fragment());
+        try pre.splice(mount_nodes.fragment());
+
+        var q: Query = .init(arena);
+        try q.call("loadContainerFromID", .{ .id = x.container_id });
+        try q.splice(env.fragment());
+        try writeActionSecrets(arena, &q, secret_env);
+        try q.splice(mount_nodes.fragment());
+        try x.writeScriptExec(&q, script, fc, secret_env);
 
         x.beginExec(num);
-        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch return error.EngineFailed;
+        const data = gql(arena, x.transport, try q.finish(), &x.err_msg) catch return error.EngineFailed;
         if (jsonFindString(data, "id")) |id| x.container_id = id;
         const out = try x.collect(num, data);
         // Any `::add-matcher::` this step emitted: read the files from the container it just
         // produced, which is where the paths it printed are valid.
         x.loadPendingMatchers(num);
         if (x.output_keys != null and resolved == .run and resolved.run.always_run != null and out.code == 0) {
-            const pre = try std.mem.concat(arena, u8, &.{ env_nodes, mount_doc.written() });
             const started = std.Io.Clock.awake.now(x.io).toMilliseconds();
-            if (x.countOutputKeyed(num, started, try x.outputKeyed(num, before, pre, env_braces + mounts.len, x.container_id))) |id| x.container_id = id;
+            if (x.countOutputKeyed(num, started, try x.outputKeyed(num, before, pre.fragment(), x.container_id))) |id| x.container_id = id;
         }
         return out;
     }
@@ -3260,81 +3258,52 @@ const Exec = struct {
     }
 
     /// Variables and PATH entries the previous steps asked for through $GITHUB_ENV / $GITHUB_PATH,
-    /// written and then forgotten: the container after this step has them. How many braces opened.
-    fn writePendingEnv(x: *Exec, w: *std.Io.Writer) !usize {
+    /// written and then forgotten: the container after this step has them.
+    fn writePendingEnv(x: *Exec, q: *Query) !void {
         const arena = x.arena;
         const ev = x.ev;
-        var opened: usize = 0;
-        for (ev.pending_env.items) |e| {
-            try w.writeAll("withEnvVariable(name:");
-            try std.json.Stringify.value(e.name, .{}, w);
-            try w.writeAll(",value:");
-            try std.json.Stringify.value(e.value, .{}, w);
-            try w.writeAll(") { ");
-            opened += 1;
-        }
+        for (ev.pending_env.items) |e| try q.call("withEnvVariable", .{ .name = e.name, .value = e.value });
         if (ev.pending_path.items.len > 0) {
             const joined = try std.mem.join(arena, ":", ev.pending_path.items);
-            try w.writeAll("withEnvVariable(name:\"PATH\",value:");
-            try std.json.Stringify.value(try std.fmt.allocPrint(arena, "{s}:$PATH", .{joined}), .{}, w);
-            try w.writeAll(",expand:true) { ");
-            opened += 1;
+            const value = try std.fmt.allocPrint(arena, "{s}:$PATH", .{joined});
+            try q.call("withEnvVariable", .{ .name = "PATH", .value = value, .expand = true });
         }
         ev.pending_env.clearRetainingCapacity();
         ev.pending_path.clearRetainingCapacity();
-        return opened;
     }
 
-    /// Each mount as its node, open; the caller counts one brace per mount.
-    fn writeMounts(mw: *std.Io.Writer, mounts: []const Mount) !void {
-        for (mounts) |m| {
-            switch (m) {
-                .dir => |d| {
-                    try mw.writeAll("withDirectory(path:");
-                    try std.json.Stringify.value(d.path, .{}, mw);
-                    try mw.writeAll(",source:");
-                    try std.json.Stringify.value(d.id, .{}, mw);
-                    if (d.owner) |o| {
-                        try mw.writeAll(",owner:");
-                        try std.json.Stringify.value(o, .{}, mw);
-                    }
-                },
-                .file => |f| {
-                    try mw.writeAll("withFile(path:");
-                    try std.json.Stringify.value(f.path, .{}, mw);
-                    try mw.writeAll(",source:");
-                    try std.json.Stringify.value(f.id, .{}, mw);
-                    try mw.print(",permissions:{d}", .{f.permissions});
-                },
-                .new_file => |f| {
-                    try mw.writeAll("withNewFile(path:");
-                    try std.json.Stringify.value(f.path, .{}, mw);
-                    try mw.writeAll(",contents:");
-                    try std.json.Stringify.value(f.contents, .{}, mw);
-                    try mw.print(",permissions:{d}", .{f.permissions});
-                },
-            }
-            try mw.writeAll(") { ");
-        }
+    /// Each mount as its call.
+    fn writeMounts(q: *Query, mounts: []const Mount) !void {
+        for (mounts) |m| switch (m) {
+            .dir => |d| try q.call("withDirectory", .{ .path = d.path, .source = d.id, .owner = d.owner }),
+            .file => |f| try q.call("withFile", .{ .path = f.path, .source = f.id, .permissions = f.permissions }),
+            .new_file => |f| try q.call("withNewFile", .{
+                .path = f.path,
+                .contents = f.contents,
+                .permissions = f.permissions,
+            }),
+        };
     }
 
     /// The exec itself and what is read back: exit code and output, the combined file commands, and
     /// the container id — taken after the step's secrets are removed, so the next step starts without
     /// them. Nesting gives the step's `dagger` CLI a session on this engine, sharing its cache.
-    fn writeScriptExec(x: *Exec, w: *std.Io.Writer, script: []const u8, fc: u32, secret_env: []const SecretRef) !void {
+    fn writeScriptExec(x: *Exec, q: *Query, script: []const u8, fc: u32, secret_env: []const SecretRef) !void {
         const arena = x.arena;
-        try w.writeAll("withExec(args:");
-        try std.json.Stringify.value([_][]const u8{ "sh", "-c", script }, .{}, w);
-        try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
-        try w.print(" fc_all: file(path:\"{s}\") {{ contents }}", .{try fcPath(arena, "all", fc)});
-        for (secret_env, 0..) |_, i| {
-            try w.writeAll(" withoutSecretVariable(name:");
-            try std.json.Stringify.value(try secretAlias(arena, i), .{}, w);
-            try w.writeAll(") {");
-        }
-        try w.writeAll(" id");
-        for (secret_env) |_| try w.writeAll(" }");
-        try w.writeAll(" }");
+        const nesting: ?bool = if (x.nesting) true else null;
+        try q.call("withExec", .{
+            .args = &[_][]const u8{ "sh", "-c", script },
+            .expect = Raw{ .text = "ANY" },
+            .experimentalPrivilegedNesting = nesting,
+        });
+        try q.leaf("exitCode");
+        try q.leaf("stdout");
+        try q.leaf("stderr");
+        try q.callAs("fc_all", "file", .{ .path = try fcPath(arena, "all", fc) });
+        try q.leaf("contents");
+        try q.close(1);
+        for (secret_env, 0..) |_, i| try q.call("withoutSecretVariable", .{ .name = try secretAlias(arena, i) });
+        try q.leaf("id");
     }
 
     /// Reads the matcher files a step asked for, and registers what they define.
@@ -3399,20 +3368,22 @@ const Exec = struct {
     ///
     /// The content stays in the engine: the runner only handles the digest and removed paths. Null
     /// (keep the step's own container) when anything fails, so the job runs as without output keys.
-    fn outputKeyed(x: *Exec, num: u32, before: []const u8, pre: []const u8, pre_braces: usize, after: []const u8) !?[]const u8 {
+    fn outputKeyed(x: *Exec, num: u32, before: []const u8, pre: Query.Fragment, after: []const u8) !?[]const u8 {
         const arena = x.arena;
         var msg: []const u8 = "";
         var t = std.Io.Clock.awake.now(x.io).toMilliseconds();
 
         // What the step changed in the container's filesystem (cache volumes and mounts are not part
         // of it), as a directory with its digest, and what it removed.
-        var without: std.Io.Writer.Allocating = .init(arena);
-        for (outputs_ignored) |p| try without.writer.print("withoutDirectory(path:{f}) {{ ", .{std.json.fmt(p, .{})});
-        const closing = try arena.alloc(u8, 2 * outputs_ignored.len);
-        for (0..outputs_ignored.len) |i| @memcpy(closing[2 * i ..][0..2], " }");
-        const pre_closing = try arena.alloc(u8, 2 * pre_braces);
-        for (0..pre_braces) |i| @memcpy(pre_closing[2 * i ..][0..2], " }");
-        const older = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ {s}zig_base: id zig_user: user zig_fs: rootfs {{ {s}id{s} }}{s} }} }}", .{ std.json.fmt(before, .{}), pre, without.written(), closing, pre_closing }), &msg) catch {
+        var older_q: Query = .init(arena);
+        try older_q.call("loadContainerFromID", .{ .id = before });
+        try older_q.splice(pre);
+        try older_q.leafAs("zig_base", "id");
+        try older_q.leafAs("zig_user", "user");
+        try older_q.callAs("zig_fs", "rootfs", .{});
+        for (outputs_ignored) |p| try older_q.call("withoutDirectory", .{ .path = p });
+        try older_q.leaf("id");
+        const older = gql(arena, x.transport, try older_q.finish(), &msg) catch {
             x.outputsFallback(num, "{s}", .{msg});
             return null;
         };
@@ -3422,7 +3393,16 @@ const Exec = struct {
         const user = jsonFindString(older, "zig_user") orelse "";
         const older_id = (if (jsonFind(older, "zig_fs")) |f| jsonFindString(f, "id") else null) orelse return null;
         x.outputsPhase(num, "the container before the step", &t);
-        const changes = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ rootfs {{ {s}changes(from:{f}) {{ removedPaths layer {{ id digest }} }}{s} }} }} }}", .{ std.json.fmt(after, .{}), without.written(), std.json.fmt(older_id, .{}), closing }), &msg) catch {
+        var changes_q: Query = .init(arena);
+        try changes_q.call("loadContainerFromID", .{ .id = after });
+        try changes_q.call("rootfs", .{});
+        for (outputs_ignored) |p| try changes_q.call("withoutDirectory", .{ .path = p });
+        try changes_q.call("changes", .{ .from = older_id });
+        try changes_q.leaf("removedPaths");
+        try changes_q.call("layer", .{});
+        try changes_q.leaf("id");
+        try changes_q.leaf("digest");
+        const changes = gql(arena, x.transport, try changes_q.finish(), &msg) catch {
             x.outputsFallback(num, "{s}", .{msg});
             return null;
         };
@@ -4846,31 +4826,36 @@ const Exec = struct {
         // never replayed and keeps the real run-specific values.
         const script = try containerScript(arena, num, fc, argv, env.plain, names, always_run, x.event_from_env, false, if (dr.repository.len > 0) dr.repository else dr.label);
 
-        var doc: std.Io.Writer.Allocating = .init(arena);
-        const w = &doc.writer;
-        try w.writeAll("{ loadContainerFromID(id:");
-        try std.json.Stringify.value(img.id, .{}, w);
-        try w.writeAll(") { withWorkdir(path:\"" ++ docker_workspace ++ "\") { withFile(path:\"" ++ busybox_path ++ "\",permissions:493,source:");
-        try std.json.Stringify.value(busybox, .{}, w);
-        try w.writeAll(") { ");
-        var braces: usize = 4;
-        braces += try x.writeActionDirs(w, img, ws_in);
-        braces += try x.writeActionEnv(w);
-        braces += try writeActionSecrets(arena, w, env.secret);
+        var q: Query = .init(arena);
+        try q.call("loadContainerFromID", .{ .id = img.id });
+        try q.call("withWorkdir", .{ .path = docker_workspace });
+        try q.call("withFile", .{ .path = busybox_path, .permissions = @as(u32, 0o755), .source = busybox });
+        try x.writeActionDirs(&q, img, ws_in);
+        try x.writeActionEnv(&q);
+        try writeActionSecrets(arena, &q, env.secret);
         // A Docker action reaches the job's services by name, as on GitHub's container network.
-        var bindings: Query = .initFragment(arena);
-        try x.writeServiceBindings(&bindings);
-        try w.writeAll(bindings.fragment().text);
-        braces += bindings.fragment().opened;
-        try w.writeAll("withExec(args:");
-        try std.json.Stringify.value([_][]const u8{ busybox_path, "sh", "-c", script }, .{}, w);
-        try w.writeAll(if (x.nesting) ",expect:ANY,experimentalPrivilegedNesting:true) { exitCode stdout stderr" else ",expect:ANY) { exitCode stdout stderr");
-        try w.print(" fc_all: file(path:\"{s}\") {{ contents }}", .{try fcPath(arena, "all", fc)});
-        try w.writeAll(" ws: directory(path:\"" ++ docker_workspace ++ "\") { id } home: directory(path:\"" ++ docker_home ++ "\") { id } }");
-        for (0..braces) |_| try w.writeAll(" }");
+        try x.writeServiceBindings(&q);
+        const nesting: ?bool = if (x.nesting) true else null;
+        try q.call("withExec", .{
+            .args = &[_][]const u8{ busybox_path, "sh", "-c", script },
+            .expect = Raw{ .text = "ANY" },
+            .experimentalPrivilegedNesting = nesting,
+        });
+        try q.leaf("exitCode");
+        try q.leaf("stdout");
+        try q.leaf("stderr");
+        try q.callAs("fc_all", "file", .{ .path = try fcPath(arena, "all", fc) });
+        try q.leaf("contents");
+        try q.close(1);
+        try q.callAs("ws", "directory", .{ .path = docker_workspace });
+        try q.leaf("id");
+        try q.close(1);
+        try q.callAs("home", "directory", .{ .path = docker_home });
+        try q.leaf("id");
+        try q.close(1);
 
         x.beginExec(num);
-        const data = gql(arena, x.transport, doc.written(), &x.err_msg) catch return error.EngineFailed;
+        const data = gql(arena, x.transport, try q.finish(), &x.err_msg) catch return error.EngineFailed;
         const out = try x.collect(num, data);
         try x.takeWorkspaceBack(num, data, out);
         return out;
@@ -4935,65 +4920,41 @@ const Exec = struct {
     }
 
     /// The workspace, /github/home, and where file commands and the event go, owned by the image's
-    /// user, which may not be root (GitHub's own example action runs as one). How many braces opened.
-    fn writeActionDirs(x: *Exec, w: *std.Io.Writer, img: ImageInfo, ws_in: []const u8) !usize {
+    /// user, which may not be root (GitHub's own example action runs as one).
+    fn writeActionDirs(x: *Exec, q: *Query, img: ImageInfo, ws_in: []const u8) !void {
         const dirs = [_][2][]const u8{
             .{ docker_workspace, ws_in },
             .{ docker_home, x.docker_home orelse x.empty_dir },
             .{ fc_dir, x.empty_dir },
             .{ event_dir, x.empty_dir },
         };
-        for (dirs) |d| {
-            try w.writeAll("withDirectory(path:");
-            try std.json.Stringify.value(d[0], .{}, w);
-            try w.writeAll(",source:");
-            try std.json.Stringify.value(d[1], .{}, w);
-            if (img.user.len > 0) {
-                try w.writeAll(",owner:");
-                try std.json.Stringify.value(img.user, .{}, w);
-            }
-            try w.writeAll(") { ");
-        }
-        return dirs.len;
+        const owner: ?[]const u8 = if (img.user.len > 0) img.user else null;
+        for (dirs) |d| try q.call("withDirectory", .{ .path = d[0], .source = d[1], .owner = owner });
     }
 
     /// The default variables (volatile under step caching), the event payload, and the ran marker.
-    /// How many braces opened.
-    fn writeActionEnv(x: *Exec, w: *std.Io.Writer) !usize {
+    fn writeActionEnv(x: *Exec, q: *Query) !void {
         const ev = x.ev;
-        var opened: usize = 0;
         for (try ev.defaultEnv()) |e| {
-            try w.writeAll(if (x.step_cache and isVolatile(e.name)) "withVolatileVariable(name:" else "withEnvVariable(name:");
-            try std.json.Stringify.value(e.name, .{}, w);
-            try w.writeAll(",value:");
+            const node = if (x.step_cache and isVolatile(e.name)) "withVolatileVariable" else "withEnvVariable";
             // GitHub mounts the workspace at /github/workspace in a Docker action, and says so.
-            try std.json.Stringify.value(if (std.mem.eql(u8, e.name, "GITHUB_WORKSPACE")) docker_workspace else e.value, .{}, w);
-            try w.writeAll(") { ");
-            opened += 1;
+            const value = if (std.mem.eql(u8, e.name, "GITHUB_WORKSPACE")) docker_workspace else e.value;
+            try q.call(node, .{ .name = e.name, .value = value });
         }
-        try w.writeAll(if (x.event_from_env) "withVolatileVariable(name:\"" ++ event_env ++ "\",value:" else "withNewFile(path:\"" ++ event_path ++ "\",contents:");
-        try std.json.Stringify.value(try ev.eventJson(), .{}, w);
-        try w.writeAll(") { ");
-        opened += 1;
-        if (x.step_cache) {
-            try w.writeAll("withVolatileVariable(name:\"" ++ ran_env ++ "\",value:");
-            try std.json.Stringify.value(x.ran_marker, .{}, w);
-            try w.writeAll(") { ");
-            opened += 1;
+        const event = try ev.eventJson();
+        if (x.event_from_env) {
+            try q.call("withVolatileVariable", .{ .name = event_env, .value = event });
+        } else {
+            try q.call("withNewFile", .{ .path = event_path, .contents = event });
         }
-        return opened;
+        if (x.step_cache) try q.call("withVolatileVariable", .{ .name = ran_env, .value = x.ran_marker });
     }
 
-    /// Each secret as a Dagger secret variable under its alias. How many braces opened.
-    fn writeActionSecrets(arena: Allocator, w: *std.Io.Writer, secret: []const SecretRef) !usize {
+    /// Each secret as a Dagger secret variable under its alias.
+    fn writeActionSecrets(arena: Allocator, q: *Query, secret: []const SecretRef) !void {
         for (secret, 0..) |sr, i| {
-            try w.writeAll("withSecretVariable(name:");
-            try std.json.Stringify.value(try secretAlias(arena, i), .{}, w);
-            try w.writeAll(",secret:");
-            try std.json.Stringify.value(sr.id, .{}, w);
-            try w.writeAll(") { ");
+            try q.call("withSecretVariable", .{ .name = try secretAlias(arena, i), .secret = sr.id });
         }
-        return secret.len;
     }
 
     /// After the action ran: /github/home kept for its next step, and the workspace as the action
