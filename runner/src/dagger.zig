@@ -963,47 +963,48 @@ pub fn checkoutQuery(arena: Allocator, job: job_mod.Job, co: job_mod.Checkout, a
     const own = co.repository == null or std.mem.eql(u8, repo, job.github.repository);
     const url = try std.fmt.allocPrint(arena, "{s}/{s}.git", .{ std.mem.trimEnd(u8, job.github.server_url, "/"), repo });
 
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.writeAll("{ git(url:");
-    try std.json.Stringify.value(url, .{}, w);
-    try writeGitAuth(w, auth);
-    try w.writeAll(",keepGitDir:true) { ");
+    var q: Query = .init(arena);
+    // The token, sent as GitHub expects one over HTTPS (user `x-access-token`).
+    const auth_user: ?[]const u8 = if (auth != null) "x-access-token" else null;
+    try q.call("git", .{ .url = url, .httpAuthUsername = auth_user, .httpAuthToken = auth, .keepGitDir = true });
     if (co.ref orelse (if (own and job.github.sha.len > 0) job.github.sha else null)) |ref| {
-        if (isSha(ref)) {
-            try w.writeAll("commit(id:");
-        } else {
-            try w.writeAll("ref(name:");
-        }
-        try std.json.Stringify.value(ref, .{}, w);
-        try w.writeAll(")");
+        if (isSha(ref)) try q.call("commit", .{ .id = ref }) else try q.call("ref", .{ .name = ref });
     } else {
-        try w.writeAll("head");
+        try q.open("head");
     }
     // `depth` is always sent: Dagger's default is 1, and 0 is what fetches the full history.
     // Dagger's git gives every file the time 1970-01-01 00:00:01. Tools reject that (Python wheels
     // are zips, which cannot hold times before 1980: "ZIP does not support timestamps before 1980");
     // a fixed later time keeps the tree the same from run to run, so cached steps still match.
     // Without `submodules`, the root's entries say whether there are any to empty (see `fetchCheckout`).
-    try w.print(" {{ tree(depth:{d}{s}) {{ withTimestamps(timestamp:{d}) {{ id{s} }} }} }} }} }}", .{ co.fetch_depth, if (co.fetch_tags) ",includeTags:true" else "", checkout_mtime, if (co.submodules) "" else " entries" });
-    return .{ .doc = aw.written() };
+    const include_tags: ?bool = if (co.fetch_tags) true else null;
+    try q.call("tree", .{ .depth = co.fetch_depth, .includeTags = include_tags });
+    try q.call("withTimestamps", .{ .timestamp = checkout_mtime });
+    try q.leaf("id");
+    if (!co.submodules) try q.leaf("entries");
+    return .{ .doc = try q.finish() };
 }
 
 /// The tree with each submodule's directory emptied, as actions/checkout leaves them without
 /// `submodules` (Dagger's git always checks them out). The paths come from `.gitmodules`.
 fn withoutSubmodules(arena: Allocator, t: Transport, dir: []const u8, msg: *[]const u8) !?[]const u8 {
-    const read = try std.fmt.allocPrint(arena, "{{ loadDirectoryFromID(id:{f}) {{ file(path:\".gitmodules\") {{ contents }} }} }}", .{std.json.fmt(dir, .{})});
-    const data = gql(arena, t, read, msg) catch return null;
+    var read: Query = .init(arena);
+    try read.call("loadDirectoryFromID", .{ .id = dir });
+    try read.call("file", .{ .path = ".gitmodules" });
+    try read.leaf("contents");
+    const data = gql(arena, t, try read.finish(), msg) catch return null;
     const paths = try gitmodulePaths(arena, jsonFindString(data, "contents") orelse "");
     if (paths.len == 0) return dir;
-    var aw: std.Io.Writer.Allocating = .init(arena);
-    const w = &aw.writer;
-    try w.print("{{ loadDirectoryFromID(id:{f}) {{ ", .{std.json.fmt(dir, .{})});
-    for (paths) |p| try w.print("withoutDirectory(path:{f}) {{ withNewDirectory(path:{f}) {{ ", .{ std.json.fmt(p, .{}), std.json.fmt(p, .{}) });
+    var q: Query = .init(arena);
+    try q.call("loadDirectoryFromID", .{ .id = dir });
+    for (paths) |p| {
+        try q.call("withoutDirectory", .{ .path = p });
+        try q.call("withNewDirectory", .{ .path = p });
+    }
     // The new directories get the checkout's fixed time, as every other file has.
-    try w.print("withTimestamps(timestamp:{d}) {{ id }}", .{checkout_mtime});
-    for (0..paths.len * 2 + 2) |_| try w.writeAll(" }");
-    const out = gql(arena, t, aw.written(), msg) catch return null;
+    try q.call("withTimestamps", .{ .timestamp = checkout_mtime });
+    try q.leaf("id");
+    const out = gql(arena, t, try q.finish(), msg) catch return null;
     return jsonFindString(out, "id") orelse {
         msg.* = "Dagger returned no tree";
         return null;
@@ -1130,13 +1131,6 @@ fn looksLikeAuthFailure(text: []const u8) bool {
     const needles = [_][]const u8{ "not found", "authentication", "Authentication", "denied", "403", "401", "could not read Username" };
     for (needles) |n| if (std.mem.indexOf(u8, text, n) != null) return true;
     return false;
-}
-
-/// `,httpAuthUsername:...,httpAuthToken:...` for a `git(...)` query, when there is a token.
-fn writeGitAuth(w: *std.Io.Writer, auth: ?[]const u8) !void {
-    const id = auth orelse return;
-    try w.writeAll(",httpAuthUsername:\"x-access-token\",httpAuthToken:");
-    try std.json.Stringify.value(id, .{}, w);
 }
 
 fn fetchCheckout(arena: Allocator, t: Transport, job: job_mod.Job, co: job_mod.Checkout, auth: ?[]const u8) !Fetched {
@@ -1472,12 +1466,11 @@ const SecretRef = struct { name: []const u8, id: []const u8 };
 /// Registers `plaintext` as a Dagger secret in this session and returns its id.
 fn newSecret(arena: Allocator, t: Transport, counter: *u32, plaintext: []const u8, err_msg: *[]const u8) ![]const u8 {
     counter.* += 1;
-    var doc: std.Io.Writer.Allocating = .init(arena);
-    const w = &doc.writer;
-    try w.print("{{ setSecret(name:\"zig-secret-{d}\",plaintext:", .{counter.*});
-    try std.json.Stringify.value(plaintext, .{}, w);
-    try w.writeAll(") { id } }");
-    const data = try gql(arena, t, doc.written(), err_msg);
+    const name = try std.fmt.allocPrint(arena, "zig-secret-{d}", .{counter.*});
+    var q: Query = .init(arena);
+    try q.call("setSecret", .{ .name = name, .plaintext = plaintext });
+    try q.leaf("id");
+    const data = try gql(arena, t, try q.finish(), err_msg);
     return jsonFindString(data, "id") orelse {
         err_msg.* = "Dagger returned no secret id";
         return error.DaggerQueryFailed;
@@ -2788,11 +2781,8 @@ fn cacheVolumeIds(
 ) ![]const []const u8 {
     if (!opts.package_caches or job.github.repository.len == 0) return &.{};
     const scope = try packageCacheScope(arena, ev, job.github.repository);
-    var doc: std.Io.Writer.Allocating = .init(arena);
-    const w = &doc.writer;
-    try w.writeAll("{");
+    var q: Query = .init(arena);
     for (package_cache_dirs, 0..) |d, i| {
-        try w.print(" c{d}: cacheVolume(key:", .{i});
         // The tool cache holds binaries built for one image (glibc or musl, its libraries), so
         // each image has its own.
         const key = if (std.mem.eql(u8, d.name, "toolcache"))
@@ -2802,11 +2792,11 @@ fn cacheVolumeIds(
         // Volumes root filled hold files `runner_user` cannot write: steps that run as it get
         // their own.
         const user_key = if (as_runner) try std.mem.concat(arena, u8, &.{ key, "/", runner_user }) else key;
-        try std.json.Stringify.value(user_key, .{}, w);
-        try w.writeAll(") { id }");
+        try q.callAs(try std.fmt.allocPrint(arena, "c{d}", .{i}), "cacheVolume", .{ .key = user_key });
+        try q.leaf("id");
+        try q.close(1);
     }
-    try w.writeAll(" }");
-    const data = gql(arena, transport, doc.written(), err_msg) catch return error.BaseContainerFailed;
+    const data = gql(arena, transport, try q.finish(), err_msg) catch return error.BaseContainerFailed;
     const ids = try arena.alloc([]const u8, package_cache_dirs.len);
     for (ids, 0..) |*id, i| {
         const v = jsonFind(data, try std.fmt.allocPrint(arena, "c{d}", .{i})) orelse {
@@ -3321,13 +3311,13 @@ const Exec = struct {
     fn loadPendingMatchers(x: *Exec, num: u32) void {
         const pending = x.sh.takePendingMatchers();
         for (pending) |path| {
-            const q = std.fmt.allocPrint(
-                x.arena,
-                "{{ loadContainerFromID(id:{f}) {{ file(path:{f}) {{ contents }} }} }}",
-                .{ std.json.fmt(x.container_id, .{}), std.json.fmt(path, .{}) },
-            ) catch continue;
+            var q: Query = .init(x.arena);
+            q.call("loadContainerFromID", .{ .id = x.container_id }) catch continue;
+            q.call("file", .{ .path = path }) catch continue;
+            q.leaf("contents") catch continue;
+            const doc = q.finish() catch continue;
             var msg: []const u8 = "";
-            const data = gql(x.arena, x.transport, q, &msg) catch {
+            const data = gql(x.arena, x.transport, doc, &msg) catch {
                 x.warnMatcher(num, "Could not read the problem matcher '{s}'", .{path});
                 continue;
             };
@@ -3454,7 +3444,13 @@ const Exec = struct {
     /// action left (`ws_out`) copied in by its digest. Null when that could not be done.
     fn outputKeyedWorkspace(x: *Exec, num: u32, ws_out: []const u8) !?[]const u8 {
         var msg: []const u8 = "";
-        const data = gql(x.arena, x.transport, try std.fmt.allocPrint(x.arena, "{{ loadContainerFromID(id:{f}) {{ user }} loadDirectoryFromID(id:{f}) {{ digest }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(ws_out, .{}) }), &msg) catch {
+        var q: Query = .init(x.arena);
+        try q.call("loadContainerFromID", .{ .id = x.container_id });
+        try q.leaf("user");
+        try q.close(1);
+        try q.call("loadDirectoryFromID", .{ .id = ws_out });
+        try q.leaf("digest");
+        const data = gql(x.arena, x.transport, try q.finish(), &msg) catch {
             x.outputsFallback(num, "{s}", .{msg});
             return null;
         };
@@ -3501,9 +3497,10 @@ const Exec = struct {
         if (x.outputs_volume) |v| return v;
         const arena = x.arena;
         var msg: []const u8 = "";
-        const key = std.json.fmt(x.output_keys.?, .{});
-        const query = try std.fmt.allocPrint(arena, "{{ cacheVolume(key:{f}) {{ id }} }}", .{key});
-        const data = gql(arena, x.transport, query, &msg) catch {
+        var q: Query = .init(arena);
+        try q.call("cacheVolume", .{ .key = x.output_keys.? });
+        try q.leaf("id");
+        const data = gql(arena, x.transport, try q.finish(), &msg) catch {
             x.outputsFallback(num, "no store: {s}", .{msg});
             return null;
         };
@@ -3540,12 +3537,14 @@ const Exec = struct {
             \\/bin/busybox mv -T "$t" "$d" 2>/dev/null || /bin/busybox rm -rf "$t"; test -d "$d" && /bin/busybox touch "$d"
         , .{ x.outputs_days, digest, &tmp_name });
         var msg: []const u8 = "";
-        _ = gql(arena, x.transport, try std.fmt.allocPrint(arena, "{{ container {{ withFile(path:\"/bin/busybox\",source:{f},permissions:493) {{ withMountedCache(path:\"/store\",cache:{f}) {{ withMountedDirectory(path:\"/in\",source:{f}) {{ withExec(args:{f}) {{ exitCode }} }} }} }} }} }}", .{
-            std.json.fmt(busybox, .{}),
-            std.json.fmt(volume, .{}),
-            std.json.fmt(layer_id, .{}),
-            std.json.fmt([_][]const u8{ "/bin/busybox", "sh", "-c", store_script }, .{}),
-        }), &msg) catch {
+        var q: Query = .init(arena);
+        try q.open("container");
+        try q.call("withFile", .{ .path = "/bin/busybox", .source = busybox, .permissions = @as(u32, 0o755) });
+        try q.call("withMountedCache", .{ .path = "/store", .cache = volume });
+        try q.call("withMountedDirectory", .{ .path = "/in", .source = layer_id });
+        try q.call("withExec", .{ .args = &[_][]const u8{ "/bin/busybox", "sh", "-c", store_script } });
+        try q.leaf("exitCode");
+        _ = gql(arena, x.transport, try q.finish(), &msg) catch {
             x.outputsFallback(num, "could not store the step's output: {s}", .{msg});
             return false;
         };
@@ -3604,16 +3603,19 @@ const Exec = struct {
         script: []const u8,
     ) !?[]const u8 {
         const arena = x.arena;
-        var doc: std.Io.Writer.Allocating = .init(arena);
-        const w = &doc.writer;
-        try w.print("{{ loadContainerFromID(id:{f}) {{ ", .{std.json.fmt(base, .{})});
-        try w.print("withMountedCache(path:\"" ++ outputs_store ++ "\",cache:{f}) {{ withMountedFile(path:\"" ++ outputs_busybox ++ "\",source:{f}) {{ ", .{ std.json.fmt(volume, .{}), std.json.fmt(busybox, .{}) });
-        try w.print("withUser(name:\"root\") {{ withExec(args:{f}) {{ exitCode ", .{std.json.fmt([_][]const u8{ outputs_busybox, "sh", "-c", script }, .{})});
-        if (user.len > 0) try w.print("withUser(name:{f}) {{ ", .{std.json.fmt(user, .{})}) else try w.writeAll("withoutUser { ");
-        try w.writeAll("withoutMount(path:\"" ++ outputs_store ++ "\") { withoutMount(path:\"" ++ outputs_busybox ++ "\") { id");
-        for (0..5 + 4) |_| try w.writeAll(" }");
+        var q: Query = .init(arena);
+        try q.call("loadContainerFromID", .{ .id = base });
+        try q.call("withMountedCache", .{ .path = outputs_store, .cache = volume });
+        try q.call("withMountedFile", .{ .path = outputs_busybox, .source = busybox });
+        try q.call("withUser", .{ .name = "root" });
+        try q.call("withExec", .{ .args = &[_][]const u8{ outputs_busybox, "sh", "-c", script } });
+        try q.leaf("exitCode");
+        if (user.len > 0) try q.call("withUser", .{ .name = user }) else try q.call("withoutUser", .{});
+        try q.call("withoutMount", .{ .path = outputs_store });
+        try q.call("withoutMount", .{ .path = outputs_busybox });
+        try q.leaf("id");
         var msg: []const u8 = "";
-        const next = gql(arena, x.transport, doc.written(), &msg) catch {
+        const next = gql(arena, x.transport, try q.finish(), &msg) catch {
             x.outputsFallback(num, "could not copy the step's output into the next container: {s}", .{msg});
             return null;
         };
@@ -4503,20 +4505,17 @@ const Exec = struct {
         ws: []const u8,
         patterns: []const HashPattern,
     ) Allocator.Error![]const u8 {
-        var doc: std.Io.Writer.Allocating = .init(arena);
-        const w = &doc.writer;
-        w.writeAll("{ loadContainerFromID(id:") catch return error.OutOfMemory;
-        std.json.Stringify.value(container_id, .{}, w) catch return error.OutOfMemory;
-        w.print(") {{ directory(path:{f}) {{", .{std.json.fmt(ws, .{})}) catch return error.OutOfMemory;
+        var q: Query = .init(arena);
+        q.call("loadContainerFromID", .{ .id = container_id }) catch return error.OutOfMemory;
+        q.call("directory", .{ .path = ws }) catch return error.OutOfMemory;
         for (patterns, 0..) |p, i| {
-            w.print(" p{d}: glob(pattern:", .{i}) catch return error.OutOfMemory;
-            std.json.Stringify.value(p.glob, .{}, w) catch return error.OutOfMemory;
-            w.print(") d{d}: glob(pattern:", .{i}) catch return error.OutOfMemory;
-            std.json.Stringify.value(try std.fmt.allocPrint(arena, "{s}/**", .{p.glob}), .{}, w) catch return error.OutOfMemory;
-            w.writeAll(")") catch return error.OutOfMemory;
+            const as_given = try std.fmt.allocPrint(arena, "p{d}", .{i});
+            const with_all = try std.fmt.allocPrint(arena, "d{d}", .{i});
+            const all = try std.fmt.allocPrint(arena, "{s}/**", .{p.glob});
+            q.leafArgs(as_given, "glob", .{ .pattern = p.glob }) catch return error.OutOfMemory;
+            q.leafArgs(with_all, "glob", .{ .pattern = all }) catch return error.OutOfMemory;
         }
-        w.writeAll(" } } }") catch return error.OutOfMemory;
-        return doc.written();
+        return q.finish() catch return error.OutOfMemory;
     }
 
     /// `sha256sum` over the files, in order, in the job's container (the names are listed in a
@@ -4528,18 +4527,14 @@ const Exec = struct {
         files: []const []const u8,
     ) Allocator.Error!expr.HashFiles.Result {
         const list = try std.mem.join(arena, "\n", files);
-        var doc: std.Io.Writer.Allocating = .init(arena);
-        const w2 = &doc.writer;
-        w2.writeAll("{ loadContainerFromID(id:") catch return error.OutOfMemory;
-        std.json.Stringify.value(x.container_id, .{}, w2) catch return error.OutOfMemory;
-        w2.writeAll(") { withNewFile(path:\"" ++ hash_list_path ++ "\",contents:") catch return error.OutOfMemory;
-        std.json.Stringify.value(list, .{}, w2) catch return error.OutOfMemory;
-        w2.writeAll(") { withExec(args:") catch return error.OutOfMemory;
+        var q: Query = .init(arena);
+        q.call("loadContainerFromID", .{ .id = x.container_id }) catch return error.OutOfMemory;
+        q.call("withNewFile", .{ .path = hash_list_path, .contents = list }) catch return error.OutOfMemory;
         const hash_cmd = std.fmt.allocPrint(arena, "cd {s} && tr '\\n' '\\0' < " ++ hash_list_path ++ " | xargs -0 sha256sum --", .{ws}) catch return error.OutOfMemory;
-        std.json.Stringify.value([_][]const u8{ "sh", "-c", hash_cmd }, .{}, w2) catch return error.OutOfMemory;
-        w2.writeAll(",expect:ANY) { exitCode stdout stderr } } } }") catch return error.OutOfMemory;
+        q.call("withExec", .{ .args = &[_][]const u8{ "sh", "-c", hash_cmd }, .expect = Raw{ .text = "ANY" } }) catch return error.OutOfMemory;
+        for ([_][]const u8{ "exitCode", "stdout", "stderr" }) |f| q.leaf(f) catch return error.OutOfMemory;
         var msg: []const u8 = "";
-        const hdata = gql(arena, x.transport, doc.written(), &msg) catch |e| switch (e) {
+        const hdata = gql(arena, x.transport, q.finish() catch return error.OutOfMemory, &msg) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return .{ .failed = msg },
         };
@@ -4883,7 +4878,11 @@ const Exec = struct {
     /// The job's workspace as a directory id, to copy into the action's container.
     fn workspaceDirId(x: *Exec) ![]const u8 {
         const arena = x.arena;
-        const doc = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ directory(path:{f}) {{ id }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(x.ev.workspace, .{}) });
+        var q: Query = .init(arena);
+        try q.call("loadContainerFromID", .{ .id = x.container_id });
+        try q.call("directory", .{ .path = x.ev.workspace });
+        try q.leaf("id");
+        const doc = try q.finish();
         const data = gql(arena, x.transport, doc, &x.err_msg) catch return error.EngineFailed;
         return jsonFindString(data, "id") orelse {
             x.err_msg = "Dagger returned no workspace directory";
@@ -4978,9 +4977,12 @@ const Exec = struct {
                 return;
             }
         }
-        const owner: []const u8 = if (x.dir_owner) |o| try std.fmt.allocPrint(arena, ",owner:{f}", .{std.json.fmt(o, .{})}) else "";
-        const back = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ withoutDirectory(path:{f}) {{ withDirectory(path:{f},source:{f}{s}) {{ id }} }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(x.ev.workspace, .{}), std.json.fmt(x.ev.workspace, .{}), std.json.fmt(ws_out, .{}), owner });
-        const bdata = gql(arena, x.transport, back, &x.err_msg) catch return error.EngineFailed;
+        var q: Query = .init(arena);
+        try q.call("loadContainerFromID", .{ .id = x.container_id });
+        try q.call("withoutDirectory", .{ .path = x.ev.workspace });
+        try q.call("withDirectory", .{ .path = x.ev.workspace, .source = ws_out, .owner = x.dir_owner });
+        try q.leaf("id");
+        const bdata = gql(arena, x.transport, try q.finish(), &x.err_msg) catch return error.EngineFailed;
         x.container_id = jsonFindString(bdata, "id") orelse {
             x.err_msg = "Dagger returned no container";
             return error.EngineFailed;
@@ -5301,7 +5303,10 @@ const Exec = struct {
             x.sh.append(ls, try std.fmt.allocPrint(x.arena, "Print service container logs: {s}", .{r.name}));
             for (x.sh.takeServiceLog(i)) |l| x.sh.append(ls, l);
             x.sh.append(ls, try std.fmt.allocPrint(x.arena, "Stop and remove container: {s}", .{r.name}));
-            const doc = try std.fmt.allocPrint(x.arena, "{{ loadServiceFromID(id:{f}) {{ stop }} }}", .{std.json.fmt(r.id, .{})});
+            var q: Query = .init(x.arena);
+            try q.call("loadServiceFromID", .{ .id = r.id });
+            try q.leaf("stop");
+            const doc = try q.finish();
             var msg: []const u8 = "";
             _ = gql(x.arena, x.transport, doc, &msg) catch x.sh.append(ls, try std.fmt.allocPrint(x.arena, "##[warning]Could not stop {s}: {s}", .{ r.name, msg }));
         }
@@ -5313,7 +5318,15 @@ const Exec = struct {
     fn busyboxFile(x: *Exec, num: u32) !?[]const u8 {
         if (x.busybox_id) |id| return id;
         var msg: []const u8 = "";
-        const data = gql(x.arena, x.transport, "{ bb: container { from(address:\"" ++ busybox_image ++ "\") { file(path:\"/bin/busybox\") { id } } } empty: directory { id } }", &msg) catch {
+        var q: Query = .init(x.arena);
+        try q.callAs("bb", "container", .{});
+        try q.call("from", .{ .address = busybox_image });
+        try q.call("file", .{ .path = "/bin/busybox" });
+        try q.leaf("id");
+        try q.close(3);
+        try q.callAs("empty", "directory", .{});
+        try q.leaf("id");
+        const data = gql(x.arena, x.transport, try q.finish(), &msg) catch {
             _ = try x.actionFailed(num, "could not get busybox from {s}: {s}", .{ busybox_image, msg });
             return null;
         };
@@ -5337,15 +5350,21 @@ const Exec = struct {
             .build => |b| try std.fmt.allocPrint(arena, "build {s} {s} {s}", .{ b.dir, b.context, b.dockerfile }),
         };
         if (x.images.get(key)) |info| return info;
-        const fields = "{{ id entrypoint defaultArgs user }}";
-        const doc = switch (image) {
-            .pull => |ref| try std.fmt.allocPrint(arena, "{{ container {{ from(address:{f}) " ++ fields ++ " }} }}", .{std.json.fmt(ref, .{})}),
-            .build => |b| try std.fmt.allocPrint(arena, "{{ loadDirectoryFromID(id:{f}) {{ directory(path:{f}) {{ dockerBuild(dockerfile:{f}) " ++ fields ++ " }} }} }}", .{
-                std.json.fmt(b.dir, .{}), std.json.fmt(b.context, .{}), std.json.fmt(b.dockerfile, .{}),
-            }),
-        };
+        var q: Query = .init(arena);
+        switch (image) {
+            .pull => |ref| {
+                try q.open("container");
+                try q.call("from", .{ .address = ref });
+            },
+            .build => |b| {
+                try q.call("loadDirectoryFromID", .{ .id = b.dir });
+                try q.call("directory", .{ .path = b.context });
+                try q.call("dockerBuild", .{ .dockerfile = b.dockerfile });
+            },
+        }
+        for ([_][]const u8{ "id", "entrypoint", "defaultArgs", "user" }) |f| try q.leaf(f);
         var msg: []const u8 = "";
-        const data = gql(arena, x.transport, doc, &msg) catch {
+        const data = gql(arena, x.transport, try q.finish(), &msg) catch {
             switch (image) {
                 .pull => |ref| _ = try x.actionFailed(num, "could not pull {s} for {s}: {s}", .{ ref, label, msg }),
                 .build => |b| _ = try x.actionFailed(num, "could not build {s} of {s}: {s}", .{ b.dockerfile, label, msg }),
@@ -5401,21 +5420,20 @@ const Exec = struct {
         const ref_label = try std.fmt.allocPrint(arena, "{s}/{s}{s}@{s}", .{ u.owner, u.name, sub, u.ref });
         const url = try std.fmt.allocPrint(arena, "{s}/{s}/{s}.git", .{ std.mem.trimEnd(u8, x.job.github.server_url, "/"), u.owner, u.name });
 
-        var doc: std.Io.Writer.Allocating = .init(arena);
-        const w = &doc.writer;
-        try w.writeAll("{ git(url:");
-        try std.json.Stringify.value(url, .{}, w);
         // GITHUB_TOKEN reads only the job's own repository; other actions are fetched anonymously.
         const own_repo = std.mem.eql(u8, try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.owner, u.name }), x.job.github.repository);
-        try writeGitAuth(w, if (own_repo) x.gitAuth() else null);
-        try w.writeAll(") { ");
-        try w.writeAll(if (isSha(u.ref)) "commit(id:" else "ref(name:");
-        try std.json.Stringify.value(u.ref, .{}, w);
-        try w.writeAll(") { tree(depth:1) { id entries(path:");
-        try std.json.Stringify.value(if (u.path.len > 0) u.path else ".", .{}, w);
-        try w.writeAll(") } sha: commit } } }");
+        const auth: ?[]const u8 = if (own_repo) x.gitAuth() else null;
+        const auth_user: ?[]const u8 = if (auth != null) "x-access-token" else null;
+        var q: Query = .init(arena);
+        try q.call("git", .{ .url = url, .httpAuthUsername = auth_user, .httpAuthToken = auth });
+        if (isSha(u.ref)) try q.call("commit", .{ .id = u.ref }) else try q.call("ref", .{ .name = u.ref });
+        try q.call("tree", .{ .depth = @as(u32, 1) });
+        try q.leaf("id");
+        try q.leafArgs(null, "entries", .{ .path = if (u.path.len > 0) u.path else "." });
+        try q.close(1);
+        try q.leafAs("sha", "commit");
         var msg: []const u8 = "";
-        const data = gql(arena, x.transport, doc.written(), &msg) catch
+        const data = gql(arena, x.transport, try q.finish(), &msg) catch
             return .{ .unresolved = try unresolvedMessage(arena, u, msg, own_repo) };
         const dir = jsonFindString(data, "id") orelse return .{ .failed = try std.fmt.allocPrint(arena, "could not fetch {s}: Dagger returned no tree", .{ref_label}) };
         var file_name: ?[]const u8 = null;
@@ -5425,14 +5443,12 @@ const Exec = struct {
         };
         const name = file_name orelse return .{ .failed = try std.fmt.allocPrint(arena, "{s} has no action.yml or action.yaml", .{ref_label}) };
 
-        doc = .init(arena);
-        const w2 = &doc.writer;
-        try w2.writeAll("{ loadDirectoryFromID(id:");
-        try std.json.Stringify.value(dir, .{}, w2);
-        try w2.writeAll(") { file(path:");
-        try std.json.Stringify.value(if (u.path.len > 0) try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.path, name }) else name, .{}, w2);
-        try w2.writeAll(") { contents } } }");
-        const fdata = gql(arena, x.transport, doc.written(), &msg) catch
+        const file_path = if (u.path.len > 0) try std.fmt.allocPrint(arena, "{s}/{s}", .{ u.path, name }) else name;
+        var fq: Query = .init(arena);
+        try fq.call("loadDirectoryFromID", .{ .id = dir });
+        try fq.call("file", .{ .path = file_path });
+        try fq.leaf("contents");
+        const fdata = gql(arena, x.transport, try fq.finish(), &msg) catch
             return .{ .failed = try std.fmt.allocPrint(arena, "could not read {s} of {s}: {s}", .{ name, ref_label, msg }) };
         const text = jsonFindString(fdata, "contents") orelse return .{ .failed = try std.fmt.allocPrint(arena, "could not read {s} of {s}", .{ name, ref_label }) };
 
@@ -5462,7 +5478,12 @@ const Exec = struct {
         const abs = if (u.path.len > 0) try std.fmt.allocPrint(arena, "{s}/{s}", .{ x.ev.workspace, u.path }) else x.ev.workspace;
         const label = try std.fmt.allocPrint(arena, "./{s}", .{u.path});
         const missing = try std.fmt.allocPrint(arena, "Can't find 'action.yml' or 'action.yaml' under '{s}'. Did you forget to run actions/checkout before running your local action?", .{abs});
-        const doc = try std.fmt.allocPrint(arena, "{{ loadContainerFromID(id:{f}) {{ directory(path:{f}) {{ id entries }} }} }}", .{ std.json.fmt(x.container_id, .{}), std.json.fmt(abs, .{}) });
+        var q: Query = .init(arena);
+        try q.call("loadContainerFromID", .{ .id = x.container_id });
+        try q.call("directory", .{ .path = abs });
+        try q.leaf("id");
+        try q.leaf("entries");
+        const doc = try q.finish();
         var msg: []const u8 = "";
         const data = gql(arena, x.transport, doc, &msg) catch return .{ .failed = missing };
         const dir = jsonFindString(data, "id") orelse return .{ .failed = missing };
@@ -5472,7 +5493,11 @@ const Exec = struct {
             if (std.mem.eql(u8, e.string, "action.yml") or (file_name == null and std.mem.eql(u8, e.string, "action.yaml"))) file_name = e.string;
         };
         const name = file_name orelse return .{ .failed = missing };
-        const fdoc = try std.fmt.allocPrint(arena, "{{ loadDirectoryFromID(id:{f}) {{ file(path:{f}) {{ contents }} }} }}", .{ std.json.fmt(dir, .{}), std.json.fmt(name, .{}) });
+        var fq: Query = .init(arena);
+        try fq.call("loadDirectoryFromID", .{ .id = dir });
+        try fq.call("file", .{ .path = name });
+        try fq.leaf("contents");
+        const fdoc = try fq.finish();
         const fdata = gql(arena, x.transport, fdoc, &msg) catch
             return .{ .failed = try std.fmt.allocPrint(arena, "could not read {s} of {s}: {s}", .{ name, label, msg }) };
         const text = jsonFindString(fdata, "contents") orelse return .{ .failed = try std.fmt.allocPrint(arena, "could not read {s} of {s}", .{ name, label }) };
