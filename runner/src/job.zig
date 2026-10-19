@@ -2,8 +2,8 @@
 //!
 //! Step inputs use the compact template-token encoding: `{"type":N, ...}` where 0 is a string
 //! (`lit`), 1 a sequence (`seq`), 2 a mapping (`map` of `{Key,Value}`), 3 a basic expression
-//! (`expr`), 5 a boolean (`bool`), 6 a number (`num`) and 7 null. Strings and booleans are literals;
-//! a type 3 token is an expression (the server rewrites `echo ${{ github.sha }}` into
+//! (`expr`), 5 a boolean (`bool`), 6 a number (`num`) and 7 null. Strings and booleans are
+//! literals; a type 3 token is an expression (the server rewrites `echo ${{ github.sha }}` into
 //! `format('echo {0}', github.sha)`), kept as a `Template` and evaluated when the step runs.
 //! Anything else marks the step unsupported so it fails loudly instead of running wrong.
 const std = @import("std");
@@ -32,11 +32,11 @@ pub const Action = union(enum) {
     /// `uses: actions/checkout`, replaced by a built-in checkout (Dagger's git support). The raw
     /// inputs are validated and turned into a `Checkout` when the step runs (`checkoutFromInputs`).
     checkout: []const Input,
-    /// `uses: owner/repo[/path]@ref` of any other action. The runner reads the action's `action.yml`
-    /// when the step runs; `inputs` are the step's `with:` values.
+    /// `uses: owner/repo[/path]@ref` of any other action. The runner reads the action's
+    /// `action.yml` when the step runs; `inputs` are the step's `with:` values.
     uses: Uses,
-    /// `uses: docker://<image>`: runs the image as a Docker action. `args` and `entrypoint` among the
-    /// inputs say how; all inputs also arrive as INPUT_<NAME>.
+    /// `uses: docker://<image>`: runs the image as a Docker action. `args` and `entrypoint` among
+    /// the inputs say how; all inputs also arrive as INPUT_<NAME>.
     docker: struct { image: []const u8, inputs: []const Input = &.{} },
     /// Why the step cannot run. The executor logs this and fails the step.
     unsupported: []const u8,
@@ -119,7 +119,8 @@ pub const Job = struct {
     /// The job's `outputs:` (the message's `jobOutputs`), evaluated after its steps and sent with
     /// completejob, so later jobs read them as `needs.<job>.outputs.<name>`.
     outputs: []const Input = &.{},
-    /// Literal values that must never reach a log: the job token and every variable marked `isSecret`.
+    /// Literal values that must never reach a log: the job token and every variable marked
+    /// `isSecret`.
     secrets: []const []const u8,
     /// The `secrets` context: user secrets by name (they arrive as variables flagged `isSecret`),
     /// plus `GITHUB_TOKEN`. Values are credentials; never log them.
@@ -137,8 +138,8 @@ pub const Job = struct {
     steps: []const Step,
 };
 
-/// From the `SystemVssConnection` endpoint's `data`, and the `actions_uses_cache_service_v2` variable.
-/// A `services:` entry: a container that runs next to the job's steps for the whole job.
+/// From the `SystemVssConnection` endpoint's `data`, and the `actions_uses_cache_service_v2`
+/// variable. A `services:` entry: a container that runs next to the job's steps for the whole job.
 pub const Service = struct {
     /// The key under `services:`: the name the steps reach it by, and `job.services.<name>`.
     name: []const u8,
@@ -208,7 +209,10 @@ pub fn parse(arena: Allocator, json: []const u8) Error!Job {
             var g = githubContext(arena, root);
             // GitHub leaves `job` out of the github context. The job's key in the workflow is the
             // `system.github.job` variable (`jobName` is a matrix job's leg, such as "zig").
-            if (g.job.len == 0) g.job = variable(root, "system.github.job") orelse path(root, &.{"jobName"}) orelse "";
+            if (g.job.len == 0) g.job = variable(
+                root,
+                "system.github.job",
+            ) orelse path(root, &.{"jobName"}) orelse "";
             break :github g;
         },
         .env = try jobEnv(arena, root),
@@ -234,7 +238,8 @@ fn jobServices(arena: Allocator, root: Value) Allocator.Error!JobServices {
     const services = parseServices(arena, sc) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Unsupported => return .{
-            .err = "services: could not be read (written as an expression, or in a form the runner does not know)",
+            .err = "services: could not be read (written as an expression, or in a form the " ++
+                "runner does not know)",
         },
     };
     return .{ .services = services };
@@ -249,7 +254,8 @@ fn jobContainer(arena: Allocator, root: Value) Allocator.Error!JobContainer {
     const container = parseService(arena, "job", jc) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Unsupported => return .{
-            .err = "container: could not be read (written as an expression, or in a form the runner does not know)",
+            .err = "container: could not be read (written as an expression, or in a form the " ++
+                "runner does not know)",
         },
     };
     return .{ .container = container };
@@ -282,8 +288,12 @@ fn parseStep(arena: Allocator, sv: Value) Error!Step {
         .name = try displayName(arena, shown.explicit orelse "", ref.script_text, ref.uses_label),
         .name_expr = shown.name_expr,
         .condition = condition,
-        .continue_on_error = if (o.get("continueOnError")) |c| (tokenTemplate(c) orelse .{ .lit = "false" }) else .{ .lit = "false" },
-        .timeout_minutes = if (o.get("timeoutInMinutes")) |t| try numberTemplate(arena, t) else null,
+        .continue_on_error = if (o.get("continueOnError")) |c| (tokenTemplate(c) orelse
+            .{ .lit = "false" }) else .{ .lit = "false" },
+        .timeout_minutes = if (o.get("timeoutInMinutes")) |t| try numberTemplate(
+            arena,
+            t,
+        ) else null,
         .env = env.env,
         .action = ref.action,
         .uses = ref.uses_label,
@@ -327,8 +337,10 @@ fn parseReference(arena: Allocator, sv: Value, o: std.json.ObjectMap) Error!Step
         const text = if (is_literal) action.script.script.lit else "";
         return .{ .action = action, .script_text = text };
     }
-    if (std.mem.eql(u8, reference_type, "repository")) return parseRepositoryReference(arena, sv, o);
-    if (std.mem.eql(u8, reference_type, "containerRegistry")) return parseImageReference(arena, sv, o);
+    if (std.mem.eql(u8, reference_type, "repository"))
+        return parseRepositoryReference(arena, sv, o);
+    if (std.mem.eql(u8, reference_type, "containerRegistry"))
+        return parseImageReference(arena, sv, o);
     const why = try std.fmt.allocPrint(
         arena,
         "unsupported step reference type '{s}' (v0 supports run: steps)",
@@ -359,7 +371,8 @@ fn parseRepositoryReference(
     } else if (std.ascii.eqlIgnoreCase(uses_name, "actions/checkout"))
         try parseCheckoutInputs(arena, o.get("inputs"))
     else
-        try parseUses(arena, uses_name, path(sv, &.{ "reference", "path" }) orelse "", uses_ref, uses_label, o.get("inputs"));
+        try parseUses(arena, uses_name, path(sv, &.{ "reference", "path" }) orelse
+            "", uses_ref, uses_label, o.get("inputs"));
     return .{ .action = action, .uses_label = uses_label };
 }
 
@@ -386,7 +399,10 @@ fn parseImageReference(arena: Allocator, sv: Value, o: std.json.ObjectMap) Error
             },
         };
     };
-    return .{ .action = .{ .docker = .{ .image = image, .inputs = kv } }, .uses_label = uses_label };
+    return .{
+        .action = .{ .docker = .{ .image = image, .inputs = kv } },
+        .uses_label = uses_label,
+    };
 }
 
 /// The step's name as the job message gives it: an expression to evaluate per run, or a literal
@@ -414,7 +430,9 @@ fn parseScript(arena: Allocator, inputs: ?Value) Error!Action {
     const iv = inputs orelse return .{ .unsupported = "run step has no inputs" };
     const kv = mappingInputs(arena, iv) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.Unsupported => return .{ .unsupported = "run step inputs must be strings or expressions" },
+        error.Unsupported => return .{
+            .unsupported = "run step inputs must be strings or expressions",
+        },
     };
     var script: ?Template = null;
     var shell: ?Template = null;
@@ -431,7 +449,14 @@ fn parseScript(arena: Allocator, inputs: ?Value) Error!Action {
     return .{ .script = .{ .script = s, .shell = shell, .working_directory = wd } };
 }
 
-fn parseUses(arena: Allocator, name: []const u8, ref_path: []const u8, ref: []const u8, label: []const u8, inputs: ?Value) Error!Action {
+fn parseUses(
+    arena: Allocator,
+    name: []const u8,
+    ref_path: []const u8,
+    ref: []const u8,
+    label: []const u8,
+    inputs: ?Value,
+) Error!Action {
     // `name` is `owner/repo`, and may carry the action's directory too (`owner/repo/sub/dir`).
     var parts = std.mem.splitScalar(u8, name, '/');
     const owner = parts.next() orelse "";
@@ -439,12 +464,20 @@ fn parseUses(arena: Allocator, name: []const u8, ref_path: []const u8, ref: []co
     const rest = parts.rest();
     const dir = std.mem.trim(u8, if (ref_path.len > 0) ref_path else rest, "/");
     if (owner.len == 0 or repo.len == 0 or ref.len == 0 or std.mem.indexOf(u8, dir, "..") != null)
-        return .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s} is not a valid action reference", .{label}) };
+        return .{ .unsupported = try std.fmt.allocPrint(
+            arena,
+            "uses: {s} is not a valid action reference",
+            .{label},
+        ) };
     var kv: []const Input = &.{};
     if (inputs) |iv| if (iv != .null) {
         kv = mappingInputs(arena, iv) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.Unsupported => return .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s}: inputs must be strings or expressions", .{label}) },
+            error.Unsupported => return .{ .unsupported = try std.fmt.allocPrint(
+                arena,
+                "uses: {s}: inputs must be strings or expressions",
+                .{label},
+            ) },
         };
     };
     return .{ .uses = .{ .owner = owner, .name = repo, .path = dir, .ref = ref, .inputs = kv } };
@@ -464,21 +497,38 @@ pub fn localActionPath(local: []const u8) ?[]const u8 {
 
 fn parseLocalUses(arena: Allocator, local: []const u8, inputs: ?Value) Error!Action {
     const dir = localActionPath(local) orelse
-        return .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s}: a local action must be inside the workspace", .{local}) };
+        return .{ .unsupported = try std.fmt.allocPrint(
+            arena,
+            "uses: {s}: a local action must be inside the workspace",
+            .{local},
+        ) };
     var kv: []const Input = &.{};
     if (inputs) |iv| if (iv != .null) {
         kv = mappingInputs(arena, iv) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.Unsupported => return .{ .unsupported = try std.fmt.allocPrint(arena, "uses: {s}: inputs must be strings or expressions", .{local}) },
+            error.Unsupported => return .{ .unsupported = try std.fmt.allocPrint(
+                arena,
+                "uses: {s}: inputs must be strings or expressions",
+                .{local},
+            ) },
         };
     };
-    return .{ .uses = .{ .owner = "", .name = "", .path = dir, .ref = "", .inputs = kv, .local = true } };
+    return .{ .uses = .{
+        .owner = "",
+        .name = "",
+        .path = dir,
+        .ref = "",
+        .inputs = kv,
+        .local = true,
+    } };
 }
 
 /// `bash`, `sh`, `python`, or a custom command for any of them with `{0}` standing for the script
-/// file (`bash -l {0}`, `/bin/bash --login -eo pipefail {0}`, `python3 {0}`), as GitHub accepts them.
+/// file (`bash -l {0}`, `/bin/bash --login -eo pipefail {0}`, `python3 {0}`), as GitHub accepts
+/// them.
 pub fn validShell(sh: []const u8) bool {
-    if (std.mem.eql(u8, sh, "bash") or std.mem.eql(u8, sh, "sh") or std.mem.eql(u8, sh, "python")) return true;
+    if (std.mem.eql(u8, sh, "bash") or std.mem.eql(u8, sh, "sh") or std.mem.eql(u8, sh, "python"))
+        return true;
     if (std.mem.indexOf(u8, sh, "{0}") == null) return false;
     var it = std.mem.tokenizeAny(u8, sh, " \t");
     return isRunnableShell(std.fs.path.basenamePosix(it.next() orelse return false));
@@ -502,7 +552,9 @@ pub fn unsupportedShell(arena: Allocator, sh: []const u8) Allocator.Error![]cons
     else if (std.mem.eql(u8, prog, "cmd"))
         "cmd is Windows-only; use `shell: bash`"
     else
-        "this runner runs bash, sh and python, the shells of GitHub's Ubuntu runners: use `shell: bash`, `sh`, `python`, or one of their commands with {0} for the script file, such as `bash -l {0}`";
+        "this runner runs bash, sh and python, the shells of GitHub's Ubuntu runners: use " ++
+            "`shell: bash`, `sh`, `python`, or one of their commands with {0} for the script " ++
+            "file, such as `bash -l {0}`";
     return std.fmt.allocPrint(arena, "unsupported shell '{s}': {s}", .{ sh, why });
 }
 
@@ -511,15 +563,33 @@ fn parseCheckoutInputs(arena: Allocator, inputs: ?Value) Error!Action {
     if (iv == .null) return .{ .checkout = &.{} };
     const kv = mappingInputs(arena, iv) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
-        error.Unsupported => return .{ .unsupported = "actions/checkout inputs must be strings or expressions" },
+        error.Unsupported => return .{
+            .unsupported = "actions/checkout inputs must be strings or expressions",
+        },
     };
     return .{ .checkout = kv };
 }
 
 /// Inputs that change nothing we do (we never persist credentials or run the action's own git).
-const ignored_checkout_inputs = [_][]const u8{ "persist-credentials", "token", "clean", "show-progress", "set-safe-directory", "filter", "sparse-checkout-cone-mode", "ssh-strict", "ssh-user" };
+const ignored_checkout_inputs = [_][]const u8{
+    "persist-credentials",
+    "token",
+    "clean",
+    "show-progress",
+    "set-safe-directory",
+    "filter",
+    "sparse-checkout-cone-mode",
+    "ssh-strict",
+    "ssh-user",
+};
 /// Inputs that are only acceptable when they ask for the default (off) behaviour.
-const off_only_checkout_inputs = [_][]const u8{ "lfs", "sparse-checkout", "ssh-key", "ssh-known-hosts", "github-server-url" };
+const off_only_checkout_inputs = [_][]const u8{
+    "lfs",
+    "sparse-checkout",
+    "ssh-key",
+    "ssh-known-hosts",
+    "github-server-url",
+};
 
 pub const CheckoutResult = union(enum) { ok: Checkout, unsupported: []const u8 };
 
@@ -532,32 +602,64 @@ pub fn checkoutFromInputs(arena: Allocator, kv: []const EnvVar) Allocator.Error!
         else if (std.mem.eql(u8, e.name, "path")) {
             if (nonEmpty(e.value)) |pth| {
                 if (std.fs.path.isAbsolute(pth) or std.mem.indexOf(u8, pth, "..") != null)
-                    return .{ .unsupported = try std.fmt.allocPrint(arena, "actions/checkout path '{s}' must be relative and stay inside the workspace", .{pth}) };
+                    return .{ .unsupported = try std.fmt.allocPrint(
+                        arena,
+                        "actions/checkout path '{s}' must be relative and stay inside the " ++
+                            "workspace",
+                        .{pth},
+                    ) };
                 co.path = pth;
             }
         } else if (std.mem.eql(u8, e.name, "fetch-depth")) {
             co.fetch_depth = std.fmt.parseInt(u32, e.value, 10) catch
-                return .{ .unsupported = try std.fmt.allocPrint(arena, "actions/checkout fetch-depth '{s}' is not a number", .{e.value}) };
+                return .{ .unsupported = try std.fmt.allocPrint(
+                    arena,
+                    "actions/checkout fetch-depth '{s}' is not a number",
+                    .{e.value},
+                ) };
         } else if (std.mem.eql(u8, e.name, "fetch-tags")) {
             co.fetch_tags = parseBool(e.value) orelse
-                return .{ .unsupported = try std.fmt.allocPrint(arena, "actions/checkout fetch-tags '{s}' is not true or false", .{e.value}) };
+                return .{ .unsupported = try std.fmt.allocPrint(
+                    arena,
+                    "actions/checkout fetch-tags '{s}' is not true or false",
+                    .{e.value},
+                ) };
         } else if (std.mem.eql(u8, e.name, "submodules")) {
-            co.submodules = if (e.value.len == 0) false else if (std.ascii.eqlIgnoreCase(e.value, "recursive")) true else parseBool(e.value) orelse
-                return .{ .unsupported = try std.fmt.allocPrint(arena, "actions/checkout submodules '{s}' is not true, false or recursive", .{e.value}) };
+            co.submodules = if (e.value.len == 0) false else if (std.ascii.eqlIgnoreCase(
+                e.value,
+                "recursive",
+            )) true else parseBool(e.value) orelse
+                return .{ .unsupported = try std.fmt.allocPrint(
+                    arena,
+                    "actions/checkout submodules '{s}' is not true, false or recursive",
+                    .{e.value},
+                ) };
         } else if (inList(&ignored_checkout_inputs, e.name)) {
             continue;
         } else if (inList(&off_only_checkout_inputs, e.name)) {
             if (e.value.len > 0 and !std.mem.eql(u8, e.value, "false") and !isDefaultServer(e))
-                return .{ .unsupported = try std.fmt.allocPrint(arena, "actions/checkout input '{s}: {s}' is not supported yet", .{ e.name, e.value }) };
+                return .{ .unsupported = try std.fmt.allocPrint(
+                    arena,
+                    "actions/checkout input '{s}: {s}' is not supported yet",
+                    .{ e.name, e.value },
+                ) };
         } else {
-            return .{ .unsupported = try std.fmt.allocPrint(arena, "unsupported actions/checkout input '{s}'", .{e.name}) };
+            return .{ .unsupported = try std.fmt.allocPrint(
+                arena,
+                "unsupported actions/checkout input '{s}'",
+                .{e.name},
+            ) };
         }
     }
     return .{ .ok = co };
 }
 
 fn isDefaultServer(e: EnvVar) bool {
-    return std.mem.eql(u8, e.name, "github-server-url") and std.mem.eql(u8, std.mem.trimEnd(u8, e.value, "/"), "https://github.com");
+    return std.mem.eql(
+        u8,
+        e.name,
+        "github-server-url",
+    ) and std.mem.eql(u8, std.mem.trimEnd(u8, e.value, "/"), "https://github.com");
 }
 
 /// A boolean input; "" is false, as an unset input is.
@@ -592,7 +694,11 @@ fn githubContext(arena: Allocator, root: Value) Github {
         if (k != .string) continue;
         // run_id and friends may arrive as numbers.
         if (std.mem.eql(u8, k.string, "run_id")) {
-            if (v == .string) g.run_id = v.string else if (v == .integer) g.run_id = std.fmt.allocPrint(arena, "{d}", .{v.integer}) catch "";
+            if (v == .string) {
+                g.run_id = v.string;
+            } else if (v == .integer) {
+                g.run_id = std.fmt.allocPrint(arena, "{d}", .{v.integer}) catch "";
+            }
             continue;
         }
         if (v != .string) continue;
@@ -603,7 +709,11 @@ fn githubContext(arena: Allocator, root: Value) Github {
         else if (std.mem.eql(u8, k.string, "repository")) g.repository = v.string //
         else if (std.mem.eql(u8, k.string, "sha")) g.sha = v.string //
         else if (std.mem.eql(u8, k.string, "ref")) g.ref = v.string //
-        else if (std.mem.eql(u8, k.string, "server_url") and v.string.len > 0) g.server_url = v.string;
+        else if (std.mem.eql(
+            u8,
+            k.string,
+            "server_url",
+        ) and v.string.len > 0) g.server_url = v.string;
     }
     return g;
 }
@@ -616,8 +726,10 @@ fn mappingInputs(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![
     if (map != .array) return error.Unsupported;
     for (map.array.items) |pair| {
         if (pair != .object) return error.Unsupported;
-        const k = literal(pair.object.get("Key") orelse return error.Unsupported) orelse return error.Unsupported;
-        const val = tokenTemplate(pair.object.get("Value") orelse return error.Unsupported) orelse return error.Unsupported;
+        const k = literal(pair.object.get("Key") orelse return error.Unsupported) orelse
+            return error.Unsupported;
+        const val = tokenTemplate(pair.object.get("Value") orelse return error.Unsupported) orelse
+            return error.Unsupported;
         try out.append(arena, .{ .name = k, .value = val });
     }
     return out.items;
@@ -632,14 +744,20 @@ fn parseServices(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![
     if (map != .array) return error.Unsupported;
     for (map.array.items) |pair| {
         if (pair != .object) return error.Unsupported;
-        const name = literal(pair.object.get("Key") orelse return error.Unsupported) orelse return error.Unsupported;
-        try out.append(arena, try parseService(arena, name, pair.object.get("Value") orelse return error.Unsupported));
+        const name = literal(pair.object.get("Key") orelse return error.Unsupported) orelse
+            return error.Unsupported;
+        try out.append(arena, try parseService(arena, name, pair.object.get("Value") orelse
+            return error.Unsupported));
     }
     return out.items;
 }
 
 /// One service, or the job's container: a mapping, or just the image.
-fn parseService(arena: Allocator, name: []const u8, body: Value) error{ OutOfMemory, Unsupported }!Service {
+fn parseService(
+    arena: Allocator,
+    name: []const u8,
+    body: Value,
+) error{ OutOfMemory, Unsupported }!Service {
     {
         if (tokenTemplate(body)) |image| return .{ .name = name, .image = image };
         if (tokenType(body) != 2) return error.Unsupported;
@@ -648,7 +766,8 @@ fn parseService(arena: Allocator, name: []const u8, body: Value) error{ OutOfMem
         if (fields != .array) return error.Unsupported;
         for (fields.array.items) |f| {
             if (f != .object) return error.Unsupported;
-            const key = literal(f.object.get("Key") orelse return error.Unsupported) orelse return error.Unsupported;
+            const key = literal(f.object.get("Key") orelse return error.Unsupported) orelse
+                return error.Unsupported;
             const val = f.object.get("Value") orelse return error.Unsupported;
             if (std.mem.eql(u8, key, "image")) {
                 svc.image = tokenTemplate(val) orelse return error.Unsupported;
@@ -672,12 +791,16 @@ fn parseService(arena: Allocator, name: []const u8, body: Value) error{ OutOfMem
 }
 
 /// A sequence token of literals or expressions.
-fn sequenceTemplates(arena: Allocator, v: Value) error{ OutOfMemory, Unsupported }![]const Template {
+fn sequenceTemplates(
+    arena: Allocator,
+    v: Value,
+) error{ OutOfMemory, Unsupported }![]const Template {
     if (tokenType(v) != 1) return error.Unsupported;
     var out: std.ArrayList(Template) = .empty;
     const seq = v.object.get("seq") orelse return out.items;
     if (seq != .array) return error.Unsupported;
-    for (seq.array.items) |item| try out.append(arena, try numberTemplate(arena, item) orelse return error.Unsupported);
+    for (seq.array.items) |item| try out.append(arena, try numberTemplate(arena, item) orelse
+        return error.Unsupported);
     return out.items;
 }
 
@@ -742,7 +865,12 @@ fn numberTemplate(arena: Allocator, v: Value) Allocator.Error!?Template {
     return tokenTemplate(v);
 }
 
-fn displayName(arena: Allocator, name: []const u8, script: []const u8, uses_label: []const u8) Allocator.Error![]const u8 {
+fn displayName(
+    arena: Allocator,
+    name: []const u8,
+    script: []const u8,
+    uses_label: []const u8,
+) Allocator.Error![]const u8 {
     if (name.len > 0 and !std.mem.startsWith(u8, name, "__")) return name;
     if (uses_label.len > 0) return std.fmt.allocPrint(arena, "Run {s}", .{uses_label});
     if (script.len == 0) return "Run step";
@@ -782,7 +910,8 @@ fn collectSecretVars(arena: Allocator, root: Value) Allocator.Error![]const EnvV
         const name = e.key_ptr.*;
         if (std.mem.startsWith(u8, name, "system.")) continue;
         const val = path(v, &.{"value"}) orelse continue;
-        try out.append(arena, .{ .name = if (std.mem.eql(u8, name, "github_token")) "GITHUB_TOKEN" else name, .value = val });
+        const env_name = if (std.mem.eql(u8, name, "github_token")) "GITHUB_TOKEN" else name;
+        try out.append(arena, .{ .name = env_name, .value = val });
     }
     return out.items;
 }
@@ -823,14 +952,18 @@ fn checkRunId(root: Value) u64 {
 
 fn runtime(root: Value) Runtime {
     var r: Runtime = .{};
-    if (variable(root, "actions_uses_cache_service_v2")) |v| r.cache_v2 = std.ascii.eqlIgnoreCase(v, "true");
+    if (variable(root, "actions_uses_cache_service_v2")) |v|
+        r.cache_v2 = std.ascii.eqlIgnoreCase(v, "true");
     const res = root.object.get("resources") orelse return r;
     if (res != .object) return r;
     const eps = res.object.get("endpoints") orelse return r;
     if (eps != .array) return r;
     for (eps.array.items) |ep| {
         if (!std.mem.eql(u8, path(ep, &.{"name"}) orelse "", "SystemVssConnection")) continue;
-        r.pipelines_url = path(ep, &.{ "data", "PipelinesServiceUrl" }) orelse path(ep, &.{"url"}) orelse "";
+        r.pipelines_url = path(
+            ep,
+            &.{ "data", "PipelinesServiceUrl" },
+        ) orelse path(ep, &.{"url"}) orelse "";
         r.cache_url = path(ep, &.{ "data", "CacheServerUrl" }) orelse "";
         r.results_url = path(ep, &.{ "data", "ResultsServiceUrl" }) orelse "";
         r.id_token_url = path(ep, &.{ "data", "GenerateIdTokenUrl" }) orelse "";

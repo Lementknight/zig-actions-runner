@@ -94,16 +94,17 @@ const token_refresh_secs = 10 * 60;
 pub const Cycle = union(enum) {
     /// A job ran and GitHub was told; whether it succeeded.
     job: bool,
-    /// No job ran (or it could not be completed): the exit code, and whether trying again could help.
+    /// No job ran (or it could not be completed): the exit code, and whether trying again could
+    /// help.
     failed: struct { exit: Exit, retry: bool = true },
     /// A stop was requested while the runner waited for a job.
     stopped,
 };
 
-/// Runs `n` runners in this process as concurrent tasks (`std.Io.Group`), each serving jobs one after
-/// another (`serve`) with its own registrations, memory per job and Dagger session per job. They
-/// share the configuration, the log sinks and the database connection (all safe to share). Returns
-/// once every runner has stopped: the most severe exit code among them.
+/// Runs `n` runners in this process as concurrent tasks (`std.Io.Group`), each serving jobs one
+/// after another (`serve`) with its own registrations, memory per job and Dagger session per job.
+/// They share the configuration, the log sinks and the database connection (all safe to share).
+/// Returns once every runner has stopped: the most severe exit code among them.
 pub fn pool(c: Context, n: u32) !Exit {
     const slots = try c.arena.alloc(Slot, n);
     // One per process, so what one runner learns about a repository the others use too.
@@ -128,8 +129,8 @@ pub fn pool(c: Context, n: u32) !Exit {
     return worst;
 }
 
-/// One runner of a pool. Its error messages go through its own buffer, flushed a cycle at a time, so
-/// runners' messages do not interleave mid-line.
+/// One runner of a pool. Its error messages go through its own buffer, flushed a cycle at a time,
+/// so runners' messages do not interleave mid-line.
 const Slot = struct {
     c: Context,
     exit: Exit = .done,
@@ -147,10 +148,10 @@ const Slot = struct {
     }
 };
 
-/// Runs jobs one after another: each cycle registers a fresh JIT runner (GitHub gives a JIT runner a
-/// single job), waits for a job, runs it, and frees everything the cycle allocated before the next.
-/// A cycle that fails before running a job is retried with a growing delay (`backoffSecs`), unless
-/// GitHub rejected the registration itself (bad token or scope), which retrying cannot fix.
+/// Runs jobs one after another: each cycle registers a fresh JIT runner (GitHub gives a JIT runner
+/// a single job), waits for a job, runs it, and frees everything the cycle allocated before the
+/// next. A cycle that fails before running a job is retried with a growing delay (`backoffSecs`),
+/// unless GitHub rejected the registration itself (bad token or scope), which retrying cannot fix.
 /// With `--once`, returns after the first cycle: 0 if its job succeeded.
 pub fn serve(c: Context) !Exit {
     var failures: u32 = 0;
@@ -178,11 +179,16 @@ pub fn serve(c: Context) !Exit {
                 if (!f.retry) return f.exit;
                 failures += 1;
                 const wait = backoffSecs(failures);
-                try c.err.print("trying again in {d}s ({d} failed attempt(s) in a row)\n", .{ wait, failures });
+                try c.err.print(
+                    "trying again in {d}s ({d} failed attempt(s) in a row)\n",
+                    .{ wait, failures },
+                );
                 try c.err.flush();
                 // In steps, so a stop is not kept waiting.
                 var waited: u32 = 0;
-                while (waited < wait * 5 and !stopRequested()) : (waited += 1) c.io.sleep(.fromMilliseconds(200), .awake) catch {};
+                while (waited < wait * 5 and !stopRequested()) : (waited += 1) {
+                    c.io.sleep(.fromMilliseconds(200), .awake) catch {};
+                }
                 if (stopRequested()) return .done;
             },
         }
@@ -211,7 +217,12 @@ fn poll(c: Context, url: []const u8, token: []const u8) !Polled {
     return first;
 }
 
-fn pollOnce(arena: Allocator, io: std.Io, url: []const u8, token: []const u8) anyerror!broker.Response {
+fn pollOnce(
+    arena: Allocator,
+    io: std.Io,
+    url: []const u8,
+    token: []const u8,
+) anyerror!broker.Response {
     return broker.call(arena, io, .GET, url, token, null);
 }
 
@@ -220,7 +231,13 @@ var stop_announced: std.atomic.Value(bool) = .init(false);
 fn waitForStop(c: Context) void {
     while (!stopRequested()) c.io.sleep(.fromMilliseconds(200), .awake) catch return;
     // No allocation: the poll may be using the cycle's arena at the same time.
-    if (!stop_announced.swap(true, .acq_rel)) c.log.append(0, 0, .stderr, "stopping: waiting runners stop now, running jobs finish first (a second signal exits at once)") catch {};
+    if (!stop_announced.swap(true, .acq_rel)) c.log.append(
+        0,
+        0,
+        .stderr,
+        "stopping: waiting runners stop now, running jobs finish first " ++
+            "(a second signal exits at once)",
+    ) catch {};
 }
 
 /// Deletes the cycle's runner registration, trying again (after 1 s, then 2 s) when GitHub refuses
@@ -229,7 +246,8 @@ fn waitForStop(c: Context) void {
 fn removeRegistration(c: Context, id: u64, name: []const u8) void {
     var last: []const u8 = "";
     for (0..3) |attempt| {
-        if (attempt > 0) c.io.sleep(.fromMilliseconds(@as(i64, @intCast(attempt)) * 1000), .awake) catch {};
+        if (attempt > 0)
+            c.io.sleep(.fromMilliseconds(@as(i64, @intCast(attempt)) * 1000), .awake) catch {};
         if (jitconfig.deleteRunner(c.arena, c.io, c.cfg, id)) |status| {
             const code = @backingInt(status);
             if (status.class() == .success or code == 404) return;
@@ -237,53 +255,47 @@ fn removeRegistration(c: Context, id: u64, name: []const u8) void {
             if (code != 422 and status.class() != .server_error) break;
         } else |e| last = @errorName(e);
     }
-    c.err.print("could not remove runner registration '{s}' (id {d}): {s}; delete it in the repository's runner settings\n", .{ name, id, last }) catch {};
+    c.err.print(
+        "could not remove runner registration '{s}' (id {d}): {s}; " ++
+            "delete it in the repository's runner settings\n",
+        .{ name, id, last },
+    ) catch {};
 }
 
 /// One registration and at most one job.
 pub fn cycle(c: Context) !Cycle {
     var status: std.http.Status = .ok;
     var message: []const u8 = "";
-    const jit = jitconfig.generate(c.arena, c.io, c.cfg, c.name, &status, &message) catch |e| {
-        try c.err.writeAll("github error: ");
-        try redact.write(c.err, @errorName(e), c.secrets);
-        try c.err.print(" (HTTP {d})", .{@backingInt(status)});
-        if (message.len > 0) {
-            try c.err.writeAll(": ");
-            try redact.write(c.err, message, c.secrets);
-        }
-        // What the token needs, for the refusals a wrong token causes.
-        if (@backingInt(status) == 403 or @backingInt(status) == 404)
-            try c.err.writeAll("\n  GH_TOKEN must be able to manage self-hosted runners of GH_SCOPE: a fine-grained token with \"Administration: read and write\" on the repository (\"Self-hosted runners: read and write\" for an organization), or a classic token with repo (admin:org)");
-        try c.err.writeByte('\n');
-        // Rejected credentials or scope will be rejected again; anything else may be transient.
-        const fatal = switch (@backingInt(status)) {
-            401, 403, 404, 422 => true,
-            else => false,
-        };
-        return .{ .failed = .{ .exit = .github, .retry = !fatal } };
-    };
-    // GitHub removes ephemeral runners itself once their job completes; an idle one must be removed.
+    const jit = jitconfig.generate(c.arena, c.io, c.cfg, c.name, &status, &message) catch |e|
+        return registrationFailed(c, e, status, message);
+    // GitHub removes ephemeral runners once their job completes; an idle one must be removed.
     defer removeRegistration(c, jit.runner_id, jit.runner_name);
     try say(c, "registered runner '{s}' (id {d})", .{ jit.runner_name, jit.runner_id });
 
-    const creds = auth.parseCredentials(c.arena, jit.files) catch |e| return fail(c, "credentials", e);
-    const settings = broker.parseSettings(c.arena, jit.files) catch |e| return fail(c, "runner settings", e);
+    const creds = auth.parseCredentials(c.arena, jit.files) catch |e|
+        return fail(c, "credentials", e);
+    const settings = broker.parseSettings(c.arena, jit.files) catch |e|
+        return fail(c, "runner settings", e);
     var token = mintToken(c, creds, &status) catch |e| return failHttp(c, "oauth token", e, status);
     var token_at = std.Io.Clock.real.now(c.io).toSeconds();
 
-    const base = try std.fmt.allocPrint(c.arena, "{s}{s}", .{ settings.broker_url, if (std.mem.endsWith(u8, settings.broker_url, "/")) "" else "/" });
-    const created = broker.call(c.arena, c.io, .POST, try std.fmt.allocPrint(c.arena, "{s}session", .{base}), token, try broker.sessionBody(c.arena, settings, "zig-runner")) catch |e| return fail(c, "create session", e);
+    const base = try withSlash(c.arena, settings.broker_url);
+    const session_url = try std.fmt.allocPrint(c.arena, "{s}session", .{base});
+    const session_body = try broker.sessionBody(c.arena, settings, "zig-runner");
+    const created = broker.call(c.arena, c.io, .POST, session_url, token, session_body) catch |e|
+        return fail(c, "create session", e);
     if (created.status.class() != .success) return failBody(c, "create session", created);
-    const sid = jsonString(c.arena, created.body, "sessionId") orelse return fail(c, "create session", error.BadResponse);
-    defer _ = broker.call(c.arena, c.io, .DELETE, std.fmt.allocPrint(c.arena, "{s}session?sessionId={s}", .{ base, sid }) catch "", token, null) catch {};
+    const sid = jsonString(c.arena, created.body, "sessionId") orelse
+        return fail(c, "create session", error.BadResponse);
+    defer deleteSession(c, base, sid, token);
     try say(c, "'{s}' listening for jobs (labels: {s})", .{ c.name, c.cfg.labels });
 
     while (true) {
         if (stopRequested()) return .stopped;
         const now = std.Io.Clock.real.now(c.io).toSeconds();
         if (now - token_at > token_refresh_secs) {
-            token = mintToken(c, creds, &status) catch |e| return failHttp(c, "oauth token refresh", e, status);
+            token = mintToken(c, creds, &status) catch |e|
+                return failHttp(c, "oauth token refresh", e, status);
             token_at = now;
         }
         const m = switch (try poll(c, try broker.messageUrl(c.arena, base, sid, "Online"), token)) {
@@ -298,9 +310,55 @@ pub fn cycle(c: Context) !Cycle {
             try say(c, "ignoring message of type '{s}'", .{mtype});
             continue;
         }
-        const inner = jsonString(c.arena, m.body, "body") orelse return fail(c, "job request", error.BadResponse);
-        return handleJob(c, .{ .creds = creds, .token = token, .token_at = token_at, .url = try broker.messageUrl(c.arena, base, sid, "Busy") }, inner);
+        const inner = jsonString(c.arena, m.body, "body") orelse
+            return fail(c, "job request", error.BadResponse);
+        return handleJob(c, .{
+            .creds = creds,
+            .token = token,
+            .token_at = token_at,
+            .url = try broker.messageUrl(c.arena, base, sid, "Busy"),
+        }, inner);
     }
+}
+
+/// Why the runner could not be registered, with what the token must allow when GitHub refused it.
+/// Rejected credentials or scope will be rejected again; anything else may be transient.
+fn registrationFailed(
+    c: Context,
+    e: anyerror,
+    status: std.http.Status,
+    message: []const u8,
+) !Cycle {
+    try c.err.writeAll("github error: ");
+    try redact.write(c.err, @errorName(e), c.secrets);
+    try c.err.print(" (HTTP {d})", .{@backingInt(status)});
+    if (message.len > 0) {
+        try c.err.writeAll(": ");
+        try redact.write(c.err, message, c.secrets);
+    }
+    if (@backingInt(status) == 403 or @backingInt(status) == 404)
+        try c.err.writeAll("\n  GH_TOKEN must be able to manage self-hosted runners of " ++
+            "GH_SCOPE: a fine-grained token with \"Administration: read and write\" " ++
+            "on the repository (\"Self-hosted runners: read and write\" for an organization), " ++
+            "or a classic token with repo (admin:org)");
+    try c.err.writeByte('\n');
+    const fatal = switch (@backingInt(status)) {
+        401, 403, 404, 422 => true,
+        else => false,
+    };
+    return .{ .failed = .{ .exit = .github, .retry = !fatal } };
+}
+
+/// `url` with one trailing slash, so paths can be appended to it.
+fn withSlash(arena: Allocator, url: []const u8) ![]const u8 {
+    if (std.mem.endsWith(u8, url, "/")) return url;
+    return std.fmt.allocPrint(arena, "{s}/", .{url});
+}
+
+/// Ends the broker session; best effort, on the way out.
+fn deleteSession(c: Context, base: []const u8, sid: []const u8, token: []const u8) void {
+    const url = std.fmt.allocPrint(c.arena, "{s}session?sessionId={s}", .{ base, sid }) catch "";
+    _ = broker.call(c.arena, c.io, .DELETE, url, token, null) catch {};
 }
 
 /// Writes run state at the transitions SPEC §5.2 names: job start, step start, step end, job end.
@@ -330,7 +388,13 @@ const Reporter = struct {
 
     fn stepStartedFn(ptr: *anyopaque, number: u32, name: []const u8, started_ms: i64) void {
         const r: *Reporter = @ptrCast(@alignCast(ptr));
-        r.store.upsertStep(.{ .job_id = r.job_id, .number = number, .name = name, .status = "in_progress", .started_at = r.iso(started_ms) }) catch |e| r.note(e);
+        r.store.upsertStep(.{
+            .job_id = r.job_id,
+            .number = number,
+            .name = name,
+            .status = "in_progress",
+            .started_at = r.iso(started_ms),
+        }) catch |e| r.note(e);
     }
 
     fn stepFinishedFn(ptr: *anyopaque, number: u32, res: dagger.StepResult) void {
@@ -366,10 +430,25 @@ const Reporter = struct {
             .started_at = r.iso(now_ms),
         }) catch |e| r.note(e);
         // Step 0 is "Set up job" (db/migrations/001_init.sql): registration, acquiring and parsing.
-        r.store.upsertStep(.{ .job_id = r.job_id, .number = 0, .name = "Set up job", .status = "completed", .conclusion = "success", .started_at = r.iso(now_ms), .completed_at = r.iso(now_ms) }) catch |e| r.note(e);
+        r.store.upsertStep(.{
+            .job_id = r.job_id,
+            .number = 0,
+            .name = "Set up job",
+            .status = "completed",
+            .conclusion = "success",
+            .started_at = r.iso(now_ms),
+            .completed_at = r.iso(now_ms),
+        }) catch |e| r.note(e);
     }
 
-    fn jobFinished(r: *Reporter, job: job_mod.Job, runner_name: []const u8, conclusion: []const u8, started_ms: i64, now_ms: i64) void {
+    fn jobFinished(
+        r: *Reporter,
+        job: job_mod.Job,
+        runner_name: []const u8,
+        conclusion: []const u8,
+        started_ms: i64,
+        now_ms: i64,
+    ) void {
         r.store.upsertJob(.{
             .id = r.job_id,
             .run_id = r.run_id,
@@ -425,25 +504,33 @@ const Listening = struct {
     url: []const u8,
 };
 
-fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
+/// Whether `repo`'s jobs have spent too long on output keys lately (see `SlowOutputs`).
+fn slowOutputs(c: Context, repo: []const u8) bool {
+    const so = c.slow_outputs orelse return false;
+    return so.spent(repo) != null;
+}
+
+fn handleJob(c: Context, session: Listening, body: []const u8) !Cycle {
     const runner_token = session.token;
-    const jr = runservice.parseJobRequest(c.arena, inner_body) catch |e| return fail(c, "job request", e);
-    const acq = runservice.acquire(c.arena, c.io, jr, runner_token) catch |e| return fail(c, "acquirejob", e);
+    const jr = runservice.parseJobRequest(c.arena, body) catch |e| return fail(c, "job request", e);
+    const acq = runservice.acquire(c.arena, c.io, jr, runner_token) catch |e|
+        return fail(c, "acquirejob", e);
     if (acq.status.class() != .success) return failBody(c, "acquirejob", acq);
 
     // The definition holds secrets; it is parsed but never printed.
     const job = job_mod.parse(c.arena, acq.body) catch |e| return fail(c, "parse job", e);
 
-    // GitHub cancels a job (in its UI, or at the job's timeout-minutes) through the runner's session.
+    // GitHub cancels a job (in its UI, or at the job's timeout-minutes) through the runner's
+    // session.
     var cancel: dagger.Cancel = .{};
     // Keep the hold on the job while it runs, as GitHub's runner does (see `Renewer`).
-    var renewer: Renewer = .{ .c = c, .token = job.job_token, .jr = jr, .plan_id = job.plan_id, .job_id = job.job_id, .log_job = job.check_run_id, .cancel = &cancel };
+    var renewer = Renewer.init(c, job, jr, &cancel);
     var renewing: ?std.Io.Future(void) = c.io.concurrent(Renewer.run, .{&renewer}) catch null;
     defer if (renewing) |*f| {
         renewer.stop.store(true, .release);
         f.await(c.io);
     };
-    var watcher: CancelWatch = .{ .c = c, .session = session, .job_id = job.job_id, .log_job = job.check_run_id, .cancel = &cancel };
+    var watcher = CancelWatch.init(c, session, job, &cancel);
     var watching: ?std.Io.Future(void) = c.io.concurrent(CancelWatch.run, .{&watcher}) catch null;
     defer if (watching) |*f| {
         watcher.stop.store(true, .release);
@@ -465,7 +552,7 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
         live.finish(&.{});
     };
     // For the runner's own console and database only: the job's log starts as GitHub's does.
-    try c.log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job acquired: {d} steps", .{job.steps.len}));
+    try sayJob(c.log, c.arena, job, "job acquired: {d} steps", .{job.steps.len});
 
     const job_started_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
     var reporter = try startReporter(c, job, job_started_ms);
@@ -473,29 +560,64 @@ fn handleJob(c: Context, session: Listening, inner_body: []const u8) !Cycle {
 
     const completion = try logCompleteJob(c, job, log, &live, result, job_started_ms);
     if (reporter) |*r| {
-        r.jobFinished(job, c.name, reporterConclusion(result), job_started_ms, std.Io.Clock.real.now(c.io).toMilliseconds());
-        if (r.failures > 0) try c.err.print("run state: {d} database write(s) failed (last: {s})\n", .{ r.failures, r.last_error });
+        try finishReporter(c, r, job, result, job_started_ms);
     }
     try reportCacheAndKeys(c, job, log, result);
     const shown = try shownSteps(c.arena, live.ids, job, result, job_started_ms, completion);
-    try uploadLogs(c, job, shown, log.collect.collected(c.arena), result.summaries, log.currentSecrets());
+    const lines = log.collect.collected(c.arena);
+    try uploadLogs(c, job, shown, lines, result.summaries, log.currentSecrets());
     // The live view ends with the steps as completejob reports them.
     live_done = true;
     collect.collect.listener = null;
     live.finish(try liveFinals(c.arena, shown));
 
-    const conclusion: runservice.Conclusion = if (result.cancelled) .canceled else if (result.succeeded) .succeeded else .failed;
+    const conclusion = jobConclusion(result);
     if (try completeJobWithRetry(c, jr, job, conclusion, shown, result)) |failed| return failed;
-    try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(c.arena, "job {s}", .{@tagName(conclusion)}));
+    try sayJob(log, c.arena, job, "job {s}", .{@tagName(conclusion)});
     return .{ .job = result.succeeded };
 }
 
+/// A line in the job's log, under its "Set up job" step, as `std.fmt` writes it.
+fn sayJob(
+    log: *sink.LogSink,
+    arena: Allocator,
+    job: job_mod.Job,
+    comptime fmt: []const u8,
+    args: anytype,
+) !void {
+    try log.append(job.check_run_id, 0, .stdout, try std.fmt.allocPrint(arena, fmt, args));
+}
+
+/// The run-state rows at the job's end, and a note when any of its writes failed.
+fn finishReporter(
+    c: Context,
+    r: *Reporter,
+    job: job_mod.Job,
+    result: dagger.Result,
+    job_started_ms: i64,
+) !void {
+    const ended_ms = std.Io.Clock.real.now(c.io).toMilliseconds();
+    r.jobFinished(job, c.name, reporterConclusion(result), job_started_ms, ended_ms);
+    if (r.failures > 0) try c.err.print(
+        "run state: {d} database write(s) failed (last: {s})\n",
+        .{ r.failures, r.last_error },
+    );
+}
+
+/// What completejob is told: cancelled first, then whether every step that had to succeed did.
+fn jobConclusion(result: dagger.Result) runservice.Conclusion {
+    if (result.cancelled) return .canceled;
+    if (result.succeeded) return .succeeded;
+    return .failed;
+}
+
 /// The job's log on disk while it runs, rather than in memory until it ends: it is then bounded by
-/// the spool and survives the process (see `sink.Spool`). Best effort — a directory the runner cannot
-/// write to is said once and the lines stay in memory, because logging must not fail a job. Null when
-/// no spool directory is configured or the file could not be made. It lives on the cycle's arena so
-/// the collector can be pointed at it here, where it cannot be forgotten: the first extraction of
-/// handleJob dropped that one line, and only an unused-parameter error caught it.
+/// the spool and survives the process (see `sink.Spool`). Best effort — a directory the runner
+/// cannot write to is said once and the lines stay in memory, because logging must not fail a job.
+/// Null when no spool directory is configured or the file could not be made. It lives on the
+/// cycle's arena so the collector can be pointed at it here, where it cannot be forgotten: the
+/// first extraction of handleJob dropped that one line, and only an unused-parameter error caught
+/// it.
 const JobSpool = struct {
     spool: sink.Spool,
     path: []const u8,
@@ -508,9 +630,16 @@ const JobSpool = struct {
 
 fn openSpool(c: Context, job: job_mod.Job, collect: *sink.LogSink) !?*JobSpool {
     if (c.cfg.log_spool_dir.len == 0) return null;
-    const path = std.fmt.allocPrint(c.arena, "{s}/zig-runner-job-{d}.log", .{ c.cfg.log_spool_dir, job.check_run_id }) catch return null;
+    const path = std.fmt.allocPrint(
+        c.arena,
+        "{s}/zig-runner-job-{d}.log",
+        .{ c.cfg.log_spool_dir, job.check_run_id },
+    ) catch return null;
     const file = std.Io.Dir.cwd().createFile(c.io, path, .{ .read = true }) catch |e| {
-        try c.err.print("job {d}: no log spool in {s} ({s}); the job's log is kept in memory\n", .{ job.check_run_id, c.cfg.log_spool_dir, @errorName(e) });
+        try c.err.print(
+            "job {d}: no log spool in {s} ({s}); the job's log is kept in memory\n",
+            .{ job.check_run_id, c.cfg.log_spool_dir, @errorName(e) },
+        );
         return null;
     };
     const js = try c.arena.create(JobSpool);
@@ -573,7 +702,7 @@ fn runJobSteps(
         .step_cache = c.cfg.step_cache,
         .step_user = c.cfg.step_user,
         // Skipped for a repository whose jobs spend too long on them (see `SlowOutputs`).
-        .output_keys = c.cfg.output_keys and (if (c.slow_outputs) |so| so.spent(job.github.repository) == null else true),
+        .output_keys = c.cfg.output_keys and !slowOutputs(c, job.github.repository),
         .output_keys_days = c.cfg.output_keys_days,
         .cancel = cancel,
         .observer = observer: {
@@ -609,10 +738,12 @@ fn logCompleteJob(
     job_started_ms: i64,
 ) !CompleteStep {
     const complete_started = std.Io.Clock.real.now(c.io).toMilliseconds();
-    const complete_step: u32 = if (result.next_log_step > 0) result.next_log_step else @intCast(job.steps.len + 1);
+    const after_last: u32 = @intCast(job.steps.len + 1);
+    const complete_step: u32 = if (result.next_log_step > 0) result.next_log_step else after_last;
     if (result.set_up_failed) {
-        // GitHub keeps a step's first conclusion and number: say "Set up job" failed before "Complete
-        // job" starts (which would end it as a success), and number the steps that did not run.
+        // GitHub keeps a step's first conclusion and number: say "Set up job" failed before
+        // "Complete job" starts (which would end it as a success), and number the steps that did
+        // not run.
         live.end(0, "Set up job", .failure, job_started_ms, complete_started);
         live.skipNumbers(@intCast(job.steps.len));
     }
@@ -629,33 +760,64 @@ fn logCompleteJob(
 
 /// On the runner's own console: how many steps the engine served from cache, as the step logs say
 /// (`dagger.reused_note`) — what step caching saved this job, next to what output keys cost it.
-fn reportCacheAndKeys(c: Context, job: job_mod.Job, log: *sink.LogSink, result: dagger.Result) !void {
+fn reportCacheAndKeys(
+    c: Context,
+    job: job_mod.Job,
+    log: *sink.LogSink,
+    result: dagger.Result,
+) !void {
     if (c.cfg.step_cache and job.steps.len > 0) {
         var replayed: usize = 0;
         for (log.collect.collected(c.arena)) |l| {
-            if (l.step >= 1 and l.step <= job.steps.len and std.mem.eql(u8, l.text, dagger.reused_note)) replayed += 1;
+            if (l.step >= 1 and l.step <= job.steps.len and
+                std.mem.eql(u8, l.text, dagger.reused_note)) replayed += 1;
         }
-        try c.err.print("job {d}: {d} of {d} steps replayed from the cache\n", .{ job.check_run_id, replayed, job.steps.len });
+        try c.err.print(
+            "job {d}: {d} of {d} steps replayed from the cache\n",
+            .{ job.check_run_id, replayed, job.steps.len },
+        );
     }
     const ok = result.output_keys;
     if (ok.applied + ok.fell_back == 0) return;
-    try c.err.print("job {d}: output keys: {d} of {d} always-run steps applied", .{ job.check_run_id, ok.applied, ok.applied + ok.fell_back });
+    try c.err.print(
+        "job {d}: output keys: {d} of {d} always-run steps applied",
+        .{ job.check_run_id, ok.applied, ok.applied + ok.fell_back },
+    );
     const ms: u64 = @intCast(@max(ok.ms, 0));
     try c.err.print(" in {d}.{d} s", .{ ms / 1000, ms % 1000 / 100 });
-    if (ok.fell_back > 0) try c.err.print("; {d} fell back (last: {s})", .{ ok.fell_back, ok.last_reason });
+    if (ok.fell_back > 0)
+        try c.err.print("; {d} fell back (last: {s})", .{ ok.fell_back, ok.last_reason });
     try c.err.writeAll("\n");
     // Over the limit: the rest of this repository's jobs do without them (see `SlowOutputs`).
     const cap = c.cfg.output_keys_max_ms;
     if (cap > 0 and ok.ms > cap and job.github.repository.len > 0) if (c.slow_outputs) |so| {
         if (so.record(job.github.repository, ok.ms))
-            try c.err.print("job {d}: output keys: {d}.{d} s is over the {d}.{d} s limit, so {s}'s later jobs skip them (RUNNER_OUTPUT_KEYS_MAX_MS)\n", .{ job.check_run_id, ms / 1000, ms % 1000 / 100, cap / 1000, cap % 1000 / 100, job.github.repository });
+            try c.err.print(
+                "job {d}: output keys: {d}.{d} s is over the {d}.{d} s limit, so {s}'s later " ++
+                    "jobs skip them (RUNNER_OUTPUT_KEYS_MAX_MS)\n",
+                .{
+                    job.check_run_id,
+                    ms / 1000,
+                    ms % 1000 / 100,
+                    cap / 1000,
+                    cap % 1000 / 100,
+                    job.github.repository,
+                },
+            );
     };
 }
 
 /// The steps as completejob reports them, for the live view's last update.
 fn liveFinals(arena: std.mem.Allocator, shown: []const Shown) ![]const Live.Final {
     const finals = try arena.alloc(Live.Final, shown.len);
-    for (shown, finals) |sh, *f| f.* = .{ .id = sh.id, .number = sh.number, .name = sh.name, .conclusion = liveConclusion(sh.conclusion), .started_ms = sh.started_ms, .completed_ms = sh.completed_ms };
+    for (shown, finals) |sh, *f| f.* = .{
+        .id = sh.id,
+        .number = sh.number,
+        .name = sh.name,
+        .conclusion = liveConclusion(sh.conclusion),
+        .started_ms = sh.started_ms,
+        .completed_ms = sh.completed_ms,
+    };
     return finals;
 }
 
@@ -672,10 +834,22 @@ fn completeJobWithRetry(
 ) !?Cycle {
     const step_json = try stepResultsJson(c.arena, shown);
     const annotations_json = try annotationsJson(c.arena, shown, result.annotations);
-    var done = completeJob(c, jr, job, conclusion, step_json, result.outputs, annotations_json) catch |e|
+    var done = completeJob(
+        c,
+        jr,
+        job,
+        conclusion,
+        step_json,
+        result.outputs,
+        annotations_json,
+    ) catch |e|
         return try fail(c, "completejob", e);
     if (done.status.class() != .success) {
-        try c.err.print("completejob with step results and annotations failed (HTTP {d}: {s}); retrying without them\n", .{ @backingInt(done.status), done.body[0..@min(done.body.len, 200)] });
+        try c.err.print(
+            "completejob with step results and annotations failed (HTTP {d}: {s}); retrying " ++
+                "without them\n",
+            .{ @backingInt(done.status), done.body[0..@min(done.body.len, 200)] },
+        );
         done = completeJob(c, jr, job, conclusion, "[]", result.outputs, "[]") catch |e|
             return try fail(c, "completejob", e);
         if (done.status.class() != .success) return try failBody(c, "completejob", done);
@@ -686,16 +860,41 @@ fn completeJobWithRetry(
 /// completejob, tried again (after 2, 5 and 10 s) when the request fails or GitHub answers 5xx:
 /// a job not completed stays held, and once its hold runs out GitHub fails it ("lost
 /// communication") whatever its steps did. The hold is still being renewed meanwhile.
-fn completeJob(c: Context, jr: runservice.JobRequest, job: job_mod.Job, conclusion: runservice.Conclusion, step_json: []const u8, outputs: []const job_mod.EnvVar, annotations_json: []const u8) !broker.Response {
+fn completeJob(
+    c: Context,
+    jr: runservice.JobRequest,
+    job: job_mod.Job,
+    conclusion: runservice.Conclusion,
+    step_json: []const u8,
+    outputs: []const job_mod.EnvVar,
+    annotations_json: []const u8,
+) !broker.Response {
     const delays = [_]i64{ 2, 5, 10 };
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
-        const r = runservice.complete(c.arena, c.io, jr, job.job_token, job.plan_id, job.job_id, conclusion, step_json, outputs, annotations_json);
+        const r = runservice.complete(
+            c.arena,
+            c.io,
+            jr,
+            job.job_token,
+            job.plan_id,
+            job.job_id,
+            conclusion,
+            step_json,
+            outputs,
+            annotations_json,
+        );
         const retry = if (r) |resp| resp.status.class() == .server_error else |_| true;
         if (!retry or attempt == delays.len) return r;
         if (r) |resp| {
-            try c.err.print("completejob: HTTP {d}; trying again in {d}s\n", .{ @backingInt(resp.status), delays[attempt] });
-        } else |e| try c.err.print("completejob: {s}; trying again in {d}s\n", .{ @errorName(e), delays[attempt] });
+            try c.err.print(
+                "completejob: HTTP {d}; trying again in {d}s\n",
+                .{ @backingInt(resp.status), delays[attempt] },
+            );
+        } else |e| try c.err.print(
+            "completejob: {s}; trying again in {d}s\n",
+            .{ @errorName(e), delays[attempt] },
+        );
         c.io.sleep(.fromSeconds(delays[attempt]), .awake) catch {};
     }
 }
@@ -706,8 +905,8 @@ pub const Shown = struct {
     id: []const u8,
     number: u32,
     name: []const u8,
-    /// Which lines are its log (`sink.CollectedLine.step`): 0 is "Set up job", 1..n the job's steps,
-    /// then `pre`/`post` scripts and "Complete job" (see `dagger.ExtraStep`).
+    /// Which lines are its log (`sink.CollectedLine.step`): 0 is "Set up job", 1..n the job's
+    /// steps, then `pre`/`post` scripts and "Complete job" (see `dagger.ExtraStep`).
     log_step: u32,
     /// succeeded / failed / skipped, as completejob takes them.
     conclusion: []const u8,
@@ -721,6 +920,23 @@ pub const Shown = struct {
 /// completejob it takes the job's own token; the runner's gets 401. Runs next to the job, so it
 /// has memory of its own and reports through the runner's shared (locked) sink, not the job's log.
 const Renewer = struct {
+    fn init(
+        c: Context,
+        job: job_mod.Job,
+        jr: runservice.JobRequest,
+        cancel: *dagger.Cancel,
+    ) Renewer {
+        return .{
+            .c = c,
+            .token = job.job_token,
+            .jr = jr,
+            .plan_id = job.plan_id,
+            .job_id = job.job_id,
+            .log_job = job.check_run_id,
+            .cancel = cancel,
+        };
+    }
+
     c: Context,
     token: []const u8,
     jr: runservice.JobRequest,
@@ -737,33 +953,54 @@ const Renewer = struct {
         var reported = false;
         while (true) {
             var waited: u32 = 0;
-            while (waited < interval_secs * 5 and !r.stop.load(.acquire)) : (waited += 1) r.c.io.sleep(.fromMilliseconds(200), .awake) catch return;
+            while (waited < interval_secs * 5 and !r.stop.load(.acquire)) : (waited += 1) {
+                r.c.io.sleep(.fromMilliseconds(200), .awake) catch return;
+            }
             if (r.stop.load(.acquire)) return;
             var call: std.heap.ArenaAllocator = .init(r.c.gpa);
             defer call.deinit();
             const arena = call.allocator();
-            const resp = runservice.renew(arena, r.c.io, r.jr, r.token, r.plan_id, r.job_id) catch |e| {
+            const resp = runservice.renew(
+                arena,
+                r.c.io,
+                r.jr,
+                r.token,
+                r.plan_id,
+                r.job_id,
+            ) catch |e| {
                 r.say(arena, "renewjob failed: {s}", .{@errorName(e)});
                 continue;
             };
             if (resp.status == .not_found) {
                 // Seen when a cancelled job's grace period ran out: GitHub closed the job itself.
                 r.say(arena, "GitHub no longer has the job (renewjob: HTTP 404); stopping it", .{});
-                r.cancel.hard_deadline_ms.store(std.Io.Clock.real.now(r.c.io).toMilliseconds(), .release);
+                r.cancel.hard_deadline_ms.store(
+                    std.Io.Clock.real.now(r.c.io).toMilliseconds(),
+                    .release,
+                );
                 r.cancel.requested.store(true, .release);
                 return;
             }
             if (resp.status.class() != .success) {
-                r.say(arena, "renewjob failed: HTTP {d}: {s}", .{ @backingInt(resp.status), resp.body[0..@min(resp.body.len, 200)] });
+                r.say(
+                    arena,
+                    "renewjob failed: HTTP {d}: {s}",
+                    .{ @backingInt(resp.status), resp.body[0..@min(resp.body.len, 200)] },
+                );
             } else if (!reported) {
                 reported = true;
-                r.say(arena, "job hold renewed (locked until {s})", .{jsonString(arena, resp.body, "lockedUntil") orelse "?"});
+                r.say(
+                    arena,
+                    "job hold renewed (locked until {s})",
+                    .{jsonString(arena, resp.body, "lockedUntil") orelse "?"},
+                );
             }
         }
     }
 
     fn say(r: *Renewer, arena: Allocator, comptime fmt: []const u8, args: anytype) void {
-        const text = std.fmt.allocPrint(arena, "job {d}: " ++ fmt, .{r.log_job} ++ args) catch return;
+        const text = std.fmt.allocPrint(arena, "job {d}: " ++ fmt, .{r.log_job} ++ args) catch
+            return;
         r.c.log.append(0, 0, .stderr, text) catch {};
     }
 };
@@ -774,6 +1011,16 @@ const Renewer = struct {
 /// job definition does not carry it). The timeout is the grace period for what still runs after the
 /// cancel (`if: always()` steps, post scripts); past it, the job's queries are ended too.
 const CancelWatch = struct {
+    fn init(c: Context, session: Listening, job: job_mod.Job, cancel: *dagger.Cancel) CancelWatch {
+        return .{
+            .c = c,
+            .session = session,
+            .job_id = job.job_id,
+            .log_job = job.check_run_id,
+            .cancel = cancel,
+        };
+    }
+
     c: Context,
     session: Listening,
     job_id: []const u8,
@@ -805,7 +1052,8 @@ const CancelWatch = struct {
                 continue;
             };
             if (m.status.class() != .success or m.body.len == 0) {
-                if (m.status != .accepted and m.status.class() != .success) cc.io.sleep(.fromSeconds(5), .awake) catch return;
+                if (m.status != .accepted and m.status.class() != .success)
+                    cc.io.sleep(.fromSeconds(5), .awake) catch return;
                 continue;
             }
             const mtype = jsonString(cc.arena, m.body, "messageType") orelse "";
@@ -813,10 +1061,19 @@ const CancelWatch = struct {
             const inner = jsonString(cc.arena, m.body, "body") orelse continue;
             const id = jsonString(cc.arena, inner, "jobId") orelse continue;
             if (!std.mem.eql(u8, id, w.job_id)) continue;
-            const grace_ms = timeSpanMs(jsonString(cc.arena, inner, "timeout") orelse "") orelse default_grace_ms;
-            w.cancel.hard_deadline_ms.store(std.Io.Clock.real.now(cc.io).toMilliseconds() + grace_ms, .release);
+            const grace_ms = timeSpanMs(jsonString(cc.arena, inner, "timeout") orelse "") orelse
+                default_grace_ms;
+            w.cancel.hard_deadline_ms.store(
+                std.Io.Clock.real.now(cc.io).toMilliseconds() + grace_ms,
+                .release,
+            );
             w.cancel.requested.store(true, .release);
-            const text = std.fmt.allocPrint(cc.arena, "job {d}: cancelled by GitHub; stopping the running step ({d} s for what still runs)", .{ w.log_job, @divTrunc(grace_ms, 1000) }) catch return;
+            const text = std.fmt.allocPrint(
+                cc.arena,
+                "job {d}: cancelled by GitHub; stopping the running step ({d} s for what still " ++
+                    "runs)",
+                .{ w.log_job, @divTrunc(grace_ms, 1000) },
+            ) catch return;
             w.c.log.append(0, 0, .stderr, text) catch {};
             return;
         }
@@ -917,11 +1174,18 @@ test "timeSpanMs reads GitHub's cancel timeout" {
     try std.testing.expectEqual(@as(?i64, null), timeSpanMs("soon"));
 }
 
-/// The steps GitHub shows for a job, in its runner's order and numbering: "Set up job", the actions'
-/// `pre` scripts, the job's steps, their `post` scripts, "Complete job". GitHub lists only the job's
-/// own steps; its runner adds the others with ids of their own, and so does this one.
+/// The steps GitHub shows for a job, in its runner's order and numbering: "Set up job", the
+/// actions' `pre` scripts, the job's steps, their `post` scripts, "Complete job". GitHub lists only
+/// the job's own steps; its runner adds the others with ids of their own, and so does this one.
 /// `ids`: GitHub's id of each log step (see `Live.ids`), the same the live view used.
-pub fn shownSteps(arena: Allocator, ids: []const []const u8, job: job_mod.Job, result: dagger.Result, job_started_ms: i64, complete: CompleteStep) ![]Shown {
+pub fn shownSteps(
+    arena: Allocator,
+    ids: []const []const u8,
+    job: job_mod.Job,
+    result: dagger.Result,
+    job_started_ms: i64,
+    complete: CompleteStep,
+) ![]Shown {
     var out: std.ArrayList(Shown) = .empty;
     var first_started: i64 = complete.started_ms;
     for (result.steps) |r| if (r.started_ms > 0 and r.started_ms < first_started) {
@@ -930,7 +1194,8 @@ pub fn shownSteps(arena: Allocator, ids: []const []const u8, job: job_mod.Job, r
     for (result.extra) |e| if (e.started_ms > 0 and e.started_ms < first_started) {
         first_started = e.started_ms;
     };
-    try out.append(arena, .{ .id = ids[0], .number = 0, .name = "Set up job", .log_step = 0, .conclusion = if (result.set_up_failed) "failed" else "succeeded", .started_ms = job_started_ms, .completed_ms = first_started });
+    const set_up: []const u8 = if (result.set_up_failed) "failed" else "succeeded";
+    try out.append(arena, bookend(ids[0], "Set up job", 0, set_up, job_started_ms, first_started));
     for (result.extra) |e| if (e.kind == .initialize) try out.append(arena, extraShown(ids, e));
     for (result.extra) |e| if (e.kind == .pre) try out.append(arena, extraShown(ids, e));
     for (job.steps, result.steps, 1..) |step, r, n| try out.append(arena, .{
@@ -938,7 +1203,7 @@ pub fn shownSteps(arena: Allocator, ids: []const []const u8, job: job_mod.Job, r
         .number = 0,
         .name = if (r.name.len > 0) r.name else step.name,
         .log_step = @intCast(n),
-        // Same vocabulary as the job conclusion (verified live): succeeded / failed / canceled / skipped.
+        // Same vocabulary as the job conclusion (verified live): succeeded/failed/canceled/skipped.
         .conclusion = switch (r.outcome) {
             .success => "succeeded",
             .failure => if (r.continued) "succeeded" else "failed",
@@ -962,7 +1227,7 @@ pub fn shownSteps(arena: Allocator, ids: []const []const u8, job: job_mod.Job, r
     const stop_at = out.items.len;
     for (result.extra) |e| if (e.kind == .stop) try out.append(arena, extraShown(ids, e));
     const has_stop = out.items.len > stop_at;
-    try out.append(arena, .{ .id = ids[complete.log_step], .number = 0, .name = "Complete job", .log_step = complete.log_step, .conclusion = "succeeded", .started_ms = complete.started_ms, .completed_ms = complete.completed_ms });
+    try out.append(arena, completeShown(ids, complete));
 
     // GitHub's numbers (seen on every hosted job compared): in order up to the last main step. With
     // post steps or "Stop containers", one number is set aside after it for each step that could
@@ -979,6 +1244,31 @@ pub fn shownSteps(arena: Allocator, ids: []const []const u8, job: job_mod.Job, r
         next += 1;
     }
     return out.items;
+}
+
+fn completeShown(ids: []const []const u8, c: CompleteStep) Shown {
+    const id = ids[c.log_step];
+    return bookend(id, "Complete job", c.log_step, "succeeded", c.started_ms, c.completed_ms);
+}
+
+/// "Set up job" and "Complete job": GitHub shows them without a step number.
+fn bookend(
+    id: []const u8,
+    name: []const u8,
+    log_step: u32,
+    conclusion: []const u8,
+    started_ms: i64,
+    completed_ms: i64,
+) Shown {
+    return .{
+        .id = id,
+        .number = 0,
+        .name = name,
+        .log_step = log_step,
+        .conclusion = conclusion,
+        .started_ms = started_ms,
+        .completed_ms = completed_ms,
+    };
 }
 
 /// The live view's conclusion for a step's completejob one.
@@ -1003,12 +1293,22 @@ fn extraShown(ids: []const []const u8, e: dagger.ExtraStep) Shown {
 
 /// Uploads each shown step's log, then the whole job's, so GitHub's UI can show them. Failures are
 /// reported but never stop the job from completing.
-fn uploadLogs(c: Context, job: job_mod.Job, shown: []const Shown, lines: []const sink.CollectedLine, summaries: []const []const u8, secrets: []const []const u8) !void {
+fn uploadLogs(
+    c: Context,
+    job: job_mod.Job,
+    shown: []const Shown,
+    lines: []const sink.CollectedLine,
+    summaries: []const []const u8,
+    secrets: []const []const u8,
+) !void {
     for (shown) |s| {
         const blob = try results.formatBlob(c.arena, lines, s.log_step);
         if (blob.line_count == 0) continue;
         const r = results.upload(c.arena, c.io, job, .{ .step = s.id }, blob);
-        try c.err.print("job {d}: log upload '{s}': {s}{s}\n", .{ job.check_run_id, s.name, if (r.ok) "ok, " else "FAILED: ", r.detail });
+        try c.err.print(
+            "job {d}: log upload '{s}': {s}{s}\n",
+            .{ job.check_run_id, s.name, if (r.ok) "ok, " else "FAILED: ", r.detail },
+        );
     }
     // Step summaries, masked as the logs are.
     for (shown) |s| {
@@ -1018,12 +1318,18 @@ fn uploadLogs(c: Context, job: job_mod.Job, shown: []const Shown, lines: []const
         var masked: std.Io.Writer.Allocating = .init(c.arena);
         try redact.write(&masked.writer, md, secrets);
         const r = results.uploadSummary(c.arena, c.io, job, s.id, masked.written());
-        try c.err.print("job {d}: summary upload '{s}': {s}{s}\n", .{ job.check_run_id, s.name, if (r.ok) "ok, " else "FAILED: ", r.detail });
+        try c.err.print(
+            "job {d}: summary upload '{s}': {s}{s}\n",
+            .{ job.check_run_id, s.name, if (r.ok) "ok, " else "FAILED: ", r.detail },
+        );
     }
     const all = try results.formatBlob(c.arena, lines, null);
     if (all.line_count > 0) {
         const r = results.upload(c.arena, c.io, job, .job, all);
-        try c.err.print("job {d}: log upload job: {s}{s}\n", .{ job.check_run_id, if (r.ok) "ok, " else "FAILED: ", r.detail });
+        try c.err.print(
+            "job {d}: log upload job: {s}{s}\n",
+            .{ job.check_run_id, if (r.ok) "ok, " else "FAILED: ", r.detail },
+        );
     }
 }
 
@@ -1033,7 +1339,11 @@ fn uploadLogs(c: Context, job: job_mod.Job, shown: []const Shown, lines: []const
 /// FAILURE / WARNING / NOTICE, the message, and where it points (a repository path and lines and
 /// columns) when the workflow command said, with the number of the step it came from. An annotation
 /// without a file is shown by GitHub on the job's line in the workflow file.
-pub fn annotationsJson(arena: Allocator, shown: []const Shown, annotations: []const dagger.Annotation) ![]const u8 {
+pub fn annotationsJson(
+    arena: Allocator,
+    shown: []const Shown,
+    annotations: []const dagger.Annotation,
+) ![]const u8 {
     const Item = struct {
         level: []const u8,
         message: []const u8,
@@ -1052,7 +1362,11 @@ pub fn annotationsJson(arena: Allocator, shown: []const Shown, annotations: []co
         const line = propertyNumber(an.line);
         const col = propertyNumber(an.col);
         it.* = .{
-            .level = if (std.mem.eql(u8, an.level, "error")) "FAILURE" else if (std.mem.eql(u8, an.level, "warning")) "WARNING" else "NOTICE",
+            .level = if (std.mem.eql(
+                u8,
+                an.level,
+                "error",
+            )) "FAILURE" else if (std.mem.eql(u8, an.level, "warning")) "WARNING" else "NOTICE",
             .message = an.message,
             .title = if (an.title) |t| (if (t.len > 0) t else null) else null,
             .path = if (an.file) |f| (if (f.len > 0) f else null) else null,
@@ -1106,7 +1420,10 @@ pub fn stepResultsJson(arena: Allocator, shown: []const Shown) ![]const u8 {
         .status = "completed",
         .conclusion = s.conclusion,
         .started_at = if (s.started_ms > 0) try timefmt.isoTime(arena, s.started_ms) else null,
-        .completed_at = if (s.completed_ms > 0) try timefmt.isoTime(arena, s.completed_ms) else null,
+        .completed_at = if (s.completed_ms > 0) try timefmt.isoTime(
+            arena,
+            s.completed_ms,
+        ) else null,
     };
     var aw: std.Io.Writer.Allocating = .init(arena);
     try std.json.Stringify.value(items, .{ .emit_null_optional_fields = false }, &aw.writer);
@@ -1117,7 +1434,12 @@ fn mintToken(c: Context, creds: auth.Credentials, status: *std.http.Status) !([]
     var jti: [8]u8 = undefined;
     c.io.random(&jti);
     const now = std.Io.Clock.real.now(c.io).toSeconds();
-    const jwt = try auth.buildJwt(c.arena, creds, now, try std.fmt.allocPrint(c.arena, "{x}", .{jti}));
+    const jwt = try auth.buildJwt(
+        c.arena,
+        creds,
+        now,
+        try std.fmt.allocPrint(c.arena, "{x}", .{jti}),
+    );
     return auth.fetchAccessToken(c.arena, c.io, creds, jwt, status);
 }
 
@@ -1138,13 +1460,19 @@ fn fail(c: Context, what: []const u8, e: anyerror) !Cycle {
 }
 
 fn failHttp(c: Context, what: []const u8, e: anyerror, status: std.http.Status) !Cycle {
-    try c.err.print("error during {s}: {s} (HTTP {d})\n", .{ what, @errorName(e), @backingInt(status) });
+    try c.err.print(
+        "error during {s}: {s} (HTTP {d})\n",
+        .{ what, @errorName(e), @backingInt(status) },
+    );
     return github_failure;
 }
 
 fn failBody(c: Context, what: []const u8, r: broker.Response) !Cycle {
     // Error bodies are short JSON documents without credentials.
-    try c.err.print("error during {s}: HTTP {d}: {s}\n", .{ what, @backingInt(r.status), r.body[0..@min(r.body.len, 400)] });
+    try c.err.print(
+        "error during {s}: HTTP {d}: {s}\n",
+        .{ what, @backingInt(r.status), r.body[0..@min(r.body.len, 400)] },
+    );
     return github_failure;
 }
 

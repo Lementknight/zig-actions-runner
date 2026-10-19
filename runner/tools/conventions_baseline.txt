@@ -2,8 +2,5 @@
 # Every function over 70 lines, with its length, and every file's count of
 # lines over 100 columns. The check fails when anything here gets worse.
 long-lines src/dagger.zig 569
-long-lines src/engine.zig 34
 long-lines src/github/auth.zig 1
-long-lines src/job.zig 66
-long-lines src/loop.zig 82
-long-lines src/expr.zig 30
+long-lines src/job.zig 17
