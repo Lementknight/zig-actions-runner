@@ -1501,22 +1501,9 @@ fn splitEnv(
     }
 }
 
-fn writeEnvNodes(w: *std.Io.Writer, plain: []const job_mod.EnvVar, secret: []const SecretRef) !usize {
-    for (plain) |e| {
-        try w.writeAll("withEnvVariable(name:");
-        try std.json.Stringify.value(e.name, .{}, w);
-        try w.writeAll(",value:");
-        try std.json.Stringify.value(e.value, .{}, w);
-        try w.writeAll(") { ");
-    }
-    for (secret) |sr| {
-        try w.writeAll("withSecretVariable(name:");
-        try std.json.Stringify.value(sr.name, .{}, w);
-        try w.writeAll(",secret:");
-        try std.json.Stringify.value(sr.id, .{}, w);
-        try w.writeAll(") { ");
-    }
-    return plain.len + secret.len;
+fn writeEnvNodes(q: *Query, plain: []const job_mod.EnvVar, secret: []const SecretRef) !void {
+    for (plain) |e| try q.call("withEnvVariable", .{ .name = e.name, .value = e.value });
+    for (secret) |sr| try q.call("withSecretVariable", .{ .name = sr.name, .secret = sr.id });
 }
 
 // --- the log reader ---
@@ -2233,8 +2220,8 @@ const BasePlan = struct {
 
 /// The container every step starts from, as one query: the job image behind its registry auth and
 /// its own env, the provisioning exec, the workspace and user, the cache mounts, the event payload
-/// and the job's environment. Each writer opens GraphQL braces and returns how many, so this closes
-/// exactly that many. On failure the message is in `err_msg` and the caller fails the job with it.
+/// and the job's environment. Each writer adds its calls to the query; `finish` closes them. On
+/// failure the message is in `err_msg` and the caller fails the job with it.
 fn baseContainerId(
     arena: Allocator,
     transport: Transport,
@@ -2244,18 +2231,15 @@ fn baseContainerId(
     secret_counter: *u32,
     err_msg: *[]const u8,
 ) ![]const u8 {
-    var doc: std.Io.Writer.Allocating = .init(arena);
-    const w = &doc.writer;
-    try w.writeAll("{ container { ");
-    var braces: usize = 2;
-    braces += try writeImage(w, arena, transport, ev, job, plan, secret_counter, err_msg);
-    braces += try writeProvisionAndWorkspace(w, arena, ev, plan);
-    braces += try writeCacheMounts(w, arena, plan);
-    braces += try writeRunEnv(w, ev, plan);
-    braces += try writeJobEnv(w, arena, transport, ev, job, secret_counter, err_msg);
-    try w.writeAll("id");
-    for (0..braces) |_| try w.writeAll(" }");
-    const data = gql(arena, transport, doc.written(), err_msg) catch return error.BaseContainerFailed;
+    var q: Query = .init(arena);
+    try q.open("container");
+    try writeImage(&q, arena, transport, ev, job, plan, secret_counter, err_msg);
+    try writeProvisionAndWorkspace(&q, arena, ev, plan);
+    try writeCacheMounts(&q, arena, plan);
+    try writeRunEnv(&q, ev, plan);
+    try writeJobEnv(&q, arena, transport, ev, job, secret_counter, err_msg);
+    try q.leaf("id");
+    const data = gql(arena, transport, try q.finish(), err_msg) catch return error.BaseContainerFailed;
     return jsonFindString(data, "id") orelse {
         err_msg.* = "Dagger returned no container";
         return error.BaseContainerFailed;
@@ -2265,7 +2249,7 @@ fn baseContainerId(
 /// `from` the job image, behind a private registry's credentials when there are any, with a container
 /// job's cache variables and its own `env:` set on it.
 fn writeImage(
-    w: *std.Io.Writer,
+    q: *Query,
     arena: Allocator,
     transport: Transport,
     ev: *Evaluator,
@@ -2273,28 +2257,18 @@ fn writeImage(
     plan: BasePlan,
     secret_counter: *u32,
     err_msg: *[]const u8,
-) !usize {
-    var opened: usize = 0;
+) !void {
     if (job.container) |jc| {
         // A private image: its registry's credentials.
         if (try registryAuthNode(arena, ev, transport, secret_counter, jc, plan.job_image, err_msg)) |node| {
-            try w.writeAll(node);
-            opened += 1;
+            try q.splice(node, 1);
         } else if (err_msg.len > 0) return error.BaseContainerFailed;
     }
-    try w.writeAll("from(address:");
-    try std.json.Stringify.value(plan.job_image, .{}, w);
-    try w.writeAll(") { ");
-    opened += 1;
+    try q.call("from", .{ .address = plan.job_image });
     if (job.container != null) for (plan.cache_ids, 0..) |_, i| {
         // Before the container's env, so its own value wins.
         if (package_cache_dirs[i].env.len == 0) continue;
-        try w.writeAll("withEnvVariable(name:");
-        try std.json.Stringify.value(package_cache_dirs[i].env, .{}, w);
-        try w.writeAll(",value:");
-        try std.json.Stringify.value(package_cache_dirs[i].path, .{}, w);
-        try w.writeAll(") { ");
-        opened += 1;
+        try q.call("withEnvVariable", .{ .name = package_cache_dirs[i].env, .value = package_cache_dirs[i].path });
     };
     if (job.container) |jc| {
         // The container's env, as `docker create -e` sets it: every step sees it.
@@ -2302,27 +2276,15 @@ fn writeImage(
             err_msg.* = try std.fmt.allocPrint(arena, "could not evaluate the container's env: {s}", .{ev.diag});
             return error.BaseContainerFailed;
         };
-        for (env) |e| {
-            try w.writeAll("withEnvVariable(name:");
-            try std.json.Stringify.value(e.name, .{}, w);
-            try w.writeAll(",value:");
-            try std.json.Stringify.value(e.value, .{}, w);
-            try w.writeAll(") { ");
-            opened += 1;
-        }
+        for (env) |e| try q.call("withEnvVariable", .{ .name = e.name, .value = e.value });
     }
-    return opened;
 }
 
 /// Provisioning in the default image, the workspace and RUNNER_TEMP, the step user, and the workdir.
-fn writeProvisionAndWorkspace(w: *std.Io.Writer, arena: Allocator, ev: *Evaluator, plan: BasePlan) !usize {
-    var opened: usize = 0;
+fn writeProvisionAndWorkspace(q: *Query, arena: Allocator, ev: *Evaluator, plan: BasePlan) !void {
     if (plan.provision) {
-        try w.writeAll("withExec(args:");
         const script = if (plan.as_runner) provision_runner_script else provision_script;
-        try std.json.Stringify.value([_][]const u8{ "sh", "-c", script }, .{}, w);
-        try w.writeAll(") { ");
-        opened += 1;
+        try q.call("withExec", .{ .args = &[_][]const u8{ "sh", "-c", script } });
     }
     // The job's workspace and RUNNER_TEMP, the step user's in the default image (cached per
     // repository). A job container's user may be unable to make them; its steps then report
@@ -2336,95 +2298,67 @@ fn writeProvisionAndWorkspace(w: *std.Io.Writer, arena: Allocator, ev: *Evaluato
         try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s}{s}", .{ ev.workspace, ev.temp, link, chown })
     else
         try std.fmt.allocPrint(arena, "mkdir -p {s} {s}{s} 2>/dev/null || true", .{ ev.workspace, ev.temp, link });
-    try w.writeAll("withExec(args:");
-    try std.json.Stringify.value([_][]const u8{ "sh", "-c", mk }, .{}, w);
-    try w.writeAll(") { ");
-    opened += 1;
+    try q.call("withExec", .{ .args = &[_][]const u8{ "sh", "-c", mk } });
     if (plan.as_runner) {
-        try w.writeAll("withUser(name:\"" ++ runner_user ++ "\") { ");
-        try w.writeAll("withEnvVariable(name:\"HOME\",value:\"" ++ runner_home ++ "\") { ");
-        opened += 2;
+        try q.call("withUser", .{ .name = runner_user });
+        try q.call("withEnvVariable", .{ .name = "HOME", .value = runner_home });
     }
-    try w.print("withWorkdir(path:\"{s}\") {{ ", .{ev.workspace});
-    opened += 1;
-    return opened;
+    try q.call("withWorkdir", .{ .path = ev.workspace });
 }
 
 /// One cache volume mount per package manager, owned by the step user when steps run as it.
-fn writeCacheMounts(w: *std.Io.Writer, arena: Allocator, plan: BasePlan) !usize {
+fn writeCacheMounts(q: *Query, arena: Allocator, plan: BasePlan) !void {
     for (plan.cache_ids, 0..) |id, i| {
-        try w.writeAll("withMountedCache(path:");
         const path = if (plan.as_runner) try runnerCachePath(arena, i) else package_cache_dirs[i].path;
-        try std.json.Stringify.value(path, .{}, w);
-        try w.writeAll(",cache:");
-        try std.json.Stringify.value(id, .{}, w);
-        if (plan.as_runner) try w.writeAll(",owner:\"" ++ runner_user ++ "\"");
-        try w.writeAll(") { ");
+        const owner: ?[]const u8 = if (plan.as_runner) runner_user else null;
+        try q.call("withMountedCache", .{ .path = path, .cache = id, .owner = owner });
     }
-    return plan.cache_ids.len;
 }
 
 /// The values that identify this run: the event payload, the ran marker, uv's environment, and the
 /// default variables — volatile under step caching, so they do not reach exec cache keys.
-fn writeRunEnv(w: *std.Io.Writer, ev: *Evaluator, plan: BasePlan) !usize {
-    var opened: usize = 0;
+fn writeRunEnv(q: *Query, ev: *Evaluator, plan: BasePlan) !void {
     // The event payload, as on GitHub (actions read it through GITHUB_EVENT_PATH). It differs on
     // every run, so with step caching it travels in a volatile variable that each step writes to
     // the file; a payload too large for one variable is written into the container instead.
     const event = try ev.eventJson();
     if (plan.step_cache and event.len <= max_event_env) {
-        try w.writeAll("withVolatileVariable(name:\"" ++ event_env ++ "\",value:");
+        try q.call("withVolatileVariable", .{ .name = event_env, .value = event });
     } else {
-        try w.writeAll("withNewFile(path:\"" ++ event_path ++ "\",contents:");
+        try q.call("withNewFile", .{ .path = event_path, .contents = event });
     }
-    try std.json.Stringify.value(event, .{}, w);
-    try w.writeAll(") { ");
-    opened += 1;
-    if (plan.step_cache) {
-        try w.writeAll("withVolatileVariable(name:\"" ++ ran_env ++ "\",value:");
-        try std.json.Stringify.value(plan.ran_marker, .{}, w);
-        try w.writeAll(") { ");
-        opened += 1;
-    }
+    if (plan.step_cache) try q.call("withVolatileVariable", .{ .name = ran_env, .value = plan.ran_marker });
     if (plan.uv_env) |e| {
-        try w.writeAll("withEnvVariable(name:\"UV_PROJECT_ENVIRONMENT\",value:");
-        try std.json.Stringify.value(e, .{}, w);
+        try q.call("withEnvVariable", .{ .name = "UV_PROJECT_ENVIRONMENT", .value = e });
         // The environment outlives the job, and `uv venv` refuses to replace one that exists
         // ("A virtual environment already exists at ..."), where on a hosted runner the
         // workspace is new every job and it always succeeds. This keeps `uv venv` meaning
         // "make me a fresh environment"; `uv sync` still reconciles the one that is there.
-        try w.writeAll(") { withEnvVariable(name:\"UV_VENV_CLEAR\",value:\"1\") { ");
-        opened += 2;
+        try q.call("withEnvVariable", .{ .name = "UV_VENV_CLEAR", .value = "1" });
     }
-    const defaults = try ev.defaultEnv();
-    for (defaults) |e| {
+    for (try ev.defaultEnv()) |e| {
         // Run-specific values do not take part in exec cache keys, so unchanged steps are reused.
-        const node = if (plan.step_cache and isVolatile(e.name)) "withVolatileVariable(name:" else "withEnvVariable(name:";
-        try w.writeAll(node);
-        try std.json.Stringify.value(e.name, .{}, w);
-        try w.writeAll(",value:");
-        try std.json.Stringify.value(e.value, .{}, w);
-        try w.writeAll(") { ");
+        const node = if (plan.step_cache and isVolatile(e.name)) "withVolatileVariable" else "withEnvVariable";
+        try q.call(node, .{ .name = e.name, .value = e.value });
     }
-    return opened + defaults.len;
 }
 
 /// Workflow- and job-level env is part of every step's environment; what carries a secret goes in
 /// as a Dagger secret.
 fn writeJobEnv(
-    w: *std.Io.Writer,
+    q: *Query,
     arena: Allocator,
     transport: Transport,
     ev: *Evaluator,
     job: job_mod.Job,
     secret_counter: *u32,
     err_msg: *[]const u8,
-) !usize {
+) !void {
     var plain: std.ArrayList(job_mod.EnvVar) = .empty;
     var secret: std.ArrayList(SecretRef) = .empty;
     splitEnv(arena, transport, job, secret_counter, ev.job_env.items, &plain, &secret, err_msg) catch
         return error.BaseContainerFailed;
-    return writeEnvNodes(w, plain.items, secret.items);
+    try writeEnvNodes(q, plain.items, secret.items);
 }
 
 /// A `run:` step's script, shell and working directory, evaluated, with its header logged as GitHub
