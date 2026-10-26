@@ -1,0 +1,49 @@
+# Load test for zig-runner: the same work as its CI's "Format, build and test" job, once per slot,
+# all queued at once. Start with `gh workflow run bench.yml -f slots='[1,2,3,4]'`.
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      slots:
+        description: JSON list, one job per entry (e.g. [1,2,3,4])
+        required: true
+        default: "[1,2,3,4]"
+      ref:
+        description: zig-runner ref to build and test
+        required: true
+        default: v0.5.0
+
+permissions: {}
+
+jobs:
+  test:
+    name: test ${{ matrix.slot }}
+    runs-on: [self-hosted, laptop]
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: ${{ fromJSON(inputs.slots) }}
+    permissions:
+      contents: read
+    # Unique per job and run, so Dagger runs every job's steps instead of sharing one job's result;
+    # its caches (Zig's, the tool cache) still carry over, as between commits in real CI.
+    env:
+      BENCH_NONCE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.slot }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: Open-Blue/zig-runner
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Install Zig
+        run: .github/scripts/install-zig.sh
+
+      - name: Format check
+        working-directory: runner
+        run: zig fmt --check .
+
+      - name: Test
+        working-directory: runner
+        run: zig build test --summary all
