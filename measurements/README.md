@@ -28,6 +28,7 @@ samples either, for a different reason: its answer is a selection count, not a t
 |---|---|---|
 | `S.2-io-concurrency.jsonl` | S.2, a forced-copy install with 1 and with 3 jobs at once | **measured** on the Pi, 2026-10-17, by `concurrency/arm.sh` |
 | `S.3-cpu-concurrency.jsonl` | S.3, the same sweep on flask's test suite | **measured** on the Pi, 2026-10-17, by `concurrency/arm.sh` |
+| `laptop-runners-pilot.jsonl` | none: a pilot of `RUNNER_COUNT` 1-16 on a Ryzen laptop, one round per arm ([`laptop/`](laptop/README.md)) | **measured** on a laptop, 2026-10-26, by `laptop/bench.sh`, not the harness |
 | `S.1-runners-pilot2.jsonl` | S.1, superseded: total contended copying by `RUNNER_COUNT` | **measured** on the Pi, 2026-10-17, by `concurrency/superseded/arm.sh` |
 | `S.1-runners-pilot.jsonl` | S.1's first instrument, makespan, which could not resolve it | **measured** on the Pi, 2026-10-17, by `concurrency/superseded/arm.sh` |
 | `S.1-runners-aborted.jsonl` | S.1's confirmation, abandoned after trials went from 2 to 35 minutes | **measured** on the Pi, 2026-10-17; four warm-ups, one reading, two failures |
